@@ -3595,7 +3595,7 @@ class GivePokemonFormView(discord.ui.View):
     
     def _make_callback(self, form_key: Optional[str], form_display: str):
         async def callback(interaction: Interaction):
-            await interaction.response.defer(ephemeral=False)
+            await interaction.response.defer(ephemeral=True)
             
             try:
                 # Load species data to build proper payload
@@ -4189,6 +4189,7 @@ class AdminGivePokemon(commands.Cog):
             self.team_mons = team_mons
             self.sprite_file = sprite_file
             self.message: Optional[discord.Message] = None
+            self._handled = False
             
             # Add buttons for each slot (1-6)
             for slot in range(1, 7):
@@ -4222,8 +4223,15 @@ class AdminGivePokemon(commands.Cog):
         
         def _make_slot_callback(self, slot: int):
             async def callback(interaction: Interaction):
+                if self._handled:
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message("Already handled.", ephemeral=True)
+                    else:
+                        await interaction.followup.send("Already handled.", ephemeral=True)
+                    return
+                self._handled = True
                 if not interaction.response.is_done():
-                    await interaction.response.defer(ephemeral=False)
+                    await interaction.response.defer(ephemeral=True)
                 
                 # Update payload with selected slot
                 self.payload["selected_slot"] = slot
@@ -4293,6 +4301,7 @@ class AdminGivePokemon(commands.Cog):
             self.payload = payload
             self.message: Optional[discord.Message] = None
             self.gigantamax_enabled = False
+            self._handled = False
             
             # Add Gigantamax toggle if species can Gigantamax
             species_name = payload.get("species_name", "")
@@ -4335,8 +4344,15 @@ class AdminGivePokemon(commands.Cog):
 
         @ui.button(label="Confirm", style=discord.ButtonStyle.primary)
         async def confirm(self, interaction: Interaction, button: ui.Button):
+            if self._handled:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("Already handled.", ephemeral=True)
+                else:
+                    await interaction.followup.send("Already handled.", ephemeral=True)
+                return
+            self._handled = True
             if not interaction.response.is_done():
-                await interaction.response.defer(ephemeral=False)
+                await interaction.response.defer(ephemeral=True)
             try:
                 # Ensure can_gigantamax is set (default to False if not already set)
                 if "can_gigantamax" not in self.payload:
@@ -4501,8 +4517,16 @@ class AdminGivePokemon(commands.Cog):
             pass
 
         suffix = f" • Autoslotted to **Slot {slotted}**" if slotted else ""
+        success_name = str(p.get("form_display_name") or p.get("species_name") or "pokemon").strip()
+        if not success_name:
+            success_name = "pokemon"
+        # Keep Mimikyu default naming clean when using disguised-as-base handling.
+        if success_name.lower() in {"mimikyu (base)", "mimikyu (disguised)", "mimikyu (disguised form)"}:
+            success_name = "Mimikyu"
+        elif success_name == str(p.get("species_name") or ""):
+            success_name = success_name.replace("-", " ").title()
         await inter.followup.send(
-            f"✅ Gave **{p['species_name']}** (Lv {p['level']}) to <@{p['target_id']}>.{suffix}",
+            f"✅ Gave **{success_name}** (Lv {p['level']}) to <@{p['target_id']}>.{suffix}",
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions(users=True),
         )
@@ -4641,7 +4665,7 @@ class AdminGivePokemon(commands.Cog):
         evs: Optional[str] = None,
         friendship: Optional[int] = None,
     ):
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
 
         # Admin gate removed - command now available to all users
         
@@ -4772,9 +4796,40 @@ class AdminGivePokemon(commands.Cog):
                 # If we didn't auto-select for Greninja, show form selection UI
                 # Skip form selection for Wishiwashi - solo form is the base form (temporary battle forms don't need selection)
                 if (species_name.lower() != "greninja" or not ability) and species_name.lower() != "wishiwashi":
-                    # Add base form as first option
-                    available_forms = [{'form_key': None, 'display_name': f"{species_name.title()} (Base)"}]
-                    available_forms.extend([{'form_key': row['form_key'], 'display_name': row['display_name']} for row in form_rows])
+                    # Base option handling:
+                    # - Mimikyu: default/base should be the Disguised form and labeled just "Mimikyu".
+                    # - Others: include explicit base option.
+                    available_forms: list[dict] = []
+                    if species_name.lower() == "mimikyu":
+                        disguised_row = None
+                        remaining_rows = []
+                        for row in form_rows:
+                            fk = str((row["form_key"] if hasattr(row, "keys") else row[0]) or "").strip().lower()
+                            dn = str((row["display_name"] if hasattr(row, "keys") else row[1]) or "").strip().lower()
+                            if disguised_row is None and ("disguised" in fk or "disguised" in dn):
+                                disguised_row = row
+                            else:
+                                remaining_rows.append(row)
+                        if disguised_row is not None:
+                            disguised_key = disguised_row["form_key"] if hasattr(disguised_row, "keys") else disguised_row[0]
+                            available_forms.append({"form_key": disguised_key, "display_name": species_name.title()})
+                            # If only disguised is available, auto-select it without showing a form picker.
+                            if not remaining_rows:
+                                sp = dict(sp)
+                                sp["_selected_form"] = disguised_key
+                        else:
+                            available_forms.append({"form_key": None, "display_name": species_name.title()})
+                            remaining_rows = list(form_rows)
+                        available_forms.extend([
+                            {
+                                "form_key": (row["form_key"] if hasattr(row, "keys") else row[0]),
+                                "display_name": (row["display_name"] if hasattr(row, "keys") else row[1]),
+                            }
+                            for row in remaining_rows
+                        ])
+                    else:
+                        available_forms.append({'form_key': None, 'display_name': f"{species_name.title()} (Base)"})
+                        available_forms.extend([{'form_key': row['form_key'], 'display_name': row['display_name']} for row in form_rows])
                     
                     if len(available_forms) > 1:
                         # Get gen for legality
@@ -4888,6 +4943,12 @@ class AdminGivePokemon(commands.Cog):
 
         # Get form if auto-selected (for Greninja)
         form_key = sp.get("_selected_form") if isinstance(sp, dict) else None
+        form_display_name = None
+        try:
+            if species_name.lower() == "mimikyu" and form_key and "disguised" in str(form_key).lower():
+                form_display_name = "Mimikyu"
+        except Exception:
+            form_display_name = None
         
         payload = {
             "target_id": target_id,
@@ -4896,6 +4957,7 @@ class AdminGivePokemon(commands.Cog):
             "target_tag": f"{target.name}#{getattr(target, 'discriminator', '0')}" if hasattr(target, "discriminator") else target.name,
             "species_id": species_id,
             "species_name": species_name,
+            "form_display_name": form_display_name,
             "base_stats": base_stats,  # already normalized
             "gen": gen,
             "level": lvl,
@@ -12479,6 +12541,14 @@ async def walk_cmd(inter: discord.Interaction, name: str, slot: int | None = Non
 def _team_species_label(row: dict) -> str:
     species = str(row.get("species") or "Unknown").replace("-", " ").replace("_", " ").title()
     form = str(row.get("form") or "").strip()
+    form_norm = form.lower().replace("_", "-").strip()
+    species_norm = str(row.get("species") or "").strip().lower().replace("_", "-")
+    # Mimikyu's default visual state is the Disguised form; keep the label as plain "Mimikyu".
+    if species_norm == "mimikyu" and (
+        form_norm in {"disguised", "mimikyu-disguised", "disguised-form", "mimikyu-disguised-form"}
+        or "disguised" in form_norm
+    ):
+        return "Mimikyu"
     if form:
         form_title = form.replace("-", " ").replace("_", " ").title()
         if form_title.lower() not in species.lower():
