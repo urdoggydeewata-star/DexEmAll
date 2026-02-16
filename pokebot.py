@@ -1,0 +1,15392 @@
+# ======= BirbxNa1og_PokemonBot — global slash + DB-backed =======
+import os
+import sys
+import pathlib
+import json
+from io import BytesIO
+
+# Optional Pillow for route panel cropping
+try:
+    from PIL import Image  # type: ignore
+except Exception:  # Pillow not installed
+    Image = None  # type: ignore
+import random
+import math
+import asyncio
+import inspect
+import copy
+import time
+import re
+import difflib
+from io import BytesIO
+import datetime as dt
+from datetime import datetime, timedelta, timezone
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Tuple, Optional, List, Sequence, Any, Literal, Dict, TYPE_CHECKING
+from dataclasses import dataclass, field
+
+# Load .env BEFORE any project imports that read env vars (e.g., pvp/db_pool)
+from dotenv import load_dotenv
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+load_dotenv()
+
+import aiohttp
+import discord
+from discord.ext import commands
+from discord import app_commands, ui, Interaction, Embed
+
+from db_async import connect as db_connect
+from pvp.engine import build_mon
+from pvp.panel import _base_pp, _max_pp
+if TYPE_CHECKING:
+    from pvp.engine import Mon
+    from pvp.panel import BattleState
+
+import lib
+from lib import db
+try:
+    from lib import db_cache
+except ImportError:
+    db_cache = None
+from lib.poke_ingest import ensure_species_and_learnsets
+from pvp.panel import _base_pp, _max_pp
+from lib.stats import generate_mon, calc_all_stats
+from lib.team_import import parse_showdown_team, get_preset_team_names, get_preset_team, ParsedPokemon
+from lib.legality import legal_moves, species_allowed
+from lib.rules import rules_for
+import lib.rules as _rules
+try:
+    from tools.cache_everything import warm_cache, STATIC_TABLES
+except ImportError:
+    warm_cache = None
+    STATIC_TABLES = []
+
+# Warm up renderer once to avoid first-GIF stall (no-op if renderer missing)
+try:
+    from pvp.renderer import render_turn_gif
+    def _warm_renderer_once() -> None:
+        try:
+            render_turn_gif(
+                battle_id="warmup",
+                turn=1,
+                pov="p1",
+                gen=1,
+                my_species="bulbasaur",
+                my_shiny=False,
+                my_female=False,
+                my_level=5,
+                my_hp_current=20,
+                my_hp_max=20,
+                my_team_alive=1,
+                my_team_total=1,
+                my_form=None,
+                my_has_substitute=False,
+                my_status=None,
+                my_mega_evolved=False,
+                my_dynamaxed=False,
+                my_primal_reversion=None,
+                opp_species="charmander",
+                opp_shiny=False,
+                opp_female=False,
+                opp_level=5,
+                opp_hp_current=19,
+                opp_hp_max=19,
+                opp_team_alive=1,
+                opp_team_total=1,
+                opp_form=None,
+                opp_has_substitute=False,
+                opp_status=None,
+                opp_mega_evolved=False,
+                opp_dynamaxed=False,
+                opp_primal_reversion=None,
+                canvas_size=(128, 96),
+                duration_ms=80,
+                hide_hp_text=True,
+                nullscape_active=False,
+                my_team_statuses=[None],
+                opp_team_statuses=[None],
+                my_team_hp=[(20, 20)],
+                opp_team_hp=[(19, 19)],
+                bg_key=None,
+            )
+        except Exception:
+            pass
+    _warm_renderer_once()
+except Exception:
+    pass
+
+# =========================
+#  Terastallization helpers
+# =========================
+VALID_TERA_TYPES: tuple[str, ...] = (
+    "normal", "fire", "water", "electric", "grass", "ice",
+    "fighting", "poison", "ground", "flying", "psychic", "bug",
+    "rock", "ghost", "dragon", "dark", "steel", "fairy", "stellar"
+)
+
+
+def _normalize_type_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    s = s.replace("type", "").replace("_", "-").replace(" ", "-")
+    return s or None
+
+
+def _extract_species_types(entry: Mapping[str, Any]) -> list[str]:
+    raw = entry.get("types")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = [raw]
+    if raw is None:
+        return []
+    types: list[str] = []
+    for item in raw:
+        norm = _normalize_type_id(item)
+        if norm and norm not in types:
+            types.append(norm)
+    return types
+
+
+def _roll_default_tera_type(types: Sequence[str]) -> str | None:
+    if not types:
+        return None
+    return random.choice(list(types))
+
+
+# =========================
+#  Config / Intents
+# =========================
+# Modern EXP Share (Gen VI+ behavior): when True, all non-fainted party mons gain full EXP
+EXP_SHARE_ALWAYS_ON = True
+
+# .env is already loaded above before importing db
+TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
+if not TOKEN:
+    raise RuntimeError("Missing DISCORD_TOKEN in .env — add DISCORD_TOKEN=your_bot_token to .env")
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True            # requires Members intent enabled in Dev Portal if you really need it
+intents.messages = True
+intents.message_content = True    # keep True if you still use prefix commands elsewhere
+
+# Banned user IDs (blocked from all slash commands and app interactions)
+BANNED_IDS: frozenset[int] = frozenset({
+    891797928396587059
+})
+
+# Access code gate: users must run /code <code> before using the bot (set BOT_ACCESS_CODE in .env)
+BOT_ACCESS_CODE: str = (os.getenv("BOT_ACCESS_CODE") or "").strip()
+# IDs that bypass the code gate (owners + comma-separated from env, e.g. CODE_BYPASS_IDS=123,456)
+_CODE_BYPASS_RAW = os.getenv("CODE_BYPASS_IDS", "")
+CODE_BYPASS_IDS: frozenset[int] = frozenset(
+    int(x.strip()) for x in _CODE_BYPASS_RAW.split(",") if x.strip()
+)
+
+
+class _BannedCheckTree(app_commands.CommandTree):
+    """CommandTree that blocks banned users and enforces access code gate."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user:
+            return await super().interaction_check(interaction)
+        uid = interaction.user.id
+
+        # 1) Banned users
+        if uid in BANNED_IDS:
+            try:
+                await interaction.response.send_message(
+                    "❌ You are banned from using this bot.",
+                    ephemeral=True,
+                )
+            except discord.DiscordException:
+                pass
+            return False
+
+        # 2) Access code gate (skip if no code configured)
+        if BOT_ACCESS_CODE:
+            bypass = uid in (OWNER_IDS | CODE_BYPASS_IDS)
+            cmd_name = (interaction.data or {}).get("name", "")
+            if not bypass and cmd_name != "code":
+                verified = await db.is_access_verified(str(uid))
+                if not verified:
+                    try:
+                        await interaction.response.send_message(
+                            "🔒 You need to enter the access code first.\n"
+                            "Use `/code <your_code>` to unlock the bot.",
+                            ephemeral=True,
+                        )
+                    except discord.DiscordException:
+                        pass
+                    return False
+
+        return await super().interaction_check(interaction)
+
+
+bot = commands.Bot(command_prefix='.', intents=intents, tree_cls=_BannedCheckTree)
+# ==== OWNER / ADMIN CHECKS ====
+OWNER_IDS: set[int] = { 764310943781617716 }  # <-- your ID
+DEV_GUILD_ID = 889548793912123392
+DEV_GUILD = discord.Object(id=DEV_GUILD_ID)
+
+# Embed echo (set these IDs to enable)
+EMBED_ECHO_GUILD_ID: int | None = 889548793912123392
+EMBED_ECHO_CHANNEL_IDS: set[int] = {
+    907370913002049628,  # rules-and-info
+    1459363727483600990, # future-implementations
+    1465864011223535774, # sneak-peaks
+}
+EMBED_ECHO_USER_IDS: set[int] | None = None  # e.g. {123} to limit to you; None = allow all
+EMBED_ECHO_DELETE_SOURCE = True              # delete original user message after echo
+EMBED_ECHO_IGNORE_PREFIX_COMMANDS = True     # ignore messages starting with the prefix
+
+# Verification button (rules channel)
+VERIFY_GUILD_ID = 889548793912123392
+VERIFY_CHANNEL_ID = 907370913002049628
+BETA_ANNOUNCEMENT_CHANNEL_ID = 1464033412183752808
+BETA_CLAIM_CUSTOM_ID = "beta_claim"
+
+
+class BetaClaimView(discord.ui.View):
+    """One-time Claim button for beta token announcement. First clicker gets 1 token; button is removed."""
+
+    def __init__(self, *, timeout: float | None = None):
+        super().__init__(timeout=timeout)
+
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, custom_id=BETA_CLAIM_CUSTOM_ID)
+    async def claim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.defer(ephemeral=False)
+        except Exception:
+            return
+        message_id = interaction.message.id if interaction.message else None
+        user_id = str(interaction.user.id)
+        if not message_id:
+            try:
+                await interaction.followup.send("❌ Could not identify message.", ephemeral=True)
+            except Exception:
+                pass
+            return
+        try:
+            async with db.session() as conn:
+                cur = await conn.execute("SELECT 1 FROM beta_claims WHERE message_id = ? LIMIT 1", (message_id,))
+                row = await cur.fetchone()
+                await cur.close()
+                if row:
+                    await interaction.followup.send("❌ This reward has already been claimed.", ephemeral=True)
+                    return
+                await conn.execute(
+                    """
+                    INSERT INTO users (user_id, created_at, coins, currencies, beta_tokens)
+                    VALUES (?, CURRENT_TIMESTAMP, 0, '{"coins": 0}'::jsonb, 1)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                      beta_tokens = COALESCE(users.beta_tokens, 0) + 1
+                    """,
+                    (user_id,),
+                )
+                await conn.execute("INSERT INTO beta_claims (message_id) VALUES (?) ON CONFLICT (message_id) DO NOTHING", (message_id,))
+                await conn.commit()
+            try:
+                await interaction.message.edit(view=None)
+            except Exception:
+                pass
+            await interaction.followup.send("✅ You claimed **1 Beta Token**! It has been added to your account.", ephemeral=True)
+        except Exception as e:
+            try:
+                await interaction.followup.send(f"❌ Something went wrong: {e}", ephemeral=True)
+            except Exception:
+                pass
+            import traceback
+            traceback.print_exc()
+
+
+# Beta claim view is created in on_ready() (needs a running event loop) and stored on bot.beta_claim_view
+
+
+VERIFY_ROLE_ID = 907370845167566929
+VERIFY_BUTTON_CUSTOM_ID = "verify:accept_rules"
+
+def owners_only():
+    """Allow only hardcoded owner IDs."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.user and interaction.user.id in OWNER_IDS:
+            return True
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True)
+        return False
+    return app_commands.check(predicate)
+
+def admin_only():
+    """Allow ONLY users listed in the DB admins table."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        try:
+            if await db.is_admin(str(interaction.user.id)):
+                return True
+        except Exception:
+            pass
+        await interaction.response.send_message(
+            "❌ You are not allowed to use this command (DB admin only).",
+            ephemeral=True
+        )
+        return False
+    return app_commands.check(predicate)
+DB_WRITE_LOCK = asyncio.Lock()
+
+def _close_discord_files(files) -> None:
+    """Best-effort close of discord.File handles to avoid FD leaks."""
+    if not files:
+        return
+    for f in files:
+        try:
+            if f:
+                f.close()
+        except Exception:
+            pass
+
+async def open_db():
+    # Use the shared, WAL-configured connection from lib.db
+    return await db.connect()
+@bot.tree.command(name="restartbot", description="Owner only: restart the bot process.")
+@owners_only()
+async def restartbot(interaction: discord.Interaction):
+    # Acknowledge before restarting so Discord gets the reply
+    await interaction.response.send_message("🔁 Restarting bot…", ephemeral=True)
+
+    async def _reexec():
+        await asyncio.sleep(1)
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)  # replace current process
+        except Exception:
+            os._exit(0)  # fallback: exit; your process manager/host restarts it
+
+    asyncio.create_task(_reexec())
+# Quick check (anyone): are you a DB admin?
+@bot.tree.command(name="am_i_admin", description="Tell me if I can run DB-admin commands.")
+async def am_i_admin(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    in_db = await db.is_admin(str(interaction.user.id))
+    await interaction.followup.send(
+        "DB Admin: " + ("YES ✅" if in_db else "NO ❌"),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="check_schema", description="List tables in the database (to verify migration ran).")
+async def check_schema(interaction: discord.Interaction):
+    """List tables in public schema so you can confirm init_schema / migration worked."""
+    await interaction.response.defer(ephemeral=False)
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+        names = [str(r[0]) for r in rows] if rows else []
+        if names:
+            text = "**Tables in public schema:**\n" + ", ".join(names)
+        else:
+            text = "No tables in public schema. Run the bot once (init_schema runs at startup) or apply `db/schema_pg.sql` manually (e.g. `psql $DATABASE_URL -f db/schema_pg.sql`)."
+        await interaction.followup.send(text[:2000], ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Could not list tables: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="post_beta_announcement", description="Owner only: post the beta tokens announcement to the announcement channel.")
+@owners_only()
+async def post_beta_announcement(interaction: discord.Interaction):
+    """Post an announcement embed to the beta announcement channel. Owner only."""
+    await interaction.response.defer(ephemeral=False)
+    channel = bot.get_channel(BETA_ANNOUNCEMENT_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(BETA_ANNOUNCEMENT_CHANNEL_ID)
+        except Exception:
+            channel = None
+    if not isinstance(channel, discord.TextChannel):
+        return await interaction.followup.send("❌ Announcement channel not found.", ephemeral=True)
+    embed = discord.Embed(
+        title="🪙 Beta Tokens — Announcement",
+        description=(
+            "**Routing is almost operational.**\n\n"
+            "For that, I'm introducing **Beta Tokens** — a currency for beta testers.\n\n"
+            "• **Beta-exclusive:** These tokens are for beta testers only and will **disappear when Gen 1 fully releases**.\n"
+            "• **1 token per person** per command that awards them.\n"
+            "• **Use:** Beta tokens will unlock **exclusive rewards** once the bot stands on its feet.\n\n"
+            "Thank you for testing. 🎮"
+        ),
+        color=0x9B59B6,
+    )
+    embed.set_footer(text="Beta Tokens • 1 per person per eligible command • Disappear at Gen 1 full release")
+    view = getattr(bot, "beta_claim_view", None) or BetaClaimView()
+    await channel.send(embed=embed, view=view)
+    await interaction.followup.send("✅ Beta announcement posted.", ephemeral=True)
+
+
+def _canon_item_id(pokeapi_name: str) -> str:
+    # PokeAPI uses hyphens; your DB uses underscores (e.g., poke-ball -> poke_ball)
+    return pokeapi_name.strip().lower().replace("-", "_")
+
+async def _item_english_name(payload: dict) -> str:
+    # Prefer English pretty name; fallback to base name
+    for n in payload.get("names", []):
+        if n.get("language", {}).get("name") == "en":
+            return n.get("name") or payload.get("name", "")
+    return payload.get("name", "")
+
+def _item_english_desc(payload: dict) -> str | None:
+    # Take last English flavor (they vary by version)
+    en = [f for f in payload.get("flavor_text_entries", [])
+          if f.get("language", {}).get("name") == "en"]
+    if not en:
+        return None
+    # Clean newlines
+    return en[-1].get("text", "").replace("\n", " ").replace("\f", " ").strip() or None
+
+async def _upsert_item_row(conn, *, item_id: str, name: str | None, icon_url: str | None,
+                           category: str | None, description: str | None,
+                           price: int | None, sell_price: int | None):
+    # Works with your schema:
+    # items(id, name, emoji, icon_url, category, description, price, sell_price)
+    await conn.execute("""
+        INSERT INTO items (id, name, icon_url, category, description, price, sell_price)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name        = COALESCE(excluded.name, items.name),
+            icon_url    = COALESCE(excluded.icon_url, items.icon_url),
+            category    = COALESCE(excluded.category, items.category),
+            description = COALESCE(excluded.description, items.description),
+            price       = COALESCE(excluded.price, items.price),
+            sell_price  = COALESCE(excluded.sell_price, items.sell_price)
+    """, (item_id, name, icon_url, category, description, price, sell_price))
+
+async def _fetch_json(session: aiohttp.ClientSession, url: str) -> dict:
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+async def _import_all_items_from_pokeapi() -> tuple[int, int]:
+    """
+    Returns (inserted_or_updated_count, total_seen)
+    """
+    base = "https://pokeapi.co/api/v2/item?limit=100000&offset=0"
+    async with aiohttp.ClientSession() as session:
+        listing = await _fetch_json(session, base)
+        results = listing.get("results", [])
+        total = len(results)
+        if total == 0:
+            return 0, 0
+
+        changed = 0
+        async with db.session() as conn:
+            # Gentle on the API: fetch details sequentially (still fast enough), or batch if you want
+            for idx, entry in enumerate(results, start=1):
+                try:
+                    detail = await _fetch_json(session, entry["url"])
+                except Exception as e:
+                    print(f"[items] skip {entry.get('name')} (fetch error: {e})")
+                    continue
+
+                pid = _canon_item_id(detail["name"])
+                pretty_name = await _item_english_name(detail)
+                icon_url = (detail.get("sprites") or {}).get("default") or None
+                category = (detail.get("category") or {}).get("name")
+                if category:
+                    category = category.replace("-", "_")
+                desc = _item_english_desc(detail)
+                price = detail.get("cost")
+                sell_price = price // 2 if isinstance(price, int) else None  # simple default
+
+                await _upsert_item_row(
+                    conn,
+                    item_id=pid,
+                    name=pretty_name,
+                    icon_url=icon_url,
+                    category=category,
+                    description=desc,
+                    price=price if isinstance(price, int) else None,
+                    sell_price=sell_price
+                )
+                changed += 1
+
+                # optional: tiny sleep to be nice to PokeAPI
+                await asyncio.sleep(0.01)
+
+            await conn.commit()
+            return changed, total
+
+@bot.tree.command(name="import_items", description="(DB Admin) Cache all PokeAPI items into the database.")
+@admin_only()
+async def import_items_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        changed, total = await _import_all_items_from_pokeapi()
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Import failed: {e}", ephemeral=True)
+    await interaction.followup.send(
+        f"📥 Imported/updated **{changed}** items (saw {total}).\n"
+        f"You can now set emojis with `/set_item_emoji` and view them in `/bag`.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="seed_tm_fragments", description="(DB Admin) Ensure TM Fragment + all Gen1 TMs exist in items; give you 1 fragment per TM.")
+@admin_only()
+async def seed_tm_fragments_cmd(interaction: discord.Interaction):
+    """Ensure item_master has tm-fragment and every GEN1 TM; give the invoker 1 TM Fragment per TM (for testing/exchange)."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    uid = str(interaction.user.id)
+    try:
+        await db.upsert_item_master(TM_FRAGMENT_ITEM_ID, name="TM Fragment")
+        for item_id, move_name in GEN1_TMS:
+            num = item_id.replace("tm-", "").zfill(2)
+            await db.upsert_item_master(item_id, name=f"TM{num} {move_name}")
+        n_tms = len(GEN1_TMS)
+        await db.give_item(uid, TM_FRAGMENT_ITEM_ID, n_tms)
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Seed failed: {e}", ephemeral=True)
+    await interaction.followup.send(
+        f"✅ Seeded **TM Fragment** and all **{n_tms}** Gen 1 TMs in the item catalog.\n"
+        f"You received **{n_tms}** TM Fragment(s).",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="mygen", description="Show your current game generation.")
+async def mygen(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+    try:
+        g = await db.get_user_gen(uid)   # defaults to 1 if column empty/missing
+    except Exception:
+        g = 1
+    await interaction.followup.send(f"Your current generation is **Gen {g}**.", ephemeral=True)
+
+@bot.tree.command(name="setgen", description="Admin: set a user's generation (1–9).")
+@app_commands.describe(user="Target user", gen="Generation number (1–9)")
+@owners_only()
+async def setgen(
+    interaction: discord.Interaction,
+    user: discord.User,
+    gen: app_commands.Range[int, 1, 9],
+    also_unlock: bool = True
+):
+    """
+    Set a user's current generation and optionally unlock up to that gen.
+    
+    Args:
+        user: The user to modify
+        gen: Generation to set (1-9)
+        also_unlock: If True, also sets max_unlocked_gen to this value (default: True)
+    """
+    await interaction.response.defer(ephemeral=False)
+    uid = str(user.id)
+    
+    await db.set_user_gen(uid, gen)
+    
+    if also_unlock:
+        conn = await db.connect()
+        try:
+            await conn.execute(
+                "INSERT OR IGNORE INTO user_rulesets (user_id, generation, max_unlocked_gen) VALUES (?, 1, 1)",
+                (uid,)
+            )
+            await conn.execute(
+                "UPDATE user_rulesets SET max_unlocked_gen = ?, updated_at_utc = CURRENT_TIMESTAMP WHERE user_id = ?",
+                (gen, uid)
+            )
+            await conn.commit()
+            await interaction.followup.send(
+                f"✅ Set {user.mention}'s generation to **Gen {gen}** and unlocked up to **Gen {gen}**.", ephemeral=True
+            )
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+    else:
+        await interaction.followup.send(
+            f"✅ Set {user.mention}'s generation to **Gen {gen}**.", ephemeral=True
+        )
+
+# --- Call this helper BEFORE you allow a held item / battle gimmick ---
+async def enforce_item_gimmick_gate(
+    interaction: discord.Interaction,
+    owner_id: str,
+    item_id: str | None
+) -> bool:
+    """
+    Returns True if the item is allowed for the owner's current gen, else
+    sends an ephemeral error and returns False.
+
+    Use this anywhere you equip, give, or activate an item that could be
+    a gimmick enabler (Mega stones, Z-crystals, Dynamax, Tera Orb).
+    """
+    if not item_id:
+        return True  # nothing to check
+    try:
+        user_gen = await db.get_user_gen(owner_id)
+    except Exception:
+        user_gen = 1
+
+    if not _rules.gimmick_allowed_in_gen(user_gen, item_id):
+        await interaction.followup.send(
+            f"❌ `{item_id}` isn’t allowed in **Gen {user_gen}**.", ephemeral=True
+        )
+        return False
+    return True
+##sprites:
+# === Local Pokémon sprites (project_root/sprites/<species>/...) ===
+SPRITES_DIR = Path(__file__).resolve().parent / "sprites"   # e.g. sprites/bulbasaur/...
+
+def _species_folder_name(species: str) -> str:
+    """
+    Your folder layout is 'sprites/{species name}/...'.
+    We'll normalize to lowercase and turn spaces/underscores into dashes
+    to match your actual folders (e.g., 'Mr Mime' -> 'mr-mime').
+    """
+    s = str(species or "").strip().lower()
+    # Normalize well-known alias folders
+    if s in ("greninja-ash", "ash-greninja"):
+        s = "greninja-battle-bond"
+    # Also convert any '...-ash' variant for greninja to battle-bond
+    if s.startswith("greninja-") and s.endswith("-ash"):
+        s = s.replace("-ash", "-battle-bond")
+    return s.replace(" ", "-").replace("_", "-")
+
+def pokemon_sprite_attachment(
+    species: str,
+    *,
+    shiny: bool = False,
+    gender: str | None = None,
+) -> tuple[str | None, discord.File | None]:
+    """
+    Returns (attachment_url, discord.File) for the *best* local sprite you have.
+
+    Priority (always animated over static, as requested):
+      1) female animated shiny front  -> female animated front
+      2) female shiny front           -> female front
+      3) animated shiny front         -> animated front
+      4) shiny front                  -> front
+      5) icon                         (only if no animated/static fronts exist)
+
+    Filenames assumed from your screenshot:
+      animated-front.gif
+      animated-back.gif
+      animated-shiny-front.gif
+      animated-shiny-back.gif
+      front.png
+      back.png
+      shiny-front.png
+      shiny-back.png
+      icon.png
+      and the female-prefixed versions:
+      female-animated-front.gif, female-animated-shiny-front.gif,
+      female-front.png, female-shiny-front.png, etc.
+
+    If nothing local exists, returns (None, None).
+    """
+    folder = SPRITES_DIR / _species_folder_name(species)
+
+    def _exists(name: str) -> Path | None:
+        p = folder / name
+        try:
+            return p if p.exists() and p.stat().st_size > 0 else None
+        except Exception:
+            return None
+
+    is_female = (str(gender or "").strip().lower() == "female")
+
+    # Build candidate list in strict priority (animated > static; shiny > normal; female first)
+    candidates: list[str] = []
+    if is_female:
+        if shiny:
+            candidates += ["female-animated-shiny-front.gif", "female-shiny-front.png"]
+        candidates += ["female-animated-front.gif", "female-front.png"]
+
+    if shiny:
+        candidates += ["animated-shiny-front.gif", "shiny-front.png"]
+    candidates += ["animated-front.gif", "front.png"]
+
+    # If absolutely nothing, try icon last
+    candidates += ["icon.png"]
+
+    for fname in candidates:
+        p = _exists(fname)
+        if p:
+            return f"attachment://{p.name}", discord.File(p, filename=p.name)
+
+    return None, None
+##shiny odds
+TRIGGER_NAME = "pokemons_shiny_auto"
+
+class OwnerShinyOddsCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        # Pull the same OWNER_IDS set you already use
+        ids = None
+        try:
+            # If this cog is in a separate file and your main file is named pokebot.py:
+            from pokebot import OWNER_IDS as _IDS  # noqa: F401
+            ids = set(_IDS)
+        except Exception:
+            # If it's the same file, OWNER_IDS will already be in globals()
+            ids = set(globals().get("OWNER_IDS", set()))
+        self.owner_ids: set[int] = set(int(x) for x in (ids or set()))
+
+    async def _is_owner(self, interaction: discord.Interaction) -> bool:
+        # Primary: your OWNER_IDS set
+        if self.owner_ids and interaction.user.id in self.owner_ids:
+            return True
+        # Fallback only if OWNER_IDS is empty
+        try:
+            app = await interaction.client.application_info()
+            if app.owner:
+                return interaction.user.id == app.owner.id
+        except Exception:
+            pass
+        return False
+
+    async def _current_denominator(self) -> int | None:
+        return None
+
+    async def _create_trigger(self, n: int) -> None:
+        if getattr(db, "DB_IS_POSTGRES", False):
+            return
+        conn = await db.connect()
+        try:
+            await conn.execute(f"DROP TRIGGER IF EXISTS {TRIGGER_NAME}")
+            await conn.execute(f"""
+            CREATE TRIGGER {TRIGGER_NAME}
+            AFTER INSERT ON pokemons
+            BEGIN
+              UPDATE pokemons
+              SET shiny = CASE WHEN (abs(random()) % {n}) = 0 THEN 1 ELSE shiny END
+              WHERE id = NEW.id;
+            END;
+            """)
+            await conn.commit()
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+    @app_commands.command(name="shiny_odds", description="Show the current global shiny odds (owner only).")
+    async def shiny_odds(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=False)
+        if not await self._is_owner(interaction):
+            return await interaction.followup.send("❌ Owner only.", ephemeral=True)
+        if getattr(db, "DB_IS_POSTGRES", False):
+            return await interaction.followup.send("❌ Shiny trigger is not supported on Postgres.", ephemeral=True)
+        n = await self._current_denominator()
+        if not n:
+            return await interaction.followup.send("No shiny trigger found. Run `/set_shiny_odds` first.", ephemeral=True)
+        await interaction.followup.send(f"⭐ Current shiny odds: **1 / {n}**", ephemeral=True)
+
+    @app_commands.command(name="set_shiny_odds", description="Set global shiny odds to 1/N for all new Pokémon inserts (owner only).")
+    @app_commands.describe(n="Denominator N (e.g., 4096). Use 1 for always-shiny during testing.")
+    async def set_shiny_odds(self, interaction: discord.Interaction, n: app_commands.Range[int, 1, 1000000]):
+        await interaction.response.defer(ephemeral=False)
+        if not await self._is_owner(interaction):
+            return await interaction.followup.send("❌ Owner only.", ephemeral=True)
+        if getattr(db, "DB_IS_POSTGRES", False):
+            return await interaction.followup.send("❌ Shiny trigger is not supported on Postgres.", ephemeral=True)
+        await self._create_trigger(n)
+        await interaction.followup.send(f"✅ Shiny odds set to **1 / {n}** for all NEW Pokémon inserts.", ephemeral=True)
+# =========================
+#  Owner admin management
+# =========================
+async def _count(conn, table: str, where_sql: str = "", args: tuple = ()):
+    cur = await conn.execute(f"SELECT COUNT(*) AS c FROM {table} {where_sql}", args)
+    row = await cur.fetchone()
+    await cur.close()
+    return int(row["c"] if row else 0)
+
+_PG_POKEMONS_COLS_OK = False
+
+async def _ensure_pg_pokemons_columns(conn) -> None:
+    global _PG_POKEMONS_COLS_OK
+    if _PG_POKEMONS_COLS_OK or not getattr(db, "DB_IS_POSTGRES", False):
+        return
+    try:
+        await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS hp_now INTEGER")
+        await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS moves_pp JSONB")
+        await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS shiny INTEGER NOT NULL DEFAULT 0")
+        await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS is_hidden_ability INTEGER NOT NULL DEFAULT 0")
+        _PG_POKEMONS_COLS_OK = True
+    except Exception:
+        # leave flag false so we can try again later
+        pass
+
+async def _pg_pokemons_column_flags(conn) -> dict:
+    """Return existence flags for optional PG columns on pokemons."""
+    flags = {"hp_now": True, "moves_pp": True, "shiny": True, "is_hidden_ability": True}
+    if not getattr(db, "DB_IS_POSTGRES", False):
+        return flags
+    try:
+        flags["hp_now"] = await db._column_exists(conn, "pokemons", "hp_now")
+    except Exception:
+        flags["hp_now"] = False
+    try:
+        flags["moves_pp"] = await db._column_exists(conn, "pokemons", "moves_pp")
+    except Exception:
+        flags["moves_pp"] = False
+    try:
+        flags["shiny"] = await db._column_exists(conn, "pokemons", "shiny")
+    except Exception:
+        flags["shiny"] = False
+    try:
+        flags["is_hidden_ability"] = await db._column_exists(conn, "pokemons", "is_hidden_ability")
+    except Exception:
+        flags["is_hidden_ability"] = False
+    return flags
+
+async def _tx_begin(conn) -> None:
+    await conn.execute("BEGIN")
+
+async def _tx_commit(conn) -> None:
+    if getattr(db, "DB_IS_POSTGRES", False):
+        await conn.execute("COMMIT")
+    else:
+        await conn.commit()
+
+async def _tx_rollback(conn) -> None:
+    if getattr(db, "DB_IS_POSTGRES", False):
+        await conn.execute("ROLLBACK")
+    else:
+        await conn.rollback()
+
+async def _wipe_user(conn, uid: str) -> dict:
+    """
+    Remove EVERYTHING for one user.
+    Note: owner_id tables -> uid in owner_id; users/user_rulesets -> uid in user_id.
+    """
+    stats = {
+        "pokemons":       await _count(conn, "pokemons",       "WHERE owner_id=?", (uid,)),
+        "user_items":     await _count(conn, "user_items",     "WHERE owner_id=?", (uid,)),
+        "user_equipment": await _count(conn, "user_equipment", "WHERE owner_id=?", (uid,)),
+        "user_boxes":     await _count(conn, "user_boxes",     "WHERE owner_id=?", (uid,)),
+        "user_meta":      await _count(conn, "user_meta",      "WHERE owner_id=?", (uid,)),
+        "user_rulesets":  await _count(conn, "user_rulesets",  "WHERE user_id=?",  (uid,)),
+        "event_log":      await _count(conn, "event_log",      "WHERE user_id=?",  (uid,)),
+        "users":          await _count(conn, "users",          "WHERE user_id=?",  (uid,)),
+    }
+
+    await _tx_begin(conn)
+    try:
+        # Enable foreign keys to ensure CASCADE works
+        if not getattr(db, "DB_IS_POSTGRES", False):
+            await conn.execute("PRAGMA foreign_keys = ON")
+        # children first (in order of dependencies)
+        await conn.execute("DELETE FROM pokemons       WHERE owner_id=?", (uid,))
+        await conn.execute("DELETE FROM user_items     WHERE owner_id=?", (uid,))
+        await conn.execute("DELETE FROM user_equipment WHERE owner_id=?", (uid,))
+        await conn.execute("DELETE FROM user_boxes     WHERE owner_id=?", (uid,))
+        await conn.execute("DELETE FROM user_meta      WHERE owner_id=?",  (uid,))
+        await conn.execute("DELETE FROM user_rulesets  WHERE user_id=?",  (uid,))
+        await conn.execute("DELETE FROM event_log      WHERE user_id=?",  (uid,))
+        # finally the user row
+        await conn.execute("DELETE FROM users          WHERE user_id=?",  (uid,))
+        await _tx_commit(conn)
+        db.invalidate_pokemons_cache(uid)
+        db.invalidate_bag_cache(uid)
+    except Exception:
+        await _tx_rollback(conn)
+        raise
+    return stats
+
+async def _recache_after_wipe() -> None:
+    try:
+        if db_cache is not None:
+            db_cache.clear_cache()
+        if warm_cache is not None:
+            await warm_cache()
+    except Exception:
+        pass
+
+async def _wipe_all(conn) -> dict:
+    """Delete ALL players & data. Order matters (children -> parent)."""
+    stats = {
+        "pokemons":       await _count(conn, "pokemons"),
+        "user_items":     await _count(conn, "user_items"),
+        "user_equipment": await _count(conn, "user_equipment"),
+        "user_boxes":     await _count(conn, "user_boxes"),
+        "user_meta":      await _count(conn, "user_meta"),
+        "user_rulesets":  await _count(conn, "user_rulesets"),
+        "users":          await _count(conn, "users"),
+    }
+
+    await _tx_begin(conn)
+    try:
+        await conn.execute("DELETE FROM pokemons")
+        await conn.execute("DELETE FROM user_items")
+        await conn.execute("DELETE FROM user_equipment")
+        await conn.execute("DELETE FROM user_boxes")
+        await conn.execute("DELETE FROM user_meta")
+        await conn.execute("DELETE FROM user_rulesets")
+        await conn.execute("DELETE FROM users")
+        await _tx_commit(conn)
+        db.clear_all_pokemons_cache()
+        db.clear_all_bag_cache()
+    except Exception:
+        await _tx_rollback(conn)
+        raise
+    return stats
+
+
+@bot.tree.command(name="wipe", description="OWNER: wipe one user OR wipe ALL player data.")
+@owners_only()
+@app_commands.describe(
+    scope="Choose single user or ALL players.",
+    user="Target user (mention or ID) if scope=user.",
+    confirm="Type CONFIRM to proceed."
+)
+@app_commands.choices(
+    scope=[
+        app_commands.Choice(name="single user", value="user"),
+        app_commands.Choice(name="ALL players", value="all"),
+    ]
+)
+async def wipe_cmd(
+    interaction: discord.Interaction,
+    scope: app_commands.Choice[str],
+    user: str | None = None,
+    confirm: str | None = None,
+):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if (confirm or "").strip().upper() != "CONFIRM":
+        return await interaction.followup.send(
+            "❗ Destructive action. Re-run with `confirm: CONFIRM`.",
+            ephemeral=True,
+        )
+
+    # Get data first, then release connection before sending messages
+    conn = await db.connect()
+    # Ensure foreign keys are enabled (SQLite only)
+    if not getattr(db, "DB_IS_POSTGRES", False):
+        await conn.execute("PRAGMA foreign_keys = ON")
+
+    try:
+        if scope.value == "user":
+            if not user:
+                await conn.close()  # Release before network call
+                return await interaction.followup.send("Provide `user:` (ID or mention).", ephemeral=True)
+
+            # accept <@123>, <@!123>, or raw 123
+            uid = user.strip()
+            if uid.startswith("<@") and uid.endswith(">"):
+                uid = uid.strip("<@!>")
+
+            # sanity check
+            cur = await conn.execute("SELECT 1 FROM users WHERE user_id=?", (uid,))
+            exists = bool(await cur.fetchone())
+            await cur.close()
+            
+            if not exists:
+                await conn.close()  # Release before network call
+                return await interaction.followup.send(f"No save found for user `{uid}`.", ephemeral=True)
+
+            stats = await _wipe_user(conn, uid)
+            await conn.close()  # Release connection before network call
+            await _recache_after_wipe()
+            lines = "\n".join(f"- {k}: {v}" for k, v in stats.items())
+            return await interaction.followup.send(f"🧹 Wiped user `{uid}`:\n{lines}", ephemeral=True)
+
+        # wipe all
+        stats = await _wipe_all(conn)
+        await conn.close()  # Release connection before network call
+        await _recache_after_wipe()
+        lines = "\n".join(f"- {k}: {v}" for k, v in stats.items())
+        return await interaction.followup.send(f"💣 **ALL PLAYERS ERASED**\n{lines}", ephemeral=True)
+
+    except Exception as e:
+        try:
+            await conn.close()
+        except:
+            pass
+        return await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+@bot.tree.command(name="db_pool_stats", description="(Owner) Show current database pool statistics.")
+@owners_only()
+async def db_pool_stats(interaction: discord.Interaction):
+    """Show database pool statistics for monitoring connection usage."""
+    await interaction.response.defer(ephemeral=False)
+    
+    try:
+        from pvp.db_pool import get_pool_stats
+        stats = get_pool_stats()
+        
+        embed = discord.Embed(
+            title="📊 Database Pool Statistics",
+            color=discord.Color.blue()
+        )
+        
+        embed.add_field(
+            name="Pool Configuration",
+            value=f"Pool Size: {stats['pool_size']}\nTimeout: 60s",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Current Usage",
+            value=f"Available: {stats['available_connections']}\nIn Use: {stats['in_use_connections']}\nTotal: {stats['total_connections']}",
+            inline=True
+        )
+        
+        utilization = stats.get('pool_utilization_pct', 0)
+        color_status = "🟢 Good" if utilization < 50 else "🟡 Moderate" if utilization < 80 else "🔴 High"
+        
+        embed.add_field(
+            name="Utilization",
+            value=f"{utilization}%\n{color_status}",
+            inline=True
+        )
+        
+        if stats.get('total_connections', 0) > stats.get('pool_size', 0):
+            embed.add_field(
+                name="⚠️ Warning",
+                value="Potential connection leak detected! Total connections exceed pool size.",
+                inline=False
+            )
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except ImportError:
+        await interaction.followup.send("❌ Pool stats not available (pvp.db_pool not found)", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+@bot.tree.command(name="admin_list", description="(Owner) Show current DB admins.")
+@owners_only()
+async def admin_list(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    admins = await db.list_admins(limit=200)
+    if not admins:
+        return await interaction.followup.send("No admins in DB.", ephemeral=True)
+    lines = [f"- <@{a['user_id']}> (`{a['user_id']}`) added_at: {a['added_at']}" for a in admins]
+    await interaction.followup.send("**Admins in DB:**\n" + "\n".join(lines), ephemeral=True)
+
+@bot.tree.command(name="admin_add", description="(Owner) Add a user to the admin whitelist.")
+@owners_only()
+@app_commands.describe(member="User to grant admin access")
+async def admin_add(interaction: discord.Interaction, member: discord.Member):
+    uid = str(member.id)
+    await db.add_admin(uid)
+    await interaction.response.send_message(
+        f"✅ Added {member.mention} (`{uid}`) to admin whitelist.", ephemeral=True
+    )
+
+@bot.tree.command(name="admin_remove", description="(Owner) Remove a user from the admin whitelist.")
+@owners_only()
+@app_commands.describe(member="User to remove from admin access")
+async def admin_remove(interaction: discord.Interaction, member: discord.Member):
+    uid = str(member.id)
+    if member.id in OWNER_IDS:
+        return await interaction.response.send_message("❌ You can’t remove an owner.", ephemeral=True)
+    await db.remove_admin(uid)
+    await interaction.response.send_message(
+        f"✅ Removed {member.mention} (`{uid}`) from admin whitelist.", ephemeral=True
+    )
+
+# =========================
+#  Utility / admin-only slash
+# =========================
+# --- fuzzy matching helpers ---
+def _canon(s: str) -> str:
+    """lowercase and strip non-alphanumerics for fuzzy compare"""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+# ============================================================================
+# ENHANCED FUZZY MATCHING SYSTEM
+# ============================================================================
+
+class FuzzyMatcher:
+    """
+    Comprehensive fuzzy matching for Pokemon data with abbreviations,
+    typo tolerance, and smart suggestions.
+    """
+    
+    # Common abbreviations for moves
+    MOVE_ABBREVIATIONS = {
+        "eq": "earthquake",
+        "dclaw": "dragon-claw",
+        "stone": "stone-edge",
+        "sword": "swords-dance",
+        "rocks": "stealth-rock",
+        "twave": "thunder-wave",
+        "willowisp": "will-o-wisp",
+        "wow": "will-o-wisp",
+        "sr": "stealth-rock",
+        "hp": "hidden-power",
+        "sub": "substitute",
+        "protect": "protect",
+        "toxic": "toxic",
+        "roost": "roost",
+        "uturn": "u-turn",
+        "volt": "volt-switch",
+        "scald": "scald",
+        "knock": "knock-off",
+        "defog": "defog",
+        "rapid": "rapid-spin",
+        "spin": "rapid-spin",
+        "flamethrower": "flamethrower",
+        "fireblast": "fire-blast",
+        "icebeam": "ice-beam",
+        "thunderbolt": "thunderbolt",
+        "thunder": "thunder",
+        "psychic": "psychic",
+        "shadowball": "shadow-ball",
+        "energyball": "energy-ball",
+        "focusblast": "focus-blast",
+        "aurasphere": "aura-sphere",
+        "darkpulse": "dark-pulse",
+        "dragonpulse": "dragon-pulse",
+        "dracometeor": "draco-meteor",
+        "overheat": "overheat",
+        "closecombat": "close-combat",
+        "superpower": "superpower",
+        "ironhead": "iron-head",
+        "playrough": "play-rough",
+        "moonblast": "moonblast",
+        "gigadrain": "giga-drain",
+    }
+    
+    # Common nature abbreviations
+    NATURE_ABBREVIATIONS = {
+        "ada": "adamant",
+        "bold": "bold",
+        "brave": "brave",
+        "calm": "calm",
+        "care": "careful",
+        "hast": "hasty",
+        "imp": "impish",
+        "jol": "jolly",
+        "lax": "lax",
+        "lone": "lonely",
+        "mild": "mild",
+        "mod": "modest",
+        "naive": "naive",
+        "naugh": "naughty",
+        "quie": "quiet",
+        "rash": "rash",
+        "relax": "relaxed",
+        "sass": "sassy",
+        "seri": "serious",
+        "timi": "timid",
+    }
+    
+    @staticmethod
+    def normalize(text: str) -> str:
+        """Normalize text for matching"""
+        if not text:
+            return ""
+        # Convert to string if it's not already (handles move IDs)
+        text = str(text)
+        return text.strip().lower().replace(" ", "-").replace("_", "-")
+    
+    @staticmethod
+    def fuzzy_match(query: str, choices: list[str], threshold: float = 0.72) -> tuple[Optional[str], float, list[str]]:
+        """
+        Enhanced fuzzy matching with better scoring.
+        Returns: (best_match, score, suggestions[:5])
+        """
+        if not choices:
+            return None, 0.0, []
+        
+        query_norm = FuzzyMatcher.normalize(query)
+        
+        # Check exact match first
+        for choice in choices:
+            if FuzzyMatcher.normalize(choice) == query_norm:
+                return choice, 1.0, [choice]
+        
+        # Score all choices
+        scored = []
+        for choice in choices:
+            choice_norm = FuzzyMatcher.normalize(choice)
+            
+            # Calculate similarity ratio
+            ratio = difflib.SequenceMatcher(a=query_norm, b=choice_norm).ratio()
+            
+            # Bonus for prefix match
+            if choice_norm.startswith(query_norm):
+                ratio = max(ratio, 0.85)
+            
+            # Bonus for containing the query
+            if query_norm in choice_norm:
+                ratio = max(ratio, 0.80)
+            
+            scored.append((ratio, choice))
+        
+        scored.sort(reverse=True, key=lambda x: x[0])
+        
+        best_score, best_choice = scored[0]
+        suggestions = [c for s, c in scored if s >= threshold][:5]
+        
+        return best_choice, best_score, suggestions
+    
+    @staticmethod
+    async def fuzzy_move(conn, query: str, species_id: Optional[int] = None, 
+                         gen: Optional[int] = None) -> tuple[Optional[str], float, list[str]]:
+        """
+        Fuzzy match move name with abbreviation support and legality checking.
+        Returns: (move_name, confidence, suggestions)
+        """
+        query_norm = FuzzyMatcher.normalize(query)
+        
+        # Check abbreviations first
+        if query_norm in FuzzyMatcher.MOVE_ABBREVIATIONS:
+            exact_move = FuzzyMatcher.MOVE_ABBREVIATIONS[query_norm]
+            return exact_move, 1.0, [exact_move]
+        
+        # Get all moves (or legal moves if species_id provided)
+        if species_id and gen:
+            cur = await conn.execute("""
+                SELECT DISTINCT m.name
+                FROM moves m
+                JOIN learnsets l ON m.id = l.move_id
+                WHERE l.species_id = ? AND l.generation <= ?
+            """, (species_id, gen))
+        else:
+            cur = await conn.execute("SELECT name FROM moves")
+        
+        move_rows = await cur.fetchall()
+        await cur.close()
+        
+        all_moves = [row['name'] for row in move_rows]
+        
+        return FuzzyMatcher.fuzzy_match(query, all_moves, threshold=0.70)
+    
+    @staticmethod
+    async def fuzzy_species(conn, query: str) -> tuple[Optional[dict], float, list[str]]:
+        """
+        Fuzzy match species name.
+        Returns: (species_row, confidence, suggestions)
+        """
+        cur = await conn.execute("SELECT id, name FROM pokedex")
+        species_rows = await cur.fetchall()
+        await cur.close()
+        
+        species_names = [row['name'] for row in species_rows]
+        best_name, score, suggestions = FuzzyMatcher.fuzzy_match(query, species_names, threshold=0.70)
+        
+        if best_name:
+            cur = await conn.execute("SELECT * FROM pokedex WHERE LOWER(name) = LOWER(?)", (best_name,))
+            species_row = await cur.fetchone()
+            await cur.close()
+            return dict(species_row) if species_row else None, score, suggestions
+        
+        return None, 0.0, suggestions
+    
+    @staticmethod
+    async def fuzzy_ability(conn, query: str, valid_abilities: Optional[list[str]] = None) -> tuple[Optional[str], float, list[str]]:
+        """
+        Fuzzy match ability name.
+        Returns: (ability_name, confidence, suggestions)
+        """
+        if valid_abilities:
+            choices = valid_abilities
+        else:
+            # Get all abilities from database (you may need to adjust this query)
+            cur = await conn.execute("SELECT DISTINCT ability FROM pokemons WHERE ability IS NOT NULL")
+            rows = await cur.fetchall()
+            await cur.close()
+            choices = list(set(row['ability'] for row in rows if row['ability']))
+        
+        return FuzzyMatcher.fuzzy_match(query, choices, threshold=0.75)
+    
+    @staticmethod
+    async def fuzzy_item(conn, query: str) -> tuple[Optional[str], float, list[str]]:
+        """
+        Fuzzy match item name. Uses item cache when available to avoid DB round-trip.
+        Returns: (item_id, confidence, suggestions)
+        """
+        item_rows = []
+        if db_cache is not None:
+            item_rows = db_cache.get_all_cached_items()
+        if not item_rows:
+            cur = await conn.execute("SELECT id, name FROM items")
+            item_rows = [dict(r) for r in await cur.fetchall()]
+            await cur.close()
+        
+        item_ids = [r.get("id") or "" for r in item_rows]
+        item_names = [r.get("name") or r.get("id") or "" for r in item_rows]
+        
+        best_id, score_id, sugg_id = FuzzyMatcher.fuzzy_match(query, item_ids, threshold=0.70)
+        best_name, score_name, sugg_name = FuzzyMatcher.fuzzy_match(query, item_names, threshold=0.70)
+        
+        if score_id > score_name:
+            return best_id, score_id, sugg_id
+        if best_name:
+            for row in item_rows:
+                if (row.get("name") or "").lower() == best_name.lower():
+                    sugg = [r.get("id") or "" for r in item_rows if (r.get("name") or "") in sugg_name]
+                    return row.get("id"), score_name, sugg
+        return None, 0.0, []
+    
+    @staticmethod
+    async def fuzzy_move(conn, query: str) -> tuple[Optional[str], float, list[str]]:
+        """
+        Fuzzy match move name.
+        Returns: (move_name, confidence, suggestions)
+        The move_name is normalized (lowercase, hyphens).
+        """
+        cur = await conn.execute("SELECT name FROM moves")
+        move_rows = await cur.fetchall()
+        await cur.close()
+        
+        # Get all move names
+        move_names = [row['name'] for row in move_rows]
+        
+        # Check abbreviations first
+        query_norm = FuzzyMatcher.normalize(query)
+        if query_norm in FuzzyMatcher.MOVE_ABBREVIATIONS:
+            abbrev_full = FuzzyMatcher.MOVE_ABBREVIATIONS[query_norm]
+            # Check if abbreviated move exists
+            if abbrev_full in move_names:
+                return abbrev_full, 1.0, [abbrev_full]
+        
+        # Try fuzzy match
+        best_match, score, suggestions = FuzzyMatcher.fuzzy_match(query, move_names, threshold=0.70)
+        
+        return best_match, score, suggestions[:5]  # Return top 5 suggestions
+    
+    @staticmethod
+    def fuzzy_nature(query: str) -> tuple[Optional[str], float, list[str]]:
+        """
+        Fuzzy match nature name with abbreviation support.
+        Returns: (nature_name, confidence, suggestions)
+        """
+        import lib.stats as stats
+        
+        query_norm = FuzzyMatcher.normalize(query)
+        
+        # Check abbreviations first
+        if query_norm in FuzzyMatcher.NATURE_ABBREVIATIONS:
+            return FuzzyMatcher.NATURE_ABBREVIATIONS[query_norm], 1.0, [FuzzyMatcher.NATURE_ABBREVIATIONS[query_norm]]
+        
+        natures = list(stats.NATURE_PLUS_MINUS.keys())
+        return FuzzyMatcher.fuzzy_match(query, natures, threshold=0.75)
+
+# Keep old function for backwards compatibility
+def _fuzzy_best(query: str, choices: list[str]):
+    """
+    Return (best_choice, best_ratio, suggestions[:3]) using difflib.
+    best_ratio is 0..1; ~0.90 is a good autocorrect threshold.
+    (Legacy function - use FuzzyMatcher for new code)
+    """
+    qc = _canon(query)
+    if not choices:
+        return None, 0.0, []
+    scored = []
+    for c in choices:
+        ratio = difflib.SequenceMatcher(a=qc, b=_canon(c)).ratio()
+        scored.append((ratio, c))
+    scored.sort(reverse=True)
+    best_ratio, best = scored[0]
+    suggestions = [c for r, c in scored if r >= 0.72][:3]
+    return best, best_ratio, suggestions
+
+# --- replace your existing resolve_team_mon with this version ---
+async def resolve_team_mon(
+    interaction,
+    name: str,
+    slot: int | None = None,
+    *,
+    threshold: float = 0.85,  # relaxed from 0.90
+    conn=None,
+) -> dict | None:
+    """
+    Resolve a user's TEAM Pokémon by fuzzy name (and optional slot).
+    - Autocorrects on a confident match OR when the name looks like a prefix variant.
+    - If duplicates and slot not given, prompts which slot to specify.
+    - Sends an ephemeral message itself on failure and returns None.
+    - Pass conn from db.session() to reuse a connection (e.g. for mpokeinfo).
+    """
+    # If caller hasn't replied yet, safely defer so followups work
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+
+    uid = str(interaction.user.id)
+
+    # Try cache first (avoids DB round-trip)
+    team = None
+    if db_cache is not None:
+        try:
+            cached = db_cache.get_cached_pokemons(uid)
+            if cached is None:
+                # Populate cache on miss (for mpokeinfo, /team, etc.)
+                await db.list_pokemons(uid, limit=2000, offset=0)
+                cached = db_cache.get_cached_pokemons(uid)
+            if cached is not None:
+                team = [
+                    {"id": p.get("id"), "species": p.get("species"), "team_slot": p.get("team_slot")}
+                    for p in cached
+                    if p.get("team_slot") and 1 <= int(p.get("team_slot") or 0) <= 6
+                ]
+                team.sort(key=lambda p: (int(p.get("team_slot") or 0), int(p.get("id") or 0)))
+        except Exception:
+            pass
+
+    if team is None:
+        async def _run(qconn):
+            cur = await qconn.execute("""
+                SELECT id, species, team_slot
+                FROM pokemons
+                WHERE owner_id = ?
+                  AND team_slot BETWEEN 1 AND 6
+                ORDER BY team_slot, id
+            """, (uid,))
+            out = [dict(r) for r in await cur.fetchall()]
+            await cur.close()
+            return out
+
+        if conn is not None:
+            team = await _run(conn)
+        else:
+            async with db.session() as c:
+                team = await _run(c)
+        # Populate cache for future mpokeinfo, /team calls
+        try:
+            await db.list_pokemons(uid, limit=2000, offset=0)
+        except Exception:
+            pass
+
+    if not team:
+        await interaction.followup.send("Your team is empty.", ephemeral=True)
+        return None
+
+    # Group by species
+    species_map: dict[str, list[dict]] = {}
+    for r in team:
+        species_map.setdefault(r["species"].lower(), []).append(r)
+
+    key = name.lower()
+    autocorrected_to = None
+
+    if key not in species_map:
+        names = list(species_map.keys())
+        best, score, suggestions = _fuzzy_best(name, names)
+
+        # NEW: prefix/near-prefix heuristic (helps "charmand" -> "charmander")
+        qc = _canon(name)
+        bc = _canon(best) if best else ""
+        is_prefixish = bool(best) and len(qc) >= 4 and (bc.startswith(qc) or qc.startswith(bc))
+
+        if best and (score >= threshold or is_prefixish):
+            key = best
+            autocorrected_to = best.title()
+        elif suggestions:
+            pretty = ", ".join(s.title() for s in suggestions)
+            await interaction.followup.send(
+                f"No **{name.title()}** in your team. Did you mean: {pretty} ?\n"
+                f"Re-run with the corrected name (and `slot:` if you have duplicates).",
+                ephemeral=True
+            )
+            return None
+        else:
+            have = ", ".join(sorted({r['species'].title() for r in team}))
+            await interaction.followup.send(
+                f"No **{name.title()}** in your team. Team contains: {have}.",
+                ephemeral=True
+            )
+            return None
+
+    mons = species_map[key]
+
+    # Duplicate handling
+    if len(mons) > 1 and slot is None:
+        choices = ", ".join(f"slot {m['team_slot']} (ID #{m['id']})" for m in mons)
+        await interaction.followup.send(
+            f"You have {len(mons)} **{key.title()}** in your team: {choices}.\n"
+            f"Re-run with `slot:<1-6>`.",
+            ephemeral=True
+        )
+        return None
+
+    # Choose the one in the requested slot (or first)
+    if slot is not None:
+        for m in mons:
+            if int(m["team_slot"]) == int(slot):
+                m = dict(m)
+                break
+        else:
+            choices = ", ".join(str(m["team_slot"]) for m in mons)
+            await interaction.followup.send(
+                f"No **{key.title()}** in team slot {slot}. Available slots: {choices}.",
+                ephemeral=True
+            )
+            return None
+    else:
+        m = dict(mons[0])
+
+    if autocorrected_to:
+        m["_autocorrected_to"] = autocorrected_to
+    return m
+async def _item_index(conn) -> tuple[dict, list[str]]:
+    """
+    Build a lookup: candidate_string -> row_dict and the flat list of candidates.
+    Candidates include items.id and items.name (if present).
+    """
+    cur = await conn.execute("SELECT * FROM items")
+    rows = [dict(r) for r in await cur.fetchall()]
+    await cur.close()
+
+    lookup: dict[str, dict] = {}
+    candidates: list[str] = []
+    for r in rows:
+        iid = r["id"]
+        lookup[iid] = r;    candidates.append(iid)
+        nm = (r.get("name") or "").strip()
+        if nm:
+            lookup[nm] = r; candidates.append(nm)
+    return lookup, candidates
+
+
+def _is_prefixish(a: str, b: str) -> bool:
+    qa = _canon(a)
+    qb = _canon(b)
+    return len(qa) >= 4 and (qb.startswith(qa) or qa.startswith(qb))
+
+async def _resolve_item_fuzzy(conn, query: str, *, threshold: float = 0.85):
+    """
+    Returns (row_dict | None, autocorrect_to | None, suggestions: list[str])
+    - Exact match on id or name (case-insensitive)
+    - Else fuzzy match using your _fuzzy_best helpers
+    """
+    q = (query or "").strip()
+
+    # 1) exact by canonical id (e.g., "poke_ball")
+    canon_id = item_id_from_user(q)
+    cur = await conn.execute("SELECT * FROM items WHERE LOWER(id) = LOWER(?) LIMIT 1", (canon_id,))
+    row = await cur.fetchone(); await cur.close()
+    if row:
+        return dict(row), None, []
+
+    # 2) exact by display name (case-insensitive)
+    cur = await conn.execute("SELECT * FROM items WHERE LOWER(name) = LOWER(?) LIMIT 1", (q,))
+    row = await cur.fetchone(); await cur.close()
+    if row:
+        return dict(row), None, []
+
+    # 3) fuzzy: use cache when available, else DB
+    rows = []
+    if db_cache is not None:
+        rows = [{"id": r.get("id"), "name": r.get("name") or r.get("id")} for r in db_cache.get_all_cached_items()]
+    if not rows:
+        cur = await conn.execute("SELECT id, COALESCE(name, id) AS name FROM items")
+        rows = [dict(r) for r in await cur.fetchall()]
+        await cur.close()
+    names = [r["name"] for r in rows]
+
+    best, score, suggestions = _fuzzy_best(q, names)
+    if best and (score >= threshold or _is_prefixish(q, best)):
+        match_id = next((r["id"] for r in rows if r["name"] == best), None)
+        if match_id:
+            row = await _fetch_item_by_query(conn, str(match_id))
+            if row:
+                return dict(row), best, []
+    return None, None, [s.title() for s in suggestions[:3]]
+##items
+MAX_STACK = 999  # per-item cap
+
+class AdminItems(commands.Cog):
+    # ---------- helpers ----------
+    async def _is_admin(self, user_id: int) -> bool:
+        conn = await open_db()
+        try:
+            cur = await conn.execute("SELECT 1 FROM admins WHERE user_id = ?", (str(user_id),))
+            row = await cur.fetchone()
+            await cur.close()
+            return row is not None
+        finally:
+            await conn.close()
+
+    async def _resolve_item(self, conn, query: str):
+        """Use project fuzzy resolver if available, else LIKE fallback."""
+        try:
+            return await _resolve_item_fuzzy(conn, query)  # your existing helper
+        except Exception:
+            like = f"%{query.lower()}%"
+            cur = await conn.execute(
+                "SELECT id, name FROM items WHERE LOWER(id) LIKE ? OR LOWER(name) LIKE ? LIMIT 25",
+                (like, like)
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            if not rows:
+                return None, None, []
+            best = rows[0]
+            # (row, autocorrect_to, suggestions)
+            return dict(best), (best["name"] or best["id"]), [r["name"] or r["id"] for r in rows[1:6]]
+    # ---------- end helpers ----------
+
+    @app_commands.command(
+        name="give_item",
+        description="(Admin) Give a registered item to a player (cap 999)."
+    )
+    @app_commands.describe(
+        user="The player to receive the item.",
+        item="Item id or name (fuzzy).",
+        qty="How many to give (>=1)."
+    )
+    async def give_item(
+        self,
+        interaction: discord.Interaction,
+        user: discord.User,
+        item: str,
+        qty: app_commands.Range[int, 1, 1_000_000] = 1
+    ):
+        # admin gate
+        if not await self._is_admin(interaction.user.id):
+            return await interaction.response.send_message("❌ You are not allowed to use this command.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # resolve item using FuzzyMatcher
+        conn = await open_db()
+        try:
+            item_id, confidence, suggestions = await FuzzyMatcher.fuzzy_item(conn, item)
+        finally:
+            await conn.close()
+
+        if not item_id or confidence < 0.70:
+            sugg_text = f" Did you mean: {', '.join(suggestions[:5])}?" if suggestions else ""
+            return await interaction.followup.send(
+                f"❌ Item **{item}** not found.{sugg_text}",
+                ephemeral=True
+            )
+
+        # Get full item details
+        conn = await open_db()
+        try:
+            cur = await conn.execute("SELECT id, name FROM items WHERE id = ?", (item_id,))
+            row = await cur.fetchone()
+            await cur.close()
+        finally:
+            await conn.close()
+
+        if not row:
+            return await interaction.followup.send(f"❌ Item **{item_id}** not found in database.", ephemeral=True)
+
+        item_id = row["id"]
+        pretty = row["name"] if row["name"] else item_id
+        owner = str(user.id)
+
+        async with DB_WRITE_LOCK:
+            conn = await open_db()
+            try:
+                # Postgres uses BEGIN; SQLite uses BEGIN IMMEDIATE
+                await conn.execute("BEGIN" if getattr(db, "DB_IS_POSTGRES", False) else "BEGIN IMMEDIATE")
+
+                # ensure user exists
+                cur = await conn.execute("SELECT 1 FROM users WHERE user_id = ?", (owner,))
+                exists = await cur.fetchone(); await cur.close()
+                if not exists:
+                    await conn.execute("INSERT INTO users(user_id, coins, currencies) VALUES(?, 3000, '{\"coins\": 3000}'::jsonb)", (owner,))
+
+                # current qty
+                cur = await conn.execute(
+                    "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
+                    (owner, item_id)
+                )
+                r = await cur.fetchone(); await cur.close()
+                current = int(r[0]) if r else 0
+
+                if current >= MAX_STACK:
+                    await conn.execute("ROLLBACK")
+                    return await interaction.followup.send(
+                        f"❌ {user.mention} already has **{current}/{MAX_STACK}** `{pretty}`.",
+                        ephemeral=True
+                    )
+
+                allowed = min(int(qty), MAX_STACK - current)
+                if allowed <= 0:
+                    await conn.execute("ROLLBACK")
+                    return await interaction.followup.send(
+                        f"❌ Cannot give more `{pretty}` due to the cap ({current}/{MAX_STACK}).",
+                        ephemeral=True
+                    )
+
+                await conn.execute(
+                    "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,?) "
+                    "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = LEAST(user_items.qty + excluded.qty, ?::int);",
+                    (owner, item_id, allowed, MAX_STACK)
+                )
+
+                cur = await conn.execute(
+                    "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
+                    (owner, item_id)
+                )
+                r = await cur.fetchone(); await cur.close()
+                new_qty = int(r[0]) if r else current
+
+                await _tx_commit(conn)
+                db.invalidate_bag_cache(owner)
+            finally:
+                await conn.close()
+
+        note = ""
+        if allowed < int(qty):
+            note = f" (reduced by cap to {allowed}; now **{new_qty}/{MAX_STACK}**)"
+
+        # Show autocorrect info if item name differs from query
+        autocorrect_note = ""
+        if item.lower() != item_id.lower() and item.lower() != pretty.lower():
+            autocorrect_note = f" (matched: {pretty})"
+
+        desc = f"✅ Gave **{allowed}× {pretty}** to {user.mention}{note}{autocorrect_note}"
+        emb = discord.Embed(description=desc, color=0x57F287)
+        await interaction.followup.send(embed=emb, ephemeral=True)
+
+    # 🔽 AUTOCOMPLETE — note it targets the param name **'item'**, not 'item_id'
+    @give_item.autocomplete("item")
+    async def give_item_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str
+    ) -> list[app_commands.Choice[str]]:
+        q = (current or "").strip().lower()
+        if not q:
+            return []
+
+        like = f"%{q}%"
+        conn = await open_db()
+        try:
+            cur = await conn.execute(
+                "SELECT id, name FROM items "
+                "WHERE LOWER(id) LIKE ? OR LOWER(name) LIKE ? "
+                "ORDER BY CASE "
+                "  WHEN LOWER(id)=? OR LOWER(name)=? THEN 0 "
+                "  WHEN LOWER(id) LIKE ? OR LOWER(name) LIKE ? THEN 1 "
+                "  ELSE 2 "
+                "END, id "
+                "LIMIT 25",
+                (like, like, q, q, like, like)
+            )
+            rows = await cur.fetchall(); await cur.close()
+        finally:
+            await conn.close()
+
+        choices: list[app_commands.Choice[str]] = []
+        for r in rows:
+            _id = r["id"]; _name = r["name"]
+            label = f"{_name} ({_id})" if _name and _name.lower() != _id else _id
+            choices.append(app_commands.Choice(name=label, value=_id))
+        return choices
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+    # /merge_item_id
+    @app_commands.command(
+        name="merge_item_id",
+        description="(DB Admin) Merge an old item id into a canonical item id (fix duplicates like pokeball → poke_ball)."
+    )
+    @app_commands.describe(
+        old_id="Alias to replace (e.g. pokeball)",
+        new_id="Canonical id to keep (e.g. poke_ball)"
+    )
+    @admin_only()
+    async def merge_item_id(
+        self,
+        interaction: Interaction,
+        old_id: str,
+        new_id: str
+    ):
+        await interaction.response.defer(ephemeral=False)
+
+        old_norm = item_id_from_user(old_id)
+        new_norm = item_id_from_user(new_id)
+
+        if old_norm == new_norm:
+            return await interaction.followup.send(
+                "⚠️ The old id and new id are the same after normalization.",
+                ephemeral=True
+            )
+
+        moved = await db.merge_item_ids(old_norm, new_norm)
+        await interaction.followup.send(
+            f"🔧 Merged `{old_norm}` → `{new_norm}` (moved {moved} inventory rows).",
+            ephemeral=True
+        )
+
+    # /items_autofix
+    @app_commands.command(
+        name="items_autofix",
+        description="(DB Admin) Suggest and merge common item id aliases; list orphans."
+    )
+    @admin_only()
+    async def items_autofix(self, interaction: Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            orphans = await db.find_orphan_user_item_ids()
+        except AttributeError:
+            orphans = []
+
+        try:
+            pairs = await db.find_probable_alias_pairs()
+        except AttributeError:
+            pairs = []
+
+        if not orphans and not pairs:
+            return await interaction.followup.send("✅ No obvious problems found.", ephemeral=True)
+
+        lines = []
+        if orphans:
+            lines.append("**Orphans in `user_items` (no matching `items.id`):**")
+            lines += [f"• `{i}`" for i in orphans]
+            lines.append("_Create these in `items` or merge them into an existing id._")
+
+        if pairs:
+            results = await db.merge_many(pairs)
+            moved_total = sum(n for *_ , n in results)
+            lines.append("\n**Merged duplicate ids (old → new):**")
+            lines += [f"• `{a}` → `{b}`" for (a, b, _) in results]
+            lines.append(f"\n🔧 Affected rows: **{moved_total}**")
+
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+## shinies 
+async def _reply(interaction: discord.Interaction, *args, **kwargs):
+    """
+    Sends either via interaction.response.send_message (first reply)
+    or via interaction.followup.send if the interaction was already responded to / deferred.
+    """
+    if interaction.response.is_done():
+        return await interaction.followup.send(*args, **kwargs)
+    else:
+        return await interaction.response.send_message(*args, **kwargs)
+
+# --- Force embeds for user-facing interaction responses ---
+_EMBED_WRAP_ENABLED = False
+
+def _content_needs_plain_text(content: str) -> bool:
+    if not content:
+        return False
+    if "@everyone" in content or "@here" in content:
+        return True
+    if "<@" in content or "<#" in content:
+        return True
+    return False
+
+def _wrap_content_into_embed(kwargs: dict) -> None:
+    if kwargs.get("embed") is not None:
+        return
+    if kwargs.get("embeds"):
+        return
+    content = kwargs.get("content")
+    if content is None:
+        return
+    content_str = str(content)
+    if not content_str.strip():
+        return
+    if len(content_str) > 3900:
+        kwargs["embed"] = discord.Embed(description="(message)")
+        # keep content to avoid embed length issues
+        return
+    kwargs["embed"] = discord.Embed(description=content_str)
+    if not _content_needs_plain_text(content_str):
+        kwargs["content"] = None
+
+def _wrap_send_func(func):
+    async def wrapped(self, *args, **kwargs):
+        if args and "content" not in kwargs:
+            kwargs["content"] = args[0]
+            args = args[1:]
+        _wrap_content_into_embed(kwargs)
+        return await func(self, *args, **kwargs)
+    return wrapped
+
+def _enable_embed_only_messages() -> None:
+    global _EMBED_WRAP_ENABLED
+    if _EMBED_WRAP_ENABLED:
+        return
+    _EMBED_WRAP_ENABLED = True
+    try:
+        discord.InteractionResponse.send_message = _wrap_send_func(discord.InteractionResponse.send_message)
+    except Exception:
+        pass
+    try:
+        discord.InteractionResponse.edit_message = _wrap_send_func(discord.InteractionResponse.edit_message)
+    except Exception:
+        pass
+    try:
+        if hasattr(discord, "Webhook"):
+            discord.Webhook.send = _wrap_send_func(discord.Webhook.send)
+            if hasattr(discord.Webhook, "edit_message"):
+                discord.Webhook.edit_message = _wrap_send_func(discord.Webhook.edit_message)
+    except Exception:
+        pass
+##money:
+COIN = "🪙"
+PKDollar_NAME = "PokéDollars"
+
+def _norm_item_query(s: str) -> str:
+    return re.sub(r"[^a-z0-9_]", "", re.sub(r"[\s\-]+", "_", s.strip().lower()))
+
+async def _fetch_item_by_query(conn, q: str) -> dict | None:
+    """Find by id or english name (case-insensitive). Uses item cache when available."""
+    if db_cache is not None:
+        cached = db_cache.get_cached_item(q)
+        if cached is not None:
+            return cached
+
+    qn = _norm_item_query(q)
+    # try id
+    cur = await conn.execute("SELECT * FROM items WHERE id = ? LIMIT 1", (qn,))
+    row = await cur.fetchone()
+    if row:
+        await cur.close()
+        d = dict(row)
+        if db_cache is not None:
+            db_cache.set_cached_item(q, d)
+        return d
+    await cur.close()
+    # try by name
+    cur = await conn.execute("SELECT * FROM items WHERE LOWER(name) = LOWER(?) LIMIT 1", (q.strip(),))
+    row = await cur.fetchone()
+    await cur.close()
+    if row:
+        d = dict(row)
+        if db_cache is not None:
+            db_cache.set_cached_item(q, d)
+        return d
+    return None
+
+async def _user_item_qty(conn, owner_id: str, item_id: str) -> int:
+    cur = await conn.execute(
+        "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
+        (owner_id, item_id)
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    return int(row["qty"]) if row else 0
+
+
+async def _user_money(conn, owner_id: str) -> int:
+    await conn.execute("INSERT OR IGNORE INTO user_meta(owner_id) VALUES (?)", (owner_id,))
+    cur = await conn.execute("SELECT money FROM user_meta WHERE owner_id=?", (owner_id,))
+    row = await cur.fetchone(); await cur.close()
+    return int(row["money"] or 0)
+
+async def _set_user_money(conn, owner_id: str, new_val: int) -> None:
+    await conn.execute("UPDATE user_meta SET money=? WHERE owner_id=?", (int(new_val), owner_id))
+
+def _item_title_line(row: dict) -> str:
+    emoji = row.get("emoji") or ""
+    nm = row.get("name") or row["id"]
+    nice = pretty_item_name(nm)
+    return f"{emoji + ' ' if emoji else ''}{nice}"
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+ITEM_ICON_DIR = ASSETS_DIR / "item_icons"
+def _looks_http(s: str | None) -> bool:
+    return isinstance(s, str) and (s.startswith("http://") or s.startswith("https://"))
+
+
+def _is_displayable_item_emoji(s: str | None) -> bool:
+    """True if we should show this in embeds. Bare :shortcode: renders as literal text — hide it."""
+    if not s or not isinstance(s, str):
+        return False
+    s = s.strip()
+    if not s:
+        return False
+    # Bare :shortcode: (e.g. :choicescarf:) shows as text when emoji missing — don't display
+    if s.startswith(":") and ":" in s[1:] and not s.startswith("<"):
+        return False
+    return True
+def item_icon_file(item_id: str) -> tuple[str | None, discord.File | None]:
+    """
+    Returns (attachment_url, discord.File) if we have a local icon,
+    else (None, None). Use the returned File in send()/edit().
+    """
+    safe = str(item_id).lower().strip()
+    p = ITEM_ICON_DIR / f"{safe}.png"
+    if not p.exists():
+        return None, None
+    # to reference an attachment in an embed, use "attachment://<filename>"
+    return f"attachment://{p.name}", discord.File(p, filename=p.name)
+# ---------- item display helpers ----------
+
+def build_item_embed(item_row: dict, owner_id: int, price: int, have_qty: int) -> discord.Embed:
+    """
+    Build a clean embed for an item panel.
+    Expects item_row to contain at least: id, name (optional), description (optional),
+    icon_url (optional), category (optional), sell_price (optional).
+    """
+    title = pretty_item_name(item_row.get("name") or item_row.get("id") or "")
+    desc  = (item_row.get("description") or "—").strip()
+
+    e = discord.Embed(title=title, description=desc)
+
+    # Thumbnail (only one image to avoid the “double icon” issue)
+    icon = item_row.get("icon_url")
+    if icon:
+        e.set_thumbnail(url=icon)
+
+    e.add_field(name="Price",   value=f"{int(price or 0):,} {PKDollar_NAME}", inline=True)
+    e.add_field(name="You own", value=str(int(have_qty or 0)),     inline=True)
+
+    cat = (item_row.get("category") or "").replace("_", " ").title()
+    if cat:
+        e.add_field(name="Category", value=cat, inline=True)
+
+    sp = item_row.get("sell_price")
+    if sp is not None:
+        e.add_field(name="Sell Price", value=f"{int(sp):,} {PKDollar_NAME}", inline=True)
+
+    return e
+## bag
+async def _decrement_user_item(owner_id: str, item_id: str, amount: int = 1) -> bool:
+    """
+    Remove `amount` of `item_id` from the user's bag.
+    Returns True if successful, False if not enough quantity.
+    """
+    conn = await db.connect()
+    try:
+        cur = await conn.execute(
+            "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
+            (owner_id, item_id),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        qty = (row["qty"] if hasattr(row, "keys") else row[0]) if row else 0
+        try:
+            qty = int(qty or 0)
+        except Exception:
+            qty = 0
+        if qty < amount:
+            return False
+        new_qty = qty - amount
+        await conn.execute(
+            "UPDATE user_items SET qty=? WHERE owner_id=? AND item_id=?",
+            (new_qty, owner_id, item_id),
+        )
+        await conn.commit()
+        db.invalidate_bag_cache(owner_id)
+        return True
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
+async def _get_item_qty(owner_id: str, item_id: str, conn=None) -> int:
+    own_conn = conn is None
+    if own_conn:
+        conn = await db.connect()
+    try:
+        cur = await conn.execute(
+            "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
+            (owner_id, item_id),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        try:
+            return int((row["qty"] if hasattr(row, "keys") else (row[0] if row else 0)) or 0)
+        except Exception:
+            return 0
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+async def _count_item_in_use(owner_id: str, item_id: str, conn=None) -> int:
+    own_conn = conn is None
+    if own_conn:
+        conn = await db.connect()
+    try:
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM pokemons WHERE owner_id=? AND held_item=?",
+            (owner_id, item_id),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        try:
+            return int((row[0] if row else 0) or 0)
+        except Exception:
+            return 0
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+async def _get_usage(owner_id: str, item_id: str, conn=None) -> tuple[int, int]:
+    """Single query: (used, total). Use for usage checks and display."""
+    own_conn = conn is None
+    if own_conn:
+        conn = await db.connect()
+    try:
+        cur = await conn.execute("""
+            SELECT
+                COALESCE((SELECT qty FROM user_items WHERE owner_id=? AND item_id=? LIMIT 1), 0) AS total,
+                (SELECT COUNT(*) FROM pokemons WHERE owner_id=? AND held_item=?) AS used
+        """, (owner_id, item_id, owner_id, item_id))
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return 0, 0
+        total = int((row["total"] if hasattr(row, "keys") else row[0]) or 0)
+        used = int((row["used"] if hasattr(row, "keys") else row[1]) or 0)
+        return used, total
+    except Exception:
+        return 0, 0
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+async def _usage_str(owner_id: str, item_id: str, conn=None) -> str:
+    used, total = await _get_usage(owner_id, item_id, conn)
+    return f"{used}/{total}"
+
+
+class ConfirmSwapView(discord.ui.View):
+    """Generic confirm/cancel view with correct callback signatures."""
+    def __init__(self, *, timeout: float = 120.0):
+        super().__init__(timeout=timeout)
+        self._confirmed: bool | None = None
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._confirmed = True
+        # edit the message that has this view
+        if interaction.response.is_done():
+            try:
+                await interaction.message.edit(content="Confirmed.", view=None)  # type: ignore
+            except Exception:
+                pass
+        else:
+            await interaction.response.edit_message(content="Confirmed.", view=None)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._confirmed = False
+        if interaction.response.is_done():
+            try:
+                await interaction.message.edit(content="Cancelled.", view=None)  # type: ignore
+            except Exception:
+                pass
+        else:
+            await interaction.response.edit_message(content="Cancelled.", view=None)
+        self.stop()
+
+    @property
+    def confirmed(self) -> bool | None:
+        return self._confirmed
+
+@bot.tree.command(
+    name="give",
+    description="Give an item from your bag to a team Pokémon (does not consume; enforces used/total)."
+)
+@app_commands.describe(
+    name="Pokémon species (e.g., garchomp)",
+    item="Item id or name to give (autocorrects)",
+    slot="Team slot (1–6) if you have duplicates"
+)
+async def give_item(interaction: discord.Interaction, name: str, item: str, slot: int | None = None):
+    await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+
+    # Resolve team Pokémon
+    mon = await resolve_team_mon(interaction, name, slot)
+    if not mon:
+        return
+    mon_id = int(mon["id"])
+    mon_name = mon['species'].title()
+
+    # Resolve item with fuzzy matching
+    conn = await db.connect()
+    try:
+        # Use FuzzyMatcher for intelligent item matching
+        item_id, confidence, suggestions = await FuzzyMatcher.fuzzy_item(conn, item)
+        
+        if not item_id or confidence < 0.70:
+            sugg_text = f" Did you mean: {', '.join(suggestions[:5])}?" if suggestions else ""
+            return await interaction.followup.send(
+                f"❌ Item **{item}** not found.{sugg_text}",
+                ephemeral=True
+            )
+        
+        # Get full item details
+        cur = await conn.execute("SELECT id, name, emoji FROM items WHERE id = ?", (item_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        
+        if not row:
+            return await interaction.followup.send(f"❌ Item **{item_id}** not found in database.", ephemeral=True)
+        
+        give_id = row["id"]
+        if not give_id:
+            return await interaction.followup.send("❌ Invalid item.", ephemeral=True)
+        
+        # Convert Row to dict for .get() method
+        row_dict = dict(row)
+        give_emoji_raw = (row_dict.get("emoji") or "").strip()
+        give_emoji = give_emoji_raw if _is_displayable_item_emoji(give_emoji_raw) else ""
+        give_disp = pretty_item_name(row_dict.get("name") or row_dict.get("id") or item)
+        # Show autocorrect if the matched item is different from what user typed
+        ac_suffix = f" _(autocorrected to {give_disp})_" if item.lower().replace(" ", "-") != give_id.lower() else ""
+
+        # Check ownership and capacity (single _get_usage call)
+        used_now, total_qty = await _get_usage(uid, give_id, conn)
+        if total_qty <= 0:
+            return await interaction.followup.send(
+                f"❌ You don't have {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** in your bag.{ac_suffix}",
+                ephemeral=True
+            )
+
+        # Get current held item
+        cur = await conn.execute("SELECT held_item FROM pokemons WHERE owner_id=? AND id=?", (uid, mon_id))
+        hold_row = await cur.fetchone()
+        await cur.close()
+        current_held = (hold_row["held_item"] if hasattr(hold_row, "keys") else (hold_row[0] if hold_row else None)) or None
+
+        # Check if already holding the same item
+        if current_held and str(current_held).lower() == give_id.lower():
+            usage = await _usage_str(uid, give_id, conn)
+            return await interaction.followup.send(
+                f"ℹ️ **{mon_name}** already holds {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** (**{usage}** in use).{ac_suffix}",
+                ephemeral=True
+            )
+
+        # Check item capacity
+        free = total_qty - used_now
+        if free <= 0:
+            usage = f"{used_now}/{total_qty}"
+            return await interaction.followup.send(
+                f"❌ All copies of {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** are in use (**{usage}**).\n"
+                f"💡 Use `/take` to remove it from another Pokémon first.{ac_suffix}",
+                ephemeral=True
+            )
+
+        # If no current item, just give it
+        if not current_held:
+            try:
+                await db.set_held_item(uid, mon_id, give_id)
+            except Exception:
+                await conn.execute("UPDATE pokemons SET held_item=? WHERE owner_id=? AND id=?", (give_id, uid, mon_id))
+                await conn.commit()
+                db.invalidate_pokemons_cache(uid)
+            
+            new_usage = await _usage_str(uid, give_id, conn)
+            return await interaction.followup.send(
+                f"✅ Gave {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** to **{mon_name}** (**{new_usage}** in use).{ac_suffix}",
+                ephemeral=True
+            )
+
+        # Get info about current held item
+        prow = await _resolve_item_fuzzy(conn, str(current_held))
+        if isinstance(prow, tuple):
+            prow, _, _ = prow
+        pemoji_raw = (prow.get("emoji") if prow else "") or ""
+        pemoji = pemoji_raw if _is_displayable_item_emoji(pemoji_raw) else ""
+        pdisp = pretty_item_name(prow.get("name") if prow else str(current_held))
+        usage_prev = await _usage_str(uid, str(current_held), conn)
+        usage_new = await _usage_str(uid, give_id, conn)
+
+        # Create confirmation view
+        view = ConfirmSwapView(timeout=60.0)
+        msg = await interaction.followup.send(
+            content=(
+                f"**{mon_name}** currently holds {(pemoji + ' ') if pemoji else ''}**{pdisp}** (**{usage_prev}** in use).\n\n"
+                f"Switch to {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** (**{usage_new}** in use)?{ac_suffix}"
+            ),
+            view=view,
+            ephemeral=True,
+            wait=True
+        )
+        
+        # Wait for user response
+        await view.wait()
+        
+        if view.confirmed:
+            # Double-check capacity (race condition protection)
+            used_check, total_check = await _get_usage(uid, give_id, conn)
+            if used_check >= total_check:
+                return await msg.edit(
+                    content=f"❌ All copies of **{give_disp}** are now in use. Try again.",
+                    view=None
+                )
+            
+            # Perform the swap
+            try:
+                await db.set_held_item(uid, mon_id, give_id)
+            except Exception:
+                await conn.execute("UPDATE pokemons SET held_item=? WHERE owner_id=? AND id=?", (give_id, uid, mon_id))
+                await conn.commit()
+                db.invalidate_pokemons_cache(uid)
+            
+            new_usage2 = await _usage_str(uid, give_id, conn)
+            prev_usage2 = await _usage_str(uid, str(current_held), conn)
+            
+            await msg.edit(
+                content=(
+                    f"✅ Switched **{mon_name}'s** held item!\n"
+                    f"• Removed: {(pemoji + ' ') if pemoji else ''}**{pdisp}** (now **{prev_usage2}** in use)\n"
+                    f"• Equipped: {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** (now **{new_usage2}** in use){ac_suffix}"
+                ),
+                view=None
+            )
+        elif view.confirmed is False:
+            await msg.edit(content="❌ Item swap cancelled.", view=None)
+        else:
+            # Timeout
+            await msg.edit(content="⏱️ Item swap timed out.", view=None)
+    
+    finally:
+        await conn.close()
+
+
+@bot.tree.command(
+    name="take",
+    description="Take the held item from a team Pokémon back to your free pool (does not consume)."
+)
+@app_commands.describe(
+    name="Pokémon species (e.g., garchomp)",
+    slot="Team slot (1–6) if you have duplicates"
+)
+async def take_item(interaction: discord.Interaction, name: str, slot: int | None = None):
+    await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+
+    # Team mon selection (uses your fuzzy autocorrect)
+    mon = await resolve_team_mon(interaction, name, slot)
+    if not mon:
+        return
+    mon_id = int(mon["id"])
+
+    conn = await db.connect()
+    try:
+        cur = await conn.execute("SELECT held_item FROM pokemons WHERE owner_id=? AND id=?", (uid, mon_id))
+        row = await cur.fetchone(); await cur.close()
+        held = (row["held_item"] if hasattr(row, "keys") else (row[0] if row else None)) or None
+        if not held:
+            return await interaction.followup.send(
+                f"ℹ️ **{mon['species'].title()}** isn’t holding anything.", ephemeral=True
+            )
+
+        # Add the item back to the user's bag before removing it from the Pokémon
+        await conn.execute(
+            "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,1) "
+            "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = qty + 1;",
+            (uid, str(held))
+        )
+        await conn.commit()
+        db.invalidate_bag_cache(uid)
+
+        # Now remove it from the Pokémon
+        try:
+            await db.set_held_item(uid, mon_id, None)
+        except Exception:
+            await conn.execute("UPDATE pokemons SET held_item=NULL WHERE owner_id=? AND id=?", (uid, mon_id))
+            await conn.commit()
+            db.invalidate_pokemons_cache(uid)
+
+        # Pretty print with updated usage (success path)
+        prow, _, _ = await _resolve_item_fuzzy(conn, str(held))
+        pemoji_raw = (prow.get("emoji") if prow else "") or ""
+        pemoji = pemoji_raw if _is_displayable_item_emoji(pemoji_raw) else ""
+        pdisp  = pretty_item_name(prow.get("name") if prow else str(held))
+        usage  = await _usage_str(uid, str(held), conn)
+
+        await interaction.followup.send(
+            f"✅ Took {(pemoji + ' ') if pemoji else ''}**{pdisp}** from **{mon['species'].title()}** "
+            f"(now **{usage}** in use).",
+            ephemeral=True
+        )
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Failed to take item: {e}", ephemeral=True)
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
+MAX_STACK = 999
+class QuantityModal(discord.ui.Modal, title="Buy item"):
+    def __init__(self, parent_view: "BuyItemView", source_message: discord.Message):
+        super().__init__()
+        self.parent_view = parent_view
+        self.source_message = source_message
+
+        self.qty_input = discord.ui.TextInput(
+            label="How many do you want to buy?",
+            default="1",
+            required=True,
+            max_length=3,  # 1..999
+            placeholder=f"Enter 1–{MAX_STACK}"
+        )
+        self.add_item(self.qty_input)
+
+    async def on_submit(self, itx: discord.Interaction):
+        await itx.response.defer(ephemeral=True)  # ACK immediately
+
+        try:
+            # Parse qty
+            try:
+                qty_requested = int(str(self.qty_input.value).strip())
+            except Exception:
+                return await itx.followup.send("❌ Please enter a valid integer.", ephemeral=False)
+            if qty_requested <= 0:
+                return await itx.followup.send("❌ Quantity must be positive.", ephemeral=False)
+            if qty_requested > MAX_STACK:
+                return await itx.followup.send(f"❌ Max per purchase is **{MAX_STACK}**.", ephemeral=False)
+
+            unit   = int(self.parent_view.price or 0)
+            owner  = str(self.parent_view.owner_id)
+            item_id = self.parent_view.item_row["id"]
+
+            # Open DB once; do everything atomically
+            async with DB_WRITE_LOCK:
+                conn = await open_db()
+                try:
+                    # Postgres uses BEGIN; SQLite uses BEGIN IMMEDIATE
+                    await conn.execute("BEGIN" if getattr(db, "DB_IS_POSTGRES", False) else "BEGIN IMMEDIATE")
+
+                    # read balance (currencies JSON or coins fallback)
+                    cur = await conn.execute("SELECT * FROM users WHERE user_id=? LIMIT 1", (owner,))
+                    row = await cur.fetchone()
+                    await cur.close()
+                    row_dict = dict(row) if row else None
+                    balance = int(db.get_currency_from_row(row_dict, "coins"))
+
+                    # current qty for this item
+                    cur = await conn.execute(
+                        "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
+                        (owner, item_id)
+                    )
+                    r = await cur.fetchone()
+                    current_qty = int(r[0]) if r else 0
+                    await cur.close()
+
+                    if current_qty >= MAX_STACK:
+                        await conn.execute("ROLLBACK")
+                        return await itx.followup.send(
+                            f"❌ You already have **{current_qty}/{MAX_STACK}**. You can’t carry more.",
+                            ephemeral=True
+                        )
+
+                    # allowed by stack cap
+                    allowed_by_cap = MAX_STACK - current_qty
+                    allowed = min(qty_requested, allowed_by_cap)
+
+                    # cost for allowed amount
+                    total_cost = unit * allowed
+
+                    # balance check (only if item costs money)
+                    if unit > 0 and balance < total_cost:
+                        await conn.execute("ROLLBACK")
+                        return await itx.followup.send(
+                            f"❌ Not enough PokéDollars. Cost: **{total_cost:,} {PKDollar_NAME}**, you have **{balance:,} {PKDollar_NAME}**.",
+                            ephemeral=True
+                        )
+
+                    # ensure user row exists (currencies JSON)
+                    await conn.execute(
+                        "INSERT INTO users(user_id, coins, currencies) VALUES(?, 0, '{\"coins\": 0}'::jsonb) "
+                        "ON CONFLICT(user_id) DO NOTHING",
+                        (owner,)
+                    )
+
+                    # deduct coins (currencies JSON)
+                    if unit > 0 and total_cost > 0:
+                        await db.add_currency_conn(conn, owner, "coins", -total_cost)
+
+                    # upsert item
+                    if allowed > 0:
+                        await conn.execute(
+                            "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,?) "
+                            "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = MIN(qty + excluded.qty, ?);",
+                            (owner, item_id, allowed, MAX_STACK)
+                        )
+
+                    # new qty
+                    cur = await conn.execute(
+                        "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
+                        (owner, item_id)
+                    )
+                    r = await cur.fetchone()
+                    new_qty = int(r[0]) if r else current_qty
+                    await cur.close()
+
+                    await conn.commit()
+                    db.invalidate_bag_cache(owner)
+                finally:
+                    await conn.close()
+
+            # refresh panel
+            self.parent_view.have_qty = new_qty
+            embed = build_item_embed(
+                self.parent_view.item_row,
+                self.parent_view.owner_id,
+                self.parent_view.price,
+                new_qty
+            )
+
+            try:
+                await self.source_message.edit(embed=embed, view=self.parent_view)
+            except Exception:
+                await itx.followup.send(embed=embed, view=self.parent_view, ephemeral=False)
+
+            bought_text = f"Bought **{allowed}×**" if allowed > 0 else "Couldn’t buy any"
+            item_name = pretty_item_name(self.parent_view.item_row.get("name") or item_id)
+
+            # If we reduced due to cap, tell the user
+            extra = ""
+            if allowed < qty_requested:
+                extra = f" (reduced by bag cap: {current_qty} ➜ {new_qty}/{MAX_STACK})"
+
+            cost_text = f" for **{total_cost:,} {PKDollar_NAME}**" if total_cost else ""
+            await itx.followup.send(f"✅ {bought_text} **{item_name}**{cost_text}.{extra}", ephemeral=False)
+
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            await itx.followup.send(f"⚠️ Purchase failed: `{type(e).__name__}: {e}`", ephemeral=True)
+class BuyItemView(discord.ui.View):
+    def __init__(self, owner_id: int, item_row: dict, price: int, have_qty: int):
+        super().__init__(timeout=90)
+        self.owner_id = owner_id
+        self.item_row = item_row
+        self.price = int(price or 0)
+        self.have_qty = have_qty
+
+        self.buy_btn = discord.ui.Button(
+            label=f"Buy… ({self.price:,} {PKDollar_NAME} each)",
+            style=discord.ButtonStyle.success
+        )
+        self.add_item(self.buy_btn)
+        self.buy_btn.callback = self.on_buy_click
+
+        self.bound_message: discord.Message | None = None
+
+    async def on_buy_click(self, itx: discord.Interaction):
+        if itx.user.id != self.owner_id:
+            return await itx.response.send_message("This shop panel isn’t for you.", ephemeral=True)
+
+        msg = self.bound_message or itx.message
+        modal = QuantityModal(self, msg)
+        await itx.response.send_modal(modal)
+@bot.tree.command(name="item", description="Show info about an item and buy it.")
+@app_commands.describe(name="Item id or name (e.g. 'poke ball', 'choice scarf')")
+async def item_cmd(interaction: discord.Interaction, name: str):
+    start_time = time.time()
+    # Defer IMMEDIATELY - wrapped in try/catch for expired interactions
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            defer_time = time.time() - start_time
+            if defer_time > 1.0:
+                print(f"[SLOW] /item defer took {defer_time:.2f}s")
+    except discord.errors.NotFound:
+        elapsed = time.time() - start_time
+        print(f"[WARNING] /item command expired after {elapsed:.2f}s")
+        return
+
+    # Resolve item (exact or fuzzy)
+    conn = await db.connect()
+    try:
+        row, autocorrect_to, suggestions = await _resolve_item_fuzzy(conn, name)
+
+        if row is None:
+            if suggestions:
+                return await interaction.followup.send(
+                    f"❌ Item **{name}** not found. Did you mean: {', '.join(suggestions)} ?",
+                    ephemeral=True
+                )
+            return await interaction.followup.send(
+                f"❌ Item **{name}** not found. Try `/items` to browse.",
+                ephemeral=True
+            )
+
+        item_id = row["id"]
+        price = int(row.get("price") or 0)
+
+        # ✅ How many of THIS item the user already has (read from user_items; fallback to legacy inventory)
+        uid = str(interaction.user.id)
+        cur = await conn.execute(
+            "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
+            (uid, item_id)
+        )
+        r = await cur.fetchone(); await cur.close()
+        if r is None:
+            # backward-compat (old schema)
+            try:
+                cur = await conn.execute(
+                    "SELECT qty FROM inventory WHERE owner_id=? AND item_id=?",
+                    (uid, item_id)
+                )
+                r = await cur.fetchone(); await cur.close()
+            except Exception:
+                r = None
+        have_qty = int(r[0]) if r else 0
+
+        # Build embed (per-unit price is shown inside)
+        embed = build_item_embed(row, interaction.user.id, price, have_qty)
+        embed.title = pretty_item_name(row.get("name") or item_id)
+
+        # Display sprite in BOTH locations: author icon (small) + thumbnail (large)
+        files = None
+        att_url, att_file = item_icon_file(item_id)     # ("attachment://...", discord.File) or (None, None)
+        if att_file:
+            embed.set_author(name=embed.title, icon_url=att_url)  # Small icon next to title
+            embed.set_thumbnail(url=att_url)  # Large image on the right
+            files = [att_file]
+        elif row.get("icon_url"):
+            embed.set_author(name=embed.title, icon_url=row["icon_url"])  # Small icon
+            embed.set_thumbnail(url=row["icon_url"])  # Large image
+
+        if autocorrect_to:
+            embed.set_footer(text=f"Autocorrected to {autocorrect_to}")
+
+        view = BuyItemView(interaction.user.id, row, price, have_qty)
+
+        if files:
+            sent_msg = await interaction.followup.send(
+                embed=embed, view=view, files=files, ephemeral=True
+            )
+        else:
+            sent_msg = await interaction.followup.send(
+                embed=embed, view=view, ephemeral=True
+            )
+
+        # Let the Buy view edit this same message after purchase
+        view.bound_message = sent_msg
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+# ---------- /items (catalog browser with pagination) ----------
+from discord import ui, Interaction, Embed, SelectOption
+ITEMS_PER_PAGE = 15  # keep/tweak
+
+async def _items_catalog_page(page: int, per_page: int = ITEMS_PER_PAGE):
+    # Prefer in-memory cache if available (fast, no DB round-trip)
+    if db_cache:
+        cached_items = db_cache.get_cached_items_table()
+        if cached_items:
+            items = list(cached_items)
+            items.sort(
+                key=lambda r: (
+                    (r.get("name") is None),
+                    (r.get("name") or "").lower(),
+                    str(r.get("id") or "").lower(),
+                )
+            )
+            total = len(items)
+            max_pages = max(1, (total + per_page - 1) // per_page)
+            page = max(1, min(page, max_pages))
+            offset = (page - 1) * per_page
+            rows = items[offset:offset + per_page]
+            return rows, max_pages, total
+
+    # Fallback to DB (cloud)
+    async with db.session() as conn:
+        cur = await conn.execute("SELECT COUNT(*) AS c FROM items")
+        row = await cur.fetchone(); await cur.close()
+        total = int(row["c"] or 0)
+        if total == 0:
+            return [], 1, 0
+
+        max_pages = max(1, (total + per_page - 1) // per_page)
+        page = max(1, min(page, max_pages))
+        offset = (page - 1) * per_page
+
+        cur = await conn.execute("""
+            SELECT id, name, emoji, icon_url, price, sell_price, category, description
+            FROM items
+            ORDER BY (name IS NULL), name COLLATE NOCASE ASC, id COLLATE NOCASE ASC
+            LIMIT ? OFFSET ?
+        """, (per_page, offset))
+        rows = [dict(r) if hasattr(r, "keys") else {
+            "id": r[0],
+            "name": r[1],
+            "emoji": r[2],
+            "icon_url": r[3],
+            "price": r[4],
+            "sell_price": r[5],
+            "category": r[6],
+            "description": r[7],
+        } for r in await cur.fetchall()]
+        await cur.close()
+        return rows, max_pages, total
+
+def _fmt_item_row(r: dict) -> str:
+    name = r.get("name") or r["id"]
+    emj  = (r.get("emoji") or "").strip()
+    return (f"{emj} **{name}** `({r['id']})`") if emj else (f"**{name}** `({r['id']})`")
+
+def _build_items_embed(page: int, max_pages: int, total: int, rows: list[dict]) -> Embed:
+    e = Embed(title=f"📦 Items — Page {page}/{max_pages}")
+    e.description = "_No items found._" if not rows else "\n".join(_fmt_item_row(r) for r in rows)
+    e.set_footer(text=f"{total} total • Use /item <name> to view details")
+    return e
+
+class JumpModal(ui.Modal, title="Jump to page"):
+    def __init__(self, on_submit_cb):
+        super().__init__()
+        self.on_submit_cb = on_submit_cb
+        self.page_input = ui.TextInput(label="Page number", placeholder="e.g. 42", required=True, max_length=6)
+        self.add_item(self.page_input)
+
+    async def on_submit(self, interaction: Interaction):
+        try:
+            n = int(str(self.page_input.value).strip())
+        except Exception:
+            return await interaction.response.send_message("Please enter a valid number.", ephemeral=True)
+        await self.on_submit_cb(interaction, n)
+
+class ItemsView(ui.View):
+    def __init__(self, page: int, max_pages: int):
+        super().__init__(timeout=120)
+        self.page = page
+        self.max_pages = max_pages
+
+        # Prev / Next
+        self.prev_btn = ui.Button(label="Prev", style=discord.ButtonStyle.secondary, disabled=(page <= 1))
+        self.next_btn = ui.Button(label="Next", style=discord.ButtonStyle.secondary, disabled=(page >= max_pages))
+        self.prev_btn.callback = self.on_prev
+        self.next_btn.callback = self.on_next
+        self.add_item(self.prev_btn)
+        self.add_item(self.next_btn)
+
+        # If there are at most 25 pages, show a select; otherwise show a Jump modal button.
+        if max_pages <= 25:
+            options = [SelectOption(label=f"Page {i}", value=str(i), default=(i == page))
+                       for i in range(1, max_pages + 1)]
+            self.page_select = ui.Select(placeholder="Jump to…", options=options, min_values=1, max_values=1)
+            self.page_select.callback = self.on_jump_select
+            self.add_item(self.page_select)
+            self.jump_btn = None
+        else:
+            self.page_select = None
+            self.jump_btn = ui.Button(label="Jump", style=discord.ButtonStyle.primary)
+            self.jump_btn.callback = self.on_jump_modal
+            self.add_item(self.jump_btn)
+
+    async def _reload(self, interaction: Interaction, new_page: int):
+        rows, max_pages, total = await _items_catalog_page(new_page)
+        self.page = max(1, min(new_page, max_pages))
+        self.max_pages = max_pages
+
+        # Update buttons
+        self.prev_btn.disabled = (self.page <= 1)
+        self.next_btn.disabled = (self.page >= self.max_pages)
+
+        # If we’re using a select, refresh its options (<=25 pages only)
+        if self.page_select is not None:
+            self.page_select.options = [
+                SelectOption(label=f"Page {i}", value=str(i), default=(i == self.page))
+                for i in range(1, self.max_pages + 1)
+            ]
+
+        embed = _build_items_embed(self.page, self.max_pages, total, rows)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    # Callbacks
+    async def on_prev(self, interaction: Interaction):
+        await self._reload(interaction, max(1, self.page - 1))
+
+    async def on_next(self, interaction: Interaction):
+        await self._reload(interaction, min(self.max_pages, self.page + 1))
+
+    async def on_jump_select(self, interaction: Interaction):
+        choice = int(self.page_select.values[0])
+        await self._reload(interaction, choice)
+
+    async def on_jump_modal(self, interaction: Interaction):
+        async def go_to(inter: Interaction, n: int):
+            n = max(1, min(n, self.max_pages))
+            await self._reload(inter, n)
+        await interaction.response.send_modal(JumpModal(go_to))
+
+@bot.tree.command(name="items", description="Browse the items catalog with pages.")
+@app_commands.describe(page="Start on this page (default 1)")
+async def items_cmd(interaction: discord.Interaction, page: int = 1):
+    await interaction.response.defer(ephemeral=False)
+    rows, max_pages, total = await _items_catalog_page(page)
+    page = max(1, min(page, max_pages))
+    embed = _build_items_embed(page, max_pages, total, rows)
+    view = ItemsView(page, max_pages)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=False)
+@bot.tree.command(name="list_commands", description="Show the commands I currently have.")
+@admin_only()
+@app_commands.guild_only()
+async def list_commands(interaction: discord.Interaction):
+    names = [c.name for c in bot.tree.get_commands()]
+    await interaction.response.send_message(
+        "Commands: " + (", ".join(names) if names else "(none)"), ephemeral=True
+    )
+
+@bot.tree.command(name="fix_dupes", description="Remove guild-registered copies; keep global only.")
+@admin_only()
+@app_commands.guild_only()
+async def fix_dupes(interaction: discord.Interaction):
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message("Run this in a server, not DMs.", ephemeral=True)
+    bot.tree.clear_commands(guild=guild)
+    await bot.tree.sync(guild=guild)
+    await interaction.response.send_message(
+        f"Cleared guild copies for **{guild.name}**. You should now see one copy of each command.",
+        ephemeral=True
+    )
+
+# =========================
+#  Players & Pokemons
+# =========================
+@bot.tree.command(name="players", description="List players in a custom format.")
+@app_commands.describe(
+    page="Page number (starts at 1)",
+    resolve_names="Resolve usernames (true = slower; default false)"
+)
+@admin_only()
+@app_commands.guild_only()
+async def players(
+    interaction: discord.Interaction,
+    page: int = 1,
+    resolve_names: bool = False
+):
+    await interaction.response.defer(ephemeral=False)
+    if page < 1:
+        page = 1
+    page_size = 10
+    offset = (page - 1) * page_size
+
+    try:
+        total = await db.count_users()
+        users = await db.list_users(limit=page_size, offset=offset)
+    except Exception as e:
+        return await interaction.followup.send(f"DB error: {e}", ephemeral=True)
+
+    if not users:
+        return await interaction.followup.send(
+            f"No users on page {page}. Total users: {total}.",
+            ephemeral=True
+        )
+
+    lines = []
+    for u in users:
+        uid = u["user_id"]
+        name = "unknown"
+        if resolve_names:
+            user_obj = interaction.client.get_user(int(uid))
+            if user_obj is None:
+                try:
+                    user_obj = await interaction.client.fetch_user(int(uid))
+                except Exception:
+                    user_obj = None
+            if user_obj:
+                name = user_obj.name
+
+        lines.append(
+            f'user: "{name}" '
+            f'id:"{uid}" '
+            f'ip:"N/A" '  # Discord bots cannot access user IPs
+            f'starter:"{u["starter"] or ""}" '
+            f'coins:{u["coins"]} '
+            f'created_at:"{u["created_at"]}"'
+        )
+
+    pages = (total + page_size - 1) // page_size
+    footer = f"-- page {page}/{max(pages,1)} (total {total})"
+    await interaction.followup.send("\n".join(lines) + f"\n{footer}", ephemeral=True)
+
+@bot.tree.command(name="player_pkinventory", description="List a member's pokemons.")
+@app_commands.describe(member="Whose pokemons to list", page="Page number (starts at 1)")
+@admin_only()
+@app_commands.guild_only()
+async def pokemons_cmd(interaction: discord.Interaction, member: discord.Member, page: int = 1):
+    await interaction.response.defer(ephemeral=False)
+    uid = str(member.id)
+    page_size = 10
+    offset = (max(page, 1) - 1) * page_size
+
+    pkm = await db.list_pokemons(uid, limit=page_size, offset=offset)
+    if not pkm:
+        return await interaction.followup.send(
+            f"No pokemons found for {member.mention} on page {page}.",
+            ephemeral=True
+        )
+
+    embed = discord.Embed(title=f"{member.display_name}'s Pokemons (page {page})")
+    for p in pkm:
+        stats = f"Lv{p['level']} | HP:{p['hp']} ATK:{p['atk']} DEF:{p['def']}"
+        embed.add_field(name=f"#{p['id']} — {p['species']}", value=stats, inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+# =========================
+#  give pokemon
+# =========================
+
+
+USE_DM_INPUT = False
+
+# ------------- Helpers -------------
+import re
+import json
+import asyncio
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from lib import db, poke_ingest, stats, legality  # make sure lib/__init__.py exists
+
+# =================== Config ===================
+# If True, the bot DMs the admin and collects answers there.
+# If False, it prompts ephemerally in the channel and ONLY listens to the invoker there.
+USE_DM_INPUT = False
+
+# ------------- Helpers -------------
+_IV_KEYS = ["hp","attack","defense","special_attack","special_defense","speed"]
+_EV_KEYS = _IV_KEYS
+
+def _parse_yes_no(s: str) -> bool:
+    return str(s).strip().lower() in {"y","yes","true","1","shiny","on"}
+
+def _comma_or_slash_list(s: str) -> list[str]:
+    parts = re.split(r"[,/]+|\s{2,}", s.strip())
+    return [p.strip().lower().replace(" ", "-") for p in parts if p.strip()]
+
+def _parse_six_numbers(s: str, low: int, high: int) -> dict[str, int]:
+    s = s.strip()
+    if "=" in s:  # key=value style
+        kv = dict()
+        for m in re.finditer(r"(hp|atk|def|spa|spd|spe|attack|defense|special_attack|special_defense|speed)\s*=\s*(\d+)", s, re.I):
+            k = m.group(1).lower()
+            k = {"atk":"attack","def":"defense","spa":"special_attack","spd":"special_defense","spe":"speed"}.get(k, k)
+            kv[k] = int(m.group(2))
+        if set(kv.keys()) != set(_IV_KEYS):
+            raise ValueError("Please provide all 6 stats (hp, atk, def, spa, spd, spe).")
+        return {k: max(low, min(high, int(v))) for k,v in kv.items()}
+    nums = re.split(r"[,/]\s*|\s+", s)
+    nums = [n for n in nums if n]
+    if len(nums) != 6:
+        raise ValueError("Need exactly 6 numbers (hp, atk, def, spa, spd, spe).")
+    vals = [max(low, min(high, int(x))) for x in nums]
+    return dict(zip(_IV_KEYS, vals))
+
+def _validate_evs(evs: dict[str,int]) -> None:
+    if any(v < 0 or v > 252 for v in evs.values()):
+        raise ValueError("Each EV must be between 0 and 252.")
+    if sum(evs.values()) > 510:
+        raise ValueError("Total EVs cannot exceed 510.")
+
+def _get_ev_yield_for_species(species_name: str) -> dict:
+    """Return EV yield dict (hp, atk, defn, spa, spd, spe) for a species from cached pokedex. All keys int >= 0."""
+    if not species_name or not db_cache:
+        return {k: 0 for k in _STAT_KEYS_SHORT}
+    entry = db_cache.get_cached_pokedex(species_name) or db_cache.get_cached_pokedex((species_name or "").lower()) or db_cache.get_cached_pokedex((species_name or "").replace(" ", "-"))
+    if not entry:
+        return {k: 0 for k in _STAT_KEYS_SHORT}
+    raw = entry.get("ev_yield")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw) if raw else {}
+        except Exception:
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    normalized = _normalize_stats_keys(raw)
+    return {
+        "hp": max(0, int(normalized.get("hp", 0) or 0)),
+        "atk": max(0, int(normalized.get("atk", 0) or 0)),
+        "defn": max(0, int(normalized.get("def", 0) or normalized.get("defn", 0) or 0)),
+        "spa": max(0, int(normalized.get("spa", 0) or 0)),
+        "spd": max(0, int(normalized.get("spd", 0) or 0)),
+        "spe": max(0, int(normalized.get("spe", 0) or 0)),
+    }
+
+def _cap_evs(evs_dict: dict) -> dict:
+    """Return a new EV dict with each stat capped at 252 and total capped at 510."""
+    keys = list(_STAT_KEYS_SHORT)
+    evs = {k: max(0, min(252, int(evs_dict.get(k, 0) or 0))) for k in keys}
+    total = sum(evs.values())
+    while total > 510:
+        best_k = max(keys, key=lambda k: evs[k])
+        if evs[best_k] <= 0:
+            break
+        evs[best_k] -= 1
+        total -= 1
+    return evs
+
+def _maybe_json(v):
+    if isinstance(v, str):
+        try: return json.loads(v)
+        except Exception: return v
+    return v
+def _json(v, default):
+    if isinstance(v, str):
+        try: return json.loads(v)
+        except Exception: return default
+    return default if v is None else v
+async def _ask(inter: discord.Interaction, prompt: str, timeout: int = 180) -> str:
+    """
+    Ask the invoker for input and ONLY accept messages from the same user.
+    If USE_DM_INPUT=True, questions go to DM; otherwise ephemeral in the same channel.
+    """
+    if USE_DM_INPUT:
+        dm = inter.user.dm_channel or await inter.user.create_dm()
+        await dm.send(f"📝 {prompt}")
+        listen_channel_id = dm.id
+    else:
+        await inter.followup.send(prompt, ephemeral=True)
+        listen_channel_id = inter.channel_id
+
+    def check(msg: discord.Message) -> bool:
+        return msg.author.id == inter.user.id and msg.channel.id == listen_channel_id and not msg.author.bot
+
+    msg = await inter.client.wait_for("message", check=check, timeout=timeout)
+    return msg.content.strip()
+
+async def _resolve_item_id(name: str | None) -> str | None:
+    if not name:
+        return None
+    item_id = await db.find_item_id(name)
+    if not item_id:
+        try:
+            info = await poke_ingest.ensure_item_cached(name)
+            item_id = info["id"]
+        except Exception:
+            item_id = None
+    return item_id
+
+async def _send_move_list(inter: discord.Interaction, species_id: int, species_name: str, gen: int = 9):
+    """Send all learnable move names (informational only) in chunks, ephemeral/DM."""
+    legal = await legality.legal_moves(species_id, gen)
+    names = sorted({(m["name"] if isinstance(m, dict) else str(m)).replace("-", " ") for m in legal})
+    header = f"📜 **{species_name.title()}** can learn **{len(names)}** moves (Gen {gen}):"
+    await inter.followup.send(header, ephemeral=not USE_DM_INPUT)
+    # chunk messages to avoid hitting 2000-char limit
+    chunk = ""
+    for n in names:
+        add = (n + ", ")
+        if len(chunk) + len(add) > 1900:
+            await inter.followup.send(chunk.rstrip(", "), ephemeral=not USE_DM_INPUT)
+            chunk = add
+        else:
+            chunk += add
+    if chunk:
+        await inter.followup.send(chunk.rstrip(", "), ephemeral=not USE_DM_INPUT)
+
+# --- setters for shiny & pokéball on the row (requires columns in DB) ---
+EMOJI_GUILD_ID: int = 1148637394162155603  # <-- replace with your emoji server ID
+
+def _norm_key(s: str) -> str:
+    return str(s or "").strip().lower().replace("_", "-").replace("  ", " ").replace(" ", "-")
+
+def _candidates(base: str) -> set[str]:
+    return {base, base.replace("-", ""), base.replace("-", " "), base.split("-")[0]}
+
+def _titleize(s: str) -> str:
+    s = _norm_key(s).replace("-", " ")
+    return " ".join(w.capitalize() for w in s.split())
+
+async def _db_item_lookup(key: str | int | None) -> tuple[str | None, str | None]:
+    """Return (canonical name, emoji) from items by id or normalized name."""
+    from lib import db  # local import to avoid cycles
+    conn = None
+    try:
+        conn = await db.connect()
+        if isinstance(key, int) or (isinstance(key, str) and key.isdigit()):
+            cur = await conn.execute("SELECT name, emoji FROM items WHERE id=? LIMIT 1", (int(key),))
+        else:
+            cur = await conn.execute("SELECT name, emoji FROM items WHERE LOWER(name)=? LIMIT 1", (_norm_key(key or ""),))
+        row = await cur.fetchone(); await cur.close()
+        if row:
+            name = row["name"] if isinstance(row, dict) else row[0]
+            emoji = (row.get("emoji") if isinstance(row, dict) else (row[1] if len(row) > 1 else None)) or None
+            return (str(name) if name is not None else None), (str(emoji) if emoji is not None else None)
+    except Exception:
+        pass
+    finally:
+        if conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+    return None, None
+
+def _emoji_by_name_in_guild(guild: discord.Guild | None, name: str) -> str:
+    if not guild: return ""
+    cand = _candidates(_norm_key(name))
+    try:
+        for e in guild.emojis:
+            if e.name.lower() in cand:
+                return str(e)  # <:name:id>
+    except Exception:
+        pass
+    return ""
+
+async def get_emoji_global(
+    bot: commands.Bot,
+    preferred_guild: discord.Guild | None,
+    key: str | int | None,
+    *,
+    name_from_db: str | None = None,
+    emoji_hint: str | None = None,
+) -> str:
+    """
+    Resolve an emoji for item/ball/type/etc:
+    - items.emoji in DB (supports <:x:id>, numeric id, name, unicode)
+    - current guild by name
+    - EMOJI_GUILD_ID by name
+    - bot.get_emoji(numeric_id) fallback
+    If name_from_db and emoji_hint are provided, skips _db_item_lookup (avoids duplicate lookup).
+    """
+    if name_from_db is None and emoji_hint is None:
+        name_from_db, emoji_hint = await _db_item_lookup(key)
+
+    # If DB already stores a full custom emoji or unicode, use it:
+    if emoji_hint:
+        em = emoji_hint.strip()
+        if em.startswith("<") and em.endswith(">"):
+            return em  # already <:name:id>
+        if em.isdigit():
+            ge = bot.get_emoji(int(em))
+            if ge: return str(ge)
+        # try by name in current or emoji guild
+        em_name = _emoji_by_name_in_guild(preferred_guild, em)
+        if em_name: return em_name
+        emoji_guild = bot.get_guild(EMOJI_GUILD_ID)
+        em_name = _emoji_by_name_in_guild(emoji_guild, em)
+        if em_name: return em_name
+        # last chance: could be unicode emoji
+        if len(em) <= 3:
+            return em
+
+    # 2) Try current guild by name (prefer DB name; else provided key)
+    prefer_name = name_from_db or (str(key) if key is not None else "")
+    em = _emoji_by_name_in_guild(preferred_guild, prefer_name)
+    if em: return em
+
+    # 3) Try private emoji guild by name
+    emoji_guild = bot.get_guild(EMOJI_GUILD_ID)
+    em = _emoji_by_name_in_guild(emoji_guild, prefer_name)
+    if em: return em
+
+    # 4) If key is numeric id-like, try global cache
+    try:
+        if isinstance(key, int) or (isinstance(key, str) and key.isdigit()):
+            ge = bot.get_emoji(int(key))
+            if ge: return str(ge)
+    except Exception:
+        pass
+
+    return ""  # nothing found
+
+async def render_label_global(bot: commands.Bot, preferred_guild: discord.Guild | None, key: str | int | None) -> str:
+    name_from_db, emoji_hint = await _db_item_lookup(key)
+    label = _titleize(name_from_db or str(key or ""))
+    emoji = await get_emoji_global(bot, preferred_guild, key, name_from_db=name_from_db, emoji_hint=emoji_hint)
+    return f"{emoji} {label}" if emoji else label
+def _roll_gender_from_ratio(gender_ratio: dict) -> str:
+    """Return 'male' | 'female' | 'genderless' based on the Pokédex ratio."""
+    if not isinstance(gender_ratio, dict):
+        return "male"
+    if gender_ratio.get("genderless"):
+        return "genderless"
+    m = float(gender_ratio.get("male", 0) or 0.0)
+    f = float(gender_ratio.get("female", 0) or 0.0)
+    total = m + f
+    if total <= 0:
+        return "male"
+    return "male" if (random.random() * total) < m else "female"
+
+async def _get_base_friendship(species_name: str) -> int:
+    """Read base friendship from pokedex; fallback to base_happiness → 50."""
+    conn = await db.connect()
+    try:
+        cur = await conn.execute(
+            "SELECT base_friendship, base_happiness FROM pokedex WHERE LOWER(name)=LOWER(?)",
+            (species_name.lower(),)
+        )
+        row = await cur.fetchone(); await cur.close()
+        if not row:
+            return 50
+        bf = row["base_friendship"]
+        if bf is None:
+            bf = row["base_happiness"]
+        try:
+            return int(bf) if bf is not None else 50
+        except Exception:
+            return 50
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+async def _set_friendship(owner_id: str, mon_id: int, value: int) -> None:
+    """Persist friendship on pokemons(friendship) for (owner_id, id)."""
+    conn = await db.connect()
+    try:
+        await conn.execute(
+            "UPDATE pokemons SET friendship=? WHERE owner_id=? AND id=?",
+            (int(value), owner_id, mon_id)
+        )
+        await conn.commit()
+        db.invalidate_pokemons_cache(owner_id)
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+async def _give_item(owner_id: str, item_id: str, qty: int) -> None:
+    """
+    Upsert into user_items using your schema:
+      owner_id TEXT, item_id TEXT, qty INTEGER
+    """
+    qty = int(qty)
+    conn = await db.connect()
+    try:
+        # Try an UPSERT if (owner_id, item_id) is UNIQUE/PK
+        try:
+            await conn.execute("""
+                INSERT INTO user_items (owner_id, item_id, qty)
+                VALUES (?, ?, ?)
+                ON CONFLICT(owner_id, item_id)
+                DO UPDATE SET qty = qty + excluded.qty
+            """, (owner_id, item_id, qty))
+            await conn.commit()
+            return
+        except Exception:
+            # Fallback if there is no UNIQUE (owner_id, item_id) constraint
+            pass
+
+        # Manual upsert
+        cur = await conn.execute(
+            "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
+            (owner_id, item_id)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row:
+            await conn.execute(
+                "UPDATE user_items SET qty = qty + ? WHERE owner_id=? AND item_id=?",
+                (qty, owner_id, item_id)
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO user_items (owner_id, item_id, qty) VALUES (?, ?, ?)",
+                (owner_id, item_id, qty)
+            )
+        await conn.commit()
+        db.invalidate_bag_cache(owner_id)
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
+async def _user_max_unlocked_gen(user_id: str) -> int:
+    """Return the user's highest unlocked generation from user_rulesets.max_unlocked_gen (default 1)."""
+    conn = await db.connect()
+    try:
+        cur = await conn.execute("SELECT max_unlocked_gen FROM user_rulesets WHERE user_id=?", (user_id,))
+        row = await cur.fetchone(); await cur.close()
+        if row and row["max_unlocked_gen"]:
+            return int(row["max_unlocked_gen"])
+        return 1
+    except Exception:
+        return 1
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+async def shiny_roll(default_denominator: int = 4096) -> bool:
+    """
+    Reusable shiny helper for routes, gifts, starters, etc.
+    If you have a trigger named 'pokemons_shiny_auto' that uses 'RANDOM() % N = 0',
+    we read N to match the DB odds; otherwise default to 1/4096 (or override here).
+    """
+    return random.randrange(max(1, int(default_denominator))) == 0
+
+
+def normalize_base_stats(src: dict | None) -> dict:
+    """
+    Accepts {'hp','atk','def','spa','spd','spe'} OR long keys and returns long keys
+    required by your generator: attack/defense/special_attack/special_defense/speed.
+    """
+    src = dict(src or {})
+    return {
+        "hp":              int(src.get("hp",                src.get("HP", 0))),
+        "attack":          int(src.get("attack",            src.get("atk", 0))),
+        "defense":         int(src.get("defense",           src.get("def", 0))),
+        "special_attack":  int(src.get("special_attack",    src.get("spa", 0))),
+        "special_defense": int(src.get("special_defense",   src.get("spd", 0))),
+        "speed":           int(src.get("speed",             src.get("spe", 0))),
+    }
+
+
+def parse_abilities(abilities_raw) -> tuple[list[str], list[str]]:
+    """
+    Normalizes ability data from your DB (strings, dicts, or JSON string) into:
+        (regular_ability_names, hidden_ability_names)
+    Accepts formats like:
+      - ["overgrow","chlorophyll"]
+      - [{"name":"overgrow"},{"name":"chlorophyll","is_hidden":true}]
+      - [{"ability":{"name":"overgrow"},"slot":1},{"ability":{"name":"chlorophyll"},"slot":3}]
+    """
+    # if JSON text, parse first
+    if isinstance(abilities_raw, str):
+        try:
+            abilities_raw = json.loads(abilities_raw)
+        except Exception:
+            abilities_raw = []
+    regs, hides = [], []
+    for a in (abilities_raw or []):
+        if isinstance(a, str):
+            regs.append(a)
+            continue
+        if isinstance(a, dict):
+            name = a.get("name") or (a.get("ability") or {}).get("name") or ""
+            is_hidden = bool(a.get("is_hidden") or a.get("hidden") or (a.get("slot") == 3))
+            if name:
+                (hides if is_hidden else regs).append(name)
+    # de-dup while preserving order
+    def _dedup(seq: list[str]) -> list[str]:
+        seen = set(); out = []
+        for s in seq:
+            k = s.lower()
+            if k not in seen:
+                seen.add(k); out.append(s)
+        return out
+    return _dedup(regs), _dedup(hides)
+def roll_hidden_ability(abilities_raw, ha_denominator: int = 10) -> tuple[str, bool]:
+    """
+    Returns (ability_name, is_hidden).
+
+    - 1/N chance (N = ha_denominator) to get a Hidden Ability.
+    - If HA roll fails, choose uniformly among ALL regular abilities.
+    - If no regulars exist but HAs do, pick a random HA.
+    - If nothing is present, return ("", False).
+    """
+    regs, hides = parse_abilities(abilities_raw)  # uses the helper you already added
+
+    # nothing stored
+    if not regs and not hides:
+        return ("", False)
+
+    # try HA roll if any hidden exists
+    if hides and random.randrange(max(1, int(ha_denominator))) == 0:
+        return (random.choice(hides), True)
+
+    # fallback: pick a regular at random if available
+    if regs:
+        return (random.choice(regs), False)
+
+    # last resort: only hidden exists
+    return (random.choice(hides), True)
+# --- DB field setters (use your schema names) ---
+async def _set_shiny(owner_id: str, mon_id: int, shiny: bool) -> None:
+    conn = await db.connect()
+    try:
+        await conn.execute(
+            "UPDATE pokemons SET shiny=? WHERE owner_id=? AND id=?",
+            (1 if shiny else 0, owner_id, mon_id),
+        )
+        await conn.commit()
+        db.invalidate_pokemons_cache(owner_id)
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
+async def _set_pokeball(owner_id: str, mon_id: int, pokeball: str | None) -> None:
+    conn = await db.connect()
+    try:
+        await conn.execute(
+            "UPDATE pokemons SET pokeball=? WHERE owner_id=? AND id=?",
+            (pokeball, owner_id, mon_id),
+        )
+        await conn.commit()
+        db.invalidate_pokemons_cache(owner_id)
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
+# ------------- Command -------------
+import lib.stats as stats  # <— you call stats.* below; make sure this import exists
+
+# === Confirm View for /givepokemon ===
+# === Form Selection View for /givepokemon ===
+class GivePokemonFormView(discord.ui.View):
+    """Button-based form selection for /givepokemon"""
+    def __init__(self, cog, interaction: Interaction, species_id: int, species_name: str, 
+                 available_forms: List[dict], target: discord.User, gen: int, **kwargs):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.original_interaction = interaction
+        self.species_id = species_id
+        self.species_name = species_name
+        self.available_forms = available_forms
+        self.target = target
+        self.gen = gen
+        self.kwargs = kwargs
+        
+        # Add buttons for each form
+        for i, form_data in enumerate(available_forms[:25]):
+            button = discord.ui.Button(
+                label=form_data['display_name'],
+                style=discord.ButtonStyle.primary,
+                row=i // 5,
+                custom_id=f"giveform_{form_data['form_key'] or 'base'}"
+            )
+            button.callback = self._make_callback(form_data['form_key'], form_data['display_name'])
+            self.add_item(button)
+    
+    def _make_callback(self, form_key: Optional[str], form_display: str):
+        async def callback(interaction: Interaction):
+            await interaction.response.defer(ephemeral=False)
+            
+            try:
+                # Load species data to build proper payload
+                sp = await ensure_species_and_learnsets(self.species_name)
+                base_stats = sp.get("stats") or {}
+                if isinstance(base_stats, str):
+                    try: base_stats = json.loads(base_stats)
+                    except Exception: base_stats = {}
+                base_stats = self.cog._normalize_stats_long(base_stats)
+                
+                # Form stats are stored in base species stats already, no need to override
+                
+                abilities = sp.get("abilities") or []
+                if isinstance(abilities, str):
+                    try: abilities = json.loads(abilities)
+                    except Exception: abilities = []
+                
+                # Use command parameters if provided, otherwise use defaults
+                conn = await db.connect()
+                try:
+                    # If a form is selected, fetch form-specific abilities
+                    if form_key:
+                        try:
+                            cur = await conn.execute(
+                                "SELECT abilities FROM pokedex_forms WHERE species_id = ? AND form_key = ?",
+                                (self.species_id, form_key)
+                            )
+                            form_data_row = await cur.fetchone()
+                            await cur.close()
+
+                            if form_data_row and form_data_row.get('abilities'):
+                                # Override base species abilities with form abilities
+                                form_abilities = form_data_row['abilities']
+                                if isinstance(form_abilities, str):
+                                    try:
+                                        form_abilities = json.loads(form_abilities)
+                                    except Exception:
+                                        form_abilities = []
+                                if form_abilities:
+                                    abilities = form_abilities
+                        except Exception:
+                            # If form lookup fails, fall back to base abilities
+                            pass
+                
+                    gender_ratio = sp.get("gender_ratio") or {}
+                    if isinstance(gender_ratio, str):
+                        try: gender_ratio = json.loads(gender_ratio)
+                        except Exception: gender_ratio = {}
+                
+                    # Level
+                    lvl = max(1, min(100, int(self.kwargs.get('level')) if self.kwargs.get('level') else 100))
+                
+                    # Nature
+                    nat = self.kwargs.get('nature')
+                    if nat:
+                        nat = nat.strip().lower()
+                    else:
+                        nat = stats.pick_random_nature().lower()
+                
+                    # Ability - now uses form abilities if form was selected
+                    ab = await self.cog._species_autocorrect_ability(abilities, self.kwargs.get('ability'))
+                
+                    # Gender
+                    chosen_gender, gender_note = self.cog._roll_gender_legal(gender_ratio, self.kwargs.get('gender'))
+                
+                    # Shiny - use explicit parameter if provided, otherwise random chance
+                    shiny_param = self.kwargs.get('shiny')
+                    if shiny_param is not None:
+                        shiny_val = bool(shiny_param)
+                    else:
+                        shiny_val = (random.random() < (1/4096))
+                
+                    # Ball
+                    pokeball = self.cog._norm_name(self.kwargs.get('ball') or "poke-ball")
+                
+                    # Item
+                    item_id = None
+                    if self.kwargs.get('item'):
+                        matched_item, confidence, suggestions = await FuzzyMatcher.fuzzy_item(conn, self.kwargs['item'])
+                        if matched_item and confidence >= 0.70:
+                            item_id = matched_item
+                
+                    # Moves - use provided moves or get random legal ones
+                    if self.kwargs.get('moves'):
+                        wanted_moves = self.cog._parse_moves(self.kwargs['moves'])
+                        default_moves = await self.cog._choose_default_moves(self.species_id, lvl, self.gen)
+                        moves_list, move_notes = await self.cog._validate_moves(self.species_id, self.gen, wanted_moves, default_moves)
+                    else:
+                        # Get random legal moves (fetch NAMES not IDs)
+                        # Subquery: PostgreSQL requires ORDER BY expressions to appear in SELECT when using DISTINCT,
+                        # so we get distinct names first then order by random in the outer query.
+                        cur = await conn.execute("""
+                            SELECT name FROM (
+                                SELECT DISTINCT m.name AS name
+                                FROM moves m
+                                JOIN learnsets l ON m.id = l.move_id
+                                WHERE l.species_id = ? AND l.generation <= ?
+                            ) sub
+                            ORDER BY RANDOM()
+                            LIMIT 4
+                        """, (self.species_id, self.gen))
+                        random_moves = await cur.fetchall()
+                        await cur.close()
+                        moves_list = [self.cog._norm_name(row['name']) for row in random_moves]
+
+                        # IVs and EVs
+                        ivs_dict = self.cog._parse_six_csv(self.kwargs.get('ivs'), kind="ivs")
+                        evs_dict = self.cog._parse_six_csv(self.kwargs.get('evs'), kind="evs")
+                finally:
+                    try:
+                        await conn.close()
+                    except Exception:
+                        pass
+                
+                species_types = _extract_species_types(sp)
+                tera_param = self.kwargs.get('tera_type')
+                explicit_tera = None
+                tera_type_source = "auto"
+                tera_notes: list[str] = []
+                if tera_param:
+                    explicit_tera = _normalize_type_id(tera_param)
+                    if explicit_tera not in VALID_TERA_TYPES:
+                        return await interaction.followup.send(
+                            f"❌ Invalid Tera Type `{tera_param}`.",
+                            ephemeral=True
+                        )
+                    tera_type_source = "manual"
+                    if explicit_tera not in species_types:
+                        tera_notes.append(f"Tera Type `{explicit_tera.title()}` is not in this species' native pool.")
+                resolved_tera = explicit_tera or _roll_default_tera_type(species_types)
+                if tera_type_source == "auto" and resolved_tera is None:
+                    tera_notes.append("Tera Type could not be rolled; species has no type data.")
+                
+                # Calculate friendship (same logic as main command)
+                base_friendship = await _get_base_friendship(self.species_name)
+                # For Missing n0, if base_friendship is None/0, default to 50
+                if self.species_name.lower() == "missing n0" and (base_friendship is None or base_friendship == 0):
+                    base_friendship = 50
+                friendship_param = self.kwargs.get('friendship')
+                if friendship_param is None:
+                    starting_friendship = base_friendship
+                else:
+                    requested = int(friendship_param)
+                    starting_friendship = max(0, min(255, requested))
+
+                # Build full payload for OLD confirmation view
+                target_id = str(self.target.id)
+                payload = {
+                    "target_id": target_id,
+                    "target_mention": self.target.mention,
+                    "target_display": getattr(self.target, "display_name", None),
+                    "target_tag": f"{self.target.name}#{getattr(self.target, 'discriminator', '0')}" if hasattr(self.target, "discriminator") else self.target.name,
+                    "species_id": self.species_id,
+                    "species_name": self.species_name,  # Base species name (e.g., "rotom")
+                    "form_display_name": form_display,  # Display name for preview (e.g., "Rotom (Heat)")
+                    "base_stats": base_stats,
+                    "gen": self.gen,
+                    "level": lvl,  # Use resolved level
+                    "nature": nat,
+                    "ability": ab,
+                    "gender": chosen_gender,
+                    "gender_note": gender_note,
+                    "shiny": shiny_val,  # Use resolved shiny (respects command param)
+                    "pokeball": pokeball,  # Use resolved ball
+                    "item_id": item_id,  # Use resolved item
+                    "moves": moves_list,
+                    "autoslot": bool(self.kwargs.get('autoslot', True)),  # Use command param or default True
+                    "ivs": ivs_dict,  # Use resolved IVs
+                    "evs": evs_dict,  # Use resolved EVs
+                    "form": form_key,
+                    "tera_type": resolved_tera,
+                    "tera_type_source": tera_type_source,
+                    "species_types": species_types,
+                    "friendship": starting_friendship,
+                    "base_friendship": base_friendship,
+                }
+                
+                # Get sprite - pass form_key so it looks in the right folder (e.g., "kyurem-white")
+                sprite_file = self.cog._pick_sprite_file(self.species_name, chosen_gender, shiny_val, form_key)
+                
+                # Use OLD confirmation view (same as non-form Pokemon)
+                view = AdminGivePokemon._ConfirmView(payload)
+                emb = await self.cog._preview_embed(interaction, payload, tera_notes, sprite_file)
+                
+                if sprite_file:
+                    msg = await interaction.followup.send(
+                        embed=emb, 
+                        view=view, 
+                        files=[sprite_file], 
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions(users=True)
+                    )
+                else:
+                    msg = await interaction.followup.send(
+                        embed=emb, 
+                        view=view, 
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions(users=True)
+                    )
+                view.message = msg
+                
+            except Exception as e:
+                await interaction.followup.send(
+                    f"❌ Error loading form data: {e}",
+                    ephemeral=True
+                )
+        
+        return callback
+
+class AdminGivePokemon(commands.Cog):
+    """Give a Pokémon with quick options, preview (with sprite), legality checks, and autocomplete."""
+
+    # List of Pokemon that can Gigantamax (by default, not all individuals have the factor)
+    GIGANTAMAX_CAPABLE = {
+        "venusaur", "charizard", "blastoise", "butterfree", "pikachu", "meowth", "machamp",
+        "gengar", "kingler", "lapras", "eevee", "snorlax", "garbodor", "melmetal", "rillaboom",
+        "cinderace", "inteleon", "corviknight", "orbeetle", "drednaw", "coalossal", "flapple",
+        "appletun", "sandaconda", "toxtricity", "centiskorch", "hatterene", "grimmsnarl",
+        "alcremie", "copperajah", "duraludon", "urshifu", "toxtricity-low-key", "urshifu-rapid-strike"
+    }
+
+    @classmethod
+    def can_gigantamax(cls, species_name: str) -> bool:
+        """Check if a Pokemon species can Gigantamax."""
+        normalized = cls._norm_name(species_name)
+        return normalized in cls.GIGANTAMAX_CAPABLE
+
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.sprites_base = Path(__file__).resolve().parent / "pvp" / "_common" / "sprites"
+
+    # ---------- small utils ----------
+    @staticmethod
+    def _norm_name(s: str) -> str:
+        return s.strip().lower().replace(" ", "-")
+
+    @staticmethod
+    def _norm_gender(s: Optional[str]) -> Optional[str]:
+        if not s:
+            return None
+        s = s.strip().lower()
+        if s in {"m", "male", "♂️"}: return "male"
+        if s in {"f", "female", "♀️"}: return "female"
+        if s in {"n", "none", "genderless", "gender-less"}: return "genderless"
+        return None
+
+    @staticmethod
+    def _fmt6(d: dict | None) -> str:
+        d = d or {}
+        return (
+            f"HP {int(d.get('hp',0))} | Atk {int(d.get('attack',0))} | Def {int(d.get('defense',0))}\n"
+            f"SpA {int(d.get('special_attack',0))} | SpD {int(d.get('special_defense',0))} | Spe {int(d.get('speed',0))}"
+        )
+
+    @staticmethod
+    def _normalize_stats_long(stats_like: dict | None) -> dict:
+        """
+        Convert DB stats into long keys expected by calc_all_stats:
+        hp, attack, defense, special_attack, special_defense, speed
+        Supports {atk, def, spa, spd, spe} and hyphen keys.
+        """
+        d = {k.lower().replace("-", "_"): v for k, v in (stats_like or {}).items()}
+        return {
+            "hp": d.get("hp", 0),
+            "attack": d.get("attack", d.get("atk", 0)),
+            "defense": d.get("defense", d.get("def", 0)),
+            "special_attack": d.get("special_attack", d.get("spa", d.get("specialattack", 0))),
+            "special_defense": d.get("special_defense", d.get("spd", d.get("specialdefense", 0))),
+            "speed": d.get("speed", d.get("spe", 0)),
+        }
+
+    @staticmethod
+    def _parse_six_csv(
+        csv_text: Optional[str],
+        *,
+        kind: Literal["ivs", "evs"],
+        default_ivs: tuple[int, int, int, int, int, int] = (31,31,31,31,31,31),
+        default_evs: tuple[int, int, int, int, int, int] = (0,0,0,0,0,0),
+    ) -> dict:
+        if kind == "ivs":
+            defaults = default_ivs
+            lo, hi = 0, 31
+        else:
+            defaults = default_evs
+            lo, hi = 0, 252
+
+        vals = list(defaults)
+        if csv_text:
+            parts = [p.strip() for p in csv_text.split(",")]
+            for i in range(min(6, len(parts))):
+                try:
+                    n = int(parts[i])
+                except Exception:
+                    n = defaults[i]
+                n = max(lo, min(hi, n))
+                vals[i] = n
+
+        d = {
+            "hp": vals[0],
+            "attack": vals[1],
+            "defense": vals[2],
+            "special_attack": vals[3],
+            "special_defense": vals[4],
+            "speed": vals[5],
+        }
+
+        if kind == "evs":
+            total = sum(vals)
+            if total > 510 and total > 0:
+                scale = 510 / total
+                vals = [max(0, min(252, math.floor(v * scale))) for v in vals]
+                d.update({
+                    "hp": vals[0], "attack": vals[1], "defense": vals[2],
+                    "special_attack": vals[3], "special_defense": vals[4], "speed": vals[5]
+                })
+        return d
+
+    @classmethod
+    def _roll_gender_legal(cls, gender_ratio: dict, requested: Optional[str]) -> tuple[str, Optional[str]]:
+        if isinstance(gender_ratio, dict) and gender_ratio.get("genderless") is True:
+            chosen = "genderless"
+            note = None
+            req = cls._norm_gender(requested)
+            if req and req != "genderless":
+                note = "Species is genderless; forced to genderless."
+            return chosen, note
+
+        male_pct = float((gender_ratio or {}).get("male", 0.0) or 0.0)
+        fem_pct  = float((gender_ratio or {}).get("female", 0.0) or 0.0)
+
+        if male_pct > 0 and fem_pct == 0:
+            allowed = {"male"}
+        elif fem_pct > 0 and male_pct == 0:
+            allowed = {"female"}
+        elif male_pct == 0 and fem_pct == 0:
+            chosen = "genderless"
+            note = None
+            req = cls._norm_gender(requested)
+            if req and req != "genderless":
+                note = "Species is genderless; forced to genderless."
+            return chosen, note
+        else:
+            allowed = {"male", "female"}
+
+        req = cls._norm_gender(requested)
+        if req in allowed:
+            return req, None
+
+        if allowed == {"male", "female"}:
+            total = max(1.0, male_pct + fem_pct)
+            roll = random.random() * total
+            chosen = "male" if roll < male_pct else "female"
+            note = None
+            if req and req != chosen:
+                note = f"Requested {req}, but species ratio applied; rolled {chosen}."
+            return chosen, note
+
+        chosen = next(iter(allowed))
+        note = None
+        if req and req != chosen:
+            note = f"Species is {chosen}-only; forced to {chosen}."
+        return chosen, note
+
+    @staticmethod
+    async def _species_autocorrect_ability(abilities_raw: Sequence, requested: Optional[str]) -> str:
+        pool = [(a if isinstance(a, dict) else {"name": a, "is_hidden": False}) for a in (abilities_raw or [])]
+        names = {AdminGivePokemon._norm_name(a.get("name") or "") for a in pool}
+        if requested:
+            rq = AdminGivePokemon._norm_name(requested)
+            if rq in names:
+                return rq
+        # Prefer non-hidden if helper is missing
+        try:
+            pick = stats.choose_ability(pool)
+        except Exception:
+            non_hidden = [AdminGivePokemon._norm_name(a["name"]) for a in pool if not a.get("is_hidden")]
+            pick = non_hidden[0] if non_hidden else (AdminGivePokemon._norm_name(pool[0]["name"]) if pool else "")
+        return AdminGivePokemon._norm_name(pick or "")
+
+    @staticmethod
+    def _parse_moves(s: Optional[str]) -> list[str]:
+        if not s: return []
+        parts = re.split(r"[,/]+|\s{2,}", s.strip())
+        return [AdminGivePokemon._norm_name(p) for p in parts if p.strip()][:4]
+
+    @staticmethod
+    async def _choose_default_moves(species_id: int, level: int, generation: int) -> list[str]:
+        conn = await db.connect()
+        try:
+            cur = await conn.execute(
+                """
+                SELECT m.name, COALESCE(l.level_learned, 0) AS lvl
+                FROM learnsets l
+                JOIN moves m ON m.id = l.move_id
+                WHERE l.species_id=? AND l.generation=? AND l.method='level-up'
+                      AND COALESCE(l.level_learned,0) <= ?
+                ORDER BY lvl DESC, m.name
+                LIMIT 60
+                """,
+                (species_id, generation, level),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            out, seen = [], set()
+            for r in rows:
+                nm = AdminGivePokemon._norm_name(r["name"] or "")
+                if nm and nm not in seen:
+                    seen.add(nm); out.append(nm)
+                if len(out) == 4: break
+            return out
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    async def _validate_moves(species_id: int, gen: int, wanted: list[str], fallbacks: list[str]) -> tuple[list[str], list[str]]:
+        """
+        Validate move names against the database using fuzzy matching.
+        Corrects typos and only accepts moves that exist.
+        """
+        notes: list[str] = []
+        final: list[str] = []
+        
+        if wanted:
+            conn = await db.connect()
+            try:
+                for mv in wanted:
+                    if not mv or not mv.strip():
+                        continue
+                    
+                    # Try to find the move in database using fuzzy matching
+                    matched_move, confidence, suggestions = await FuzzyMatcher.fuzzy_move(conn, mv)
+                    
+                    if matched_move and confidence >= 0.70:
+                        # Move found and matched with good confidence
+                        normalized = AdminGivePokemon._norm_name(matched_move)
+                        if normalized and normalized not in final:
+                            final.append(normalized)
+                            # Add note if it was corrected (not an exact match)
+                            query_norm = FuzzyMatcher.normalize(mv)
+                            matched_norm = FuzzyMatcher.normalize(matched_move)
+                            if query_norm != matched_norm:
+                                notes.append(f"`{mv}` → `{matched_move}` (corrected)")
+                    else:
+                        # Move not found or low confidence
+                        sugg_text = f" Did you mean: {', '.join(suggestions[:3])}?" if suggestions else ""
+                        notes.append(f"❌ Move `{mv}` not found.{sugg_text}")
+            finally:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+
+        # Only use fallbacks if no wanted moves provided or all wanted moves were invalid
+        if not final:
+            for mv in fallbacks:
+                if len(final) >= 4:
+                    break
+                if mv not in final:
+                    final.append(mv)
+
+        return final[:4], notes
+
+    @staticmethod
+    def _ball_emoji(guild: Optional[discord.Guild], ball_id: Optional[str]) -> str:
+        if not guild or not ball_id:
+            return ""
+        base = ball_id.lower()
+        cand = {base, base.replace("-", ""), base.replace("-", " "), base.split("-")[0]}
+        try:
+            for e in guild.emojis:
+                en = e.name.lower()
+                if en in cand:
+                    return str(e)
+        except Exception:
+            pass
+        return ""
+
+    def _pick_sprite_file(self, species_name: str, gender: str, shiny: bool, form_key: Optional[str] = None) -> Optional[discord.File]:
+        # Use EXACT same logic as pokeinfo's attach_sprite_to_embed
+        if form_key:
+            # If form_key already contains the species name (e.g., "kyurem-white"), use it as-is
+            # Otherwise, prepend species (e.g., species="rotom", form_key="heat" → "rotom-heat")
+            if form_key.startswith(f"{species_name}-"):
+                lookup_species = form_key
+            else:
+                lookup_species = f"{species_name}-{form_key}"
+        else:
+            lookup_species = species_name
+        
+        sp_dir = self.sprites_base / self._norm_name(lookup_species)
+        if not sp_dir.is_dir():
+            return None
+
+        def exists(name: str) -> Optional[Path]:
+            p = sp_dir / name
+            return p if p.exists() else None
+
+        cand: List[str] = []
+        if gender == "female":
+            if shiny:
+                cand += [
+                    "female-animated-shiny-front.gif",
+                    "female-shiny-front.png",
+                    "animated-shiny-front.gif",
+                    "shiny-front.png",
+                    "female-animated-front.gif",
+                    "female-front.png",
+                    "animated-front.gif",
+                    "front.png",
+                ]
+            else:
+                cand += [
+                    "female-animated-front.gif",
+                    "female-front.png",
+                    "animated-front.gif",
+                    "front.png",
+                ]
+        else:
+            if shiny:
+                cand += ["animated-shiny-front.gif", "shiny-front.png", "animated-front.gif", "front.png"]
+            else:
+                cand += ["animated-front.gif", "front.png"]
+
+        for fname in cand:
+            fp = exists(fname)
+            if fp:
+                return discord.File(fp, filename=fname)
+        return None
+
+    async def _preview_embed(self, inter: Interaction, payload: dict, notes: list[str], sprite_file: Optional[discord.File]) -> Embed:
+        title_user = payload.get("target_display") or payload.get("target_tag") or "user"
+        # Use form_display_name if available (e.g., "Rotom (Heat)"), otherwise base species_name
+        display_name = payload.get("form_display_name") or payload['species_name']
+        emb = Embed(
+            title=f"Give to {title_user} — {display_name} (Lv {payload['level']})" + (" ⭐" if payload.get("shiny") else ""),
+            colour=discord.Colour.blurple(),
+            description="**Preview** — nothing saved yet.",
+        )
+        emb.add_field(name="User", value=payload["target_mention"], inline=True)
+        emb.add_field(name="Gender", value=payload.get("gender", "?").title(), inline=True)
+        emb.add_field(name="Nature", value=payload.get("nature", "?").title(), inline=True)
+        emb.add_field(name="Ability", value=payload.get("ability", "?").replace("-", " ").title(), inline=True)
+        tera_type_value = payload.get("tera_type")
+        if tera_type_value:
+            tera_label = tera_type_value.replace("-", " ").title()
+        else:
+            tera_label = "None"
+        if payload.get("tera_type_source") == "auto":
+            if tera_type_value:
+                tera_label += " (auto)"
+            else:
+                pool = payload.get("species_types") or []
+                if pool:
+                    pool_str = ", ".join(t.replace("-", " ").title() for t in pool)
+                    tera_label = f"Random (pool: {pool_str})"
+                else:
+                    tera_label = "Random (no species data)"
+        emb.add_field(name="Tera Type", value=tera_label, inline=True)
+
+        ball_label = payload.get("pokeball") or "pokeball"
+        ball_emoji = self._ball_emoji(inter.guild, ball_label)
+        emb.add_field(name="Item", value=(str(payload.get("item_id")) if payload.get("item_id") else "—"), inline=True)
+        emb.add_field(name="Ball", value=f"{ball_emoji} {ball_label}" if ball_emoji else ball_label, inline=True)
+        emb.add_field(name="Autoslot", value="Yes" if payload.get("autoslot") else "No", inline=True)
+
+        mv = payload.get("moves") or []
+        emb.add_field(name="Moves", value=(", ".join(m.replace("-", " ").title() for m in mv) or "—"), inline=False)
+
+        emb.add_field(name="IVs", value=self._fmt6(payload.get("ivs")), inline=False)
+        emb.add_field(name="EVs", value=self._fmt6(payload.get("evs")), inline=False)
+        emb.add_field(name="Friendship", value=str(payload.get("friendship", "—")), inline=True)
+
+        footer = f"Gen {payload.get('gen')} legality: {'✅' if not notes else '⚠️ ' + '; '.join(notes)}"
+        if payload.get("gender_note"):
+            footer += f" | {payload['gender_note']}"
+        emb.set_footer(text=footer)
+
+        if sprite_file:
+            emb.set_thumbnail(url=f"attachment://{sprite_file.filename}")
+        return emb
+
+    class _SlotSelectionView(ui.View):
+        """View for selecting which team slot to replace when team is full"""
+        def __init__(self, cog, payload: dict, team_mons: list, sprite_file: Optional[discord.File] = None, *, timeout: float = 120.0):
+            super().__init__(timeout=timeout)
+            self.cog = cog
+            self.payload = payload
+            self.team_mons = team_mons
+            self.sprite_file = sprite_file
+            self.message: Optional[discord.Message] = None
+            
+            # Add buttons for each slot (1-6)
+            for slot in range(1, 7):
+                # Find the Pokémon in this slot
+                mon_in_slot = next((m for m in team_mons if m['team_slot'] == slot), None)
+                if mon_in_slot:
+                    label = f"Slot {slot}: {mon_in_slot['species'].title()} Lv{mon_in_slot['level']}"
+                    # Truncate if too long
+                    if len(label) > 80:
+                        label = f"Slot {slot}: {mon_in_slot['species'].title()[:20]}..."
+                else:
+                    label = f"Slot {slot}: Empty"
+                
+                button = ui.Button(
+                    label=label[:80],  # Discord limit
+                    style=discord.ButtonStyle.secondary,
+                    row=(slot - 1) // 3,  # 3 buttons per row
+                    custom_id=f"slot_{slot}"
+                )
+                button.callback = self._make_slot_callback(slot)
+                self.add_item(button)
+            
+            # Cancel button
+            cancel_btn = ui.Button(
+                label="Cancel",
+                style=discord.ButtonStyle.danger,
+                row=2
+            )
+            cancel_btn.callback = self._cancel
+            self.add_item(cancel_btn)
+        
+        def _make_slot_callback(self, slot: int):
+            async def callback(interaction: Interaction):
+                if not interaction.response.is_done():
+                    await interaction.response.defer(ephemeral=False)
+                
+                # Update payload with selected slot
+                self.payload["selected_slot"] = slot
+                self.payload["autoslot"] = False  # Disable autoslot since we're manually selecting
+                
+                # Remove the old Pokémon from team slot (clear its slot)
+                target_id = self.payload["target_id"]
+                mon_in_slot = next((m for m in self.team_mons if m['team_slot'] == slot), None)
+                if mon_in_slot:
+                    conn = await db.connect()
+                    try:
+                        await conn.execute(
+                            "UPDATE pokemons SET team_slot=NULL WHERE owner_id=? AND id=?",
+                            (target_id, mon_in_slot['id'])
+                        )
+                        await conn.commit()
+                        db.invalidate_pokemons_cache(target_id)
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            await conn.close()
+                        except Exception:
+                            pass
+                
+                # Now finalize with the selected slot
+                try:
+                    await AdminGivePokemon._finalize(interaction, self.payload)
+                except Exception as e:
+                    await interaction.followup.send(f"❌ Failed to give Pokémon: {e}", ephemeral=True)
+                
+                # Disable all buttons
+                if self.message:
+                    try:
+                        for child in self.children:
+                            if isinstance(child, ui.Button):
+                                child.disabled = True
+                        await self.message.edit(view=self)
+                    except:
+                        pass
+            return callback
+        
+        async def _cancel(self, interaction: Interaction):
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❎ Canceled. Nothing saved.", ephemeral=True)
+            else:
+                await interaction.followup.send("❎ Canceled. Nothing saved.", ephemeral=True)
+            if self.message:
+                try:
+                    for child in self.children:
+                        if isinstance(child, ui.Button):
+                            child.disabled = True
+                    await self.message.edit(view=self)
+                except:
+                    pass
+        
+        async def on_timeout(self):
+            if self.message:
+                try:
+                    await self.message.edit(content="⏳ Slot selection expired.", view=None)
+                except:
+                    pass
+    
+    class _ConfirmView(ui.View):
+        def __init__(self, payload: dict, *, timeout: float = 90.0):
+            super().__init__(timeout=timeout)
+            self.payload = payload
+            self.message: Optional[discord.Message] = None
+            self.gigantamax_enabled = False
+            
+            # Add Gigantamax toggle if species can Gigantamax
+            species_name = payload.get("species_name", "")
+            if AdminGivePokemon.can_gigantamax(species_name):
+                # Initialize to False (user must explicitly enable)
+                self.payload["can_gigantamax"] = False
+                # Add toggle button
+                self.toggle_btn = ui.Button(
+                    label="Enable Gigantamax",
+                    style=discord.ButtonStyle.secondary,
+                    row=1
+                )
+                self.toggle_btn.callback = self.toggle_gigantamax
+                self.add_item(self.toggle_btn)
+
+        async def toggle_gigantamax(self, interaction: Interaction):
+            species_name = self.payload.get("species_name", "")
+            if not AdminGivePokemon.can_gigantamax(species_name):
+                await interaction.response.send_message("This Pokémon cannot Gigantamax.", ephemeral=True)
+                return
+            
+            self.gigantamax_enabled = not self.gigantamax_enabled
+            self.payload["can_gigantamax"] = self.gigantamax_enabled
+            
+            if self.gigantamax_enabled:
+                self.toggle_btn.label = "Disable Gigantamax"
+                self.toggle_btn.style = discord.ButtonStyle.success
+            else:
+                self.toggle_btn.label = "Enable Gigantamax"
+                self.toggle_btn.style = discord.ButtonStyle.secondary
+            
+            await interaction.response.edit_message(view=self)
+
+        async def on_timeout(self):
+            if self.message:
+                try:
+                    await self.message.edit(content="⏳ Preview expired.", view=None)
+                except Exception:
+                    pass
+
+        @ui.button(label="Confirm", style=discord.ButtonStyle.primary)
+        async def confirm(self, interaction: Interaction, button: ui.Button):
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=False)
+            try:
+                # Ensure can_gigantamax is set (default to False if not already set)
+                if "can_gigantamax" not in self.payload:
+                    self.payload["can_gigantamax"] = False
+                await AdminGivePokemon._finalize(interaction, self.payload)
+            except Exception as e:
+                try:
+                    await interaction.followup.send(f"❌ Failed to give Pokémon: {e}", ephemeral=True)
+                except Exception:
+                    pass
+            if self.message:
+                try:
+                    for child in self.children:
+                        if isinstance(child, ui.Button):
+                            child.disabled = True
+                    await self.message.edit(view=self)
+                except Exception:
+                    pass
+
+        @ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+        async def cancel(self, interaction: Interaction, button: ui.Button):
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❎ Canceled. Nothing saved.", ephemeral=True)
+            else:
+                await interaction.followup.send("❎ Canceled. Nothing saved.", ephemeral=True)
+            if self.message:
+                try:
+                    for child in self.children:
+                        if isinstance(child, ui.Button):
+                            child.disabled = True
+                    await self.message.edit(view=self)
+                except Exception:
+                    pass
+
+    # ---------- DB finalize ----------
+    @staticmethod
+    async def _finalize(inter: Interaction, p: dict):
+        # Normalize stats from DB to long keys before calc
+        base_stats_long = AdminGivePokemon._normalize_stats_long(p["base_stats"])
+
+        ivs = p.get("ivs") or {k: 31 for k in ["hp","attack","defense","special_attack","special_defense","speed"]}
+        evs = p.get("evs") or {k: 0  for k in ["hp","attack","defense","special_attack","special_defense","speed"]}
+
+        final_stats = stats.calc_all_stats(
+            base_stats=base_stats_long, ivs=ivs, evs=evs, level=p["level"], nature=p["nature"]
+        )
+
+        # Get Gigantamax status (default to False if not specified)
+        can_gigantamax = p.get("can_gigantamax", False)
+
+        tera_type = p.get("tera_type")
+        if tera_type is None:
+            try:
+                species_entry = await ensure_species_and_learnsets(p["species_name"])
+                species_types = _extract_species_types(species_entry)
+                tera_type = _roll_default_tera_type(species_types)
+            except Exception:
+                tera_type = None
+        
+        # Get form from payload (if specified)
+        form_key = p.get("form")
+        
+        mon_id = await db.add_pokemon_with_stats(
+            owner_id=p["target_id"], species=p["species_name"], level=p["level"],
+            final_stats=final_stats, ivs=ivs, evs=evs, nature=p["nature"], ability=p["ability"], 
+            gender=p["gender"], form=form_key, can_gigantamax=can_gigantamax, tera_type=tera_type
+        )
+
+        # Save shiny + ball + form + friendship using your columns
+        conn = await db.connect()
+        try:
+            # Always include friendship in the update (use value from payload or default to base_friendship)
+            friendship_value = p.get("friendship")
+            if friendship_value is None:
+                # Fallback to base_friendship if not explicitly set
+                friendship_value = p.get("base_friendship", 50)
+            
+            # Update form only if it wasn't already set in add_pokemon_with_stats (for consistency)
+            # But we'll still update it here to ensure it's correct
+            await conn.execute(
+                "UPDATE pokemons SET shiny=?, pokeball=?, form=?, friendship=? WHERE owner_id=? AND id=?",
+                (1 if p.get("shiny") else 0, (p.get("pokeball") or None), form_key, int(friendship_value), p["target_id"], mon_id),
+            )
+            await conn.commit()
+            db.invalidate_pokemons_cache(p["target_id"])
+        except Exception as e:
+            # Log error but don't fail the entire command
+            import traceback
+            print(f"[GivePokemon] Error updating pokemon (shiny/ball/form/friendship): {e}")
+            traceback.print_exc()
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+        # Held item - add to bag first, then set as held
+        try:
+            if p.get("item_id"):
+                conn = await db.connect()
+                try:
+                    # Ensure user exists in users table (for foreign key constraint)
+                    cur = await conn.execute("SELECT 1 FROM users WHERE user_id = ?", (p["target_id"],))
+                    exists = await cur.fetchone()
+                    await cur.close()
+                    if not exists:
+                        await conn.execute("INSERT INTO users(user_id, coins, currencies) VALUES(?, 3000, '{\"coins\": 3000}'::jsonb)", (p["target_id"],))
+                        await conn.commit()
+                    # Add 1 of the item to the user's bag (if not already present)
+                    await conn.execute(
+                        "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,1) "
+                        "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = qty + 1;",
+                        (p["target_id"], p["item_id"])
+                    )
+                    await conn.commit()
+                    db.invalidate_bag_cache(p["target_id"])
+                    # Now set it as held
+                    await db.set_held_item(p["target_id"], mon_id, p["item_id"])
+                finally:
+                    try:
+                        await conn.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Moves
+        try:
+            await db.set_pokemon_moves(p["target_id"], mon_id, p.get("moves") or [])
+        except Exception:
+            pass
+
+        # Team autoslot or slot selection
+        slotted = None
+        if p.get("autoslot"):
+            try:
+                slot = await db.next_free_team_slot(p["target_id"])
+                if slot is not None:
+                    await db.set_team_slot(p["target_id"], mon_id, slot)
+                    slotted = slot
+                else:
+                    # Team is full - slot selection should have been handled before finalize
+                    # If we get here and no slot was pre-selected, use slot 1 as fallback
+                    if "selected_slot" in p:
+                        await db.set_team_slot(p["target_id"], mon_id, p["selected_slot"])
+                        slotted = p["selected_slot"]
+            except Exception:
+                pass
+        elif "selected_slot" in p:
+            # Slot was manually selected (team full scenario)
+            try:
+                await db.set_team_slot(p["target_id"], mon_id, p["selected_slot"])
+                slotted = p["selected_slot"]
+            except Exception:
+                pass
+
+        try:
+            await db.log_event(
+                user_id=p["target_id"], type_="givepokemon",
+                payload={k: v for k, v in p.items() if k != "base_stats"}
+            )
+        except Exception:
+            pass
+
+        suffix = f" • Autoslotted to **Slot {slotted}**" if slotted else ""
+        await inter.followup.send(
+            f"✅ Gave **{p['species_name']}** (Lv {p['level']}) to <@{p['target_id']}>.{suffix}",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+
+    # ---------- AUTOCOMPLETE helpers ----------
+    @staticmethod
+    async def _ac_species_choices(current: str) -> List[app_commands.Choice[str]]:
+        q = f"%{(current or '').lower()}%" if current else "%"
+        conn = await db.connect()
+        try:
+            cur = await conn.execute("SELECT id, name FROM pokedex WHERE LOWER(name) LIKE ? ORDER BY name LIMIT 25", (q,))
+            rows = await cur.fetchall(); await cur.close()
+            return [app_commands.Choice(name=r["name"].title(), value=str(r["name"])) for r in rows]
+        except Exception:
+            base = ["Pikachu","Charizard","Garchomp","Gardevoir","Gengar","Dragonite","Mewtwo","Latios","Latias"]
+            return [app_commands.Choice(name=n, value=n.lower()) for n in base if n.lower().startswith((current or "").lower())][:25]
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    async def _ac_item_choices(current: str) -> List[app_commands.Choice[str]]:
+        q = f"%{(current or '').lower()}%" if current else "%"
+        conn = await db.connect()
+        try:
+            cur = await conn.execute("SELECT id, name FROM items WHERE LOWER(name) LIKE ? ORDER BY name LIMIT 25", (q,))
+            rows = await cur.fetchall(); await cur.close()
+            return [app_commands.Choice(name=r["name"].title(), value=str(r["name"])) for r in rows]
+        except Exception:
+            base = ["Choice Scarf","Choice Band","Choice Specs","Leftovers","Life Orb","Sitrus Berry","Lum Berry","Focus Sash"]
+            return [app_commands.Choice(name=n, value=AdminGivePokemon._norm_name(n)) for n in base if n.lower().startswith((current or "").lower())][:25]
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    async def _ac_ball_choices(current: str) -> List[app_commands.Choice[str]]:
+        q = f"%{(current or '').lower()}%" if current else "%"
+        conn = await db.connect()
+        try:
+            cur = await conn.execute(
+                "SELECT name FROM items WHERE LOWER(name) LIKE ? AND LOWER(name) LIKE '%ball%' ORDER BY name LIMIT 25", (q,)
+            )
+            rows = await cur.fetchall(); await cur.close()
+            res = [r["name"] for r in rows]
+            if res:
+                return [app_commands.Choice(name=n.title(), value=AdminGivePokemon._norm_name(n)) for n in res]
+        except Exception:
+            pass
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+        base = ["Poke Ball","Great Ball","Ultra Ball","Premier Ball","Luxury Ball","Quick Ball","Dusk Ball","Net Ball","Dive Ball","Repeat Ball","Timer Ball","Heal Ball","Nest Ball","Friend Ball","Level Ball","Love Ball","Moon Ball","Fast Ball","Lure Ball","Heavy Ball"]
+        return [app_commands.Choice(name=n, value=AdminGivePokemon._norm_name(n)) for n in base if n.lower().startswith((current or "").lower())][:25]
+
+    @staticmethod
+    async def _ac_moves_choices(inter: Interaction, current: str) -> List[app_commands.Choice[str]]:
+        conn = await db.connect()
+        try:
+            gen = await _ruleset_gen(conn, inter.guild)
+            sp_opt = getattr(inter, "namespace", None)
+            sp_name = getattr(sp_opt, "species", None) if sp_opt else None
+            species_id = None
+            if sp_name:
+                sp = await ensure_species_and_learnsets(sp_name)
+                species_id = int(sp["id"])
+            moves: List[str] = []
+            if species_id:
+                try:
+                    legal = await legal_moves(species_id, gen)
+                    moves = [m for m in legal if (current or "").lower() in m.lower()]
+                except Exception:
+                    cur = await conn.execute("SELECT name FROM moves WHERE LOWER(name) LIKE ? ORDER BY name LIMIT 25", (f"%{(current or '').lower()}%",))
+                    rows = await cur.fetchall(); await cur.close()
+                    moves = [r["name"] for r in rows]
+            else:
+                cur = await conn.execute("SELECT name FROM moves WHERE LOWER(name) LIKE ? ORDER BY name LIMIT 25", (f"%{(current or '').lower()}%",))
+                rows = await cur.fetchall(); await cur.close()
+                moves = [r["name"] for r in rows]
+            return [app_commands.Choice(name=m.replace("-", " ").title(), value=AdminGivePokemon._norm_name(m)) for m in moves[:25]]
+        except Exception:
+            base = ["Tackle","Growl","Dragon Dance","Draco Meteor","Earthquake","Fire Fang","Ice Beam","Thunderbolt"]
+            return [app_commands.Choice(name=n, value=AdminGivePokemon._norm_name(n)) for n in base if (current or "").lower() in n.lower()][:25]
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+    # ---------- command ----------
+    @app_commands.command(
+        name="givepokemon",
+        description="Give a Pokémon to a user (quick mode with preview).",
+    )
+    @app_commands.describe(
+        user="Target user (defaults to you)",
+        species="Species (name or Dex id)",
+        level="Level (default 1)",
+        gender="male/female/genderless (auto-legal if omitted)",
+        nature="Nature (random if omitted)",
+        ability="Ability (id or name; legal default if omitted)",
+        item="Held item (optional)",
+        moves="Comma- or slash-separated moves (≤4)",
+        shiny="Make it shiny? (default random)",
+        ball="Poké Ball (default pokeball)",
+        tera_type="Override Tera Type (default: roll from species' native types)",
+        autoslot="Put into first free team slot (default Yes)",
+        dry_run="Preview only; don’t save (default No)",
+        ivs="Six comma-separated IVs: HP,Atk,Def,SpA,SpD,Spe (default 31,31,31,31,31,31)",
+        evs="Six comma-separated EVs: HP,Atk,Def,SpA,SpD,Spe (default 0,0,0,0,0,0)",
+        friendship="Starting friendship (0-255, default uses Pokédex base friendship)",
+    )
+    async def givepokemon(
+        self,
+        interaction: Interaction,
+        user: Optional[discord.User] = None,
+        species: Optional[str] = None,
+        level: Optional[int] = None,
+        gender: Optional[str] = None,
+        nature: Optional[str] = None,
+        ability: Optional[str] = None,
+        item: Optional[str] = None,
+        moves: Optional[str] = None,
+        shiny: Optional[bool] = None,
+        ball: Optional[str] = None,
+        tera_type: Optional[str] = None,
+        autoslot: Optional[bool] = True,
+        dry_run: Optional[bool] = False,
+        ivs: Optional[str] = None,
+        evs: Optional[str] = None,
+        friendship: Optional[int] = None,
+    ):
+        await interaction.response.defer(ephemeral=False)
+
+        # Admin gate removed - command now available to all users
+        
+        target = user or interaction.user
+        target_id = str(target.id)
+
+        # Species
+        if not species:
+            species = random.choice(["garchomp","latios","latias","dragonite","charizard","gengar","mewtwo","pikachu"])
+        try:
+            sp = await ensure_species_and_learnsets(species)
+        except Exception as e:
+            # If species not found, give Missing n0 instead
+            try:
+                sp = await ensure_species_and_learnsets("missing n0")
+                # Clear ability if specified (Missing n0 abilities are rolled at battle start)
+                if ability:
+                    ability = None
+            except Exception:
+                return await interaction.followup.send(f"Couldn't load species `{species}`: {e}", ephemeral=True)
+
+        species_id   = int(sp["id"])
+        species_name = sp["name"]
+        species_types = _extract_species_types(sp)
+        friendship_note_msg = ""
+        base_friendship = await _get_base_friendship(species_name)
+        # For Missing n0, if base_friendship is None/0, default to 50
+        if species_name.lower() == "missing n0" and (base_friendship is None or base_friendship == 0):
+            base_friendship = 50
+        if friendship is None:
+            starting_friendship = base_friendship
+            friendship_note_msg = f"Starting friendship defaults to base {base_friendship}."
+        else:
+            requested = int(friendship)
+            starting_friendship = max(0, min(255, requested))
+            clamp_note = " (clamped)" if starting_friendship != requested else ""
+            friendship_note_msg = f"Starting friendship set to {starting_friendship}{clamp_note}; base {base_friendship}."
+
+        explicit_tera = None
+        tera_type_source = "auto"
+        tera_type_notes: list[str] = []
+        if tera_type:
+            explicit_tera = _normalize_type_id(tera_type)
+            if explicit_tera not in VALID_TERA_TYPES:
+                valid_list = ", ".join(t.title() for t in VALID_TERA_TYPES)
+                return await interaction.followup.send(
+                    f"❌ Invalid Tera Type `{tera_type}`. Choose one of: {valid_list}.",
+                    ephemeral=True
+                )
+            tera_type_source = "manual"
+            if explicit_tera not in species_types:
+                tera_type_notes.append(f"Tera Type `{explicit_tera.title()}` is not in this species' native pool.")
+        resolved_tera_type = explicit_tera or _roll_default_tera_type(species_types)
+
+        # Check for available forms and show buttons if needed (exclude battle-only forms, mega/primal/origin forms)
+        conn = await db.connect()
+        try:
+            cur = await conn.execute(
+                """SELECT form_key, display_name, abilities FROM pokedex_forms 
+                   WHERE species_id = ? 
+                   AND (is_battle_only IS NOT TRUE)
+                   AND (LOWER(form_key) NOT LIKE 'mega%')
+                   AND (LOWER(form_key) NOT LIKE '%mega%')
+                   AND (LOWER(form_key) NOT LIKE '%primal%')
+                   AND (LOWER(form_key) NOT LIKE '%origin%')
+                   AND form_key NOT IN ('mega-x', 'mega-y', 'mega-charizard-x', 'mega-charizard-y', 
+                                        'mega-venusaur', 'mega-blastoise', 'primal-groudon', 'primal-kyogre',
+                                        'origin-dialga', 'origin-palkia', 'origin-giratina')
+                   ORDER BY form_key""",
+                (species_id,)
+            )
+            form_rows = await cur.fetchall()
+            await cur.close()
+            
+            if form_rows:
+                # === SPECIAL HANDLING FOR GRENINJA ===
+                # Greninja is unique: ability determines the form
+                # - battle-bond ability → Battle Bond form
+                # - torrent/protean → Base form
+                # - no ability specified → ask user to choose
+                # If user specified ability, auto-select the correct form
+                if species_name.lower() == "greninja" and ability:
+                    ability_norm = ability.lower().replace(" ", "-").replace("_", "-")
+                    
+                    # If ability is battle-bond, use battle-bond form
+                    if ability_norm == "battle-bond":
+                        selected_form_key = "battle-bond"
+                        # Continue with this form (don't show selection UI)
+                        # We'll let the code below handle it by not returning early
+                    # If ability is torrent or protean, use base form
+                    elif ability_norm in ["torrent", "protean"]:
+                        selected_form_key = None  # Base form
+                    else:
+                        # Unknown ability for Greninja, show form selection
+                        selected_form_key = None
+                        ability = None  # Clear it so user can choose
+                    
+                    # If we auto-selected a form, skip the UI and continue
+                    if ability:
+                        # Continue to normal givepokemon flow with the selected form
+                        # We need to fetch form data if it's not base
+                        if selected_form_key:
+                            # Fetch form-specific data
+                            cur = await conn.execute(
+                                "SELECT abilities FROM pokedex_forms WHERE species_id = ? AND form_key = ?",
+                                (species_id, selected_form_key)
+                            )
+                            form_data_row = await cur.fetchone()
+                            await cur.close()
+                            
+                            if form_data_row and form_data_row['abilities']:
+                                # Override base species abilities with form abilities
+                                sp = dict(sp)  # Make a copy
+                                sp['abilities'] = form_data_row['abilities']
+                        
+                        # Set form in the species dict for later use
+                        sp['_selected_form'] = selected_form_key
+                        # Continue to normal flow below
+                        await conn.close()
+                        # Don't return, let it continue to normal givepokemon logic
+                    else:
+                        # Show form selection for Greninja without ability specified
+                        pass  # Fall through to form selection UI
+                else:
+                    # Not Greninja or no ability specified for other species
+                    pass
+                
+                # If we didn't auto-select for Greninja, show form selection UI
+                # Skip form selection for Wishiwashi - solo form is the base form (temporary battle forms don't need selection)
+                if (species_name.lower() != "greninja" or not ability) and species_name.lower() != "wishiwashi":
+                    # Add base form as first option
+                    available_forms = [{'form_key': None, 'display_name': f"{species_name.title()} (Base)"}]
+                    available_forms.extend([{'form_key': row['form_key'], 'display_name': row['display_name']} for row in form_rows])
+                    
+                    if len(available_forms) > 1:
+                        # Get gen for legality
+                        gen_val = await _ruleset_gen(conn, interaction.guild)
+                        
+                        # Show form selection buttons - pass all original command params
+                        view = GivePokemonFormView(
+                            cog=self,
+                            interaction=interaction,
+                            species_id=species_id,
+                            species_name=species_name,
+                            available_forms=available_forms,
+                            target=target,
+                            gen=gen_val,
+                            # Pass original command parameters
+                            level=level,
+                            gender=gender,
+                            nature=nature,
+                            ability=ability,
+                            item=item,
+                            moves=moves,
+                            shiny=shiny,
+                            ball=ball,
+                            tera_type=tera_type,
+                            autoslot=autoslot,
+                            ivs=ivs,
+                            evs=evs,
+                            friendship=friendship
+                        )
+                        await conn.close()
+                        return await interaction.followup.send(
+                            f"🔄 **Select a form for {species_name.title()}:**",
+                            view=view,
+                            ephemeral=True
+                        )
+        finally:
+            await conn.close()
+
+        base_stats = sp.get("stats") or {}
+        if isinstance(base_stats, str):
+            try: base_stats = json.loads(base_stats)
+            except Exception: base_stats = {}
+        base_stats = self._normalize_stats_long(base_stats)  # <— normalize for calc_all_stats
+
+        abilities    = sp.get("abilities") or []
+        if isinstance(abilities, str):
+            try: abilities = json.loads(abilities)
+            except Exception: abilities = []
+        gender_ratio = sp.get("gender_ratio") or {}
+        if isinstance(gender_ratio, str):
+            try: gender_ratio = json.loads(gender_ratio)
+            except Exception: gender_ratio = {}
+
+        conn = await db.connect()
+        try:
+            gen = await _ruleset_gen(conn, interaction.guild)
+
+            lvl = max(1, min(100, int(level) if level else 1))
+
+            # Fuzzy match nature
+            nat = (nature or "").strip().lower()
+            if not nat:
+                nat = stats.pick_random_nature().lower()
+            else:
+                matched_nature, confidence, suggestions = FuzzyMatcher.fuzzy_nature(nat)
+                if matched_nature and confidence >= 0.70:
+                    nat = matched_nature.lower()
+                elif nat not in stats.NATURE_PLUS_MINUS:
+                    sugg_text = f" Did you mean: {', '.join(suggestions[:3])}?" if suggestions else ""
+                    return await interaction.followup.send(f"Unknown nature `{nature}`.{sugg_text}", ephemeral=True)
+
+            # For Missing n0, ignore ability (abilities are rolled at battle start)
+            if species_name.lower() == "missing n0":
+                ab = None
+                if ability:
+                    notes.append("Ability ignored for Missing n0 (abilities are rolled at battle start).")
+            else:
+                ab = await self._species_autocorrect_ability(abilities, ability)
+            chosen_gender, gender_note = self._roll_gender_legal(gender_ratio, gender)
+            shiny_val = (random.random() < (1/4096)) if shiny is None else bool(shiny)
+
+            pokeball = self._norm_name(ball or "pokeball")
+            item_id = None
+            notes: list[str] = []
+            notes.extend(tera_type_notes)
+            if tera_type_source == "auto" and resolved_tera_type is None:
+                notes.append("Tera Type could not be rolled; species has no type data.")
+            if item:
+                # Fuzzy match item
+                matched_item, confidence, suggestions = await FuzzyMatcher.fuzzy_item(conn, item)
+                if matched_item and confidence >= 0.70:
+                    item_id = matched_item
+                    if item.lower().replace(" ", "-") != matched_item.lower():
+                        notes.append(f"Item autocorrected: '{item}' → '{matched_item}'")
+                else:
+                    sugg_text = f" Did you mean: {', '.join(suggestions[:3])}?" if suggestions else ""
+                    notes.append(f"Item `{item}` not found.{sugg_text} Will be omitted.")
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+        wanted_moves = self._parse_moves(moves)
+        default_moves = await self._choose_default_moves(species_id, lvl, gen)
+        final_moves, move_notes = await self._validate_moves(species_id, gen, wanted_moves, default_moves)
+        notes.extend(move_notes)
+
+        ivs_dict = self._parse_six_csv(ivs, kind="ivs")
+        evs_dict = self._parse_six_csv(evs, kind="evs")
+
+        # Get form if auto-selected (for Greninja)
+        form_key = sp.get("_selected_form") if isinstance(sp, dict) else None
+        
+        payload = {
+            "target_id": target_id,
+            "target_mention": target.mention,
+            "target_display": getattr(target, "display_name", None),
+            "target_tag": f"{target.name}#{getattr(target, 'discriminator', '0')}" if hasattr(target, "discriminator") else target.name,
+            "species_id": species_id,
+            "species_name": species_name,
+            "base_stats": base_stats,  # already normalized
+            "gen": gen,
+            "level": lvl,
+            "nature": nat,
+            "ability": ab,
+            "gender": chosen_gender,
+            "gender_note": gender_note,
+            "shiny": shiny_val,
+            "pokeball": pokeball,
+            "item_id": item_id,
+            "moves": final_moves,
+            "autoslot": bool(autoslot),
+            "ivs": ivs_dict,
+            "evs": evs_dict,
+            "form": form_key,  # Include form if auto-selected
+            "tera_type": resolved_tera_type,
+            "tera_type_source": tera_type_source,
+            "species_types": species_types,
+            "friendship": starting_friendship,
+            "base_friendship": base_friendship,
+        }
+
+        sprite_file = self._pick_sprite_file(species_name, chosen_gender, shiny_val, form_key)
+
+        view = AdminGivePokemon._ConfirmView(payload)
+        emb = await self._preview_embed(interaction, payload, notes, sprite_file)
+        if sprite_file:
+            msg = await interaction.followup.send(embed=emb, view=view, files=[sprite_file], ephemeral=True,
+                                                  allowed_mentions=discord.AllowedMentions(users=True))
+        else:
+            msg = await interaction.followup.send(embed=emb, view=view, ephemeral=True,
+                                                  allowed_mentions=discord.AllowedMentions(users=True))
+        view.message = msg
+
+        if dry_run:
+            await msg.edit(content="🧪 Dry run — no DB changes will be made.", view=None)
+            return
+
+    # ---- Autocomplete bindings ----
+    @givepokemon.autocomplete("species")
+    async def _ac_species(self, interaction: Interaction, current: str):
+        return await self._ac_species_choices(current)
+
+    @givepokemon.autocomplete("item")
+    async def _ac_item(self, interaction: Interaction, current: str):
+        return await self._ac_item_choices(current)
+
+    @givepokemon.autocomplete("ball")
+    async def _ac_ball(self, interaction: Interaction, current: str):
+        return await self._ac_ball_choices(current)
+
+    @givepokemon.autocomplete("moves")
+    async def _ac_moves(self, interaction: Interaction, current: str):
+        return await self._ac_moves_choices(interaction, current)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(AdminGivePokemon(bot))
+
+# =========================
+#  Gameplay commands (DB-backed)
+# =========================
+# Test
+def render_item_line(name: str, qty: int, emoji: str | None = None) -> str:
+    prefix = f"{emoji} " if emoji else ""
+    return f"{prefix}**{name}** ×{qty}"
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: Exception):
+    # Log to console
+    import traceback
+    traceback.print_exception(type(error), error, error.__traceback__)
+    # Try to respond if nothing was sent yet
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("❌ An error occurred running this command.", ephemeral=True)
+        else:
+            await interaction.followup.send("❌ An error occurred running this command.", ephemeral=True)
+    except Exception:
+        pass
+@bot.tree.command(name="test", description="Check if the bot is online.")
+async def test_slash(interaction: discord.Interaction):
+    await interaction.response.send_message("Bot Online.", ephemeral=True)
+
+
+@bot.tree.command(name="code", description="Enter the access code to unlock the bot.")
+@app_commands.describe(code="The access code you were given")
+async def code_cmd(interaction: discord.Interaction, code: str):
+    if not BOT_ACCESS_CODE:
+        await interaction.response.send_message(
+            "Access codes are not required right now.",
+            ephemeral=True,
+        )
+        return
+    uid = str(interaction.user.id)
+    if interaction.user.id in (OWNER_IDS | CODE_BYPASS_IDS):
+        await interaction.response.send_message(
+            "✅ You're already whitelisted — no code needed!",
+            ephemeral=True,
+        )
+        return
+    if (code or "").strip() == BOT_ACCESS_CODE:
+        await db.set_access_verified(uid)
+        await interaction.response.send_message(
+            "✅ Access granted! You can now use the bot.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            "❌ Invalid code. Please check and try again.",
+            ephemeral=True,
+        )
+# --- OAK Dialogue images ---
+OAK_IMAGE_URL = "https://archives.bulbagarden.net/media/upload/thumb/3/3e/Lets_Go_Pikachu_Eevee_Professor_Oak.png/180px-Lets_Go_Pikachu_Eevee_Professor_Oak.png"
+STARTER_PICK_IMAGE_URL = "https://pokemonblog.com/wp-content/uploads/2018/06/pokemon_trainer_spotlight_professor_oak_with_kanto_starters_bulbasaur_charmander_and_squirtle.jpg"
+
+import json
+import discord
+from discord import app_commands
+
+# If you renamed your package to "pokelib", switch these imports accordingly.
+from lib.poke_ingest import ensure_species_and_learnsets
+from lib.stats        import generate_mon
+from lib import db
+
+# NOTE: You said you already added these helpers elsewhere:
+#   shiny_roll(), parse_abilities(), roll_hidden_ability()
+# I will CALL them below and NOT redefine them here.
+
+# ---------------- per-user gen helpers ----------------
+def _normalize_stats_for_generator(stats: dict) -> dict:
+    """
+    Convert DB stats into underscore long-form keys required by generate_mon():
+    {hp, attack, defense, special_attack, special_defense, speed}
+    Supports short keys {atk, def, spa, spd, spe} or hyphen keys.
+    """
+    if not isinstance(stats, dict):
+        return {}
+    lk = {str(k).lower().replace("-", "_"): v for k, v in stats.items()}
+    return {
+        "hp": lk.get("hp", 0),
+        "attack": lk.get("attack", lk.get("atk", 0)),
+        "defense": lk.get("defense", lk.get("def", 0)),
+        "special_attack": lk.get("special_attack", lk.get("spa", lk.get("specialattack", 0))),
+        "special_defense": lk.get("special_defense", lk.get("spd", lk.get("specialdefense", 0))),
+        "speed": lk.get("speed", lk.get("spe", 0)),
+    }
+async def _ensure_user_in_gen1(user_id: str) -> None:
+    """
+    Make sure a user exists and is initialized at Gen 1 with user_rulesets.
+    Safe to call repeatedly.
+    """
+    conn = await db.connect()
+    try:
+        # users row (basic user data)
+        await conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        # user_rulesets row with gen 1 defaults
+        await conn.execute(
+            "INSERT OR IGNORE INTO user_rulesets (user_id, generation, max_unlocked_gen, updated_at_utc) "
+            "VALUES (?, 1, 1, CURRENT_TIMESTAMP)",
+            (user_id,),
+        )
+        await conn.commit()
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
+async def _ensure_starter_mon_row(uid: str, species: str, mon: dict, entry: dict, *, tera_type: Optional[str], base_friend: int) -> bool:
+    """
+    If the user somehow has no pokemons row (e.g., a prior transaction rolled back),
+    insert a minimal starter in team_slot=1. Best-effort; returns True if a row
+    exists or was inserted.
+    """
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute("SELECT id FROM pokemons WHERE owner_id=? LIMIT 1", (uid,))
+            row = await cur.fetchone()
+            await cur.close()
+            if row:
+                return True
+    except Exception:
+        return False
+
+    stats = mon.get("stats") or {}
+    ivs = mon.get("ivs") or {}
+    evs = mon.get("evs") or {}
+
+    # Gen 1 level-up moves up to level 5
+    moves: list[str] = []
+    try:
+        species_id = entry.get("id")
+        if species_id:
+            moves = await _default_levelup_moves(int(species_id), 5, 1)
+    except Exception:
+        moves = []
+    if not moves:
+        moves = ["Tackle"]
+    pps = [_max_pp(m, generation=1) for m in moves[:4]]
+
+    try:
+        async with db.session() as conn:
+            try:
+                col_flags = await _pg_pokemons_column_flags(conn)
+            except Exception:
+                col_flags = {"hp_now": True, "moves_pp": True, "shiny": True, "is_hidden_ability": True}
+
+            exp_group = await _get_exp_group_for_species(conn, species)
+            initial_exp = await _get_exp_total_for_level(conn, exp_group, 5)
+            cols = [
+                "owner_id", "species", "level",
+                "hp", "atk", "def", "spa", "spd", "spe",
+                "ivs", "evs", "nature", "ability", "gender",
+                "moves", "friendship",
+                "team_slot", "box_no", "box_pos",
+                "tera_type",
+                "exp", "exp_group",
+            ]
+            vals = [
+                uid, species, 5,
+                int(stats.get("hp", 1)),
+                int(stats.get("attack", 1)),
+                int(stats.get("defense", 1)),
+                int(stats.get("special_attack", 1)),
+                int(stats.get("special_defense", 1)),
+                int(stats.get("speed", 1)),
+                json.dumps(ivs, ensure_ascii=False),
+                json.dumps(evs, ensure_ascii=False),
+                mon.get("nature") or "hardy",
+                mon.get("ability"),
+                mon.get("gender"),
+                json.dumps([m.title() for m in moves[:4]], ensure_ascii=False),
+                int(base_friend),
+                1, 1, 1,
+                tera_type,
+                initial_exp, exp_group,
+            ]
+            if col_flags.get("hp_now"):
+                cols.insert(4, "hp_now")
+                vals.insert(4, int(stats.get("hp", 1)))
+            if col_flags.get("moves_pp"):
+                cols.append("moves_pp")
+                vals.append(json.dumps(pps, ensure_ascii=False))
+            if col_flags.get("shiny"):
+                cols.append("shiny")
+                vals.append(int(bool(mon.get("is_shiny"))))
+            if col_flags.get("is_hidden_ability"):
+                cols.append("is_hidden_ability")
+                vals.append(int(bool(mon.get("is_hidden_ability"))))
+            cols.append("can_gigantamax")
+            vals.append(False)
+
+            await _tx_begin(conn)
+            await conn.execute(
+                f"INSERT INTO pokemons ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                tuple(vals),
+            )
+            await _tx_commit(conn)
+            db.invalidate_pokemons_cache(uid)
+            return True
+    except Exception:
+        try:
+            await _tx_rollback(conn)
+        except Exception:
+            pass
+        return False
+
+async def _user_selected_gen(user_id: str) -> int:
+    """Return the player's currently selected gen (defaults to 1)."""
+    conn = await db.connect()
+    try:
+        cur  = await conn.execute("SELECT generation FROM user_rulesets WHERE user_id=?", (user_id,))
+        row  = await cur.fetchone(); await cur.close()
+        if row:
+            return int(row["generation"])
+        return 1
+    except Exception:
+        return 1
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
+# ---------------- helper functions for storing extra fields ----------------
+async def _default_levelup_moves(species_id: int, level: int, generation: int, limit: int = 4) -> list[str]:
+    """Best-effort: choose up to 4 highest-level level-up moves from cache or DB."""
+    if db_cache is not None:
+        try:
+            learnsets = db_cache.get_cached_learnsets()
+            if learnsets:
+                rows = [
+                    r for r in learnsets
+                    if int(r.get("species_id") or -1) == int(species_id)
+                    and int(r.get("generation") or 0) == generation
+                    and str(r.get("method") or "").strip().lower() == "level-up"
+                    and int(r.get("level_learned") or 0) <= level
+                ]
+                rows.sort(key=lambda r: (int(r.get("level_learned") or 0), str(r.get("move_id") or "")), reverse=True)
+                seen, out = set(), []
+                for r in rows[:40]:
+                    move_id = r.get("move_id")
+                    move = db_cache.get_cached_move(str(move_id)) if move_id is not None else None
+                    name = (move.get("name") if move else None) or ""
+                    if name:
+                        name = name.replace("-", " ").title()
+                        if name not in seen:
+                            seen.add(name)
+                            out.append(name)
+                    if len(out) == limit:
+                        break
+                if out:
+                    return out
+        except Exception:
+            pass
+    conn = await db.connect()
+    try:
+        cur = await conn.execute("""
+            SELECT m.name, COALESCE(l.level_learned, 0) AS lvl
+            FROM learnsets l
+            JOIN moves m ON m.id = l.move_id
+            WHERE l.species_id = ? AND l.generation = ? AND l.method = 'level-up'
+                  AND COALESCE(l.level_learned, 0) <= ?
+            ORDER BY lvl DESC, m.name
+            LIMIT 40
+        """, (species_id, generation, level))
+        rows = await cur.fetchall(); await cur.close()
+        seen, out = set(), []
+        for r in rows:
+            name = r["name"].replace("-", " ").title()
+            if name not in seen:
+                seen.add(name); out.append(name)
+            if len(out) == limit:
+                break
+        return out
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
+async def _get_move_id(move_name: str) -> Optional[int]:
+    """Return moves.id for move by name (LOWER match, space->hyphen)."""
+    if not move_name:
+        return None
+    norm = str(move_name).strip().lower().replace(" ", "-")
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT id FROM moves WHERE LOWER(name)=? OR LOWER(REPLACE(name,' ','-'))=? LIMIT 1",
+                (norm, norm),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+        return int(row["id"]) if row and row.get("id") is not None else None
+    except Exception:
+        return None
+
+async def _species_can_learn_move_by_machine(species_id: int, move_id: int, gen: int) -> bool:
+    """True if this species can learn this move by TM/HM (method=machine) in this gen."""
+    if db_cache is not None:
+        try:
+            learnsets = db_cache.get_cached_learnsets()
+            if learnsets:
+                for r in learnsets:
+                    if int(r.get("species_id") or -1) != int(species_id) or int(r.get("move_id") or -1) != int(move_id):
+                        continue
+                    if int(r.get("generation") or 0) != gen:
+                        continue
+                    if str(r.get("method") or "").strip().lower() != "machine":
+                        continue
+                    return True
+        except Exception:
+            pass
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT 1 FROM learnsets WHERE species_id=? AND move_id=? AND generation=? AND LOWER(TRIM(method))='machine' LIMIT 1",
+                (species_id, move_id, gen),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+        return row is not None
+    except Exception:
+        return False
+
+async def _get_team_can_learn_move(owner_id: str, move_name: str, gen: int) -> List[Dict[str, Any]]:
+    """Return list of team Pokémon (id, species, level, team_slot, moves, ...) that can learn this move by machine in this gen. Excludes mons that already have the move."""
+    move_id = await _get_move_id(move_name)
+    if move_id is None:
+        return []
+    move_name_norm = (move_name or "").strip().lower().replace(" ", "-")
+    out = []
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT p.id, p.species, p.level, p.team_slot, p.moves FROM pokemons p WHERE p.owner_id=? AND p.team_slot BETWEEN 1 AND 6 ORDER BY p.team_slot",
+                (str(owner_id),),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+        for row in rows or []:
+            r = dict(row) if hasattr(row, "keys") else {"id": row[0], "species": row[1], "level": row[2], "team_slot": row[3], "moves": row[4]}
+            species_id = await _get_species_id(r.get("species") or "")
+            if species_id is None:
+                continue
+            if not await _species_can_learn_move_by_machine(species_id, move_id, gen):
+                continue
+            moves_raw = r.get("moves")
+            if isinstance(moves_raw, str):
+                try:
+                    moves_raw = json.loads(moves_raw)
+                except Exception:
+                    moves_raw = []
+            if not isinstance(moves_raw, (list, tuple)):
+                moves_raw = []
+            current = [str(m).strip().lower().replace(" ", "-") for m in moves_raw[:4]]
+            if move_name_norm in current:
+                continue
+            out.append(r)
+        return out
+    except Exception:
+        return []
+
+async def _get_species_id(species_name: str) -> Optional[int]:
+    """Return pokedex id for species by name (LOWER match)."""
+    if not species_name:
+        return None
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT id FROM pokedex WHERE LOWER(name)=LOWER(?) LIMIT 1",
+                (species_name.strip(),),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+        return int(row["id"]) if row and row.get("id") is not None else None
+    except Exception:
+        return None
+
+async def _get_team_tutor_eligible(user_id: str, gen: int) -> List[Dict[str, Any]]:
+    """Return list of {id, species, display_name, species_id} for team Pokémon that can learn at least one tutor move in this gen."""
+    out: List[Dict[str, Any]] = []
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT id, species FROM pokemons WHERE owner_id=? AND team_slot IS NOT NULL ORDER BY team_slot",
+                (str(user_id),),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+        for row in rows or []:
+            mon_id = row.get("id")
+            species = (row.get("species") or "").strip()
+            if not species:
+                continue
+            species_id = await _get_species_id(species)
+            if species_id is None:
+                continue
+            tutor_moves = await _get_tutor_learnset_moves(species_id, gen)
+            if not tutor_moves:
+                continue
+            display_name = species.replace("-", " ").title()
+            out.append({"id": mon_id, "species": species, "display_name": display_name, "species_id": species_id})
+        return out
+    except Exception:
+        return []
+
+async def _get_tutor_learnset_moves(species_id: int, generation: int) -> list[str]:
+    """Return move names from learnset that are tutor-only for this species in this gen."""
+    if db_cache is not None:
+        try:
+            learnsets = db_cache.get_cached_learnsets()
+            if learnsets:
+                move_ids_seen = set()
+                out = []
+                for r in learnsets:
+                    if int(r.get("species_id") or -1) != int(species_id) or int(r.get("generation") or 0) != generation:
+                        continue
+                    if str(r.get("method") or "").strip().lower() != "tutor":
+                        continue
+                    move_id = r.get("move_id")
+                    if move_id in move_ids_seen:
+                        continue
+                    move_ids_seen.add(move_id)
+                    move = db_cache.get_cached_move(str(move_id)) if move_id is not None else None
+                    name = (move.get("name") if move else None) or ""
+                    if name:
+                        out.append(name.replace("-", " ").title())
+                if out:
+                    return sorted(out)
+        except Exception:
+            pass
+    conn = await db.connect()
+    try:
+        cur = await conn.execute("""
+            SELECT DISTINCT m.name
+            FROM learnsets l
+            JOIN moves m ON m.id = l.move_id
+            WHERE l.species_id = ? AND l.generation = ?
+              AND LOWER(TRIM(l.method)) = 'tutor'
+            ORDER BY m.name
+        """, (species_id, generation))
+        rows = await cur.fetchall()
+        await cur.close()
+        return [r["name"].replace("-", " ").title() for r in rows]
+    except Exception:
+        return []
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+async def _get_egg_machine_learnset_moves(species_id: int, generation: int) -> list[str]:
+    """Return move names from learnset that are egg or machine only (no tutor — tutor doesn't exist in Gen 1)."""
+    if db_cache is not None:
+        try:
+            learnsets = db_cache.get_cached_learnsets()
+            if learnsets:
+                methods = ("egg", "machine")
+                move_ids_seen = set()
+                out = []
+                for r in learnsets:
+                    if int(r.get("species_id") or -1) != int(species_id) or int(r.get("generation") or 0) != generation:
+                        continue
+                    m = str(r.get("method") or "").strip().lower()
+                    if m not in methods:
+                        continue
+                    move_id = r.get("move_id")
+                    if move_id in move_ids_seen:
+                        continue
+                    move_ids_seen.add(move_id)
+                    move = db_cache.get_cached_move(str(move_id)) if move_id is not None else None
+                    name = (move.get("name") if move else None) or ""
+                    if name:
+                        out.append(name.replace("-", " ").title())
+                if out:
+                    return sorted(out)
+        except Exception:
+            pass
+    conn = await db.connect()
+    try:
+        cur = await conn.execute("""
+            SELECT DISTINCT m.name
+            FROM learnsets l
+            JOIN moves m ON m.id = l.move_id
+            WHERE l.species_id = ? AND l.generation = ?
+              AND LOWER(TRIM(l.method)) IN ('egg', 'machine')
+            ORDER BY m.name
+        """, (species_id, generation))
+        rows = await cur.fetchall()
+        await cur.close()
+        return [r["name"].replace("-", " ").title() for r in rows]
+    except Exception:
+        return []
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+async def _get_non_levelup_learnset_moves(species_id: int, generation: int) -> list[str]:
+    """Return move names from learnset that are not level-up (egg, tutor, machine)."""
+    if db_cache is not None:
+        try:
+            learnsets = db_cache.get_cached_learnsets()
+            if learnsets:
+                methods = ("egg", "tutor", "machine")
+                move_ids_seen = set()
+                out = []
+                for r in learnsets:
+                    if int(r.get("species_id") or -1) != int(species_id) or int(r.get("generation") or 0) != generation:
+                        continue
+                    m = str(r.get("method") or "").strip().lower()
+                    if m not in methods:
+                        continue
+                    move_id = r.get("move_id")
+                    if move_id in move_ids_seen:
+                        continue
+                    move_ids_seen.add(move_id)
+                    move = db_cache.get_cached_move(str(move_id)) if move_id is not None else None
+                    name = (move.get("name") if move else None) or ""
+                    if name:
+                        out.append(name.replace("-", " ").title())
+                if out:
+                    return sorted(out)
+        except Exception:
+            pass
+    conn = await db.connect()
+    try:
+        cur = await conn.execute("""
+            SELECT DISTINCT m.name
+            FROM learnsets l
+            JOIN moves m ON m.id = l.move_id
+            WHERE l.species_id = ? AND l.generation = ?
+              AND LOWER(TRIM(l.method)) IN ('egg', 'tutor', 'machine')
+            ORDER BY m.name
+        """, (species_id, generation))
+        rows = await cur.fetchall()
+        await cur.close()
+        return [r["name"].replace("-", " ").title() for r in rows]
+    except Exception:
+        return []
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
+async def _set_held_item(owner_id: str, mon_id: int, item_id: str | None) -> None:
+    if hasattr(db, "set_held_item"):
+        return await db.set_held_item(owner_id, mon_id, item_id)
+    conn = await db.connect()
+    try:
+        await conn.execute("UPDATE pokemons SET held_item=? WHERE owner_id=? AND id=?",
+                           (item_id, owner_id, mon_id))
+        await conn.commit()
+        db.invalidate_pokemons_cache(owner_id)
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
+async def _set_pokemon_moves(owner_id: str, mon_id: int, moves: list[str]) -> None:
+    if hasattr(db, "set_pokemon_moves"):
+        return await db.set_pokemon_moves(owner_id, mon_id, moves[:4])
+    conn = await db.connect()
+    try:
+        base_pps = []
+        for m in moves[:4]:
+            pp_val = None
+            try:
+                if db_cache is not None:
+                    cached = db_cache.get_cached_move(m) or db_cache.get_cached_move(m.lower()) or db_cache.get_cached_move(m.lower().replace(" ", "-"))
+                    if cached and cached.get("pp") is not None:
+                        pp_val = int(cached["pp"])
+            except Exception:
+                pp_val = None
+            base_pps.append(int(pp_val) if pp_val is not None else 20)
+        await conn.execute(
+            "UPDATE pokemons SET moves=?, moves_pp=? WHERE owner_id=? AND id=?",
+            (json.dumps(moves[:4], ensure_ascii=False), json.dumps(base_pps, ensure_ascii=False), owner_id, mon_id),
+        )
+        await conn.commit()
+        db.invalidate_pokemons_cache(owner_id)
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+# ------------------------ Views ------------------------
+class OakIntroView(discord.ui.View):
+    def __init__(self, author_id: int, timeout: float = 120):
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        for label in ("Boy", "Girl"):
+            self.add_item(self._make_gender_button(label))
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return itx.user.id == self.author_id
+
+    def _make_gender_button(self, label: str) -> discord.ui.Button:
+        async def cb(itx: discord.Interaction):
+            if not self._guard(itx):
+                return await itx.response.send_message("This isn’t for you.", ephemeral=True)
+
+            emb = discord.Embed(title="Welcome Trainer to Kanto")
+            emb.description = (
+                "Our world is full of mysterious creatures called pokemons. "
+                "At the age of 10 most new trainers go for an adventure to travel across the region and discover new pokemons!\n\n"
+                "**Do you want to begin your journey?**"
+            )
+            emb.set_thumbnail(url=OAK_IMAGE_URL)
+            # Persist trainer gender selection (best-effort)
+            try:
+                gender_value = "boy" if label.lower().startswith("b") else "girl"
+                async with db.session() as conn:
+                    await conn.execute(
+                        "INSERT INTO users (user_id, user_gender) VALUES (?, ?) "
+                        "ON CONFLICT (user_id) DO UPDATE SET user_gender = EXCLUDED.user_gender",
+                        (str(itx.user.id), gender_value),
+                    )
+            except Exception:
+                pass
+
+            await itx.response.edit_message(embed=emb, view=self._make_yesno_view())
+            await itx.followup.send(f"Confirmed you are **{label}**", ephemeral=False)
+
+        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, custom_id=f"gender:{label}")
+        btn.callback = cb
+        return btn
+
+    def _make_yesno_view(self) -> discord.ui.View:
+        view = discord.ui.View(timeout=60)
+
+        async def yes_cb(itx: discord.Interaction):
+            if not self._guard(itx):
+                return await itx.response.send_message("This isn’t for you.", ephemeral=True)
+
+            starter_embed = discord.Embed(title="Alright, let’s go!!!")
+            starter_embed.description = (
+                "As a gift, choose one of these Pokémon.\n\n"
+                "**Charmander** — fire type\n"
+                "**Bulbasaur** — grass type\n"
+                "**Squirtle** — water type\n\n"
+                "_You also get 6× Poké Balls._"
+            )
+            starter_embed.set_image(url=STARTER_PICK_IMAGE_URL)
+
+            await itx.response.edit_message(
+                content=None,
+                embed=starter_embed,
+                view=StarterView(self.author_id)
+            )
+
+        async def no_cb(itx: discord.Interaction):
+            if not self._guard(itx):
+                return await itx.response.send_message("This isn’t for you.", ephemeral=True)
+            await itx.response.edit_message(
+                content="No worries. Come back with `/start` when you’re ready.",
+                embed=None,
+                view=None
+            )
+
+        yes_btn = discord.ui.Button(label="Yes", style=discord.ButtonStyle.success, custom_id="begin:yes")
+        no_btn  = discord.ui.Button(label="No",  style=discord.ButtonStyle.danger,  custom_id="begin:no")
+        yes_btn.callback = yes_cb
+        no_btn.callback  = no_cb
+        view.add_item(yes_btn)
+        view.add_item(no_btn)
+        return view
+
+
+class EvolutionConfirmView(discord.ui.View):
+    """Yes/No view for level-up evolution prompt. One view per Pokémon."""
+
+    def __init__(self, author_id: int, owner_id: str, mon_db_id: int, current_species: str, evolved_species: str, level: int, timeout: float = 120):
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.owner_id = owner_id
+        self.mon_db_id = mon_db_id
+        self.current_species = (current_species or "").replace("-", " ").title()
+        self.evolved_species = (evolved_species or "").replace("-", " ").title()
+        self.level = level
+        self._handled = False
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return itx.user.id == self.author_id
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success, custom_id="evo:yes")
+    async def yes_btn(self, itx: discord.Interaction, button: discord.ui.Button):
+        if not self._guard(itx):
+            await itx.response.send_message("This evolution prompt isn't for you.", ephemeral=True)
+            return
+        if self._handled:
+            await itx.response.defer()
+            return
+        self._handled = True
+        ok = await _apply_evolution(self.owner_id, self.mon_db_id, self.evolved_species, self.level)
+        if ok:
+            await itx.response.edit_message(
+                embed=discord.Embed(
+                    description=f"Congratulations! Your **{self.current_species}** evolved into **{self.evolved_species}**!",
+                    color=0x57F287,
+                ),
+                view=None,
+            )
+        else:
+            await itx.response.edit_message(
+                embed=discord.Embed(description="Evolution could not be applied.", color=0xED4245),
+                view=None,
+            )
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.danger, custom_id="evo:no")
+    async def no_btn(self, itx: discord.Interaction, button: discord.ui.Button):
+        if not self._guard(itx):
+            await itx.response.send_message("This evolution prompt isn't for you.", ephemeral=True)
+            return
+        if self._handled:
+            await itx.response.defer()
+            return
+        self._handled = True
+        await itx.response.edit_message(
+            embed=discord.Embed(
+                description=f"Your **{self.current_species}** did not evolve!",
+                color=0xED4245,
+            ),
+            view=None,
+        )
+
+
+class StarterView(discord.ui.View):
+    PIKA_LABELS = [
+        "Pikachu",
+        "I don't want these",
+        "Give me Pikachu",
+        "I'll catch them all!"
+    ]
+    
+    # Class-level dict to track users currently picking starters
+    _picking_in_progress: set = set()
+
+    def __init__(self, author_id: int, timeout: float = 120, pikachu_state: int = 0):
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.pikachu_state = pikachu_state
+        self.picked = False  # Instance flag to prevent double-pick
+        self.add_item(self._make_pick_button("Bulbasaur"))
+        self.add_item(self._make_pick_button("Charmander"))
+        self.add_item(self._make_pick_button("Squirtle"))
+        self.add_item(self._make_pikachu_button())
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return itx.user.id == self.author_id
+
+    def _disable_all(self):
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+    def _make_pick_button(self, species: str) -> discord.ui.Button:
+        async def cb(itx: discord.Interaction):
+            if not self._guard(itx):
+                return await itx.response.send_message("This menu isn’t for you.", ephemeral=True)
+
+            # disable all buttons immediately to prevent double-picks
+            self._disable_all()
+            try:
+                await itx.response.edit_message(view=self)
+            except Exception:
+                pass
+
+            try:
+                await self._finalize_pick(itx, species)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                try:
+                    details = f"{type(e).__name__}: {e!r}"
+                    if getattr(db, "DB_IS_POSTGRES", False) and "hp_now" in str(e):
+                        try:
+                            async with db.session() as conn:
+                                await _ensure_pg_pokemons_columns(conn)
+                        except Exception:
+                            pass
+                        await itx.followup.send(
+                            f"Error while giving {species}: {details}\n"
+                            "Tried to auto-fix schema (missing hp_now). Please retry /start.",
+                            ephemeral=True,
+                        )
+                    else:
+                        await itx.followup.send(
+                            f"Error while giving {species}: {details}",
+                            ephemeral=True,
+                        )
+                except Exception:
+                    pass
+
+        btn = discord.ui.Button(label=species, style=discord.ButtonStyle.primary, custom_id=f"starter:{species}")
+        btn.callback = cb
+        return btn
+
+    def _make_pikachu_button(self) -> discord.ui.Button:
+        label = self.PIKA_LABELS[self.pikachu_state]
+        style = discord.ButtonStyle.secondary if self.pikachu_state < 3 else discord.ButtonStyle.success
+        btn = discord.ui.Button(label=label, style=style, custom_id=f"starter:pikachu:{self.pikachu_state}")
+
+        async def cb(itx: discord.Interaction):
+            if not self._guard(itx):
+                return await itx.response.send_message("This menu isn’t for you.", ephemeral=True)
+
+            # If we’re still in the “tease” states, just advance the state,
+            # otherwise finalize with Pikachu. We also disable buttons when finalizing.
+            await itx.response.defer(ephemeral=True, thinking=False)
+
+            if self.pikachu_state == 0:
+                return await itx.edit_original_response(view=StarterView(self.author_id, pikachu_state=1))
+            if self.pikachu_state == 1:
+                return await itx.edit_original_response(view=StarterView(self.author_id, pikachu_state=2))
+            if self.pikachu_state == 2:
+                return await itx.edit_original_response(view=StarterView(self.author_id, pikachu_state=3))
+
+            # Final: pick Pikachu
+            self._disable_all()
+            try:
+                await itx.edit_original_response(view=self)
+            except Exception:
+                pass
+            try:
+                await self._finalize_pick(itx, "Pikachu")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                try:
+                    details = f"{type(e).__name__}: {e!r}"
+                    if getattr(db, "DB_IS_POSTGRES", False) and "hp_now" in str(e):
+                        try:
+                            async with db.session() as conn:
+                                await _ensure_pg_pokemons_columns(conn)
+                        except Exception:
+                            pass
+                        await itx.followup.send(
+                            f"Error while giving Pikachu: {details}\n"
+                            "Tried to auto-fix schema (missing hp_now). Please retry /start.",
+                            ephemeral=True,
+                        )
+                    else:
+                        await itx.followup.send(
+                            f"Error while giving Pikachu: {details}",
+                            ephemeral=True,
+                        )
+                except Exception:
+                    pass
+
+        btn.callback = cb
+        return btn
+
+    async def _finalize_pick(self, itx: discord.Interaction, species: str):
+        uid = str(itx.user.id)
+        
+        # Prevent double-pick (instance-level)
+        if self.picked:
+            return await itx.followup.send("You already picked a starter from this menu.", ephemeral=False)
+        
+        # Prevent race condition from multiple /start commands (class-level)
+        if uid in StarterView._picking_in_progress:
+            return await itx.followup.send("You're already picking a starter in another menu!", ephemeral=False)
+        
+        StarterView._picking_in_progress.add(uid)
+        self.picked = True
+        
+        try:
+            try:
+                await itx.followup.send("⏳ Creating your profile, please wait…", ephemeral=False)
+            except Exception:
+                pass
+
+            # ensure user exists + is in gen 1
+            await _ensure_user_in_gen1(uid)
+
+            if not await db.get_user(uid):
+                await db.create_user(uid)
+
+            # one-time only starter
+            try:
+                if hasattr(db, "has_starter") and await db.has_starter(uid):
+                    return await itx.followup.send("You already picked a starter.", ephemeral=False)
+            except Exception:
+                pass
+
+            # fetch cache row (prefer in-memory cache to avoid slow DB/network)
+            try:
+                entry = None
+                if db_cache is not None:
+                    entry = db_cache.get_cached_pokedex(species) or db_cache.get_cached_pokedex(species.lower())
+                    if not entry:
+                        entry = db_cache.get_cached_pokedex(species.replace(" ", "-"))
+                if not entry:
+                    entry = await ensure_species_and_learnsets(species)
+            except Exception as e:
+                return await itx.followup.send(f"PokeAPI/cache error: {e}", ephemeral=False)
+
+            # decode + normalize stats
+            def _j(v, d):
+                return json.loads(v) if isinstance(v, str) else (v if v is not None else d)
+            raw_stats   = _j(entry.get("stats"), {})
+            base_stats  = _normalize_stats_for_generator(raw_stats)
+            abilities   = _j(entry.get("abilities"), [])
+            species_types = _extract_species_types(entry)
+            gender_ratio = _j(entry.get("gender_ratio"), None)
+
+            # derive gender ratio fallback
+            if not gender_ratio:
+                gr = entry.get("gender_rate")
+                if isinstance(gr, str):
+                    try: gr = json.loads(gr)
+                    except Exception: pass
+                if isinstance(gr, int):
+                    if gr == -1:
+                        gender_ratio = {"genderless": True}
+                    else:
+                        female = gr * 12.5
+                        gender_ratio = {"male": 100 - female, "female": female}
+            if not gender_ratio:
+                gender_ratio = {"male": 50, "female": 50}
+
+            # roll HA + shiny (you already have these helpers)
+            ability_name, is_hidden = roll_hidden_ability(abilities, ha_denominator=50)
+            is_shiny = await shiny_roll()
+            # roll gender from the Pokédex ratio and make it authoritative
+            rolled_gender = _roll_gender_from_ratio(gender_ratio)
+            # generate, then override with rolls
+            mon = generate_mon(
+                base_stats   = base_stats,
+                abilities    = abilities,
+                gender_ratio = gender_ratio,
+                level        = 5
+            )
+            if ability_name:
+                mon["ability"] = ability_name
+            mon["is_hidden_ability"] = bool(is_hidden)
+            mon["is_shiny"] = bool(is_shiny)
+            mon["gender"] = rolled_gender
+            tera_type = _roll_default_tera_type(species_types)
+            # Friendship (avoid extra DB call; use Pokedex data)
+            bf = entry.get("base_happiness")
+            if bf is None:
+                bf = entry.get("base_friendship")
+            try:
+                base_friend = int(bf) if bf is not None else 70
+            except Exception:
+                base_friend = 70
+            # Precompute level-up moves from cache if possible (avoid DB round-trip)
+            cached_moves: list[str] | None = None
+            cached_pps: list[int] | None = None
+            try:
+                if db_cache is not None:
+                    learnsets = db_cache.get_cached_learnsets()
+                    if learnsets:
+                        species_id = entry.get("id")
+                        if species_id is not None:
+                            rows = [
+                                r for r in learnsets
+                                if int(r.get("species_id") or -1) == int(species_id)
+                                and int(r.get("generation") or 0) == 1
+                                and str(r.get("method") or "").lower() == "level-up"
+                                and int(r.get("level_learned") or 0) <= 5
+                            ]
+                            rows.sort(key=lambda r: (int(r.get("level_learned") or 0), str(r.get("move_id") or "")))
+                            rows = list(reversed(rows))
+                            seen = set()
+                            out = []
+                            for r in rows:
+                                move_id = r.get("move_id")
+                                move = db_cache.get_cached_move(str(move_id)) if move_id is not None else None
+                                name = (move.get("name") if move else None) or ""
+                                if name:
+                                    name = name.replace("-", " ").title()
+                                    if name not in seen:
+                                        seen.add(name)
+                                        out.append(name)
+                                if len(out) >= 4:
+                                    break
+                            cached_moves = out if out else None
+                            if cached_moves:
+                                pps = []
+                                for m in cached_moves:
+                                    mv = db_cache.get_cached_move(m) or db_cache.get_cached_move(m.lower()) or db_cache.get_cached_move(m.lower().replace(" ", "-"))
+                                    if mv and mv.get("pp") is not None:
+                                        try:
+                                            pps.append(int(mv["pp"]))
+                                        except Exception:
+                                            pps.append(20)
+                                    else:
+                                        pps.append(20)
+                                cached_pps = pps
+            except Exception:
+                cached_moves = None
+                cached_pps = None
+
+            # insert & setup (single DB session for speed)
+            try:
+                for attempt in range(2):
+                    try:
+                        async with db.session() as conn:
+                            try:
+                                await _ensure_pg_pokemons_columns(conn)
+                                col_flags = await _pg_pokemons_column_flags(conn)
+                                await _tx_begin(conn)
+                                await conn.execute(
+                                    "INSERT INTO users (user_id, starter, coins, currencies) VALUES (?, ?, 6000, '{\"coins\": 6000}'::jsonb) "
+                                    "ON CONFLICT (user_id) DO UPDATE SET starter = EXCLUDED.starter, "
+                                    "currencies = CASE WHEN COALESCE((users.currencies->>'coins')::int, 0) = 0 THEN jsonb_set(COALESCE(users.currencies, '{}'::jsonb), '{coins}', '6000'::jsonb) ELSE users.currencies END",
+                                    (uid, species),
+                                )
+
+                                empty_moves_json = json.dumps([], ensure_ascii=False)
+                                exp_group = await _get_exp_group_for_species(conn, entry["name"])
+                                initial_exp = await _get_exp_total_for_level(conn, exp_group, 5)
+                                cols = [
+                                    "owner_id", "species", "level",
+                                    "hp", "atk", "def", "spa", "spd", "spe",
+                                    "ivs", "evs", "nature", "ability", "gender",
+                                    "moves", "form", "can_gigantamax", "tera_type", "friendship",
+                                    "exp", "exp_group",
+                                ]
+                                vals = [
+                                    uid, entry["name"], 5,
+                                    int(mon["stats"]["hp"]),
+                                    int(mon["stats"]["attack"]),
+                                    int(mon["stats"]["defense"]),
+                                    int(mon["stats"]["special_attack"]),
+                                    int(mon["stats"]["special_defense"]),
+                                    int(mon["stats"]["speed"]),
+                                    json.dumps(mon["ivs"], ensure_ascii=False),
+                                    json.dumps(mon["evs"], ensure_ascii=False),
+                                    mon["nature"],
+                                    mon["ability"],
+                                    rolled_gender,
+                                    empty_moves_json,
+                                    None,
+                                    False,
+                                    tera_type,
+                                    int(base_friend),
+                                    initial_exp, exp_group,
+                                ]
+                                if col_flags.get("hp_now"):
+                                    cols.insert(4, "hp_now")
+                                    vals.insert(4, int(mon["stats"]["hp"]))
+                                if col_flags.get("shiny"):
+                                    cols.append("shiny")
+                                    vals.append(1 if is_shiny else 0)
+                                if col_flags.get("is_hidden_ability"):
+                                    cols.append("is_hidden_ability")
+                                    vals.append(1 if is_hidden else 0)
+                                placeholders = ", ".join(["?"] * len(cols))
+                                cur = await conn.execute(
+                                    f"INSERT INTO pokemons ({', '.join(cols)}) VALUES ({placeholders})",
+                                    tuple(vals),
+                                )
+                                pid = int(cur.lastrowid)
+                                await cur.close()
+
+                                # give 6 Poké Balls (use canonical id from items table: poke_ball)
+                                try:
+                                    await conn.execute(
+                                        """
+                                        INSERT INTO user_items (owner_id, item_id, qty)
+                                        VALUES (?, ?, ?)
+                                        ON CONFLICT(owner_id, item_id)
+                                        DO UPDATE SET qty = user_items.qty + excluded.qty
+                                        """,
+                                        (uid, "poke_ball", 6),
+                                    )
+                                    db.invalidate_bag_cache(uid)
+                                except Exception:
+                                    pass
+
+                                # learn level-up moves for user's selected gen
+                                try:
+                                    moves = cached_moves
+                                    pps = cached_pps
+                                    if not moves:
+                                        species_id = entry.get("id")
+                                        if not species_id:
+                                            cur = await conn.execute("SELECT id FROM pokedex WHERE LOWER(name)=LOWER(?)", (entry["name"].lower(),))
+                                            srow = await cur.fetchone(); await cur.close()
+                                            species_id = int(srow["id"]) if srow else None
+                                        if species_id:
+                                            cur = await conn.execute("""
+                                                SELECT m.name, COALESCE(l.level_learned, 0) AS lvl, m.pp AS pp
+                                                FROM learnsets l
+                                                JOIN moves m ON m.id = l.move_id
+                                                WHERE l.species_id = ? AND l.generation = ? AND l.method = 'level-up'
+                                                      AND COALESCE(l.level_learned, 0) <= ?
+                                                ORDER BY lvl DESC, m.name
+                                                LIMIT 40
+                                            """, (species_id, 1, 5))
+                                            rows = await cur.fetchall(); await cur.close()
+                                            seen, moves, pps = set(), [], []
+                                            for r in rows:
+                                                name = r["name"].replace("-", " ").title()
+                                                if name not in seen:
+                                                    seen.add(name); moves.append(name)
+                                                    try:
+                                                        pp_val = r["pp"]
+                                                        pps.append(int(pp_val) if pp_val is not None else 20)
+                                                    except Exception:
+                                                        pps.append(20)
+                                                if len(moves) == 4:
+                                                    break
+                                    if not moves:
+                                        moves = ["Tackle"]
+                                        pps = [20]
+                                    if col_flags.get("moves_pp"):
+                                        await conn.execute(
+                                            "UPDATE pokemons SET moves=?, moves_pp=? WHERE owner_id=? AND id=?",
+                                            (json.dumps(moves, ensure_ascii=False), json.dumps(pps or [20] * len(moves), ensure_ascii=False), uid, pid),
+                                        )
+                                    else:
+                                        await conn.execute(
+                                            "UPDATE pokemons SET moves=? WHERE owner_id=? AND id=?",
+                                            (json.dumps(moves, ensure_ascii=False), uid, pid),
+                                        )
+                                except Exception:
+                                    pass
+
+                                # put into first free team slot
+                                try:
+                                    cur = await conn.execute(
+                                        "SELECT team_slot FROM pokemons WHERE owner_id=? AND team_slot BETWEEN 1 AND 6",
+                                        (uid,),
+                                    )
+                                    used = {int(r[0]) for r in await cur.fetchall()}
+                                    await cur.close()
+                                    slot = next((s for s in range(1, 7) if s not in used), None)
+                                    if slot is not None:
+                                        await conn.execute(
+                                            "UPDATE pokemons SET team_slot=? WHERE owner_id=? AND id=?",
+                                            (slot, uid, pid),
+                                        )
+                                except Exception:
+                                    pass
+
+                                # Grant 6000 PokéDollars on start (only if not already set)
+                                try:
+                                    await conn.execute(
+                                        "UPDATE users SET currencies = jsonb_set(COALESCE(NULLIF(currencies::text, 'null')::jsonb, '{}'::jsonb), '{coins}', '6000'::jsonb) WHERE user_id = ? AND COALESCE((currencies->>'coins')::int, 0) = 0",
+                                        (uid,),
+                                    )
+                                except Exception:
+                                    pass
+
+                                await _tx_commit(conn)
+                                db.invalidate_pokemons_cache(uid)
+                            except Exception:
+                                await _tx_rollback(conn)
+                                raise
+                        break
+                    except (TimeoutError, asyncio.TimeoutError):
+                        if attempt == 0:
+                            await asyncio.sleep(1.5)
+                            continue
+                        raise
+            except Exception as e:
+                return await itx.followup.send(f"Insert error: {e!r}", ephemeral=False)
+
+            # Safety net: ensure the starter flag and 6000 PokéDollars are persisted (handles edge cases where the UPSERT was rolled back).
+            try:
+                async with db.session() as conn:
+                    await conn.execute(
+                        "UPDATE users SET starter = COALESCE(starter, ?) WHERE user_id = ?",
+                        (species, uid),
+                    )
+                    await conn.execute(
+                        "UPDATE users SET currencies = jsonb_set(COALESCE(NULLIF(currencies::text, 'null')::jsonb, '{}'::jsonb), '{coins}', '6000'::jsonb) WHERE user_id = ? AND COALESCE((currencies->>'coins')::int, 0) = 0",
+                        (uid,),
+                    )
+            except Exception:
+                pass
+
+            # Safety net: if no Pokémon row exists yet, insert the starter into team slot 1.
+            try:
+                await _ensure_starter_mon_row(uid, species, mon, entry, tera_type=tera_type, base_friend=base_friend)
+            except Exception:
+                pass
+
+            # remove the view and confirm
+            try:
+                await itx.edit_original_response(view=None)
+            except Exception:
+                pass
+            await itx.followup.send(
+                f"✅ You received **{entry['name']}** as your starter!"
+                f"{' ✨ (Shiny!)' if is_shiny else ''}"
+                f"{' (Hidden Ability)' if is_hidden else ''}\n"
+                f"🎁 You also received **6× Poké Balls**.",
+                ephemeral=True
+            )
+
+            # Initialize adventure state and send rival challenge
+            state_err = None
+            try:
+                state = await _get_adventure_state(uid)
+                state["area_id"] = "pallet-town"
+                await _save_adventure_state(uid, state)
+            except Exception as e:
+                state_err = e
+                try:
+                    print(f"[Adventure] state init failed: {e}")
+                except Exception:
+                    pass
+
+            try:
+                city = ADVENTURE_CITIES["pallet-town"]
+                rival_lines = [
+                    "**Blue:** I'll take this one, then!",
+                    "**Blue:** Heh, my Pokémon looks a lot stronger.",
+                ]
+                rival_text = "\n".join(rival_lines)
+                rival_embed, rival_files = _embed_with_image(
+                    "Your Rival Appears!",
+                    rival_text,
+                    city["image_uncleared"],
+                )
+                teaser_msg = await itx.followup.send(
+                    embed=rival_embed,
+                    files=rival_files,
+                    ephemeral=True,
+                    wait=True,
+                )
+
+                async def _send_challenge_followup():
+                    try:
+                        await asyncio.sleep(1.5)
+                        preview_desc = f"**Blue:** Wait {itx.user.display_name if hasattr(itx.user, 'display_name') else itx.user.name}! Let's check out our Pokémon! Come on, I'll take you on!"
+                        preview_emb, preview_files = _embed_with_image("Rival Challenge!", preview_desc, city["image_uncleared"])
+                        await teaser_msg.edit(
+                            embed=preview_emb,
+                            attachments=preview_files,
+                            view=RivalIntroView(itx.user.id, "pallet-town"),
+                        )
+                    except Exception:
+                        try:
+                            preview_desc = f"**Blue:** Wait {itx.user.display_name if hasattr(itx.user, 'display_name') else itx.user.name}! Let's check out our Pokémon! Come on, I'll take you on!"
+                            preview_emb, preview_files = _embed_with_image("Rival Challenge!", preview_desc, city["image_uncleared"])
+                            await itx.followup.send(embed=preview_emb, files=preview_files, view=RivalIntroView(itx.user.id, "pallet-town"), ephemeral=True)
+                        except Exception:
+                            pass
+
+                asyncio.create_task(_send_challenge_followup())
+            except Exception as e:
+                try:
+                    print(f"[Adventure] rival intro send failed: {e}")
+                except Exception:
+                    pass
+                # Fallback: send without files/view if attachments fail
+                try:
+                    city = ADVENTURE_CITIES["pallet-town"]
+                    rival_lines = [
+                        "**Blue:** I'll take this one, then!",
+                        "**Blue:** Heh, my Pokémon looks a lot stronger.",
+                    ]
+                    rival_text = "\n".join(rival_lines)
+                    rival_embed, _ = _embed_with_image(
+                        "Your Rival Appears!",
+                        rival_text,
+                        city["image_uncleared"],
+                    )
+                    await itx.followup.send(
+                        embed=rival_embed,
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
+        finally:
+            # Always remove from in-progress set, even if error occurs
+            StarterView._picking_in_progress.discard(uid)
+
+# =========================
+#  Adventure / Routes (Story Mode)
+# =========================
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+ASSETS_CITIES = ASSETS_DIR / "cities"
+ASSETS_ROUTES = ASSETS_DIR / "routes"
+
+ADVENTURE_CITIES = {
+    "pallet-town": {
+        "name": "Pallet Town",
+        "image_uncleared": ASSETS_CITIES / "pallet-town-start.png",
+        "image_cleared": ASSETS_CITIES / "pallet-town-cleared.png",
+        "next": "route-1",
+        "rival_battle": "rival-1",
+        "heal": True,
+    },
+    "viridian-city": {
+        "name": "Viridian City",
+        "image_uncleared": ASSETS_CITIES / "viridian-city-uncleared.png",
+        "image_cleared": ASSETS_CITIES / "viridian-city-cleared.png",
+        "routes": ["route-2", "route-22"],
+        "gym_leader": "viridian",
+        "gym_badge": "boulder",
+        "gym_closed": True,
+        "heal": True,
+    },
+}
+
+# Gen 1 TMs (consumable) and HMs (permanent) for TM Machine / TM Seller
+GEN1_TMS: List[Tuple[str, str]] = [
+    ("tm-01", "Mega Punch"), ("tm-02", "Razor Wind"), ("tm-03", "Swords Dance"), ("tm-04", "Whirlwind"),
+    ("tm-05", "Mega Kick"), ("tm-06", "Toxic"), ("tm-07", "Horn Drill"), ("tm-08", "Body Slam"),
+    ("tm-09", "Take Down"), ("tm-10", "Double-Edge"), ("tm-11", "Bubble Beam"), ("tm-12", "Water Gun"),
+    ("tm-13", "Ice Beam"), ("tm-14", "Blizzard"), ("tm-15", "Hyper Beam"), ("tm-16", "Pay Day"),
+    ("tm-17", "Submission"), ("tm-18", "Counter"), ("tm-19", "Seismic Toss"), ("tm-20", "Rage"),
+    ("tm-21", "Mega Drain"), ("tm-22", "Solar Beam"), ("tm-23", "Dragon Rage"), ("tm-24", "Thunderbolt"),
+    ("tm-25", "Thunder"), ("tm-26", "Earthquake"), ("tm-27", "Fissure"), ("tm-28", "Dig"),
+    ("tm-29", "Psychic"), ("tm-30", "Teleport"), ("tm-31", "Mimic"), ("tm-32", "Double Team"),
+    ("tm-33", "Reflect"), ("tm-34", "Bide"), ("tm-35", "Metronome"), ("tm-36", "Self-Destruct"),
+    ("tm-37", "Egg Bomb"), ("tm-38", "Fire Blast"), ("tm-39", "Swift"), ("tm-40", "Skull Bash"),
+    ("tm-41", "Soft-Boiled"), ("tm-42", "Dream Eater"), ("tm-43", "Sky Attack"), ("tm-44", "Rest"),
+    ("tm-45", "Thunder Wave"), ("tm-46", "Psywave"), ("tm-47", "Explosion"), ("tm-48", "Rock Slide"),
+    ("tm-49", "Tri Attack"), ("tm-50", "Substitute"),
+]
+GEN1_HMS: List[Tuple[str, str]] = [
+    ("hm-01", "Cut"), ("hm-02", "Fly"), ("hm-03", "Surf"), ("hm-04", "Strength"), ("hm-05", "Flash"),
+]
+TM_FRAGMENT_ITEM_ID = "tm-fragment"  # Rare encounter drop; display name "TM Fragment"
+TM_FRAGMENT_DROP_CHANCE = 0.02  # Rolled for every adventure wild win (grass path + /route)
+TM_SELLER_PRICE = 500  # Coins per TM (Gen 1)
+# Seller has 25 TMs (rolled from 1–50 via script, fixed)
+TM_SELLER_ITEMS = [GEN1_TMS[i - 1] for i in (1, 3, 5, 6, 7, 9, 11, 12, 15, 17, 20, 21, 22, 23, 24, 31, 34, 35, 37, 40, 42, 44, 45, 49, 50)]
+
+ADVENTURE_ROUTES = {
+    "route-1": {
+        "name": "Route 1",
+        "image_uncleared": ASSETS_ROUTES / "route-1-panel-1.png",
+        "image_cleared": ASSETS_ROUTES / "route-1-panel-1.png",
+        "panels": [
+            ASSETS_ROUTES / "route-1-panel-1.png",
+            ASSETS_ROUTES / "route-1-panel-2.png",
+            ASSETS_ROUTES / "route-1-panel-3.png",
+        ],
+        "next": "viridian-city",
+        "grass_paths": {
+            # Weighted, leveled encounters (Gen 1 Route 1)
+            1: {
+                "encounters": [
+                    {"species": "pidgey", "weight": 55, "min_level": 2, "max_level": 5},
+                    {"species": "rattata", "weight": 45, "min_level": 2, "max_level": 4},
+                ],
+                "blocker": None,
+            },
+            2: {
+                "encounters": [
+                    {"species": "pidgey", "weight": 55, "min_level": 2, "max_level": 5},
+                    {"species": "rattata", "weight": 45, "min_level": 2, "max_level": 4},
+                ],
+                "blocker": "trainer-1",
+            },
+            3: {
+                "encounters": [
+                    {"species": "pidgey", "weight": 55, "min_level": 2, "max_level": 5},
+                    {"species": "rattata", "weight": 45, "min_level": 2, "max_level": 4},
+                ],
+                "blocker": None,  # No blocker — path 2 has the only trainer
+            },
+        },
+        "trainers": {
+            "trainer-1": {
+                "name": "Youngster Tim",
+                "blocker_quote": "Hey! You can't cross the grass without battling me first! My Rattata is in the top percentage of Rattata!",
+                "team": [{"species": "Rattata", "level": 4}],
+            },
+        },
+    },
+    "route-2": {
+        "name": "Route 2",
+        "image_uncleared": ASSETS_ROUTES / "route-2-1.png",
+        "image_cleared": ASSETS_ROUTES / "route-2-1.png",
+        "next": "viridian-forest-1",
+        "next_always": True,
+        # Versioned encounters: red/blue share Rattata/Pidgey; Weedle is Red-only, Caterpie is Blue-only
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "rattata", "weight": 45, "min_level": 2, "max_level": 5},
+                    {"species": "pidgey",  "weight": 40, "min_level": 3, "max_level": 5},
+                    # Red: Weedle; Blue/Green: Caterpie. We'll include both at 15% and let version flag choose.
+                    {"species": "weedle",   "weight": 15, "min_level": 3, "max_level": 5, "version": "red"},
+                    {"species": "caterpie", "weight": 15, "min_level": 3, "max_level": 5, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "viridian-forest-1": {
+        "name": "Viridian Forest",
+        "image_uncleared": ASSETS_ROUTES / "viridian-forest-1.png",
+        "image_cleared": ASSETS_ROUTES / "viridian-forest-1.png",
+        "next": "viridian-forest-2",
+        "next_always": True,
+        "grass_paths": {},
+        "trainers": {},
+    },
+    "viridian-forest-2": {
+        "name": "Viridian Forest",
+        "image_uncleared": ASSETS_ROUTES / "viridian-forest-2.png",
+        "image_cleared": ASSETS_ROUTES / "viridian-forest-2.png",
+        "next": "viridian-forest-3-pokeball",
+        "next_blocker": "trainer-vf2-2",
+        "next_show_when_path_blockers_only": True,
+        "next_trainer": "trainer-vf2-2",
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "weedle", "weight": 40, "min_level": 3, "max_level": 5},
+                    {"species": "caterpie", "weight": 40, "min_level": 3, "max_level": 5},
+                    {"species": "pidgey", "weight": 20, "min_level": 3, "max_level": 5},
+                ],
+                "blocker": "trainer-vf2-1",
+            },
+        },
+        "trainers": {
+            "trainer-vf2-1": {
+                "name": "Bug Catcher Rick",
+                "blocker_quote": "You can't pass without battling me first!",
+                "team": [
+                    {"species": "weedle", "level": 6, "moves": ["Poison Sting", "String Shot"], "stats": {"hp": 20, "atk": 9, "defn": 7, "spa": 7, "spd": 7, "spe": 7}},
+                    {"species": "caterpie", "level": 6, "moves": ["Tackle", "String Shot"], "stats": {"hp": 21, "atk": 8, "defn": 8, "spa": 7, "spd": 7, "spe": 7}},
+                ],
+            },
+            "trainer-vf2-2": {
+                "name": "Bug Catcher Doug",
+                "rematch": False,
+                "blocker_quote": "Beat me if you want to go further!",
+                "team": [
+                    {"species": "weedle", "level": 7, "moves": ["Poison Sting", "String Shot"], "stats": {"hp": 22, "atk": 9, "defn": 9, "spa": 7, "spd": 7, "spe": 7}},
+                    {"species": "kakuna", "level": 7, "moves": ["Harden"], "stats": {"hp": 23, "atk": 8, "defn": 12, "spa": 7, "spd": 8, "spe": 8}},
+                    {"species": "weedle", "level": 7, "moves": ["Poison Sting", "String Shot"], "stats": {"hp": 22, "atk": 9, "defn": 9, "spa": 7, "spd": 7, "spe": 6}},
+                ],
+            },
+        },
+    },
+    "viridian-forest-3-pokeball": {
+        "name": "Viridian Forest",
+        "image_uncleared": ASSETS_ROUTES / "viridian-forest-3-pokeball.png",
+        "image_cleared": ASSETS_ROUTES / "viridian-forest-3-pokeball.png",
+        "next": "viridian-forest-3",
+        "next_always": True,
+        "collectible_button": {"label": "Pokéball", "state_key": "viridian_forest_pokeball_collected", "next_area": "viridian-forest-3", "item": "pokeball", "qty": 1},
+        "grass_paths": {},
+        "trainers": {},
+    },
+    "viridian-forest-3": {
+        "name": "Viridian Forest",
+        "image_uncleared": ASSETS_ROUTES / "viridian-forest-3.png",
+        "image_cleared": ASSETS_ROUTES / "viridian-forest-3.png",
+        "next": "viridian-forest-4",
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "weedle", "weight": 40, "min_level": 3, "max_level": 5},
+                    {"species": "caterpie", "weight": 40, "min_level": 3, "max_level": 5},
+                    {"species": "pidgey", "weight": 20, "min_level": 3, "max_level": 5},
+                ],
+                "blocker": None,
+            },
+            2: {
+                "encounters": [
+                    {"species": "weedle", "weight": 40, "min_level": 3, "max_level": 5},
+                    {"species": "caterpie", "weight": 40, "min_level": 3, "max_level": 5},
+                    {"species": "pidgey", "weight": 20, "min_level": 3, "max_level": 5},
+                ],
+                "blocker": "trainer-vf3-1",
+            },
+            3: {
+                "encounters": [
+                    {"species": "weedle", "weight": 40, "min_level": 3, "max_level": 5},
+                    {"species": "caterpie", "weight": 40, "min_level": 3, "max_level": 5},
+                    {"species": "pidgey", "weight": 20, "min_level": 3, "max_level": 5},
+                ],
+                "blocker": "trainer-vf3-2",
+            },
+        },
+        "trainers": {
+            "trainer-vf3-1": {
+                "name": "Bug Catcher Anthony",
+                "rematch": False,
+                "blocker_quote": "Between path 1 and 2 — you'll have to battle me!",
+                "team": [
+                    {"species": "caterpie", "level": 7, "moves": ["Tackle", "String Shot"], "stats": {"hp": 23, "atk": 8, "defn": 9, "spa": 7, "spd": 7, "spe": 7}},
+                    {"species": "caterpie", "level": 8, "moves": ["Tackle", "String Shot"], "stats": {"hp": 25, "atk": 9, "defn": 10, "spa": 8, "spd": 7, "spe": 7}},
+                ],
+            },
+            "trainer-vf3-2": {
+                "name": "Bug Catcher Charlie",
+                "rematch": False,
+                "blocker_quote": "Between path 2 and 3 — no passing!",
+                "team": [
+                    {"species": "metapod", "level": 7, "moves": ["Harden"], "stats": {"hp": 24, "atk": 6, "defn": 12, "spa": 8, "spd": 8, "spe": 8}},
+                    {"species": "caterpie", "level": 7, "moves": ["Tackle", "String Shot"], "stats": {"hp": 23, "atk": 9, "defn": 9, "spa": 6, "spd": 7, "spe": 7}},
+                    {"species": "metapod", "level": 7, "moves": ["Harden"], "stats": {"hp": 24, "atk": 7, "defn": 13, "spa": 8, "spd": 8, "spe": 8}},
+                ],
+            },
+        },
+    },
+    "viridian-forest-4": {
+        "name": "Viridian Forest",
+        "image_uncleared": ASSETS_ROUTES / "viridian-forest-4.png",
+        "image_cleared": ASSETS_ROUTES / "viridian-forest-4.png",
+        "next": "route-2-2",
+        "next_blocker": "trainer-vf4-2",
+        "next_show_when_path_blockers_only": True,
+        "next_trainer": "trainer-vf4-2",
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "weedle", "weight": 40, "min_level": 3, "max_level": 5},
+                    {"species": "caterpie", "weight": 40, "min_level": 3, "max_level": 5},
+                    {"species": "pidgey", "weight": 20, "min_level": 3, "max_level": 5},
+                ],
+                "blocker": None,
+            },
+            2: {
+                "encounters": [
+                    {"species": "weedle", "weight": 40, "min_level": 3, "max_level": 5},
+                    {"species": "caterpie", "weight": 40, "min_level": 3, "max_level": 5},
+                    {"species": "pidgey", "weight": 20, "min_level": 3, "max_level": 5},
+                ],
+                "blocker": "trainer-vf4-1",
+            },
+        },
+        "trainers": {
+            "trainer-vf4-1": {
+                "name": "Bug Catcher",
+                "rematch": False,
+                "blocker_quote": "Two trainers guard the exit — I'm the first!",
+                "team": [
+                    {"species": "weedle", "level": 7, "moves": ["Poison Sting", "String Shot"], "stats": {"hp": 22, "atk": 9, "defn": 9, "spa": 7, "spd": 7, "spe": 7}},
+                    {"species": "caterpie", "level": 7, "moves": ["Tackle", "String Shot"], "stats": {"hp": 23, "atk": 8, "defn": 9, "spa": 7, "spd": 7, "spe": 7}},
+                ],
+            },
+            "trainer-vf4-2": {
+                "name": "Bug Catcher Sammy",
+                "rematch": False,
+                "blocker_quote": "I'm the second — beat me to reach Route 2!",
+                "team": [
+                    {"species": "weedle", "level": 9, "moves": ["Poison Sting", "String Shot"], "stats": {"hp": 26, "atk": 11, "defn": 10, "spa": 8, "spd": 8, "spe": 8}},
+                ],
+            },
+        },
+    },
+    "route-2-2": {
+        "name": "Route 2",
+        "image_uncleared": ASSETS_ROUTES / "route-2-2.png",
+        "image_cleared": ASSETS_ROUTES / "route-2-2.png",
+        "next": None,
+        "next_always": True,
+        "grass_paths": {},
+        "trainers": {},
+    },
+    "route-3": {
+        "name": "Route 3",
+        "image_uncleared": ASSETS_ROUTES / "route-3-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-3-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "pidgey", "weight": 50, "min_level": 6, "max_level": 8},
+                    {"species": "spearow", "weight": 40, "min_level": 5, "max_level": 8},
+                    {"species": "jigglypuff", "weight": 10, "min_level": 3, "max_level": 7},
+                ],
+                "blocker": "trainer-route-3-colton",
+            },
+        },
+        "trainers": {
+            "trainer-route-3-colton": {
+                "name": "Bug Catcher Colton",
+                "blocker_quote": "You'll have to battle me to pass!",
+                "team": [
+                    {"species": "caterpie", "level": 10, "moves": ["Tackle", "String Shot"], "stats": {"hp": 29, "atk": 11, "defn": 10, "spa": 9, "spd": 9, "spe": 14}},
+                    {"species": "weedle", "level": 10, "moves": ["Poison Sting", "String Shot"], "stats": {"hp": 28, "atk": 12, "defn": 9, "spa": 9, "spd": 9, "spe": 16}},
+                    {"species": "caterpie", "level": 10, "moves": ["Tackle", "String Shot"], "stats": {"hp": 29, "atk": 11, "defn": 10, "spa": 9, "spd": 9, "spe": 14}},
+                ],
+            },
+        },
+    },
+    "route-4": {
+        "name": "Route 4",
+        "image_uncleared": ASSETS_ROUTES / "route-4-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-4-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "rattata", "weight": 45, "min_level": 8, "max_level": 12},
+                    {"species": "spearow", "weight": 30, "min_level": 8, "max_level": 12},
+                    {"species": "ekans", "weight": 25, "min_level": 6, "max_level": 12, "version": "red"},
+                    {"species": "sandshrew", "weight": 25, "min_level": 6, "max_level": 12, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-5": {
+        "name": "Route 5",
+        "image_uncleared": ASSETS_ROUTES / "route-5-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-5-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "oddish", "weight": 40, "min_level": 13, "max_level": 16, "version": "red"},
+                    {"species": "bellsprout", "weight": 40, "min_level": 13, "max_level": 16, "version": "blue"},
+                    {"species": "pidgey", "weight": 35, "min_level": 13, "max_level": 16},
+                    {"species": "mankey", "weight": 25, "min_level": 10, "max_level": 16, "version": "red"},
+                    {"species": "meowth", "weight": 25, "min_level": 10, "max_level": 16, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-6": {
+        "name": "Route 6",
+        "image_uncleared": ASSETS_ROUTES / "route-6-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-6-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "oddish", "weight": 40, "min_level": 13, "max_level": 16, "version": "red"},
+                    {"species": "bellsprout", "weight": 40, "min_level": 13, "max_level": 16, "version": "blue"},
+                    {"species": "pidgey", "weight": 35, "min_level": 13, "max_level": 16},
+                    {"species": "mankey", "weight": 25, "min_level": 10, "max_level": 16, "version": "red"},
+                    {"species": "meowth", "weight": 25, "min_level": 10, "max_level": 16, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-7": {
+        "name": "Route 7",
+        "image_uncleared": ASSETS_ROUTES / "route-7-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-7-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "pidgey", "weight": 35, "min_level": 19, "max_level": 22},
+                    {"species": "mankey", "weight": 30, "min_level": 17, "max_level": 20, "version": "red"},
+                    {"species": "meowth", "weight": 30, "min_level": 17, "max_level": 20, "version": "blue"},
+                    {"species": "oddish", "weight": 25, "min_level": 19, "max_level": 22, "version": "red"},
+                    {"species": "bellsprout", "weight": 25, "min_level": 19, "max_level": 22, "version": "blue"},
+                    {"species": "growlithe", "weight": 10, "min_level": 18, "max_level": 20, "version": "red"},
+                    {"species": "vulpix", "weight": 10, "min_level": 18, "max_level": 20, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-8": {
+        "name": "Route 8",
+        "image_uncleared": ASSETS_ROUTES / "route-8-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-8-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "pidgey", "weight": 35, "min_level": 18, "max_level": 20},
+                    {"species": "mankey", "weight": 25, "min_level": 18, "max_level": 20, "version": "red"},
+                    {"species": "meowth", "weight": 25, "min_level": 18, "max_level": 20, "version": "blue"},
+                    {"species": "ekans", "weight": 20, "min_level": 17, "max_level": 19, "version": "red"},
+                    {"species": "sandshrew", "weight": 20, "min_level": 17, "max_level": 19, "version": "blue"},
+                    {"species": "growlithe", "weight": 20, "min_level": 15, "max_level": 18, "version": "red"},
+                    {"species": "vulpix", "weight": 20, "min_level": 15, "max_level": 18, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-9": {
+        "name": "Route 9",
+        "image_uncleared": ASSETS_ROUTES / "route-9-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-9-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "rattata", "weight": 45, "min_level": 14, "max_level": 17},
+                    {"species": "spearow", "weight": 30, "min_level": 13, "max_level": 17},
+                    {"species": "ekans", "weight": 25, "min_level": 11, "max_level": 17, "version": "red"},
+                    {"species": "sandshrew", "weight": 25, "min_level": 11, "max_level": 17, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-10": {
+        "name": "Route 10",
+        "image_uncleared": ASSETS_ROUTES / "route-10-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-10-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "voltorb", "weight": 45, "min_level": 14, "max_level": 17},
+                    {"species": "spearow", "weight": 30, "min_level": 13, "max_level": 17},
+                    {"species": "ekans", "weight": 25, "min_level": 11, "max_level": 17, "version": "red"},
+                    {"species": "sandshrew", "weight": 25, "min_level": 11, "max_level": 17, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-11": {
+        "name": "Route 11",
+        "image_uncleared": ASSETS_ROUTES / "route-11-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-11-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "ekans", "weight": 45, "min_level": 12, "max_level": 15, "version": "red"},
+                    {"species": "sandshrew", "weight": 45, "min_level": 12, "max_level": 15, "version": "blue"},
+                    {"species": "spearow", "weight": 30, "min_level": 13, "max_level": 17},
+                    {"species": "drowzee", "weight": 25, "min_level": 9, "max_level": 15},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-12": {
+        "name": "Route 12",
+        "image_uncleared": ASSETS_ROUTES / "route-12-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-12-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "oddish", "weight": 40, "min_level": 22, "max_level": 26, "version": "red"},
+                    {"species": "bellsprout", "weight": 40, "min_level": 22, "max_level": 26, "version": "blue"},
+                    {"species": "pidgey", "weight": 35, "min_level": 23, "max_level": 27},
+                    {"species": "venonat", "weight": 20, "min_level": 24, "max_level": 26},
+                    {"species": "gloom", "weight": 5, "min_level": 28, "max_level": 30, "version": "red"},
+                    {"species": "weepinbell", "weight": 5, "min_level": 28, "max_level": 30, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-13": {
+        "name": "Route 13",
+        "image_uncleared": ASSETS_ROUTES / "route-13-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-13-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "oddish", "weight": 40, "min_level": 22, "max_level": 26, "version": "red"},
+                    {"species": "bellsprout", "weight": 40, "min_level": 22, "max_level": 26, "version": "blue"},
+                    {"species": "pidgey", "weight": 30, "min_level": 25, "max_level": 27},
+                    {"species": "venonat", "weight": 20, "min_level": 24, "max_level": 26},
+                    {"species": "gloom", "weight": 5, "min_level": 28, "max_level": 30, "version": "red"},
+                    {"species": "weepinbell", "weight": 5, "min_level": 28, "max_level": 30, "version": "blue"},
+                    {"species": "ditto", "weight": 5, "min_level": 25, "max_level": 25},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-14": {
+        "name": "Route 14",
+        "image_uncleared": ASSETS_ROUTES / "route-14-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-14-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "oddish", "weight": 40, "min_level": 22, "max_level": 26, "version": "red"},
+                    {"species": "bellsprout", "weight": 40, "min_level": 22, "max_level": 26, "version": "blue"},
+                    {"species": "venonat", "weight": 20, "min_level": 24, "max_level": 26},
+                    {"species": "pidgey", "weight": 15, "min_level": 26, "max_level": 26},
+                    {"species": "ditto", "weight": 15, "min_level": 23, "max_level": 23},
+                    {"species": "pidgeotto", "weight": 5, "min_level": 28, "max_level": 30},
+                    {"species": "gloom", "weight": 5, "min_level": 30, "max_level": 30, "version": "red"},
+                    {"species": "weepinbell", "weight": 5, "min_level": 30, "max_level": 30, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-15": {
+        "name": "Route 15",
+        "image_uncleared": ASSETS_ROUTES / "route-15-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-15-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "oddish", "weight": 40, "min_level": 22, "max_level": 26, "version": "red"},
+                    {"species": "bellsprout", "weight": 40, "min_level": 22, "max_level": 26, "version": "blue"},
+                    {"species": "venonat", "weight": 20, "min_level": 26, "max_level": 28},
+                    {"species": "pidgey", "weight": 15, "min_level": 23, "max_level": 23},
+                    {"species": "ditto", "weight": 15, "min_level": 26, "max_level": 26},
+                    {"species": "pidgeotto", "weight": 5, "min_level": 28, "max_level": 30},
+                    {"species": "gloom", "weight": 5, "min_level": 30, "max_level": 30, "version": "red"},
+                    {"species": "weepinbell", "weight": 5, "min_level": 30, "max_level": 30, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-16": {
+        "name": "Route 16",
+        "image_uncleared": ASSETS_ROUTES / "route-16-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-16-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "spearow", "weight": 40, "min_level": 20, "max_level": 22},
+                    {"species": "rattata", "weight": 30, "min_level": 18, "max_level": 22},
+                    {"species": "doduo", "weight": 25, "min_level": 18, "max_level": 22},
+                    {"species": "raticate", "weight": 5, "min_level": 23, "max_level": 25},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-17": {
+        "name": "Route 17",
+        "image_uncleared": ASSETS_ROUTES / "route-17-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-17-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "spearow", "weight": 40, "min_level": 20, "max_level": 22},
+                    {"species": "raticate", "weight": 30, "min_level": 25, "max_level": 29},
+                    {"species": "doduo", "weight": 25, "min_level": 24, "max_level": 28},
+                    {"species": "fearow", "weight": 5, "min_level": 25, "max_level": 27},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-18": {
+        "name": "Route 18",
+        "image_uncleared": ASSETS_ROUTES / "route-18-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-18-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "spearow", "weight": 40, "min_level": 20, "max_level": 22},
+                    {"species": "doduo", "weight": 25, "min_level": 24, "max_level": 28},
+                    {"species": "raticate", "weight": 20, "min_level": 25, "max_level": 29},
+                    {"species": "fearow", "weight": 15, "min_level": 25, "max_level": 29},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-19": {
+        "name": "Route 19",
+        "image_uncleared": ASSETS_ROUTES / "route-19-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-19-cleared.png",
+        "next": None,
+        # Surf encounters only (water route) - 100% Tentacool, level 5-40
+        "water_encounters": [
+            {"species": "tentacool", "weight": 100, "min_level": 5, "max_level": 40},
+        ],
+        "grass_paths": {},
+        "trainers": {},
+    },
+    "route-21": {
+        "name": "Route 21",
+        "image_uncleared": ASSETS_ROUTES / "route-21-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-21-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "rattata", "weight": 35, "min_level": 21, "max_level": 23},
+                    {"species": "pidgey", "weight": 25, "min_level": 21, "max_level": 23},
+                    {"species": "pidgeotto", "weight": 15, "min_level": 30, "max_level": 32},
+                    {"species": "raticate", "weight": 15, "min_level": 30, "max_level": 30},
+                    {"species": "tangela", "weight": 10, "min_level": 28, "max_level": 32},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-22": {
+        "name": "Route 22",
+        "image_rival_not_arrived": ASSETS_ROUTES / "route-22-rival-barrived.png",
+        "image_rival_arrived": ASSETS_ROUTES / "route-22-rival-arrived.png",
+        "image_uncleared": ASSETS_ROUTES / "route-22-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-22-cleared.png",
+        "next": "viridian-city",
+        "rival_battle": "rival-route-22",
+        "back_always": True,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "rattata", "weight": 50, "min_level": 2, "max_level": 4},
+                    {"species": "nidoran-m", "weight": 35, "min_level": 2, "max_level": 4, "version": "red"},
+                    {"species": "nidoran-f", "weight": 35, "min_level": 2, "max_level": 4, "version": "blue"},
+                    {"species": "spearow", "weight": 10, "min_level": 3, "max_level": 5},
+                    {"species": "nidoran-f", "weight": 5, "min_level": 3, "max_level": 4, "version": "red"},
+                    {"species": "nidoran-m", "weight": 5, "min_level": 3, "max_level": 4, "version": "blue"},
+                ],
+                "blocker": "trainer-route-22-1",
+            },
+            2: {
+                "encounters": [
+                    {"species": "rattata", "weight": 50, "min_level": 2, "max_level": 4},
+                    {"species": "nidoran-m", "weight": 35, "min_level": 2, "max_level": 4, "version": "red"},
+                    {"species": "nidoran-f", "weight": 35, "min_level": 2, "max_level": 4, "version": "blue"},
+                    {"species": "spearow", "weight": 10, "min_level": 3, "max_level": 5},
+                    {"species": "nidoran-f", "weight": 5, "min_level": 3, "max_level": 4, "version": "red"},
+                    {"species": "nidoran-m", "weight": 5, "min_level": 3, "max_level": 4, "version": "blue"},
+                ],
+                "blocker": "trainer-route-22-1",  # Path 2 is after path 1; same trainer blocks both until defeated
+            },
+        },
+        "trainers": {
+            "trainer-route-22-1": {
+                "name": "Route 22 Trainer",
+                "blocker_quote": "You'll have to beat me first if you want to cross!",
+                "team": [
+                    {"species": "rattata", "level": 10, "moves": ["Tackle", "Tail Whip", "Quick Attack"], "stats": {"hp": 26, "atk": 16, "defn": 12, "spa": 10, "spd": 13, "spe": 19}},
+                    {"species": "nidoran-f", "level": 10, "moves": ["Growl", "Scratch", "Tail Whip"], "stats": {"hp": 31, "atk": 12, "defn": 15, "spa": 13, "spd": 13, "spe": 14}},
+                ],
+            },
+        },
+    },
+    "route-23": {
+        "name": "Route 23",
+        "image_uncleared": ASSETS_ROUTES / "route-23-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-23-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "ditto", "weight": 30, "min_level": 33, "max_level": 43},
+                    {"species": "fearow", "weight": 25, "min_level": 38, "max_level": 43},
+                    {"species": "ekans", "weight": 25, "min_level": 26, "max_level": 26, "version": "red"},
+                    {"species": "sandshrew", "weight": 25, "min_level": 26, "max_level": 26, "version": "blue"},
+                    {"species": "spearow", "weight": 15, "min_level": 26, "max_level": 26},
+                    {"species": "arbok", "weight": 5, "min_level": 41, "max_level": 41, "version": "red"},
+                    {"species": "sandslash", "weight": 5, "min_level": 41, "max_level": 41, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-24": {
+        "name": "Route 24",
+        "image_uncleared": ASSETS_ROUTES / "route-24-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-24-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "weedle", "weight": 25, "min_level": 7, "max_level": 7, "version": "red"},
+                    {"species": "caterpie", "weight": 25, "min_level": 7, "max_level": 7, "version": "blue"},
+                    {"species": "oddish", "weight": 25, "min_level": 12, "max_level": 14, "version": "red"},
+                    {"species": "bellsprout", "weight": 25, "min_level": 12, "max_level": 14, "version": "blue"},
+                    {"species": "pidgey", "weight": 20, "min_level": 12, "max_level": 13},
+                    {"species": "kakuna", "weight": 15, "min_level": 8, "max_level": 8, "version": "red"},
+                    {"species": "metapod", "weight": 15, "min_level": 8, "max_level": 8, "version": "blue"},
+                    {"species": "abra", "weight": 15, "min_level": 8, "max_level": 12},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+    "route-25": {
+        "name": "Route 25",
+        "image_uncleared": ASSETS_ROUTES / "route-25-uncleared.png",
+        "image_cleared": ASSETS_ROUTES / "route-25-cleared.png",
+        "next": None,
+        "grass_paths": {
+            1: {
+                "encounters": [
+                    {"species": "weedle", "weight": 25, "min_level": 8, "max_level": 8, "version": "red"},
+                    {"species": "caterpie", "weight": 25, "min_level": 8, "max_level": 8, "version": "blue"},
+                    {"species": "oddish", "weight": 25, "min_level": 12, "max_level": 14, "version": "red"},
+                    {"species": "bellsprout", "weight": 25, "min_level": 12, "max_level": 14, "version": "blue"},
+                    {"species": "kakuna", "weight": 15, "min_level": 9, "max_level": 9, "version": "red"},
+                    {"species": "metapod", "weight": 15, "min_level": 9, "max_level": 9, "version": "blue"},
+                    {"species": "pidgey", "weight": 15, "min_level": 13, "max_level": 13},
+                    {"species": "abra", "weight": 15, "min_level": 10, "max_level": 12},
+                    {"species": "metapod", "weight": 4, "min_level": 7, "max_level": 7, "version": "red"},
+                    {"species": "kakuna", "weight": 4, "min_level": 7, "max_level": 7, "version": "blue"},
+                    {"species": "caterpie", "weight": 1, "min_level": 8, "max_level": 8, "version": "red"},
+                    {"species": "weedle", "weight": 1, "min_level": 8, "max_level": 8, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+        },
+        "trainers": {},
+    },
+}
+
+RIVAL_BATTLES = {
+    "rival-1": {
+        "name": "Rival",
+        # First encounter: keep it low and use Gen 1 level-up moves available at/below this level.
+        "level": 5,
+    },
+    "rival-route-22": {
+        "name": "Rival",
+        # Route 22: rival appears when user clicks any button other than Back. Team depends on player's starter.
+        "teams_by_starter": {
+            "charmander": [
+                {"species": "pidgey", "level": 9, "moves": ["Tackle", "Sand-Attack"], "stats": {"hp": 26, "atk": 13, "defn": 12, "spa": 11, "spd": 11, "spe": 15}},
+                {"species": "squirtle", "level": 9, "moves": ["Tackle", "Tail Whip"], "stats": {"hp": 27, "atk": 14, "defn": 17, "spa": 14, "spd": 17, "spe": 13}},
+            ],
+            "squirtle": [
+                {"species": "pidgey", "level": 9, "moves": ["Tackle", "Sand-Attack"], "stats": {"hp": 26, "atk": 13, "defn": 12, "spa": 11, "spd": 11, "spe": 15}},
+                {"species": "bulbasaur", "level": 9, "moves": ["Tackle", "Growl"], "stats": {"hp": 27, "atk": 14, "defn": 17, "spa": 14, "spd": 17, "spe": 13}},
+            ],
+            "bulbasaur": [
+                {"species": "pidgey", "level": 9, "moves": ["Tackle", "Sand-Attack"], "stats": {"hp": 26, "atk": 13, "defn": 12, "spa": 11, "spd": 11, "spe": 15}},
+                {"species": "charmander", "level": 9, "moves": ["Scratch", "Growl"], "stats": {"hp": 26, "atk": 12, "defn": 13, "spa": 17, "spd": 14, "spe": 17}},
+            ],
+            "pikachu": [
+                {"species": "eevee", "level": 9, "moves": ["Tackle", "Tail Whip", "Sand-Attack"], "stats": {"hp": 29, "atk": 14, "defn": 12, "spa": 12, "spd": 16, "spe": 14}},
+                {"species": "vaporeon", "level": 9, "moves": ["Water Gun", "Tackle", "Tail Whip"], "stats": {"hp": 38, "atk": 14, "defn": 14, "spa": 20, "spd": 18, "spe": 14}},
+            ],
+        },
+    },
+}
+
+def _adv_default_state() -> dict:
+    return {
+        "area_id": "pallet-town",
+        "last_city": "pallet-town",
+        "area_history": [],      # stack for back navigation
+        "cleared_cities": [],
+        "cleared_routes": [],
+        "gym_badges": [],         # badge ids (e.g. "boulder") for gym cities
+        "defeated_trainers": {},  # trainer_id -> last_defeated_ts
+        "discovered": {},         # route_id -> [species]
+        "rival_defeated": [],     # list of rival battle ids
+        "repeat_seen": [],        # species seen/caught for Repeat Ball
+        "dex_seen": 0,            # rough dex count for crit capture odds
+    }
+
+async def _get_adventure_state(user_id: str) -> dict:
+    uid = str(user_id)
+    default = _adv_default_state()
+    if db_cache is not None:
+        try:
+            cached = db_cache.get_cached_adventure_state(uid)
+            if cached is not None:
+                merged = default | cached
+                if not isinstance(merged.get("area_history"), list):
+                    merged["area_history"] = []
+                if not merged.get("last_city"):
+                    merged["last_city"] = "pallet-town"
+                return merged
+        except Exception:
+            pass
+    state = None
+    async with db.session() as conn:
+        cur = await conn.execute("SELECT data FROM adventure_state WHERE owner_id = ? LIMIT 1", (uid,))
+        row = await cur.fetchone()
+        await cur.close()
+        if row and row.get("data"):
+            try:
+                state = json.loads(row["data"])
+            except Exception:
+                state = None
+    if state is None:
+        merged = default.copy()
+        if not isinstance(merged.get("area_history"), list):
+            merged["area_history"] = []
+        if not merged.get("last_city"):
+            merged["last_city"] = "pallet-town"
+        async with db.session() as conn:
+            await conn.execute(
+                "INSERT INTO adventure_state (owner_id, data) VALUES (?, ?) ON CONFLICT (owner_id) DO NOTHING",
+                (uid, json.dumps(merged, ensure_ascii=False)),
+            )
+            await conn.commit()
+        if db_cache is not None:
+            try:
+                db_cache.set_cached_adventure_state(uid, merged)
+            except Exception:
+                pass
+        return merged
+    merged = default | state
+    if not isinstance(merged.get("area_history"), list):
+        merged["area_history"] = []
+    if not merged.get("last_city"):
+        merged["last_city"] = "pallet-town"
+    if db_cache is not None:
+        try:
+            db_cache.set_cached_adventure_state(uid, merged)
+        except Exception:
+            pass
+    return merged
+
+async def _save_adventure_state(user_id: str, state: dict) -> None:
+    uid = str(user_id)
+    async with db.session() as conn:
+        await conn.execute(
+            "UPDATE adventure_state SET data = ? WHERE owner_id = ?",
+            (json.dumps(state, ensure_ascii=False), uid),
+        )
+        await conn.commit()
+    if db_cache is not None:
+        try:
+            db_cache.set_cached_adventure_state(uid, state)
+        except Exception:
+            pass
+
+# ---------------- POKEDEX (per-user) ----------------
+async def _ensure_pokedex_tables() -> None:
+    """Create per-user Pokédex tracking tables if they don't exist."""
+    async with db.session() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_pokedex (
+                owner_id    TEXT NOT NULL,
+                species     TEXT NOT NULL,
+                seen_count  INTEGER DEFAULT 0,
+                caught_count INTEGER DEFAULT 0,
+                last_seen   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (owner_id, species)
+            )
+            """
+        )
+        await conn.commit()
+
+
+async def pokedex_mark_seen(user_id: str, species: str, caught: bool = False) -> None:
+    """Increment seen (and optionally caught) for a species for this user."""
+    await _ensure_pokedex_tables()
+    species = species.lower()
+    async with db.session() as conn:
+        await conn.execute(
+            """
+            INSERT INTO user_pokedex(owner_id, species, seen_count, caught_count, last_seen)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(owner_id, species) DO UPDATE SET
+                seen_count = user_pokedex.seen_count + 1,
+                caught_count = user_pokedex.caught_count + (excluded.caught_count),
+                last_seen = CURRENT_TIMESTAMP
+            """,
+            (user_id, species, 1, 1 if caught else 0),
+        )
+        await conn.commit()
+
+
+async def pokedex_get_entry(user_id: str, species: str) -> dict:
+    """Return pokedex entry for user/species, defaults to zeros."""
+    await _ensure_pokedex_tables()
+    species = species.lower()
+    async with db.session() as conn:
+        cur = await conn.execute(
+            "SELECT seen_count, caught_count, last_seen FROM user_pokedex WHERE owner_id=? AND species=?",
+            (user_id, species),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return {"seen": 0, "caught": 0, "last_seen": None}
+        return {
+            "seen": row["seen_count"] if hasattr(row, "keys") else row[0],
+            "caught": row["caught_count"] if hasattr(row, "keys") else row[1],
+            "last_seen": row["last_seen"] if hasattr(row, "keys") else row[2],
+        }
+
+
+async def pokedex_summary(user_id: str) -> dict:
+    """Return total seen/caught counts for a user."""
+    await _ensure_pokedex_tables()
+    async with db.session() as conn:
+        cur = await conn.execute(
+            "SELECT SUM(seen_count) as seen, SUM(caught_count) as caught FROM user_pokedex WHERE owner_id=?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return {
+            "seen": int(row["seen"] or 0) if hasattr(row, "keys") else int(row[0] or 0),
+            "caught": int(row["caught"] or 0) if hasattr(row, "keys") else int(row[1] or 0),
+        }
+
+
+async def pokedex_seen_species(user_id: str) -> list[str]:
+    """Return list of species seen by user."""
+    await _ensure_pokedex_tables()
+    async with db.session() as conn:
+        cur = await conn.execute(
+            "SELECT species FROM user_pokedex WHERE owner_id=? AND seen_count>0",
+            (user_id,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [r["species"] if hasattr(r, "keys") else r[0] for r in rows]
+def _is_city(area_id: str) -> bool:
+    return area_id in ADVENTURE_CITIES
+
+def _city_is_cleared(state: dict, area_id: str) -> bool:
+    """Cities with a gym are cleared when the player has the gym badge; others when in cleared_cities."""
+    city = ADVENTURE_CITIES.get(area_id, {})
+    badge = city.get("gym_badge")
+    if badge:
+        return badge in (state.get("gym_badges") or [])
+    return area_id in (state.get("cleared_cities") or [])
+
+async def _team_has_surf(user_id: str) -> bool:
+    """True if the user has at least one Pokémon on their team that knows Surf."""
+    uid = str(user_id)
+    if db_cache is not None:
+        try:
+            cached = db_cache.get_cached_pokemons(uid)
+            if cached is not None:
+                for p in cached:
+                    if not p.get("team_slot") or not (1 <= int(p.get("team_slot") or 0) <= 6):
+                        continue
+                    moves_raw = p.get("moves")
+                    if not moves_raw:
+                        continue
+                    if isinstance(moves_raw, str):
+                        try:
+                            moves_raw = json.loads(moves_raw)
+                        except Exception:
+                            continue
+                    if not isinstance(moves_raw, (list, tuple)):
+                        continue
+                    for m in moves_raw:
+                        name = (m if isinstance(m, str) else (m.get("name") if isinstance(m, dict) else "") or "").strip().lower().replace(" ", "-")
+                        if name == "surf":
+                            return True
+                return False
+        except Exception:
+            pass
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT moves FROM pokemons WHERE owner_id=? AND team_slot IS NOT NULL",
+                (uid,),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+        for row in rows or []:
+            moves_raw = row.get("moves")
+            if not moves_raw:
+                continue
+            if isinstance(moves_raw, str):
+                try:
+                    moves_raw = json.loads(moves_raw)
+                except Exception:
+                    continue
+            if not isinstance(moves_raw, (list, tuple)):
+                continue
+            for m in moves_raw:
+                name = (m if isinstance(m, str) else (m.get("name") if isinstance(m, dict) else "") or "").strip().lower().replace(" ", "-")
+                if name == "surf":
+                    return True
+        return False
+    except Exception:
+        return False
+
+def _route_required_trainers(route_id: str) -> list[str]:
+    """Return trainer IDs that block paths (and next_blocker if any) — only these must be defeated to clear the route."""
+    route = ADVENTURE_ROUTES.get(route_id) or {}
+    grass_paths = route.get("grass_paths") or {}
+    required = []
+    seen = set()
+    for path in grass_paths.values():
+        blocker = path.get("blocker") if isinstance(path, dict) else None
+        if blocker and blocker not in seen:
+            seen.add(blocker)
+            required.append(blocker)
+    next_blocker = route.get("next_blocker")
+    if next_blocker and next_blocker not in seen:
+        required.append(next_blocker)
+    return required
+
+def _route_is_cleared(state: dict, route_id: str) -> bool:
+    required = set(_route_required_trainers(route_id))
+    defeated = set(state.get("defeated_trainers", {}).keys())
+    return required.issubset(defeated)
+
+def _route_path_blockers_cleared(state: dict, route_id: str) -> bool:
+    """True when all path blockers (grass_paths only, not next_blocker) are defeated."""
+    route = ADVENTURE_ROUTES.get(route_id) or {}
+    grass_paths = route.get("grass_paths") or {}
+    required = []
+    seen = set()
+    for path in grass_paths.values():
+        blocker = path.get("blocker") if isinstance(path, dict) else None
+        if blocker and blocker not in seen:
+            seen.add(blocker)
+            required.append(blocker)
+    defeated = set(state.get("defeated_trainers", {}).keys())
+    return set(required).issubset(defeated)
+
+def _add_discovered(state: dict, route_id: str, species: str) -> None:
+    discovered = state.setdefault("discovered", {})
+    seen = discovered.setdefault(route_id, [])
+    s = str(species).lower().strip()
+    if s and s not in seen:
+        seen.append(s)
+
+def _pick_rival_starter(player_starter: str) -> str:
+    s = str(player_starter or "").lower().replace(" ", "-")
+    mapping = {
+        "bulbasaur": "charmander",
+        "charmander": "squirtle",
+        "squirtle": "bulbasaur",
+        "pikachu": "eevee",
+    }
+    return mapping.get(s, "charmander")
+
+def _asset_file(path: Path) -> Optional[discord.File]:
+    try:
+        if path.exists():
+            return discord.File(path, filename=path.name)
+    except Exception:
+        pass
+    return None
+
+def _embed_with_image(title: str, description: str, image_path: Path) -> tuple[discord.Embed, list[discord.File]]:
+    emb = discord.Embed(title=title, description=description)
+    files: list[discord.File] = []
+    f = _asset_file(image_path)
+    if f:
+        emb.set_image(url=f"attachment://{f.filename}")
+        files.append(f)
+    return emb, files
+
+def _embed_with_route_panel(title: str, description: str, image_path: Path, panel_index: int, panels_total: int = 3) -> tuple[discord.Embed, list[discord.File]]:
+    """
+    Like _embed_with_image, but crops the given route image into N vertical panels (top→bottom) and returns the selected panel.
+    Requires Pillow. If Pillow is unavailable or cropping fails, falls back to the full image.
+    panel_index: 1..panels_total
+    """
+    panel_index = max(1, min(int(panel_index or 1), int(panels_total or 3)))
+    if Image is None:
+        return _embed_with_image(title, description, image_path)
+    try:
+        p = Path(image_path)
+        if not p.exists():
+            return _embed_with_image(title, description, image_path)
+        img = Image.open(str(p)).convert("RGBA")
+        w, h = img.size
+        slice_h = h // panels_total
+        y0 = (panel_index - 1) * slice_h
+        y1 = h if panel_index == panels_total else (panel_index * slice_h)
+        cropped = img.crop((0, y0, w, y1))
+        buf = BytesIO()
+        cropped.save(buf, format="PNG")
+        buf.seek(0)
+        filename = f"route_panel_{p.stem}_{panel_index}.png"
+        f = discord.File(fp=buf, filename=filename)
+        emb = discord.Embed(title=title, description=description)
+        emb.set_image(url=f"attachment://{filename}")
+        return emb, [f]
+    except Exception:
+        return _embed_with_image(title, description, image_path)
+
+async def _player_lead_for_display(user_id: str) -> str:
+    """Best-effort lead name from team_slot 1 (or any slotted mon)."""
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT species FROM pokemons WHERE owner_id=? AND team_slot IS NOT NULL ORDER BY team_slot LIMIT 1",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            if row and (row.get("species") or row[0]):
+                return str(row.get("species") or row[0])
+    except Exception:
+        pass
+    return "Your Pokémon"
+
+def _encounter_preview_embed(lead_name: str, wild_name: str, level: int, image_path: Optional[Path]) -> tuple[discord.Embed, list[discord.File]]:
+    title = f"{lead_name.title()} vs. {wild_name.title()}"
+    desc = f"A wild **Lv{level} {wild_name.title()}** appeared in the grass!\nGo, {lead_name.title()}!"
+    return _embed_with_image(title, desc, image_path) if image_path else (discord.Embed(title=title, description=desc), [])
+
+def _wild_shiny_denominator() -> int:
+    """Shiny odds for wild encounters: 1/N. Used when DB trigger is not available (e.g. Postgres)."""
+    try:
+        n = int(os.environ.get("SHINY_ODDS_DENOMINATOR", "4096"))
+        return max(1, n)
+    except Exception:
+        return 4096
+
+# Short stat keys used by build_mon (pvp/engine)
+_STAT_KEYS_SHORT = ("hp", "atk", "defn", "spa", "spd", "spe")
+
+def _normalize_ivs_evs(raw, default_val: int = 0) -> dict:
+    """Normalize IVs/EVs from team entry to short-key dict (hp, atk, defn, spa, spd, spe). No rolls."""
+    if not raw:
+        return {k: default_val for k in _STAT_KEYS_SHORT}
+    if isinstance(raw, (list, tuple)) and len(raw) >= 6:
+        return dict(zip(_STAT_KEYS_SHORT, [int(raw[i]) for i in range(6)]))
+    if isinstance(raw, dict):
+        long_to_short = {"hp": "hp", "attack": "atk", "atk": "atk", "defense": "defn", "def": "defn", "defn": "defn",
+                         "special_attack": "spa", "spa": "spa", "special_defense": "spd", "spd": "spd", "speed": "spe", "spe": "spe"}
+        out = {k: default_val for k in _STAT_KEYS_SHORT}
+        for key, val in raw.items():
+            k = (key or "").lower().replace("-", "_")
+            short = long_to_short.get(k) or (k if k in _STAT_KEYS_SHORT else None)
+            if short is not None:
+                try:
+                    out[short] = int(val)
+                except (TypeError, ValueError):
+                    pass
+        return out
+    return {k: default_val for k in _STAT_KEYS_SHORT}
+
+async def _build_mon_from_team_entry(team_entry: dict) -> Optional["Mon"]:
+    """
+    Build a trainer Mon from a fixed team entry. No rolls: uses species, level, moves, and
+    optional ability, nature, ivs, evs, gender, shiny from the entry. Omitted fields use
+    deterministic defaults (first ability, hardy nature, 0 IVs/EVs, male, not shiny).
+    """
+    if not isinstance(team_entry, dict) or not team_entry.get("species"):
+        return None
+    species = str(team_entry["species"]).strip()
+    level = int(team_entry.get("level", 5))
+    try:
+        entry = await ensure_species_and_learnsets(species)
+    except Exception:
+        return None
+    raw_stats = entry.get("stats")
+    if isinstance(raw_stats, str):
+        try:
+            raw_stats = json.loads(raw_stats)
+        except Exception:
+            raw_stats = {}
+    base_long = _normalize_stats_for_generator(raw_stats or {})
+    base_short = {
+        "hp": base_long.get("hp", 1),
+        "atk": base_long.get("attack", 1),
+        "defn": base_long.get("defense", 1),
+        "spa": base_long.get("special_attack", 1),
+        "spd": base_long.get("special_defense", 1),
+        "spe": base_long.get("speed", 1),
+    }
+    types = _extract_species_types(entry)
+    types_tuple = (types[0].title() if types else "Normal", types[1].title() if len(types) > 1 else None)
+
+    move_list = team_entry.get("moves")
+    if not move_list:
+        conn = await db.connect()
+        try:
+            cur = await conn.execute("SELECT id FROM pokedex WHERE LOWER(name)=LOWER(?) LIMIT 1", (species.lower(),))
+            row = await cur.fetchone()
+            await cur.close()
+            if row:
+                move_list = await _default_levelup_moves(int(row["id"]), level, 1)
+        except Exception:
+            move_list = []
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+    if not move_list:
+        move_list = ["Tackle"]
+    move_list = [str(m).title().replace(" ", "-") if isinstance(m, str) else str(m) for m in (move_list or [])][:4]
+
+    ability = team_entry.get("ability")
+    if ability is None or (isinstance(ability, str) and not ability.strip()):
+        regs, hides = parse_abilities(entry.get("abilities") or [])
+        ability = (regs[0] if regs else (hides[0] if hides else None)) or "Unknown"
+    else:
+        ability = str(ability).strip().lower().replace(" ", "-")
+
+    nature = (team_entry.get("nature") or "hardy").strip().lower()
+    ivs = _normalize_ivs_evs(team_entry.get("ivs"), 0)
+    evs = _normalize_ivs_evs(team_entry.get("evs"), 0)
+    gender = (team_entry.get("gender") or "male").strip().lower()
+    if gender not in ("male", "female", "genderless"):
+        gender = "male"
+    is_shiny = bool(team_entry.get("shiny", False))
+
+    from lib.stats import calc_all_stats
+    ivs_long = {"hp": ivs["hp"], "attack": ivs["atk"], "defense": ivs["defn"], "special_attack": ivs["spa"], "special_defense": ivs["spd"], "speed": ivs["spe"]}
+    evs_long = {"hp": evs["hp"], "attack": evs["atk"], "defense": evs["defn"], "special_attack": evs["spa"], "special_defense": evs["spd"], "speed": evs["spe"]}
+    final_stats = calc_all_stats(base_long, ivs_long, evs_long, level, nature)
+    hp_max = final_stats.get("hp", 1)
+
+    dto = {
+        "species": entry.get("name") or species,
+        "types": types_tuple,
+        "base": base_short,
+        "ivs": ivs,
+        "evs": evs,
+        "level": level,
+        "moves": move_list,
+        "ability": ability,
+        "gender": gender,
+        "is_shiny": is_shiny,
+        "hp_now": hp_max,
+        "weight_kg": float(entry.get("weight_kg") or 100.0),
+        "friendship": int(entry.get("base_happiness") or 70),
+        "nature": nature,
+    }
+    # Optional fixed stats override (e.g. for scripted rival/trainer teams)
+    raw_stats = team_entry.get("stats")
+    if isinstance(raw_stats, dict) and raw_stats.get("hp") is not None:
+        dto["override_max_hp"] = int(raw_stats["hp"])
+        dto["override_stats"] = {
+            "atk":  int(raw_stats.get("atk", 0)),
+            "defn": int(raw_stats.get("defn", raw_stats.get("def", 0))),
+            "spa":  int(raw_stats.get("spa", 0)),
+            "spd":  int(raw_stats.get("spd", 0)),
+            "spe":  int(raw_stats.get("spe", 0)),
+        }
+    return build_mon(dto, set_level=level, heal=True)
+
+def _gender_ratio_from_entry(entry: dict) -> dict:
+    """Get gender ratio from DB/cache entry (gender_ratio or gender_rate). Same logic as starter flow."""
+    gender_ratio = _j(entry.get("gender_ratio"), None) if entry else None
+    if not gender_ratio or not isinstance(gender_ratio, dict):
+        gr = entry.get("gender_rate") if entry else None
+        if isinstance(gr, str):
+            try:
+                gr = json.loads(gr)
+            except Exception:
+                gr = None
+        if isinstance(gr, int):
+            if gr == -1:
+                gender_ratio = {"genderless": True}
+            else:
+                female = gr * 12.5
+                gender_ratio = {"male": 100 - female, "female": female}
+    if not gender_ratio or not isinstance(gender_ratio, dict):
+        gender_ratio = {"male": 50, "female": 50}
+    return gender_ratio
+
+
+async def _build_mon_from_species(species: str, level: int, moves: Optional[list[str]] = None) -> Optional["Mon"]:
+    # Prefer cache (db_cache) then ensure_species_and_learnsets (DB / API)
+    entry = None
+    if db_cache is not None:
+        key = species.strip().lower().replace(" ", "-")
+        entry = db_cache.get_cached_pokedex(key) or db_cache.get_cached_pokedex(species.lower())
+        if not entry and key != species.lower():
+            entry = db_cache.get_cached_pokedex(species.lower())
+    if entry is None:
+        try:
+            entry = await ensure_species_and_learnsets(species)
+        except Exception:
+            return None
+    raw_stats = entry.get("stats")
+    if isinstance(raw_stats, str):
+        try:
+            raw_stats = json.loads(raw_stats)
+        except Exception:
+            raw_stats = {}
+    base_long = _normalize_stats_for_generator(raw_stats or {})
+    # Normalize abilities so generate_mon/choose_ability get list[dict] with name + is_hidden (handles pokedex JSON/API formats)
+    abilities_raw = entry.get("abilities") or []
+    regs, hides = parse_abilities(abilities_raw)
+    abilities_for_gen = [{"name": r, "is_hidden": False} for r in regs] + [{"name": h, "is_hidden": True} for h in hides]
+    if not abilities_for_gen:
+        abilities_for_gen = []
+    # Gender ratio from database/cache (same as starter: gender_ratio or gender_rate)
+    gender_ratio = _gender_ratio_from_entry(entry)
+    rolled = generate_mon(base_stats=base_long, abilities=abilities_for_gen, gender_ratio=gender_ratio, level=level)
+    base_short = {
+        "hp": base_long.get("hp", 1),
+        "atk": base_long.get("attack", 1),
+        "defn": base_long.get("defense", 1),
+        "spa": base_long.get("special_attack", 1),
+        "spd": base_long.get("special_defense", 1),
+        "spe": base_long.get("speed", 1),
+    }
+    types = _extract_species_types(entry)
+    types_tuple = (types[0].title() if types else "Normal", types[1].title() if len(types) > 1 else None)
+    move_list = moves or []
+    species_id = None
+    try:
+        species_id = entry.get("id")
+        species_id = int(species_id) if species_id is not None else None
+    except (TypeError, ValueError):
+        species_id = None
+    if not move_list:
+        move_list = await _default_levelup_moves(species_id, level, 1) if species_id else ["Tackle"]
+    # Special move roll: 0.1% chance per slot to be a non-level-up move (egg/machine only; no tutor in Gen 1)
+    if species_id:
+        special_moves = await _get_egg_machine_learnset_moves(species_id, 1)
+        if special_moves:
+            move_list = list(move_list)[:4]
+            for i in range(len(move_list)):
+                if random.random() < 0.001:  # 0.1% per slot
+                    move_list[i] = random.choice(special_moves)
+    dto = {
+        "species": entry.get("name") or species,
+        "types": types_tuple,
+        "base": base_short,
+        "ivs": {
+            "hp": int(rolled["ivs"]["hp"]),
+            "atk": int(rolled["ivs"]["attack"]),
+            "defn": int(rolled["ivs"]["defense"]),
+            "spa": int(rolled["ivs"]["special_attack"]),
+            "spd": int(rolled["ivs"]["special_defense"]),
+            "spe": int(rolled["ivs"]["speed"]),
+        },
+        "evs": {
+            "hp": int(rolled["evs"]["hp"]),
+            "atk": int(rolled["evs"]["attack"]),
+            "defn": int(rolled["evs"]["defense"]),
+            "spa": int(rolled["evs"]["special_attack"]),
+            "spd": int(rolled["evs"]["special_defense"]),
+            "spe": int(rolled["evs"]["speed"]),
+        },
+        "level": level,
+        "moves": [m.title() if isinstance(m, str) else str(m) for m in move_list][:4],
+        "ability": rolled.get("ability"),
+        "gender": rolled.get("gender"),
+        "nature": rolled.get("nature"),
+        "is_shiny": await shiny_roll(_wild_shiny_denominator()),
+        "hp_now": int(rolled["stats"]["hp"]),
+        "weight_kg": float(entry.get("weight_kg") or 100.0),
+        "friendship": int(entry.get("base_happiness") or 70),
+    }
+    return build_mon(dto, set_level=level, heal=True)
+
+async def _load_pp_from_db(st: "BattleState", uid: int) -> None:
+    team = st.team_for(uid)
+    # Try twice in case the pool is momentarily exhausted.
+    for attempt in range(2):
+        try:
+            async with db.session() as conn:
+                for idx, mon in enumerate(team):
+                    db_id = getattr(mon, "_db_id", None)
+                    if not db_id:
+                        continue
+                    cur = await conn.execute("SELECT moves, moves_pp FROM pokemons WHERE id=? LIMIT 1", (int(db_id),))
+                    row = await cur.fetchone(); await cur.close()
+                    if not row:
+                        continue
+                    try:
+                        moves = json.loads(row["moves"]) if row.get("moves") else []
+                    except Exception:
+                        moves = []
+                    try:
+                        raw_pps = row.get("moves_pp")
+                        if isinstance(raw_pps, list):
+                            pps = raw_pps
+                        elif raw_pps:
+                            pps = json.loads(raw_pps)
+                        else:
+                            pps = None
+                    except Exception:
+                        pps = None
+                    st._ensure_pp_loaded(uid, mon)
+                    key = (uid, idx)
+                    if key not in st._pp:
+                        st._pp[key] = {}
+                    if moves and isinstance(pps, list) and len(pps) == len(moves):
+                        for m, left in zip(moves, pps):
+                            st._pp[key][m] = int(left)
+            break
+        except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
+            if attempt == 0:
+                await asyncio.sleep(0.2)
+                continue
+        except Exception:
+            break
+
+async def _save_party_state_from_battle(st: "BattleState", uid: int) -> None:
+    team = st.team_for(uid)
+    async with db.session() as conn:
+        for idx, mon in enumerate(team):
+            db_id = getattr(mon, "_db_id", None)
+            if not db_id:
+                continue
+            key = (uid, idx)
+            pp_store = st._pp.get(key, {})
+            move_list = (mon.moves or [])[:4]
+            moves_pp = [int(pp_store.get(m, _max_pp(m, generation=st.gen))) for m in move_list]
+            await conn.execute(
+                "UPDATE pokemons SET hp_now=?, moves_pp=? WHERE id=?",
+                (int(mon.hp), json.dumps(moves_pp, ensure_ascii=False), int(db_id)),
+            )
+        await conn.commit()
+        db.invalidate_pokemons_cache(str(uid))
+
+# --- Experience helpers (Adventure/PvE) ---
+# Valid exp_group codes (must match exp_groups / exp_requirements in DB)
+_VALID_EXP_GROUPS = frozenset({"erratic", "fast", "medium_fast", "medium_slow", "slow", "fluctuating"})
+
+
+def _normalize_growth_rate_to_exp_group(growth_rate: str | None) -> str:
+    """Map pokedex.growth_rate (e.g. 'medium-fast', 'Medium Fast') to exp_group code (e.g. 'medium_fast')."""
+    if not growth_rate or not str(growth_rate).strip():
+        return "medium_fast"
+    s = str(growth_rate).strip().lower().replace(" ", "_").replace("-", "_")
+    return s if s in _VALID_EXP_GROUPS else "medium_fast"
+
+
+async def _get_exp_group_for_species(conn, species: str) -> str:
+    """Get exp_group for a species from pokedex.growth_rate; fallback 'medium_fast'."""
+    if not species or not str(species).strip():
+        return "medium_fast"
+    try:
+        cur = await conn.execute(
+            "SELECT growth_rate FROM pokedex WHERE LOWER(name) = LOWER(?) OR LOWER(REPLACE(name,' ','-')) = LOWER(?) LIMIT 1",
+            (str(species).strip(), str(species).strip().replace(" ", "-")),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row and row.get("growth_rate") is not None:
+            return _normalize_growth_rate_to_exp_group(str(row["growth_rate"]))
+    except Exception:
+        pass
+    return "medium_fast"
+
+
+async def _get_exp_total_for_level(conn, exp_group: str, level: int) -> int:
+    """Return exp_total from exp_requirements for (exp_group, level). Returns 0 if not found."""
+    if db_cache is not None:
+        try:
+            rows = db_cache.get_cached_exp_requirements()
+            if rows:
+                key = exp_group.strip().lower().replace(" ", "_")
+                for r in rows:
+                    if str(r.get("group_code") or "").strip().lower().replace(" ", "_") == key and int(r.get("level") or 0) == level:
+                        v = r.get("exp_total")
+                        return int(v) if v is not None else 0
+        except Exception:
+            pass
+    try:
+        cur = await conn.execute(
+            "SELECT exp_total FROM exp_requirements WHERE group_code = ? AND level = ? LIMIT 1",
+            (exp_group.strip().lower().replace(" ", "_"), level),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return int(row["exp_total"]) if row and row.get("exp_total") is not None else 0
+    except Exception:
+        return 0
+
+
+async def _calc_level_from_exp(exp_group: str, exp_val: int) -> int:
+    """Return highest level where exp_total <= exp_val for a given exp_group."""
+    if db_cache is not None:
+        try:
+            rows = db_cache.get_cached_exp_requirements()
+            if rows:
+                key = (exp_group or "").strip().lower().replace(" ", "_")
+                best = 1
+                for r in rows:
+                    if str(r.get("group_code") or "").strip().lower().replace(" ", "_") != key:
+                        continue
+                    lvl = int(r.get("level") or 0)
+                    total = int(r.get("exp_total") or 0)
+                    if total <= exp_val and lvl > best:
+                        best = lvl
+                return best
+        except Exception:
+            pass
+    async with db.session() as conn:
+        cur = await conn.execute(
+            """
+            SELECT level FROM exp_requirements
+            WHERE group_code = ? AND exp_total <= ?
+            ORDER BY level DESC
+            LIMIT 1
+            """,
+            (exp_group, exp_val),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return int(row["level"]) if row and row.get("level") is not None else 1
+
+
+def _parse_evolution(evolution: Any) -> dict:
+    """Parse pokedex.evolution (JSONB or string) into a dict with 'next' list."""
+    if evolution is None:
+        return {}
+    if isinstance(evolution, dict):
+        return evolution
+    if isinstance(evolution, str):
+        try:
+            return json.loads(evolution)
+        except Exception:
+            return {}
+    return {}
+
+
+async def _get_level_up_evolution(conn, species_name: str, level: int) -> Optional[str]:
+    """
+    Return the evolved species name (lowercase) if this species can evolve by level-up at the given level.
+    Uses pokedex.evolution JSON: next[].details.trigger == 'level-up' and level >= min_level.
+    """
+    cur = await conn.execute(
+        "SELECT evolution FROM pokedex WHERE LOWER(name) = LOWER(?) LIMIT 1",
+        (species_name.strip(),),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    if not row or row.get("evolution") is None:
+        return None
+    evo = _parse_evolution(row["evolution"])
+    if not isinstance(evo, dict):
+        return None
+    raw_next = evo.get("next")
+    if isinstance(raw_next, list):
+        next_list = raw_next
+    elif raw_next is not None:
+        next_list = [raw_next]
+    else:
+        next_list = []
+    for n in next_list:
+        if isinstance(n, str):
+            # Bare species name (e.g. simple evolution format): treat as valid at any level
+            s = (n or "").strip().lower().replace(" ", "-")
+            if s:
+                return s
+            continue
+        if not isinstance(n, dict):
+            continue
+        details = n.get("details") or {}
+        trigger = (details.get("trigger") or "").lower().replace(" ", "-")
+        if trigger != "level-up":
+            continue
+        min_level = details.get("min_level")
+        if min_level is None:
+            continue
+        try:
+            min_level = int(min_level)
+        except (TypeError, ValueError):
+            continue
+        if level >= min_level:
+            species = (n.get("species") or "").strip().lower().replace(" ", "-")
+            if species:
+                return species
+    return None
+
+
+async def _apply_evolution(owner_id: str, mon_db_id: int, evolved_species_name: str, level: int) -> bool:
+    """
+    Evolve a Pokémon in the DB: update species, base stats, types, ability, moves.
+    Preserve Nature, Shininess, IVs, EVs, gender, friendship, held_item, pokeball.
+    Uses db.session() for all DB work. Returns True if updated, False if not found or error.
+    """
+    evolved_species_name = (evolved_species_name or "").strip().lower().replace(" ", "-")
+    if not evolved_species_name:
+        return False
+    async with db.session() as conn:
+        cur = await conn.execute(
+            "SELECT id, species, level, hp, hp_now, atk, def, spa, spd, spe, ivs, evs, nature, ability, gender, friendship, held_item, pokeball, shiny, is_hidden_ability, moves, form FROM pokemons WHERE owner_id = ? AND id = ? LIMIT 1",
+            (owner_id, mon_db_id),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return False
+        cur_dex = await conn.execute(
+            "SELECT id, name, stats, abilities, types FROM pokedex WHERE LOWER(name) = LOWER(?) LIMIT 1",
+            (evolved_species_name,),
+        )
+        evo_row = await cur_dex.fetchone()
+        await cur_dex.close()
+        if not evo_row:
+            return False
+        evolved_species_id = int(evo_row["id"])
+        evolved_display_name = (evo_row.get("name") or evolved_species_name).replace("-", " ").title()
+        raw_stats = evo_row.get("stats")
+        if isinstance(raw_stats, str):
+            try:
+                raw_stats = json.loads(raw_stats)
+            except Exception:
+                raw_stats = {}
+        base_long = _normalize_stats_for_generator(raw_stats or {})
+        ivs_raw = row.get("ivs")
+        if isinstance(ivs_raw, str):
+            try:
+                ivs_raw = json.loads(ivs_raw)
+            except Exception:
+                ivs_raw = {}
+        evs_raw = row.get("evs")
+        if isinstance(evs_raw, str):
+            try:
+                evs_raw = json.loads(evs_raw)
+            except Exception:
+                evs_raw = {}
+        ivs_long = {"hp": ivs_raw.get("hp", 31), "attack": ivs_raw.get("atk", ivs_raw.get("attack", 31)), "defense": ivs_raw.get("defn", ivs_raw.get("def", ivs_raw.get("defense", 31))), "special_attack": ivs_raw.get("spa", ivs_raw.get("special_attack", 31)), "special_defense": ivs_raw.get("spd", ivs_raw.get("special_defense", 31)), "speed": ivs_raw.get("spe", ivs_raw.get("speed", 31))}
+        evs_long = {"hp": evs_raw.get("hp", 0), "attack": evs_raw.get("atk", evs_raw.get("attack", 0)), "defense": evs_raw.get("defn", evs_raw.get("def", evs_raw.get("defense", 0))), "special_attack": evs_raw.get("spa", evs_raw.get("special_attack", 0)), "special_defense": evs_raw.get("spd", evs_raw.get("special_defense", 0)), "speed": evs_raw.get("spe", evs_raw.get("speed", 0))}
+        nature = (row.get("nature") or "hardy").strip().lower()
+        final_stats = calc_all_stats(base_long, ivs_long, evs_long, level, nature)
+        abilities_raw = evo_row.get("abilities") or []
+        regs, hides = parse_abilities(abilities_raw)
+        is_hidden = bool(row.get("is_hidden_ability"))
+        if is_hidden and hides:
+            new_ability = hides[0].lower().replace(" ", "-")
+        else:
+            new_ability = (regs[0].lower().replace(" ", "-") if regs else "") or (hides[0].lower().replace(" ", "-") if hides else "")
+        user_gen = await _user_selected_gen(owner_id)
+        move_list = await _default_levelup_moves(evolved_species_id, level, user_gen)
+        if not move_list:
+            move_list = ["Tackle", "Growl", "Scratch", "Ember"][:4]
+        move_list = move_list[:4]
+        base_pps = []
+        for m in move_list:
+            pp_val = 20
+            try:
+                if db_cache:
+                    cached = db_cache.get_cached_move(m) or db_cache.get_cached_move(m.lower()) or db_cache.get_cached_move(m.lower().replace(" ", "-"))
+                    if cached and cached.get("pp") is not None:
+                        pp_val = int(cached["pp"])
+            except Exception:
+                pass
+            base_pps.append(pp_val)
+        hp_val = int(final_stats.get("hp", 1))
+        await conn.execute(
+            """UPDATE pokemons SET species = ?, level = ?, hp = ?, hp_now = ?, atk = ?, def = ?, spa = ?, spd = ?, spe = ?, ability = ?, moves = ?, moves_pp = ?, form = ? WHERE owner_id = ? AND id = ?""",
+            (
+                evolved_display_name,
+                level,
+                hp_val,
+                hp_val,
+                int(final_stats.get("attack", 0)),
+                int(final_stats.get("defense", 0)),
+                int(final_stats.get("special_attack", 0)),
+                int(final_stats.get("special_defense", 0)),
+                int(final_stats.get("speed", 0)),
+                new_ability or None,
+                json.dumps(move_list, ensure_ascii=False),
+                json.dumps(base_pps, ensure_ascii=False),
+                None,
+                owner_id,
+                mon_db_id,
+            ),
+        )
+        await conn.commit()
+        db.invalidate_pokemons_cache(owner_id)
+        return True
+
+
+def _mon_to_long_stats(short: dict) -> dict:
+    """Convert pvp Mon short stat keys (hp, atk, def, spa, spd, spe) to long keys for calc_all_stats."""
+    return {
+        "hp": int(short.get("hp", 0)),
+        "attack": int(short.get("atk", short.get("attack", 0))),
+        "defense": int(short.get("def", short.get("defense", 0))),
+        "special_attack": int(short.get("spa", short.get("special_attack", 0))),
+        "special_defense": int(short.get("spd", short.get("special_defense", 0))),
+        "speed": int(short.get("spe", short.get("speed", 0))),
+    }
+
+
+async def _add_caught_wild_to_team(owner_id: str, mon: "Mon") -> Optional[int]:
+    """Create a pokemon row from a caught wild Mon and assign next free team slot. Returns mon_id or None."""
+    try:
+        base_long = _mon_to_long_stats(getattr(mon, "base", {}) or {})
+        ivs_long = _mon_to_long_stats(getattr(mon, "ivs", {}) or {})
+        evs_long = _mon_to_long_stats(getattr(mon, "evs", {}) or {})
+        level = int(getattr(mon, "level", 5))
+        nature = (getattr(mon, "nature", None) or "hardy").strip() or "hardy"
+        ability = (getattr(mon, "ability", None) or "").strip() or None
+        gender = (getattr(mon, "gender", None) or "").strip() or None
+        species = (getattr(mon, "species", None) or "").strip()
+        if not species:
+            return None
+        final_stats = calc_all_stats(base_long, ivs_long, evs_long, level, nature)
+        mon_id = await db.add_pokemon_with_stats(
+            owner_id=owner_id,
+            species=species,
+            level=level,
+            final_stats=final_stats,
+            ivs=ivs_long,
+            evs=evs_long,
+            nature=nature,
+            ability=ability or "Unknown",
+            gender=gender or "genderless",
+            form=getattr(mon, "form", None),
+            can_gigantamax=bool(getattr(mon, "can_gigantamax", False)),
+            tera_type=getattr(mon, "tera_type", None),
+        )
+        async with db.session() as conn:
+            exp_group = await _get_exp_group_for_species(conn, species)
+            initial_exp = await _get_exp_total_for_level(conn, exp_group, level)
+            await conn.execute(
+                "UPDATE pokemons SET exp=?, exp_group=?, hp_now=? WHERE owner_id=? AND id=?",
+                (initial_exp, exp_group, int(getattr(mon, "hp", mon.max_hp or 1)), owner_id, mon_id),
+            )
+            if getattr(mon, "shiny", False):
+                await conn.execute("UPDATE pokemons SET shiny=1 WHERE owner_id=? AND id=?", (owner_id, mon_id))
+            await conn.commit()
+            db.invalidate_pokemons_cache(owner_id)
+        moves = list(getattr(mon, "moves", []) or [])[:4]
+        if moves:
+            await db.set_pokemon_moves(owner_id, mon_id, moves)
+        slot = await db.next_free_team_slot(owner_id)
+        if slot is not None:
+            await db.set_team_slot(owner_id, mon_id, slot)
+        return mon_id
+    except Exception as e:
+        print(f"[PvP] Error adding caught wild to team: {e}")
+        return None
+
+
+async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list["Mon"], *, force_per_faint: bool = False) -> Tuple[List[Tuple[int, "Mon", int]], List[Tuple["Mon", int, int, int]], List[Tuple["Mon", dict]]]:
+    """Distribute XP and EVs to the winner's party. Returns (level_ups, exp_summary, ev_summary). When force_per_faint is True, award for a single fainted foe even if battle not yet over (per-faint EXP)."""
+    empty: Tuple[List[Tuple[int, "Mon", int]], List[Tuple["Mon", int, int, int]], List[Tuple["Mon", dict]]] = ([], [], [])
+    if not defeated:
+        return empty
+    if not force_per_faint and st.winner != winner_id:
+        return empty
+
+    party = st.team_for(winner_id)
+    participants = st.p1_participants if winner_id == st.p1_id else st.p2_participants
+    exp_share_on = EXP_SHARE_ALWAYS_ON
+    party_recipients = []
+    for m in party:
+        if not m or m.hp <= 0:
+            continue
+        key = getattr(m, "_db_id", None) or m.species
+        if exp_share_on or key in participants:
+            party_recipients.append(m)
+    db_ids = [getattr(m, "_db_id", None) for m in party_recipients if getattr(m, "_db_id", None) is not None]
+    if not db_ids:
+        return empty
+
+    # Total EV yield from all defeated foes (for wild EV farming)
+    total_ev_yield = {k: 0 for k in _STAT_KEYS_SHORT}
+    for foe in defeated:
+        yield_one = _get_ev_yield_for_species(getattr(foe, "species", "") or "")
+        for k in _STAT_KEYS_SHORT:
+            total_ev_yield[k] = total_ev_yield.get(k, 0) + yield_one.get(k, 0)
+    has_ev_yield = any(total_ev_yield.get(k, 0) > 0 for k in _STAT_KEYS_SHORT)
+
+    async with db.session() as conn:
+        placeholders = ",".join("?" for _ in db_ids)
+        cur = await conn.execute(
+            f"SELECT id, exp, exp_group, evs FROM pokemons WHERE id IN ({placeholders})",
+            tuple(db_ids),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        # Use int(id) as key so lookup matches mid regardless of DB driver type (int/str/bigint)
+        exp_map = {int(r["id"]): (int(r["exp"] or 0), r["exp_group"] or "medium_fast", r.get("evs")) for r in rows}
+
+        level_ups: List[Tuple[int, "Mon", int]] = []
+        exp_summary: List[Tuple["Mon", int, int, int]] = []
+        ev_summary: List[Tuple["Mon", dict]] = []
+
+        def gain_for(mon_level: int, foe_level: int, base_exp: int, gen: int, trainer_bonus: bool, outsider: bool, lucky_egg: bool, affection_boost: bool, split: int) -> int:
+            if gen <= 4:
+                base = (base_exp * foe_level) // 7
+            else:
+                ratio = ((2 * foe_level + 10) ** 2) / ((foe_level + mon_level + 10) ** 2)
+                base = (base_exp * foe_level / 5) * ((ratio ** 1.5) + 1)
+            mult = 1.0
+            mult *= 1.15 if trainer_bonus else 1.0  # 15% more than wild
+            mult *= 1.5 if outsider else 1.0
+            mult *= 1.5 if lucky_egg else 1.0
+            mult *= 1.2 if affection_boost else 1.0
+            base = base / max(1, split)
+            return max(1, int(base * mult))
+
+        trainer_foe = not (str(st.p2_name).lower().startswith("wild "))
+        split = 1 if exp_share_on else max(
+            1,
+            len([m for m in party if (getattr(m, "_db_id", None) or m.species) in participants and m and m.hp > 0]),
+        )
+        for mon in party_recipients:
+            mid = getattr(mon, "_db_id", None)
+            if mid is None:
+                continue
+            cur_exp, eg, evs_raw = exp_map.get(int(mid), (0, "medium_fast", None))
+            total_gain = 0
+            outsider = str(getattr(mon, "_owner_id", winner_id)) != str(winner_id)
+            lucky_egg = (mon.item or "").lower().replace(" ", "-") == "lucky-egg"
+            affection_boost = getattr(mon, "friendship", 0) >= 220
+            for foe in defeated:
+                cur_dex = await conn.execute(
+                    "SELECT base_experience FROM pokedex WHERE LOWER(name)=LOWER(?) LIMIT 1",
+                    (foe.species,),
+                )
+                base_row = await cur_dex.fetchone()
+                await cur_dex.close()
+                base_exp = base_row["base_experience"] if base_row and base_row.get("base_experience") is not None else 50
+                total_gain += gain_for(mon.level, foe.level, base_exp, st.gen, trainer_foe, outsider, lucky_egg, affection_boost, split)
+
+            new_exp = cur_exp + total_gain
+            cur_old = await conn.execute(
+                "SELECT level FROM exp_requirements WHERE group_code = ? AND exp_total <= ? ORDER BY level DESC LIMIT 1",
+                (eg, cur_exp),
+            )
+            row_old = await cur_old.fetchone()
+            await cur_old.close()
+            old_level = int(row_old["level"]) if row_old and row_old.get("level") is not None else 1
+            cur_new = await conn.execute(
+                "SELECT level FROM exp_requirements WHERE group_code = ? AND exp_total <= ? ORDER BY level DESC LIMIT 1",
+                (eg, new_exp),
+            )
+            row_new = await cur_new.fetchone()
+            await cur_new.close()
+            raw_new_lvl = int(row_new["level"]) if row_new and row_new.get("level") is not None else 1
+            # Never decrease level (e.g. if cur_exp was wrong/missing) or exceed 100
+            new_lvl = min(100, max(mon.level, raw_new_lvl))
+            # If we clamped level up, ensure exp is at least the exp for that level (keep DB consistent)
+            if new_lvl > raw_new_lvl:
+                min_exp = await _get_exp_total_for_level(conn, eg, new_lvl)
+                if min_exp is not None and new_exp < min_exp:
+                    new_exp = min_exp
+            await conn.execute("UPDATE pokemons SET exp=?, level=? WHERE id=?", (new_exp, new_lvl, mid))
+            exp_summary.append((mon, total_gain, old_level, new_lvl))
+            if new_lvl > old_level:
+                level_ups.append((mid, mon, new_lvl))
+            # Award EVs from defeated foes (wild EV farming)
+            if has_ev_yield:
+                current_evs = _normalize_ivs_evs(evs_raw, default_val=0)
+                new_evs = _cap_evs({k: current_evs[k] + total_ev_yield.get(k, 0) for k in _STAT_KEYS_SHORT})
+                ev_gains = {k: new_evs[k] - current_evs[k] for k in _STAT_KEYS_SHORT if new_evs[k] - current_evs[k] > 0}
+                if ev_gains:
+                    await conn.execute("UPDATE pokemons SET evs=? WHERE id=?", (json.dumps(new_evs, ensure_ascii=False), mid))
+                    ev_summary.append((mon, ev_gains))
+        await conn.commit()
+        db.invalidate_pokemons_cache(str(winner_id))
+        return (level_ups, exp_summary, ev_summary)
+
+
+async def _get_level_up_moves_at_level(conn, species_name: str, level: int, gen: int) -> List[str]:
+    """Return move names (display format) learned at exactly this level for the species (level-up, generation)."""
+    try:
+        cur = await conn.execute("SELECT id FROM pokedex WHERE LOWER(name)=LOWER(?) LIMIT 1", (species_name,))
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return []
+        species_id = row["id"]
+        cur = await conn.execute(
+            """
+            SELECT m.name FROM learnsets l
+            JOIN moves m ON m.id = l.move_id
+            WHERE l.species_id=? AND l.generation=? AND l.method='level-up'
+              AND COALESCE(l.level_learned,0)=?
+            ORDER BY m.name
+            """,
+            (species_id, gen, level),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [(r["name"] or "").replace("-", " ").title() for r in rows if r.get("name")]
+    except Exception:
+        return []
+
+
+async def _award_money_after_battle(st: "BattleState", winner_id: int, defeated: list["Mon"]) -> int:
+    """Award prize money + move-based cash; participants only; win only."""
+    if st.winner != winner_id:
+        return 0
+
+    # Build participant set and team
+    participants = st.p1_participants if winner_id == st.p1_id else st.p2_participants
+    team = st.team_for(winner_id)
+    part_mons = [m for m in team if m and (getattr(m, "_db_id", None) or m.species) in participants]
+    if not part_mons:
+        return 0
+
+    # Base prize: trainer battles only
+    is_wild = str(st.p2_name).lower().startswith("wild ")
+    avg_foe_lvl = int(sum(getattr(f, "level", 1) for f in defeated) / max(1, len(defeated)))
+    base_prize = 0 if is_wild else max(100, avg_foe_lvl * 100)
+
+    # Move-based pool (Pay Day, Make It Rain, G-Max Gold Rush)
+    pool = 0
+    if hasattr(st, "money_pool"):
+        pool = st.money_pool.get(winner_id, 0)
+
+    # Multipliers
+    mult = 1.0
+    if hasattr(st, "happy_hour_used") and st.happy_hour_used.get(winner_id):
+        mult *= 2.0
+    # Amulet Coin / Luck Incense if any participant held it
+    has_money_item = any(
+        (getattr(m, "item", "") or "").lower().replace(" ", "-") in {"amulet-coin", "luck-incense"}
+        for m in part_mons
+    )
+    if has_money_item:
+        mult *= 2.0
+
+    total = int((base_prize + pool) * mult)
+    if total <= 0:
+        return 0
+
+    # Upsert coins (currencies JSON)
+    await db.add_currency(str(winner_id), "coins", total)
+    return total
+
+async def _heal_party(user_id: str) -> int:
+    healed = 0
+    user_gen = await _user_selected_gen(user_id)
+    async with db.session() as conn:
+        cur = await conn.execute(
+            "SELECT id, hp, moves FROM pokemons WHERE owner_id=? AND team_slot IS NOT NULL ORDER BY team_slot",
+            (user_id,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        for row in rows:
+            hp_max = int(row["hp"])
+            moves = []
+            try:
+                moves = json.loads(row["moves"]) if row.get("moves") else []
+            except Exception:
+                moves = []
+            max_pp = [_max_pp(m, generation=user_gen) for m in moves[:4]] if moves else []
+            await conn.execute(
+                "UPDATE pokemons SET hp_now=?, moves_pp=? WHERE id=?",
+                (hp_max, json.dumps(max_pp, ensure_ascii=False), int(row["id"])),
+            )
+            healed += 1
+        await conn.commit()
+        db.invalidate_pokemons_cache(user_id)
+    return healed
+
+# Sentinel: _start_pve_battle returns this when user is already in a battle (message already sent). Callers must not send "Couldn't start...".
+_PVE_ALREADY_IN_BATTLE = object()
+
+async def _start_pve_battle(
+    itx: discord.Interaction,
+    opponent_team: list["Mon"],
+    opponent_name: str,
+    *,
+    fmt_label: str = "Adventure",
+    trainer_challenge: Optional[str] = None,
+    trainer_quote: Optional[str] = None,
+    area_id: Optional[str] = None,
+    route_display_name: Optional[str] = None,
+) -> Optional[bool]:
+    from pvp.manager import get_manager
+    from pvp.panel import BattleState, _turn_loop
+    from pvp.engine import build_party_from_db
+
+    bm = get_manager()
+    # Older pvp manager versions don't have this helper
+    if hasattr(bm, 'clear_stale_for_user'):
+        bm.clear_stale_for_user(itx.user.id)  # auto-clear glitched "in battle" if room is old
+    if bm.for_user(itx.user.id):
+        await itx.followup.send("You're already in a battle.", ephemeral=False)
+        return _PVE_ALREADY_IN_BATTLE  # type: ignore[return-value]
+
+    # Create dummy opponent ID
+    dummy_opponent_id = -itx.user.id - 1
+    room = bm.add(
+        guild_id=itx.guild_id,
+        channel_id=itx.channel_id,
+        challenger_id=itx.user.id,
+        opponent_id=dummy_opponent_id,
+        ranked=False,
+        fmt_key="adventure",
+    )
+
+    p1_party = await build_party_from_db(itx.user.id, set_level=None, heal=False)
+    if not p1_party:
+        await itx.followup.send("Could not load your team.", ephemeral=False)
+        bm.remove(room)
+        return None
+
+    p1_name = itx.user.display_name if hasattr(itx.user, "display_name") else itx.user.name
+    p2_name = opponent_name
+    generation = await _user_selected_gen(str(itx.user.id))
+    st = BattleState(fmt_label, generation, itx.user.id, dummy_opponent_id, p1_party, opponent_team, p1_name, p2_name, p1_is_bot=False, p2_is_bot=True, is_dummy_battle=False)
+    if trainer_challenge is not None:
+        st.trainer_challenge = trainer_challenge
+    if trainer_quote is not None:
+        st.trainer_quote = trainer_quote
+    if area_id is not None:
+        st.adventure_area_id = area_id
+    if route_display_name is not None:
+        st.adventure_route_display_name = route_display_name
+    st._bag_embed_builder = lambda p=1: _build_bag_embed_for_battle(itx.user.id, p)
+    # Per-faint EXP: award EXP after each opponent Pokémon that faints (not only at battle end)
+    st._exp_award_pending = []
+    st._exp_level_ups = []
+    st._exp_summary = []
+    st._exp_ev_summary = []
+
+    async def _on_opponent_faint(_st: "BattleState", fainted_mon: "Mon") -> None:
+        lu, es, evs = await _award_exp_to_party(_st, itx.user.id, [fainted_mon], force_per_faint=True)
+        _st._exp_level_ups.extend(lu)
+        _st._exp_summary.extend(es)
+        _st._exp_ev_summary.extend(evs)
+        # Update in-memory level so subsequent EXP calculations use correct level
+        for mid, mon, new_lvl in lu:
+            for m in _st.p1_team or []:
+                if getattr(m, "_db_id", None) == mid:
+                    m.level = new_lvl
+                    break
+
+    st._award_exp_on_faint_callback = _on_opponent_faint
+    # Seed battle-state with dex/repeat info for capture logic
+    try:
+        seen_list = await pokedex_seen_species(str(itx.user.id))
+        summary = await pokedex_summary(str(itx.user.id))
+        st.repeat_seen = seen_list
+        st.dex_seen = summary.get("seen", 0)
+    except Exception:
+        st.repeat_seen = []
+        st.dex_seen = 0
+
+    await _load_pp_from_db(st, itx.user.id)
+
+    class DummyInteraction:
+        def __init__(self, user_id):
+            self.user = type("User", (), {"id": user_id, "display_name": p2_name, "name": p2_name})()
+            self.channel = itx.channel
+            self.guild_id = itx.guild_id
+            class MockFollowup:
+                async def send(self, *args, **kwargs):
+                    return None
+            self._followup = MockFollowup()
+
+        @property
+        def followup(self):
+            return self._followup
+
+    p2_itx = DummyInteraction(dummy_opponent_id)
+
+    # For Adventure trainer/rival battles: award (or deduct) money before end embed so it shows in the same message
+    TRAINER_LOSS_PKC = 300
+
+    async def _award_and_set_money(st):
+        if st.winner != st.p1_id and st.winner != st.p2_id:
+            return
+        winner_id = st.p1_id if st.winner == st.p1_id else st.p2_id
+        defeated = st.p2_team if st.winner == st.p1_id else st.p1_team
+        gained = await _award_money_after_battle(st, winner_id, defeated)
+        st._money_earned = gained if winner_id == st.p1_id else 0
+        if st.winner == st.p2_id:
+            # Only deduct coins when losing to a trainer, not to wild Pokémon
+            is_trainer_battle = not (str(st.p2_name or "").lower().startswith("wild "))
+            if is_trainer_battle:
+                st._money_lost = TRAINER_LOSS_PKC
+                async with db.session() as conn:
+                    await conn.execute(
+                        "UPDATE users SET currencies = jsonb_set(COALESCE(NULLIF(currencies::text, 'null')::jsonb, '{}'::jsonb), '{coins}', to_jsonb(GREATEST(0, COALESCE((currencies->>'coins')::int, 0) - ?))) WHERE user_id = ?",
+                        (TRAINER_LOSS_PKC, str(itx.user.id)),
+                    )
+                    await conn.commit()
+            else:
+                st._money_lost = 0
+        else:
+            st._money_lost = 0
+
+    try:
+        # Store battle state on room so /refresh can re-send battle panel
+        room.battle_state = st
+        # Callback so panel can set last-panel when it sends battle UI (for /refresh = re-send latest panel)
+        def _set_last_panel(uid: str, panel_type: str, data: dict) -> None:
+            LAST_PANEL_BY_USER[uid] = {"type": panel_type, "data": data}
+        st._set_last_panel = _set_last_panel
+        # Only pass award_money_callback if this panel version supports it (avoids TypeError on older panel)
+        kwargs = {"room_id": room.id}
+        if "award_money_callback" in inspect.signature(_turn_loop).parameters:
+            kwargs["award_money_callback"] = _award_and_set_money if fmt_label.lower().startswith("adventure") or fmt_label.lower() == "rival" else None
+        if "cancel_previous_panel" in inspect.signature(_turn_loop).parameters:
+            kwargs["cancel_previous_panel"] = lambda uid: _cancel_previous_panel_for_user(itx.client, uid)
+        await _turn_loop(st, itx, p2_itx, **kwargs)
+    finally:
+        await _save_party_state_from_battle(st, itx.user.id)
+        level_ups: List[Tuple[int, "Mon", int]] = []
+        exp_summary: List[Tuple["Mon", int, int, int]] = []
+        ev_summary: List[Tuple["Mon", dict]] = []
+        try:
+            # Use per-faint EXP results if we awarded after each opponent KO; otherwise award once at end
+            if getattr(st, "_exp_summary", None):
+                level_ups = getattr(st, "_exp_level_ups", []) or []
+                exp_summary = getattr(st, "_exp_summary", []) or []
+                ev_summary = getattr(st, "_exp_ev_summary", []) or []
+            else:
+                level_ups, exp_summary, ev_summary = await _award_exp_to_party(st, itx.user.id, opponent_team)
+        except Exception:
+            pass
+        # Adventure (wild or trainer/rival): send one combined embed (battle ended + outcome + last turn + EXP/level-ups + money)
+        # Skip when player ran away — they already got "You got away safely!" from the panel
+        is_adventure = fmt_label.lower().startswith("adventure") or fmt_label.lower() == "rival"
+        is_adventure_wild = is_adventure and (st.p2_name or "").lower().startswith("wild ")
+        p1_ran_away = getattr(st, "_p1_ran_away", False)
+        if is_adventure and not p1_ran_away:
+            opp_name = (st.p2_name or "").replace("Wild ", "").strip() or ("Wild Pokémon" if is_adventure_wild else "Trainer")
+            opp_level = 0
+            try:
+                if st.p2_team and len(st.p2_team) > 0:
+                    opp_mon = st.p2_team[getattr(st, "p2_active", 0)] if getattr(st, "p2_active", 0) < len(st.p2_team) else st.p2_team[0]
+                    opp_level = getattr(opp_mon, "level", 0) or 0
+            except Exception:
+                pass
+            route_name = getattr(st, "adventure_route_display_name", None) or getattr(st, "fmt_label", None) or "Adventure"
+            user_tag = f"{itx.user.name}#{getattr(itx.user, 'discriminator', '0')}"
+            ts = datetime.utcnow().strftime("%d %B %Y - %I:%M:%S %p UTC")
+            last_log = list(getattr(st, "_last_turn_log", []) or [])
+            # Shake-by-shake embeds when a ball was thrown (wild only)
+            if is_adventure_wild:
+                throw_shakes = getattr(st, "_throw_shakes", 0) or 0
+                if throw_shakes > 0 and last_log and any("threw a" in line and "shook" in line for line in last_log):
+                    for i in range(1, throw_shakes + 1):
+                        try:
+                            shake_emb = discord.Embed(description=f"Shake {i}!", color=0x5865F2)
+                            await itx.followup.send(embed=shake_emb, ephemeral=False)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1.5)
+            # Outcome
+            caught_this_turn = any("and **caught" in line for line in last_log) if is_adventure_wild else False
+            if st.winner == itx.user.id:
+                outcome_desc = "" if (is_adventure_wild and caught_this_turn) else (
+                    f"**{st.p1_name}** won the battle! You've won the wild battle against a Lv. {opp_level} {opp_name} :)" if is_adventure_wild
+                    else f"You've won the battle against {st.p2_name}."
+                )
+            elif st.winner == st.p2_id:
+                outcome_desc = f"You've lost the wild battle against a Lv. {opp_level} {opp_name} :)" if is_adventure_wild else f"You've lost the battle against {st.p2_name}."
+            else:
+                outcome_desc = "The battle ended in a draw."
+            title = "Wild battle has ended!" if is_adventure_wild else f"{st.p2_name} battle ended!"
+            emb = discord.Embed(title=title, description="", color=0x5865F2)
+            emb.set_footer(text=f"{user_tag} | {route_name} | {ts}")
+            # Order: 1) last turn (no title), 2) victory/loss message (if any), 3) EXP etc
+            if last_log:
+                emb.add_field(name="", value="\n".join(last_log), inline=False)
+            if outcome_desc:
+                emb.add_field(name="", value=outcome_desc, inline=False)
+            # Money earned/lost
+            money_earned = getattr(st, "_money_earned", None)
+            money_lost = getattr(st, "_money_lost", None)
+            if money_earned is not None and money_earned > 0:
+                emb.add_field(name="", value=f"You earned {money_earned:,} PokéDollars.", inline=False)
+            if money_lost is not None and money_lost > 0:
+                emb.add_field(name="", value=f"You lost {money_lost:,} PokéDollars.", inline=False)
+            # EXP & level-ups (only when player won)
+            if st.winner == itx.user.id and exp_summary:
+                lines: List[str] = []
+                new_moves_all: List[str] = []
+                async with db.session() as conn:
+                    for mon, exp_gain, old_lvl, new_lvl in exp_summary:
+                        name = (mon.species or "Pokémon").replace("-", " ").title()
+                        if new_lvl > old_lvl:
+                            lines.append(f"**{name}** gained **{exp_gain}** EXP and grew to level **{new_lvl}**.")
+                        else:
+                            lines.append(f"**{name}** gained **{exp_gain}** EXP!")
+                    for mid, mon, new_lvl in level_ups:
+                        moves_at_lvl = await _get_level_up_moves_at_level(conn, mon.species or "", new_lvl, st.gen)
+                        if moves_at_lvl:
+                            name = (mon.species or "Pokémon").replace("-", " ").title()
+                            new_moves_all.append(f"**{name}** can now learn {', '.join(moves_at_lvl)}.")
+                if lines:
+                    emb.add_field(name="", value="\n".join(lines), inline=False)
+                    if new_moves_all:
+                        emb.add_field(name="", value="\n".join(new_moves_all), inline=False)
+            # EV gains (wild and trainer battles)
+            if st.winner == itx.user.id and ev_summary:
+                _EV_STAT_DISPLAY = {"hp": "HP", "atk": "Atk", "defn": "Def", "spa": "SpA", "spd": "SpD", "spe": "Spe"}
+                ev_lines: List[str] = []
+                for mon, ev_gains in ev_summary:
+                    name = (mon.species or "Pokémon").replace("-", " ").title()
+                    parts = [f"{_EV_STAT_DISPLAY.get(k, k)} +{v}" for k, v in ev_gains.items()]
+                    ev_lines.append(f"**{name}** gained EVs: {', '.join(parts)}.")
+                if ev_lines:
+                    emb.add_field(name="", value="\n".join(ev_lines), inline=False)
+            # Rare drop: TM Fragment (rolled for every adventure wild win: grass path + /route)
+            if is_adventure_wild and st.winner == itx.user.id and random.random() < TM_FRAGMENT_DROP_CHANCE:
+                try:
+                    await db.upsert_item_master(TM_FRAGMENT_ITEM_ID, name="TM Fragment")
+                    await db.give_item(str(itx.user.id), TM_FRAGMENT_ITEM_ID, 1)
+                    emb.add_field(name="", value="You found a **TM Fragment** on the ground!", inline=False)
+                except Exception:
+                    pass
+            try:
+                await itx.followup.send(embed=emb, ephemeral=False)
+            except Exception:
+                pass
+            # Add caught wild Pokémon to the player's team (wild only)
+            if is_adventure_wild:
+                caught_mon = getattr(st, "_caught_wild_mon", None)
+                if caught_mon is not None and st.winner == itx.user.id:
+                    try:
+                        await _add_caught_wild_to_team(str(itx.user.id), caught_mon)
+                    except Exception as e:
+                        print(f"[PvP] Error adding caught wild to team: {e}")
+        # Evolution prompts: only if player won; Everstone blocks level-up evolution
+        if st.winner == itx.user.id and level_ups:
+            pending_evos: List[Tuple[int, "Mon", str, int]] = []
+            async with db.session() as conn:
+                for mid, mon, new_lvl in level_ups:
+                    held = (mon.item or "").strip().lower().replace(" ", "-")
+                    if held == "everstone":
+                        continue
+                    evo_name = await _get_level_up_evolution(conn, mon.species, new_lvl)
+                    if evo_name:
+                        pending_evos.append((mid, mon, evo_name, new_lvl))
+            for mid, mon, evo_name, new_lvl in pending_evos:
+                cur_name = (mon.species or "").replace("-", " ").title()
+                evo_display = evo_name.replace("-", " ").title()
+                emb = discord.Embed(
+                    title="A Pokémon is evolving!",
+                    description=f"What? **{cur_name}** is evolving into ... **{evo_display}**!\n\nDo you want to evolve it?",
+                    color=0x9B59B6,
+                )
+                emb.set_footer(text="Please click Yes or No first.")
+                view = EvolutionConfirmView(itx.user.id, str(itx.user.id), mid, mon.species, evo_name, new_lvl)
+                try:
+                    await itx.followup.send(embed=emb, view=view)
+                except Exception:
+                    pass
+        # For non-Adventure/Rival, award money here and send followup; Adventure/Rival already did it in callback (shown in end embed)
+        if not (fmt_label.lower().startswith("adventure") or fmt_label.lower() == "rival"):
+            try:
+                gained = await _award_money_after_battle(st, itx.user.id, opponent_team)
+                if gained > 0:
+                    await itx.followup.send(f"💰 You earned {gained:,} {PKDollar_NAME}.", ephemeral=False)
+            except Exception:
+                pass
+        # If player blacked out (all team fainted), send them back to last city and heal (or on route-22 rival loss, rival heals and stay)
+        if fmt_label == "Adventure" or fmt_label == "Rival":
+            try:
+                player_fainted = all(mon.hp <= 0 for mon in st.p1_team if mon)
+            except Exception:
+                player_fainted = False
+            if player_fainted:
+                state = await _get_adventure_state(str(itx.user.id))
+                adv_area = getattr(st, "adventure_area_id", None)
+                if adv_area == "route-22" and fmt_label == "Rival":
+                    # Rival heals the user; stay on route-22. Panel is sent by _run_rival_battle with "Rival Wins!" and updated state.
+                    await _heal_party(str(itx.user.id))
+                else:
+                    fallback_city = state.get("last_city") or "pallet-town"
+                    state["area_id"] = fallback_city
+                    await _save_adventure_state(str(itx.user.id), state)
+                    await _heal_party(str(itx.user.id))
+                    try:
+                        await _send_adventure_panel(itx, state, edit_original=False)
+                    except Exception:
+                        pass
+        # After any adventure/rival battle, send the adventure panel so the user always returns to the map
+        if fmt_label == "Adventure" or fmt_label == "Rival":
+            try:
+                state = await _get_adventure_state(str(itx.user.id))
+                await _send_adventure_panel(itx, state, edit_original=False)
+            except Exception:
+                pass
+
+    return st.winner == st.p1_id
+
+async def _run_rival_battle(itx: discord.Interaction, area_id: str, state: dict) -> bool:
+    rival_id = ADVENTURE_CITIES.get(area_id, {}).get("rival_battle") or ADVENTURE_ROUTES.get(area_id, {}).get("rival_battle")
+    if not rival_id or rival_id not in RIVAL_BATTLES:
+        return None
+    if rival_id in state.get("rival_defeated", []):
+        return False
+    rival_def = RIVAL_BATTLES[rival_id]
+    rival_name = rival_def.get("name", "Rival")
+    team = []
+    # When teams_by_starter is defined, rival always uses starter-dependent team
+    team_entries = None
+    if rival_def.get("teams_by_starter"):
+        user = await db.get_user(str(itx.user.id))
+        starter = (user.get("starter") if isinstance(user, dict) else user["starter"]) if user else ""
+        starter_key = (starter or "").strip().lower().replace(" ", "-")
+        teams_by = rival_def["teams_by_starter"]
+        team_entries = teams_by.get(starter_key) or teams_by.get("pikachu") or teams_by.get("charmander") or teams_by.get("squirtle") or teams_by.get("bulbasaur") or (list(teams_by.values())[0] if teams_by else None)
+    if not team_entries:
+        team_entries = rival_def.get("team")
+    if team_entries:
+        for m in team_entries:
+            mon = await _build_mon_from_team_entry(m)
+            if mon:
+                team.append(mon)
+    if not team:
+        user = await db.get_user(str(itx.user.id))
+        starter = (user.get("starter") if isinstance(user, dict) else user["starter"]) if user else ""
+        rival_starter = _pick_rival_starter(starter)
+        rival_mon = await _build_mon_from_species(rival_starter, rival_def.get("level", 5))
+        if rival_mon:
+            team = [rival_mon]
+    if not team:
+        await itx.followup.send("Rival team failed to load.", ephemeral=False)
+        return False
+
+    route_def = ADVENTURE_ROUTES.get(area_id, {}) if area_id in ADVENTURE_ROUTES else {}
+    route_display_name = route_def.get("name", area_id.replace("-", " ").title()) if route_def else "Route"
+    won = await _start_pve_battle(
+        itx, team, rival_name,
+        fmt_label="Rival",
+        area_id=area_id,
+        route_display_name=route_display_name,
+    )
+    if won is None:
+        return False
+    state.setdefault("rival_defeated", []).append(rival_id)
+    if _is_city(area_id) and area_id not in state.get("cleared_cities", []):
+        state.setdefault("cleared_cities", []).append(area_id)
+    elif area_id in ADVENTURE_ROUTES and area_id != "route-22" and area_id not in state.get("cleared_routes", []):
+        # route-22 is only "cleared" when the path-1 trainer is defeated, not when rival is defeated
+        state.setdefault("cleared_routes", []).append(area_id)
+    await _save_adventure_state(str(itx.user.id), state)
+
+    if won:
+        lines = [
+            "**Blue:** WHAT? Unbelievable! I picked the wrong Pokémon!",
+            f"**Blue:** Okay! I'll make my Pokémon fight to toughen it up! {itx.user.display_name if hasattr(itx.user, 'display_name') else itx.user.name}! Gramps! Smell you later!",
+        ]
+        title = "Rival Defeated!"
+        result_emb = _adventure_help_embed(title, "\n".join(lines))
+        await itx.followup.send(embed=result_emb, ephemeral=False)
+    else:
+        # Only show "Rival Wins!" / Blue taunt for the first ever rival battle (rival-1)
+        if rival_id == "rival-1":
+            lines = ["**Blue:** Yeah! Am I great or what?"]
+            title = "Rival Wins!"
+            result_emb = _adventure_help_embed(title, "\n".join(lines))
+            await itx.followup.send(embed=result_emb, ephemeral=False)
+    await _send_adventure_panel(itx, state, edit_original=False)
+    return won
+
+class TMSellerView(discord.ui.View):
+    """TM Seller (Surf easter egg): sell Gen 1 TMs for coins. TMs are consumable."""
+    def __init__(self, author_id: int, user_id: str):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.user_id = user_id
+        self._handled = False
+        options = []
+        for item_id, move_name in TM_SELLER_ITEMS:
+            num = item_id.replace("tm-", "").zfill(2)
+            options.append(discord.SelectOption(label=f"TM{num} {move_name}", value=item_id, description=f"{TM_SELLER_PRICE} coins"))
+        sel = discord.ui.Select(placeholder="Choose a TM to buy (single-use)", options=options, custom_id="tmseller:buy")
+        sel.callback = self._on_select
+        self.add_item(sel)
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return itx.user.id == self.author_id
+
+    async def _on_select(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if self._handled:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        values = getattr(itx.data, "values", None) or []
+        if not values:
+            return await itx.response.send_message("Pick a TM.", ephemeral=True)
+        item_id = values[0]
+        entry = next((e for e in TM_SELLER_ITEMS if e[0] == item_id), None)
+        if not entry:
+            return await itx.response.send_message("Invalid TM.", ephemeral=True)
+        await itx.response.defer(ephemeral=True, thinking=False)
+        coins = await db.get_currency(self.user_id, "coins")
+        if coins < TM_SELLER_PRICE:
+            await itx.followup.send(f"Not enough coins. You need **{TM_SELLER_PRICE}** coins; you have **{coins}**.", ephemeral=False)
+            return
+        await db.add_currency(self.user_id, "coins", -TM_SELLER_PRICE)
+        await db.upsert_item_master(item_id, name=f"TM{item_id.replace('tm-', '').zfill(2)} {entry[1]}")
+        await db.give_item(self.user_id, item_id, 1)
+        self._handled = True
+        await itx.followup.send(
+            f"You bought **TM{item_id.replace('tm-', '').zfill(2)} {entry[1]}**! It was added to your TM Machine.\n\n"
+            "*\"Your Pokémon is now as strong as ever! Sadly I lost a few TMs during my journey. Hopefully you can find them in the wild!\"* — TM Seller",
+            ephemeral=True,
+        )
+
+class AdventureCityView(discord.ui.View):
+    def __init__(self, author_id: int, area_id: str, state: dict, *, has_surf: bool = False):
+        super().__init__(timeout=180)
+        self.author_id = author_id
+        self.area_id = area_id
+        self.state = state
+        self.has_surf = has_surf
+        self._handled = False
+        self._last_handled_id: str | None = None
+        self._last_handled_ts: float = 0.0
+        self._build_buttons()
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return itx.user.id == self.author_id
+
+    def _build_buttons(self):
+        city = ADVENTURE_CITIES.get(self.area_id, {})
+        if city.get("heal"):
+            heal_btn = discord.ui.Button(label="Heal", style=discord.ButtonStyle.success, custom_id="adv:heal")
+            heal_btn.callback = self._on_heal
+            self.add_item(heal_btn)
+        cleared = _city_is_cleared(self.state, self.area_id)
+        routes = city.get("routes")
+        if routes and isinstance(routes, (list, tuple)):
+            for route_id in routes:
+                route_def = ADVENTURE_ROUTES.get(route_id, {})
+                label = route_def.get("name", route_id.replace("-", " ").title())
+                next_btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary, custom_id=f"adv:next:{route_id}")
+                next_btn.callback = self._on_next
+                self.add_item(next_btn)
+        else:
+            next_id = city.get("next")
+            if next_id and cleared:
+                next_btn = discord.ui.Button(label="Next", style=discord.ButtonStyle.primary, custom_id=f"adv:next:{next_id}")
+                next_btn.callback = self._on_next
+                self.add_item(next_btn)
+        if city.get("gym_leader") and not city.get("gym_closed"):
+            gym_btn = discord.ui.Button(label="Gym Challenge", style=discord.ButtonStyle.danger, custom_id=f"adv:gym:{self.area_id}")
+            gym_btn.callback = self._on_gym
+            self.add_item(gym_btn)
+        rival_id = city.get("rival_battle")
+        if rival_id and rival_id not in self.state.get("rival_defeated", []):
+            rival_btn = discord.ui.Button(label="Rival Battle", style=discord.ButtonStyle.danger, custom_id=f"adv:rival:{rival_id}")
+            rival_btn.callback = self._on_rival
+            self.add_item(rival_btn)
+        if self.has_surf:
+            surf_btn = discord.ui.Button(label="Surf", style=discord.ButtonStyle.secondary, custom_id="adv:surf")
+            surf_btn.callback = self._on_surf
+            self.add_item(surf_btn)
+        if self.state.get("area_history"):
+            back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, custom_id="adv:back")
+            back_btn.callback = self._on_back
+            self.add_item(back_btn)
+
+    async def _on_heal(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.5:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        await itx.response.defer(ephemeral=True, thinking=False)
+        healed = await _heal_party(str(itx.user.id))
+        await itx.followup.send(f"✅ Healed your team ({healed} Pokémon).", ephemeral=True)
+
+    async def _on_next(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.5:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        await itx.response.defer(ephemeral=True, thinking=False)
+        state = await _get_adventure_state(str(itx.user.id))
+        _, next_id = itx.data["custom_id"].split("adv:next:", 1)
+        hist = state.get("area_history", [])
+        hist.append(state.get("area_id"))
+        state["area_history"] = hist[-15:]
+                # Reset Route 1 navigation whenever entering it so it always starts at Panel 1/start.
+        if next_id == "route-1":
+            rn = state.get("route_nav") or {}
+            rn["route-1"] = {"panel": 1, "pos": "start"}
+            state["route_nav"] = rn
+        state["area_id"] = next_id
+        await _save_adventure_state(str(itx.user.id), state)
+        await _send_adventure_panel(itx, state, edit_original=True)
+
+    async def _on_rival(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if self._handled:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        await itx.response.defer(ephemeral=True, thinking=False)
+        state = await _get_adventure_state(str(itx.user.id))
+        await _run_rival_battle(itx, self.area_id, state)
+
+    async def _on_gym(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        city = ADVENTURE_CITIES.get(self.area_id, {})
+        gym_team = city.get("gym_team")
+        if not gym_team or not isinstance(gym_team, (list, tuple)):
+            return await itx.response.send_message("The gym is closed.", ephemeral=True)
+        if self._handled:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        await itx.response.defer(ephemeral=True, thinking=False)
+        team = []
+        for m in gym_team:
+            mon = await _build_mon_from_team_entry(m)
+            if mon:
+                team.append(mon)
+        if not team:
+            return await itx.followup.send("Gym leader team failed to load.", ephemeral=False)
+        gym_name = city.get("gym_leader", "Gym Leader").replace("-", " ").title()
+        won = await _start_pve_battle(itx, team, gym_name)
+        if won is None:
+            return await itx.followup.send("Couldn't start the battle.", ephemeral=False)
+        if won:
+            state = await _get_adventure_state(str(itx.user.id))
+            badge = city.get("gym_badge")
+            if badge:
+                badges = state.get("gym_badges") or []
+                if badge not in badges:
+                    badges = list(badges) + [badge]
+                    state["gym_badges"] = badges
+            if self.area_id not in (state.get("cleared_cities") or []):
+                state.setdefault("cleared_cities", []).append(self.area_id)
+            await _save_adventure_state(str(itx.user.id), state)
+            await itx.followup.send(f"✅ You won the {gym_name} Gym and earned the badge!", ephemeral=False)
+        else:
+            await itx.followup.send("You lost. Try again when you're stronger!", ephemeral=False)
+
+    async def _on_surf(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if self._handled:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        await itx.response.defer(ephemeral=True, thinking=False)
+        uid = str(itx.user.id)
+        emb = discord.Embed(
+            title="TM Seller of Kanto",
+            description=(
+                "Hello young trainer! I am the TM Seller of Kanto. "
+                "Some techniques were entrusted to me by a certain yellow legend. "
+                "I sell Technical Machines — each TM is **single-use** (consumable). "
+                f"Each costs **{TM_SELLER_PRICE}** coins. Would you like to buy one?\n\n"
+                "Choose a TM below to purchase. You can check your TMs anytime with `/tm machine`."
+            ),
+            color=0x5865F2,
+        )
+        view = TMSellerView(itx.user.id, uid)
+        await itx.followup.send(embed=emb, view=view, ephemeral=False)
+        self._handled = True
+
+    async def _on_back(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.0:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        try:
+            await itx.response.defer(ephemeral=True, thinking=False)
+            state = await _get_adventure_state(str(itx.user.id))
+            hist = state.get("area_history") or []
+            if not hist:
+                return await itx.followup.send("No previous area.", ephemeral=False)
+            prev = hist.pop()
+            state["area_history"] = hist
+            state["area_id"] = prev or "pallet-town"
+            await _save_adventure_state(str(itx.user.id), state)
+            await _send_adventure_panel(itx, state, edit_original=True)
+        finally:
+            self._handled = False
+
+def _adventure_help_embed(title: str, description: str) -> discord.Embed:
+    emb = discord.Embed(title=title, description=description)
+    emb.add_field(
+        name="Adventure commands",
+        value="• `/adventure` — open your map and move between areas\n• `/refresh` — re-send the last panel the bot sent you (adventure or battle)\n• `/route <number>` — encounter a discovered Pokémon on a cleared route",
+        inline=False,
+    )
+    return emb
+
+class RivalIntroView(discord.ui.View):
+    def __init__(self, author_id: int, area_id: str = "pallet-town"):
+        super().__init__(timeout=180)
+        self.author_id = author_id
+        self.area_id = area_id
+        self._handled = False
+        self._last_handled_id: str | None = None
+        self._last_handled_ts: float = 0.0
+        yes_btn = discord.ui.Button(label="Ready to lose?", style=discord.ButtonStyle.success, custom_id="rival:yes")
+        no_btn = discord.ui.Button(label="Another time", style=discord.ButtonStyle.secondary, custom_id="rival:no")
+        yes_btn.callback = self._on_yes
+        no_btn.callback = self._on_no
+        self.add_item(yes_btn)
+        self.add_item(no_btn)
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return itx.user.id == self.author_id
+
+    async def _on_yes(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.5:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        # Defer immediately
+        if not itx.response.is_done():
+            try:
+                await itx.response.defer(ephemeral=True, thinking=False)
+            except Exception:
+                pass
+        try:
+            state = await _get_adventure_state(str(itx.user.id))
+            ok = await _run_rival_battle(itx, self.area_id, state)
+            if ok is None:
+                await itx.followup.send("Couldn't start the rival battle. Please try again in a moment.", ephemeral=False)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                await itx.followup.send(f"Rival battle failed: {type(e).__name__}: {e}", ephemeral=True)
+            except Exception:
+                pass
+        finally:
+            try:
+                for item in self.children:
+                    if hasattr(item, "disabled"):
+                        item.disabled = True
+                await itx.message.edit(view=self)
+            except Exception:
+                pass
+
+    async def _on_no(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.5:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        emb = _adventure_help_embed(
+            "Come back anytime",
+            "When you're ready to continue the story, open your adventure panel.",
+        )
+        await itx.response.edit_message(embed=emb, view=None)
+
+class AdventureRouteView(discord.ui.View):
+    def __init__(self, author_id: int, area_id: str, state: dict):
+        super().__init__(timeout=180)
+        self.author_id = author_id
+        self.area_id = area_id
+        self.state = state
+        self._handled = False
+        self._last_handled_id: str | None = None
+        self._last_handled_ts: float = 0.0
+        self._build_buttons()
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return itx.user.id == self.author_id
+
+    def _build_buttons(self):
+        route = ADVENTURE_ROUTES.get(self.area_id, {})
+        collectible = route.get("collectible_button")
+        collected = collectible and self.state.get(collectible.get("state_key"))
+
+        if not collected and collectible:
+            # Area with collectible (e.g. Pokéball on ground): show collect button only; no paths, no Next until collected
+            collect_btn = discord.ui.Button(
+                label=collectible.get("label", "Collect"),
+                style=discord.ButtonStyle.primary,
+                custom_id="adv:collect",
+            )
+            collect_btn.callback = self._on_collect
+            self.add_item(collect_btn)
+            # Next is hidden until collected; Back still available if history exists (added below)
+        else:
+            # Route 1 uses Forward/Back navigation instead of path selection
+            if self.area_id == "route-1":
+                back_btn = discord.ui.Button(label="⬇️", style=discord.ButtonStyle.secondary, custom_id="adv:r1:back")
+                back_btn.callback = self._on_back_route1
+                self.add_item(back_btn)
+
+                fwd_btn = discord.ui.Button(label="⬆️", style=discord.ButtonStyle.primary, custom_id="adv:r1:fwd")
+                fwd_btn.callback = self._on_forward_route1
+                self.add_item(fwd_btn)
+
+                force_btn = discord.ui.Button(label="⚔️ Battle", style=discord.ButtonStyle.danger, custom_id="adv:r1:force")
+                force_btn.callback = self._on_force_route1
+                self.add_item(force_btn)
+            else:
+                for path_id in sorted((route.get("grass_paths") or {}).keys()):
+                    btn = discord.ui.Button(label=str(path_id), style=discord.ButtonStyle.secondary, custom_id=f"adv:path:{path_id}")
+                    btn.callback = self._on_path
+                    self.add_item(btn)
+
+        next_id = route.get("next")
+        cleared = self.area_id in self.state.get("cleared_routes", [])
+        next_always = route.get("next_always", False)
+        next_blocker = route.get("next_blocker")
+        next_blocker_defeated = not next_blocker or next_blocker in self.state.get("defeated_trainers", {}) or route.get("next_show_when_path_blockers_only")
+        # When next_show_when_path_blockers_only: show Next as soon as path blockers (not next_blocker) are defeated
+        path_blockers_cleared = route.get("next_show_when_path_blockers_only") and _route_path_blockers_cleared(self.state, self.area_id)
+        # Don't show Next if there's an uncollected collectible (user must collect first)
+        show_next = next_id and (cleared or next_always or path_blockers_cleared) and next_blocker_defeated and (not collectible or collected)
+        if show_next:
+            next_label = "Next"
+            if _is_city(next_id):
+                next_label = ADVENTURE_CITIES.get(next_id, {}).get("name", next_id.replace("-", " ").title())
+            next_btn = discord.ui.Button(label=next_label, style=discord.ButtonStyle.primary, custom_id=f"adv:next:{next_id}")
+            next_btn.callback = self._on_next
+            self.add_item(next_btn)
+
+        # Optional rematch buttons (24h cooldown); skip if trainer has rematch: False
+        trainers = route.get("trainers") or {}
+        for tid, tdata in trainers.items():
+            if tdata.get("rematch", True) is False:
+                continue
+            last = self.state.get("defeated_trainers", {}).get(tid, 0)
+            if last:
+                label = f"Rematch: {tdata.get('name', 'Trainer')}"
+                btn = discord.ui.Button(label=label, style=discord.ButtonStyle.danger, custom_id=f"adv:rematch:{tid}")
+                btn.callback = self._on_rematch
+                self.add_item(btn)
+        # Back button if history exists or route always shows back (e.g. route-22)
+        if (self.state.get("area_history") or route.get("back_always")) and self.area_id != "route-1":
+            back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, custom_id="adv:back")
+            back_btn.callback = self._on_back
+            self.add_item(back_btn)
+
+    async def _on_next(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.5:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        try:
+            await itx.response.defer(ephemeral=True, thinking=False)
+            state = await _get_adventure_state(str(itx.user.id))
+            route = ADVENTURE_ROUTES.get(self.area_id, {})
+            rival_id = route.get("rival_battle")
+            if rival_id and rival_id not in state.get("rival_defeated", []):
+                user_name = itx.user.display_name if hasattr(itx.user, "display_name") else itx.user.name
+                if self.area_id == "route-22":
+                    challenge_emb, challenge_files = _embed_with_image(
+                        "WAIT!",
+                        f"**Rival:** {user_name}! Don't you dare walk away! I challenge you to a battle!",
+                        route.get("image_rival_arrived") or route.get("image_uncleared"),
+                    )
+                    challenge_emb.color = 0x5865F2
+                    await itx.followup.send(embed=challenge_emb, files=challenge_files or None, ephemeral=False)
+                else:
+                    challenge_emb = discord.Embed(
+                        title="Your rival appears!",
+                        description="**Rival:** Think you can get past me? Let's battle!",
+                        color=0x5865F2,
+                    )
+                    await itx.followup.send(embed=challenge_emb, ephemeral=False)
+                won = await _run_rival_battle(itx, self.area_id, state)
+                if won is None:
+                    return await itx.followup.send("Couldn't start the rival battle. Please try again.", ephemeral=False)
+                if not won:
+                    return
+                state = await _get_adventure_state(str(itx.user.id))
+            _, next_id = itx.data["custom_id"].split("adv:next:", 1)
+            # Require route to be cleared before going to next area (no skipping)
+            current_area = state.get("area_id") or self.area_id
+            route_def = ADVENTURE_ROUTES.get(current_area, {})
+            if current_area in ADVENTURE_ROUTES:
+                if not route_def.get("next_always"):
+                    cleared = current_area in state.get("cleared_routes", [])
+                    path_blockers_ok = route_def.get("next_show_when_path_blockers_only") and _route_path_blockers_cleared(state, current_area)
+                    if not cleared and not _route_is_cleared(state, current_area) and not path_blockers_ok:
+                        await itx.followup.send("Clear this route first before moving on.", ephemeral=False)
+                        return
+            # If route has next_trainer (e.g. viridian-forest-2): second trainer is only triggerable by clicking Next, not by blocking a path
+            next_trainer_id = route_def.get("next_trainer")
+            if next_trainer_id and next_trainer_id not in state.get("defeated_trainers", {}):
+                trainer = (route_def.get("trainers") or {}).get(next_trainer_id)
+                if trainer:
+                    trainer_name = trainer.get("name", "Trainer")
+                    blocker_quote = trainer.get("blocker_quote") or "You'll have to beat me first!"
+                    challenge_emb = discord.Embed(
+                        title="Before you go...",
+                        description=f"**{trainer_name}:** {blocker_quote}",
+                        color=0x5865F2,
+                    )
+                    await itx.followup.send(embed=challenge_emb, ephemeral=False)
+                    team = []
+                    for m in trainer.get("team", []):
+                        mon = await _build_mon_from_team_entry(m)
+                        if mon:
+                            team.append(mon)
+                    if not team:
+                        return await itx.followup.send("Trainer team failed to load.", ephemeral=False)
+                    won = await _start_pve_battle(itx, team, trainer_name)
+                    if won is None:
+                        return await itx.followup.send("Couldn't start the battle. Please try again.", ephemeral=False)
+                    if not won:
+                        return
+                    state.setdefault("defeated_trainers", {})[next_trainer_id] = int(time.time())
+                    if _route_is_cleared(state, current_area) and current_area not in state.get("cleared_routes", []):
+                        state.setdefault("cleared_routes", []).append(current_area)
+                    await _save_adventure_state(str(itx.user.id), state)
+                    state = await _get_adventure_state(str(itx.user.id))
+                    # Stay on current area and re-send panel so user can click Next again to advance
+                    await _send_adventure_panel(itx, state, edit_original=True)
+                    return
+            hist = state.get("area_history", [])
+            hist.append(state.get("area_id"))
+            state["area_history"] = hist[-15:]
+            state["area_id"] = next_id
+            await _save_adventure_state(str(itx.user.id), state)
+            await _send_adventure_panel(itx, state, edit_original=True)
+        finally:
+            self._handled = False
+
+    async def _on_back(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.0:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        try:
+            await itx.response.defer(ephemeral=True, thinking=False)
+            state = await _get_adventure_state(str(itx.user.id))
+            hist = state.get("area_history") or []
+            if not hist:
+                return await itx.followup.send("No previous area.", ephemeral=False)
+            prev = hist.pop()
+            state["area_history"] = hist
+            state["area_id"] = prev or "pallet-town"
+            await _save_adventure_state(str(itx.user.id), state)
+            await _send_adventure_panel(itx, state, edit_original=True)
+        finally:
+            self._handled = False
+
+
+    # ===== Route 1 3-panel navigation =====
+    def _r1_get(self, state: dict) -> dict:
+        rp = (state.setdefault("route_panels", {})).get(self.area_id)
+        if not isinstance(rp, dict):
+            rp = {"panel": 1}
+            state["route_panels"][self.area_id] = rp
+        try:
+            rp["panel"] = max(1, min(int(rp.get("panel", 1)), 3))
+        except Exception:
+            rp["panel"] = 1
+        return rp
+
+    def _r1_set(self, state: dict, panel: int) -> None:
+        state.setdefault("route_panels", {})[self.area_id] = {"panel": int(panel)}
+
+
+    async def _r1_try_wild_encounter(self, itx: discord.Interaction, state: dict, *, force: bool = False) -> None:
+        """Roll (or force) a wild encounter using Route 1 grass encounters."""
+        route = ADVENTURE_ROUTES.get(self.area_id, {})
+        # Default movement encounter chance; can be tuned via env var
+        try:
+            chance = float(os.environ.get("ROUTE_MOVE_ENCOUNTER_CHANCE", "0.35"))
+        except Exception:
+            chance = 0.35
+        if not force and random.random() > chance:
+            return
+
+        # Collect all encounter tables across grass_paths (ignoring blockers)
+        all_encounters = []
+        for p in (route.get("grass_paths") or {}).values():
+            enc = (p or {}).get("encounters") or []
+            all_encounters.extend(enc)
+
+        if not all_encounters:
+            return
+
+        # Weighted encounter selection (same logic as _on_path)
+        enc_specs = []
+        weights = []
+        version = "red"
+        for e in all_encounters:
+            if isinstance(e, str):
+                enc_specs.append({"species": e, "min_level": 3, "max_level": 3})
+                weights.append(1)
+            elif isinstance(e, dict):
+                ver = e.get("version")
+                if ver and ver.lower() not in str(version).lower():
+                    continue
+                enc_specs.append(
+                    {
+                        "species": e.get("species"),
+                        "min_level": int(e.get("min_level", 3)),
+                        "max_level": int(e.get("max_level", e.get("min_level", 3))),
+                    }
+                )
+                weights.append(int(e.get("weight", 1)))
+
+        if not enc_specs:
+            return
+
+        choice = random.choices(enc_specs, weights=weights, k=1)[0]
+        species = choice["species"]
+        # track seen species for Repeat Ball / dex counts
+        state.setdefault("repeat_seen", [])
+        if species and species.lower() not in [s.lower() for s in state["repeat_seen"]]:
+            state["repeat_seen"].append(species)
+            state["dex_seen"] = state.get("dex_seen", 0) + 1
+        try:
+            asyncio.create_task(pokedex_mark_seen(str(itx.user.id), species, caught=False))
+        except Exception:
+            pass
+
+        lvl = random.randint(choice["min_level"], choice["max_level"])
+        wild_mon = await _build_mon_from_species(species, level=lvl)
+        if not wild_mon:
+            return
+
+        route_display = route.get("name", self.area_id)
+        won = await _start_pve_battle(itx, [wild_mon], f"Wild {species.title()}", area_id=self.area_id, route_display_name=route_display)
+        if won is _PVE_ALREADY_IN_BATTLE:
+            return
+        if won is None:
+            return await itx.followup.send("Couldn't start the encounter battle. Please try again.", ephemeral=False)
+        if won:
+            _add_discovered(state, self.area_id, species)
+            try:
+                asyncio.create_task(pokedex_mark_seen(str(itx.user.id), species, caught=True))
+            except Exception:
+                pass
+
+    async def _on_back_route1(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not itx.response.is_done():
+            await itx.response.defer(ephemeral=False, thinking=False)
+
+        state = await _get_adventure_state(str(itx.user.id))
+        rp = self._r1_get(state)
+        panel = int(rp["panel"])
+
+        route = ADVENTURE_ROUTES.get(self.area_id, {})
+        prev_area = route.get("prev") or "pallet-town"
+
+        if panel > 1:
+            self._r1_set(state, panel - 1)
+            await self._r1_try_wild_encounter(itx, state, force=False)
+        else:
+            # leaving route backwards -> previous city
+            state["area_id"] = prev_area
+            state.get("route_panels", {}).pop(self.area_id, None)
+
+        await _save_adventure_state(str(itx.user.id), state)
+        await _send_adventure_panel(itx, state, edit_original=False)
+
+
+    async def _on_forward_route1(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        # Always respond quickly so Discord doesn't drop the interaction
+        if not itx.response.is_done():
+            await itx.response.defer(ephemeral=False, thinking=False)
+
+        state = await _get_adventure_state(str(itx.user.id))
+        rp = self._r1_get(state)
+        panel = int(rp["panel"])
+
+        route = ADVENTURE_ROUTES.get(self.area_id, {})
+        next_area = route.get("next")
+
+        if panel < 3:
+            self._r1_set(state, panel + 1)
+            # movement can trigger encounter
+            await self._r1_try_wild_encounter(itx, state, force=False)
+        else:
+            # leaving route -> next city
+            if next_area:
+                state["area_id"] = next_area
+            state.get("route_panels", {}).pop(self.area_id, None)
+
+        await _save_adventure_state(str(itx.user.id), state)
+        # Update the message the user clicked (component interaction)
+        await _send_adventure_panel(itx, state, edit_original=False)
+
+
+    async def _on_force_route1(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not itx.response.is_done():
+            await itx.response.defer(ephemeral=False, thinking=False)
+
+        state = await _get_adventure_state(str(itx.user.id))
+        # Force encounter
+        await self._r1_try_wild_encounter(itx, state, force=True)
+        await _save_adventure_state(str(itx.user.id), state)
+        await _send_adventure_panel(itx, state, edit_original=False)
+
+
+
+    async def _on_collect(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.5:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        try:
+            await itx.response.defer(ephemeral=True, thinking=False)
+            state = await _get_adventure_state(str(itx.user.id))
+            route = ADVENTURE_ROUTES.get(self.area_id, {})
+            collectible = route.get("collectible_button")
+            if not collectible or state.get(collectible.get("state_key")):
+                await itx.followup.send("Nothing to collect here.", ephemeral=False)
+                return
+            state[collectible.get("state_key")] = True
+            item_id = collectible.get("item")
+            qty = int(collectible.get("qty", 1))
+            if item_id and qty > 0:
+                try:
+                    await db.give_item(str(itx.user.id), item_id, qty)
+                except Exception:
+                    pass
+            next_area = collectible.get("next_area")
+            if next_area:
+                # Don't push collectible area to history: Back from next_area should go to the area before (e.g. don't return to pokeball screen once it's gone)
+                state["area_id"] = next_area
+            await _save_adventure_state(str(itx.user.id), state)
+            collect_label = collectible.get("label", "Item")
+            await itx.followup.send(f"You picked up **{collect_label}**!", ephemeral=False)
+            await _send_adventure_panel(itx, state, edit_original=True)
+        finally:
+            self._handled = False
+
+    async def _on_path(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.5:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        path_id: Optional[int] = None
+        try:
+            await itx.response.defer(ephemeral=True, thinking=False)
+            state = await _get_adventure_state(str(itx.user.id))
+            route = ADVENTURE_ROUTES.get(self.area_id, {})
+            rival_id = route.get("rival_battle")
+            if rival_id and rival_id not in state.get("rival_defeated", []):
+                user_name = itx.user.display_name if hasattr(itx.user, "display_name") else itx.user.name
+                if self.area_id == "route-22":
+                    challenge_emb, challenge_files = _embed_with_image(
+                        "WAIT!",
+                        f"**Rival:** {user_name}! Don't you dare walk away! I challenge you to a battle!",
+                        route.get("image_rival_arrived") or route.get("image_uncleared"),
+                    )
+                    challenge_emb.color = 0x5865F2
+                    await itx.followup.send(embed=challenge_emb, files=challenge_files or None, ephemeral=False)
+                else:
+                    challenge_emb = discord.Embed(
+                        title="Your rival appears!",
+                        description="**Rival:** Think you can get past me? Let's battle!",
+                        color=0x5865F2,
+                    )
+                    await itx.followup.send(embed=challenge_emb, ephemeral=False)
+                won = await _run_rival_battle(itx, self.area_id, state)
+                if won is None:
+                    return await itx.followup.send("Couldn't start the rival battle. Please try again.", ephemeral=False)
+                if not won:
+                    return
+                state = await _get_adventure_state(str(itx.user.id))
+            path_id = int(itx.data["custom_id"].split(":")[-1])
+            path = (route.get("grass_paths") or {}).get(path_id)
+            if not path:
+                return await itx.followup.send("That path doesn't exist.", ephemeral=False)
+            blocker = path.get("blocker")
+            if blocker and blocker not in state.get("defeated_trainers", {}):
+                trainer = (route.get("trainers") or {}).get(blocker)
+                if not trainer:
+                    return await itx.followup.send("Trainer data missing.", ephemeral=False)
+                trainer_name = trainer.get("name", "Trainer")
+                blocker_quote = trainer.get("blocker_quote") or f"You'll have to beat me first if you want to cross!"
+                challenge_emb = discord.Embed(
+                    title="While trying to cross grass",
+                    description=f"**{trainer_name}:** {blocker_quote}",
+                    color=0x5865F2,
+                )
+                await itx.followup.send(embed=challenge_emb, ephemeral=False)
+                team = []
+                for m in trainer.get("team", []):
+                    mon = await _build_mon_from_team_entry(m)
+                    if mon:
+                        team.append(mon)
+                if not team:
+                    return await itx.followup.send("Trainer team failed to load.", ephemeral=False)
+                won = await _start_pve_battle(itx, team, trainer_name)
+                if won is None:
+                    return await itx.followup.send("Couldn't start the battle. Please try again.", ephemeral=False)
+                if not won:
+                    return await itx.followup.send("❌ You lost the battle.", ephemeral=False)
+                state.setdefault("defeated_trainers", {})[blocker] = int(time.time())
+                if _route_is_cleared(state, self.area_id) and self.area_id not in state.get("cleared_routes", []):
+                    state.setdefault("cleared_routes", []).append(self.area_id)
+                await _save_adventure_state(str(itx.user.id), state)
+                await _send_adventure_panel(itx, state, edit_original=True)
+                return
+
+            # Encounter
+            encounters = path.get("encounters") or []
+            if not encounters:
+                return await itx.followup.send("No encounters here yet.", ephemeral=False)
+            # Support weighted encounters with level ranges and version filters
+            enc_specs = []
+            weights = []
+            # Game version (Red/Blue differences). If not stored anywhere, fall back to Red.
+            version = "red"
+            for e in encounters:
+                if isinstance(e, str):
+                    enc_specs.append({"species": e, "min_level": 3, "max_level": 3})
+                    weights.append(1)
+                elif isinstance(e, dict):
+                    ver = e.get("version")
+                    if ver and ver.lower() not in str(version).lower():
+                        continue  # skip encounters not for this version
+                    enc_specs.append(
+                        {
+                            "species": e.get("species"),
+                            "min_level": int(e.get("min_level", 3)),
+                            "max_level": int(e.get("max_level", e.get("min_level", 3))),
+                        }
+                    )
+                    weights.append(int(e.get("weight", 1)))
+            choice = random.choices(enc_specs, weights=weights, k=1)[0]
+            species = choice["species"]
+            # track seen species for Repeat Ball / dex counts
+            state.setdefault("repeat_seen", [])
+            if species.lower() not in [s.lower() for s in state["repeat_seen"]]:
+                state["repeat_seen"].append(species)
+                state["dex_seen"] = state.get("dex_seen", 0) + 1
+            # Persist to pokedex table (fire-and-forget so encounter starts faster)
+            try:
+                asyncio.create_task(pokedex_mark_seen(str(itx.user.id), species, caught=False))
+            except Exception:
+                pass
+            lvl = random.randint(choice["min_level"], choice["max_level"])
+            wild_mon = await _build_mon_from_species(species, level=lvl)
+            if not wild_mon:
+                await _save_adventure_state(str(itx.user.id), state)
+                return await itx.followup.send("Encounter failed to load.", ephemeral=False)
+
+            route_display = route.get("name", self.area_id)
+            won = await _start_pve_battle(itx, [wild_mon], f"Wild {species.title()}", area_id=self.area_id, route_display_name=route_display)
+            if won is _PVE_ALREADY_IN_BATTLE:
+                return  # "You're already in a battle." was already sent; don't send a second message
+            if won is None:
+                await _save_adventure_state(str(itx.user.id), state)
+                return await itx.followup.send("Couldn't start the encounter battle. Please try again.", ephemeral=False)
+            if won:
+                _add_discovered(state, self.area_id, species)
+                # Mark caught in Pokédex (fire-and-forget)
+                try:
+                    asyncio.create_task(pokedex_mark_seen(str(itx.user.id), species, caught=True))
+                except Exception:
+                    pass
+            await _save_adventure_state(str(itx.user.id), state)
+            await _send_adventure_panel(itx, state, edit_original=True)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            print(tb)
+            print(f"[Adventure] Error handling path {self.area_id}:{path_id} -> {e}")
+            try:
+                preview = (tb or str(e)).splitlines()[-1] if tb else str(e)
+                await itx.followup.send(f"⚠️ Something went wrong starting that encounter.\n`{preview}`", ephemeral=False)
+            except Exception:
+                pass
+        finally:
+            self._handled = False
+
+    async def _on_rematch(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.5:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        try:
+            await itx.response.defer(ephemeral=True, thinking=False)
+            state = await _get_adventure_state(str(itx.user.id))
+            route = ADVENTURE_ROUTES.get(self.area_id, {})
+            tid = itx.data["custom_id"].split(":")[-1]
+            last = state.get("defeated_trainers", {}).get(tid)
+            if not last:
+                return await itx.followup.send("You haven't defeated this trainer yet.", ephemeral=False)
+            trainer = (route.get("trainers") or {}).get(tid)
+            if not trainer:
+                return await itx.followup.send("Trainer data missing.", ephemeral=False)
+            team = []
+            for m in trainer.get("team", []):
+                mon = await _build_mon_from_team_entry(m)
+                if mon:
+                    team.append(mon)
+            if not team:
+                return await itx.followup.send("Trainer team failed to load.", ephemeral=False)
+            won = await _start_pve_battle(itx, team, trainer.get("name", "Trainer"))
+            if won is None:
+                return await itx.followup.send("Couldn't start the battle. Please try again.", ephemeral=False)
+            if won:
+                state.setdefault("defeated_trainers", {})[tid] = int(time.time())
+                await _save_adventure_state(str(itx.user.id), state)
+                await itx.followup.send("✅ Rematch won.", ephemeral=False)
+            else:
+                await itx.followup.send("❌ Rematch lost.", ephemeral=False)
+            state = await _get_adventure_state(str(itx.user.id))
+            await _send_adventure_panel(itx, state, edit_original=True)
+        finally:
+            self._handled = False
+
+# Last panel sent per user (for /refresh: re-send the latest panel — adventure or battle)
+LAST_PANEL_BY_USER: Dict[str, Dict[str, Any]] = {}
+
+async def _cancel_previous_panel_for_user(bot: discord.Client, uid: str) -> None:
+    """Disable the previous panel's buttons (like a timeout); keep the panel visible but unusable."""
+    try:
+        last = LAST_PANEL_BY_USER.get(uid)
+        if not last:
+            return
+        message_id = last.get("message_id")
+        channel_id = last.get("channel_id")
+        view = last.get("view")
+        if message_id is None or channel_id is None:
+            data = last.get("data") or {}
+            message_id = data.get("message_id")
+            channel_id = data.get("channel_id")
+            if view is None:
+                view = data.get("view")
+        if message_id is None or channel_id is None:
+            return
+        ch = bot.get_channel(channel_id)
+        if ch is None:
+            try:
+                ch = await bot.fetch_channel(channel_id)
+            except Exception:
+                return
+        if ch is None:
+            return
+        msg = await ch.fetch_message(message_id)
+        if not msg:
+            return
+        if view is not None and hasattr(view, "children"):
+            for child in view.children:
+                if hasattr(child, "disabled"):
+                    child.disabled = True
+            await msg.edit(view=view)
+        else:
+            await msg.edit(view=None)
+    except Exception:
+        pass
+
+async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_original: bool) -> None:
+    # If this is a button-press (component interaction), edit the clicked message.
+    is_component = getattr(itx, 'type', None) == discord.InteractionType.component and getattr(itx, 'message', None) is not None
+
+    uid = str(itx.user.id)
+    if not edit_original and not is_component:
+        await _cancel_previous_panel_for_user(itx.client, uid)
+    LAST_PANEL_BY_USER[uid] = {"type": "adventure", "state": copy.deepcopy(state)}
+    area_id = state.get("area_id") or "pallet-town"
+    if _is_city(area_id):
+        city = ADVENTURE_CITIES.get(area_id, {})
+        cleared = _city_is_cleared(state, area_id)
+        img = city.get("image_cleared") if cleared else city.get("image_uncleared")
+        desc = "You are in the city. Choose your next action."
+        if not cleared and city.get("rival_battle"):
+            desc = "Your rival is waiting for a battle."
+        # Track last visited city for blackout fallback
+        if state.get("last_city") != area_id:
+            state["last_city"] = area_id
+            await _save_adventure_state(str(itx.user.id), state)
+        emb, files = _embed_with_image(city.get("name", area_id), desc, img)
+        has_surf = await _team_has_surf(str(itx.user.id))
+        view = AdventureCityView(itx.user.id, area_id, state, has_surf=has_surf)
+    else:
+        route = ADVENTURE_ROUTES.get(area_id, {})
+        # route-22 is only added to cleared_routes when the path-1 blocker is defeated in _on_path, not here
+        if area_id != "route-22" and _route_is_cleared(state, area_id) and area_id not in state.get("cleared_routes", []):
+            state.setdefault("cleared_routes", []).append(area_id)
+            await _save_adventure_state(str(itx.user.id), state)
+        cleared = area_id in state.get("cleared_routes", [])
+        # Route panel navigation state (used for Route 1 3-panel navigation)
+        route_panels = state.setdefault("route_panels", {})
+        rp = route_panels.get(area_id)
+        if not isinstance(rp, dict):
+            rp = {"panel": 1, "pos": "start"}
+            route_panels[area_id] = rp
+        try:
+            rp["panel"] = max(1, min(int(rp.get("panel", 1)), 3))
+        except Exception:
+            rp["panel"] = 1
+        rp["pos"] = rp.get("pos", "start")
+        if rp["pos"] not in ("start", "end"):
+            rp["pos"] = "start"
+        # Route 22: four-stage images (rival not arrived → rival arrived → uncleared → cleared)
+        if area_id == "route-22":
+            rival_id = route.get("rival_battle")
+            if rival_id and rival_id not in state.get("rival_defeated", []):
+                img = route.get("image_rival_not_arrived") or route.get("image_uncleared")
+            elif not cleared:
+                img = route.get("image_uncleared")
+            else:
+                img = route.get("image_cleared")
+        else:
+            img = route.get("image_cleared") if cleared else route.get("image_uncleared")
+        # Route 1 uses 3-panel navigation with Forward/Back; other routes use grass paths.
+
+        if area_id == "route-1":
+
+            panel = int((state.get("route_panels", {}).get(area_id, {}) or {}).get("panel", 1))
+            pos = str((state.get("route_panels", {}).get(area_id, {}) or {}).get("pos", "start"))
+
+            # Use pre-sliced panel images if available
+            panels = route.get("panels") or []
+            if isinstance(panels, list) and len(panels) >= 3:
+                try:
+                    img_panel = panels[max(0, min(panel - 1, len(panels) - 1))]
+                except Exception:
+                    img_panel = img
+            else:
+                img_panel = img
+
+            desc = f"Use ⬆️/⬇️ to walk through the route. (Panel {panel}/3)\nMoving may trigger an encounter. Use ⚔️ Battle to force one."
+
+            emb, files = _embed_with_image(route.get("name", area_id), desc, img_panel)
+
+        else:
+
+            desc = "Choose a grass path to encounter Pokémon."
+
+            emb, files = _embed_with_image(route.get("name", area_id), desc, img)
+        view = AdventureRouteView(itx.user.id, area_id, state)
+
+    if is_component:
+        msg = await itx.message.edit(embed=emb, attachments=files, view=view)
+    elif edit_original:
+        msg = await itx.edit_original_response(embed=emb, attachments=files, view=view)
+    else:
+        # Fresh slash command without editing original; send a normal (non-ephemeral) message
+        msg = await itx.followup.send(embed=emb, files=files, view=view, ephemeral=False)
+    if msg:
+        LAST_PANEL_BY_USER[uid]["message_id"] = msg.id
+        LAST_PANEL_BY_USER[uid]["channel_id"] = msg.channel.id
+        LAST_PANEL_BY_USER[uid]["view"] = view
+
+@bot.tree.command(name="adventure", description="Open your adventure panel.")
+async def adventure_cmd(interaction: discord.Interaction):
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+    user = await db.get_user(uid)
+    if not user or not (user.get("starter") if isinstance(user, dict) else user["starter"]):
+        return await interaction.followup.send("Use `/start` to begin your journey first.", ephemeral=False)
+    state = await _get_adventure_state(uid)
+    await _send_adventure_panel(interaction, state, edit_original=True)
+
+@bot.tree.command(name="refresh", description="Re-send the last panel the bot sent you (adventure, battle, etc.).")
+async def refresh_cmd(interaction: discord.Interaction):
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+    last = LAST_PANEL_BY_USER.get(uid)
+    if not last:
+        user = await db.get_user(uid)
+        if not user or not (user.get("starter") if isinstance(user, dict) else user["starter"]):
+            return await interaction.followup.send("Use `/start` to begin your journey first.", ephemeral=False)
+        state = await _get_adventure_state(uid)
+        await _send_adventure_panel(interaction, state, edit_original=True)
+        return
+    panel_type = last.get("type")
+    if panel_type == "adventure":
+        state = last.get("state")
+        if not state:
+            state = await _get_adventure_state(uid)
+        await _send_adventure_panel(interaction, state, edit_original=True)
+        return
+    if panel_type == "battle":
+        await _cancel_previous_panel_for_user(interaction.client, uid)
+        data = last.get("data") or {}
+        room_id = data.get("room_id")
+        if room_id is not None:
+            from pvp.panel import send_battle_panel_refresh
+            out = await send_battle_panel_refresh(interaction, room_id, int(interaction.user.id))
+            if out is not None:
+                msg, view = out if isinstance(out, tuple) and len(out) == 2 else (out, None)
+                panel_data = {"room_id": room_id}
+                if msg is not None:
+                    panel_data["message_id"] = msg.id
+                    panel_data["channel_id"] = msg.channel.id
+                panel_data["view"] = view
+                LAST_PANEL_BY_USER[uid] = {"type": "battle", "data": panel_data}
+                return
+        await interaction.followup.send("Battle not found or already ended. Opening adventure panel.", ephemeral=True)
+        state = await _get_adventure_state(uid)
+        await _send_adventure_panel(interaction, state, edit_original=True)
+        return
+    # Fallback: send adventure panel
+    state = await _get_adventure_state(uid)
+    await _send_adventure_panel(interaction, state, edit_original=True)
+
+@bot.tree.command(name="route", description="Encounter a discovered Pokémon from a cleared route.")
+@app_commands.describe(number="Route number (e.g., 1)")
+async def route_cmd(interaction: discord.Interaction, number: int):
+    await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+    route_id = f"route-{int(number)}"
+    state = await _get_adventure_state(uid)
+    if route_id not in state.get("cleared_routes", []) and not _route_is_cleared(state, route_id):
+        return await interaction.followup.send("That route isn't cleared yet.", ephemeral=True)
+    if _route_is_cleared(state, route_id) and route_id not in state.get("cleared_routes", []):
+        state.setdefault("cleared_routes", []).append(route_id)
+        await _save_adventure_state(uid, state)
+    discovered = state.get("discovered", {}).get(route_id, [])
+    if not discovered:
+        return await interaction.followup.send("You haven't discovered any Pokémon on that route yet.", ephemeral=True)
+    species = random.choice(discovered)
+    wild_mon = await _build_mon_from_species(species, level=3)
+    if not wild_mon:
+        return await interaction.followup.send("Encounter failed to load.", ephemeral=True)
+    won = await _start_pve_battle(interaction, [wild_mon], f"Wild {species.title()}")
+    if won is _PVE_ALREADY_IN_BATTLE:
+        return  # "You're already in a battle." was already sent
+    if won is None:
+        return await interaction.followup.send("Couldn't start the encounter battle. Please try again.", ephemeral=True)
+
+def _tm_hm_item_to_move_name(item_id: str) -> Optional[str]:
+    """Return move name for a TM/HM item_id (from GEN1_TMS/GEN1_HMS)."""
+    item_id = (item_id or "").strip().lower()
+    for iid, mname in GEN1_TMS:
+        if (iid or "").strip().lower() == item_id:
+            return mname
+    for iid, mname in GEN1_HMS:
+        if (iid or "").strip().lower() == item_id:
+            return mname
+    return None
+
+class UseTMHMSelectView(discord.ui.View):
+    """Select which TM/HM to use."""
+    def __init__(self, author_id: int, uid: str, qty_by_id: Dict[str, int]):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.uid = uid
+        self.qty_by_id = qty_by_id
+        options = []
+        for item_id, move_name in GEN1_TMS + GEN1_HMS:
+            q = qty_by_id.get(item_id, 0)
+            if q <= 0:
+                continue
+            pre = "TM" if item_id.startswith("tm-") else "HM"
+            num = item_id.replace("tm-", "").replace("hm-", "").zfill(2)
+            options.append(discord.SelectOption(label=f"{pre}{num} {move_name}", value=item_id, description=f"×{q}" if q > 1 else "Use on a Pokémon"))
+            if len(options) >= 25:
+                break
+        if options:
+            sel = discord.ui.Select(placeholder="Use TM/HM on a Pokémon…", options=options, custom_id="tm_use:select")
+            sel.callback = self._on_select
+            self.add_item(sel)
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return itx.user.id == self.author_id
+
+    async def _on_select(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        values = getattr(itx.data, "values", None) or []
+        if not values:
+            return await itx.response.send_message("Pick a TM or HM.", ephemeral=True)
+        item_id = values[0]
+        move_name = _tm_hm_item_to_move_name(item_id)
+        if not move_name:
+            return await itx.response.send_message("Invalid TM/HM.", ephemeral=True)
+        await itx.response.defer(ephemeral=True, thinking=False)
+        gen = await _user_selected_gen(self.uid)
+        team_can_learn = await _get_team_can_learn_move(self.uid, move_name, gen)
+        if not team_can_learn:
+            return await itx.followup.send("None of your team can learn this move (in your generation) or they already know it.", ephemeral=True)
+        emb = discord.Embed(
+            title=f"Teach {move_name}",
+            description=f"Choose a Pokémon to teach **{move_name}** to. (Only Pokémon that can learn it are shown.)",
+            color=0x5865F2,
+        )
+        for r in team_can_learn:
+            name = f"Slot {r.get('team_slot', '?')} — **{(r.get('species') or '?').title()}** Lv{r.get('level', '?')}"
+            emb.add_field(name=name, value=f"ID #{r.get('id', '?')}", inline=True)
+        view = UseTMHMPokemonView(self.author_id, self.uid, item_id, move_name, team_can_learn)
+        await itx.followup.send(embed=emb, view=view, ephemeral=False)
+
+class UseTMHMPokemonView(discord.ui.View):
+    """Buttons for each Pokémon that can learn the selected move."""
+    def __init__(self, author_id: int, uid: str, item_id: str, move_name: str, team_can_learn: List[Dict[str, Any]]):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.uid = uid
+        self.item_id = item_id
+        self.move_name = move_name
+        self.team_can_learn = team_can_learn
+        self._handled = False
+        for r in team_can_learn[:25]:
+            mon_id = r.get("id")
+            species = (r.get("species") or "?").title()
+            level = r.get("level", "?")
+            label = f"{species} Lv{level}"
+            if len(label) > 80:
+                label = label[:77] + "..."
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, custom_id=f"tm_use:mon:{item_id}:{mon_id}")
+            btn.callback = self._on_mon
+            self.add_item(btn)
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return itx.user.id == self.author_id
+
+    async def _on_mon(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if self._handled:
+            return await itx.response.send_message("Already used.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id", "")
+        if not cid.startswith("tm_use:mon:"):
+            return await itx.response.send_message("Invalid.", ephemeral=True)
+        parts = cid.split(":", 3)
+        if len(parts) < 4:
+            return await itx.response.send_message("Invalid.", ephemeral=True)
+        _, _, item_id, mon_id_str = parts[0], parts[1], parts[2], parts[3]
+        try:
+            mon_id = int(mon_id_str)
+        except ValueError:
+            return await itx.response.send_message("Invalid Pokémon.", ephemeral=True)
+        entry = next((e for e in self.team_can_learn if e.get("id") == mon_id), None)
+        if not entry:
+            return await itx.response.send_message("Pokémon not in list.", ephemeral=True)
+        await itx.response.defer(ephemeral=True, thinking=False)
+        species = (entry.get("species") or "?").title()
+        try:
+            async with db.session() as conn:
+                cur = await conn.execute("SELECT moves FROM pokemons WHERE owner_id=? AND id=?", (self.uid, mon_id))
+                row = await cur.fetchone()
+                await cur.close()
+            if not row:
+                return await itx.followup.send("Pokémon not found.", ephemeral=False)
+            moves_raw = row.get("moves")
+            if isinstance(moves_raw, str):
+                try:
+                    moves_raw = json.loads(moves_raw)
+                except Exception:
+                    moves_raw = []
+            if not isinstance(moves_raw, (list, tuple)):
+                moves_raw = []
+            current = [str(m).strip() for m in moves_raw[:4]]
+            while len(current) < 4:
+                current.append("")
+            replaced = False
+            for i in range(4):
+                if not (current[i] or "").strip():
+                    current[i] = self.move_name
+                    replaced = True
+                    break
+            if not replaced:
+                current[3] = self.move_name
+            await _set_pokemon_moves(self.uid, mon_id, current[:4])
+            is_tm = (item_id or "").lower().startswith("tm-")
+            if is_tm:
+                await db.give_item(self.uid, item_id, -1)
+            self._handled = True
+            for item in self.children:
+                item.disabled = True
+            try:
+                await itx.message.edit(view=self)
+            except Exception:
+                pass
+            await itx.followup.send(f"✅ Taught **{self.move_name}** to **{species}**!{' (TM used.)' if is_tm else ''}", ephemeral=True)
+        except Exception as e:
+            await itx.followup.send(f"Failed to teach move: {e}", ephemeral=False)
+
+@bot.tree.command(name="tm_machine", description="TM Machine — View your TMs (consumable) and HMs (permanent).")
+async def tm_machine_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+    qty_by_id: Dict[str, int] = {}
+    if db_cache is not None:
+        try:
+            cached = db_cache.get_cached_tm_machine(uid)
+            if cached is not None:
+                for row in cached:
+                    iid = str(row.get("item_id") or "").strip()
+                    if iid:
+                        qty_by_id[iid] = int(row.get("qty") or 0)
+        except Exception:
+            pass
+    if not qty_by_id:
+        try:
+            async with db.session() as conn:
+                cur = await conn.execute(
+                    "SELECT item_id, qty FROM user_items WHERE owner_id = ? AND (item_id LIKE 'tm-%' OR item_id LIKE 'hm-%')",
+                    (uid,),
+                )
+                rows = await cur.fetchall()
+                await cur.close()
+            for row in rows or []:
+                iid = str(row.get("item_id", "") or "").strip()
+                if iid:
+                    qty_by_id[iid] = int(row.get("qty") or 0)
+            if db_cache is not None:
+                try:
+                    db_cache.set_cached_tm_machine(uid, [{"item_id": iid, "qty": q} for iid, q in qty_by_id.items()])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    tm_lines: List[str] = []
+    for item_id, move_name in GEN1_TMS:
+        q = qty_by_id.get(item_id, 0)
+        if q > 0:
+            num = item_id.replace("tm-", "").zfill(2)
+            tm_lines.append(f"**TM{num}** {move_name} × {q}")
+    hm_lines: List[str] = []
+    for item_id, move_name in GEN1_HMS:
+        q = qty_by_id.get(item_id, 0)
+        if q > 0:
+            num = item_id.replace("hm-", "").zfill(2)
+            hm_lines.append(f"**HM{num}** {move_name} ✓ (permanent)")
+    fragment_q = qty_by_id.get(TM_FRAGMENT_ITEM_ID, 0)
+    if not tm_lines and not hm_lines:
+        msg = "You have no TMs or HMs."
+        if fragment_q > 0:
+            msg += f"\n\nYou have **{fragment_q}** TM Fragment(s) — exchange them at the TM Seller."
+        return await interaction.followup.send(msg, ephemeral=True)
+    emb = discord.Embed(title="Your TM Machine", description="TMs are **consumable** (single use). HMs are **permanent**.", color=0x5865F2)
+    if tm_lines:
+        emb.add_field(name="TMs (consumable)", value="\n".join(tm_lines), inline=False)
+    else:
+        emb.add_field(name="TMs (consumable)", value="*None*", inline=False)
+    if hm_lines:
+        emb.add_field(name="HMs (permanent)", value="\n".join(hm_lines), inline=False)
+    else:
+        emb.add_field(name="HMs (permanent)", value="*None*", inline=False)
+    if fragment_q > 0:
+        emb.add_field(name="TM Fragment", value=f"You have **{fragment_q}** TM Fragment(s). (Rare finds from the field — exchange at the TM Seller.)", inline=False)
+    view = UseTMHMSelectView(interaction.user.id, uid, qty_by_id) if any(qty_by_id.get(iid, 0) > 0 for iid, _ in GEN1_TMS + GEN1_HMS) else None
+    send_kwargs: Dict[str, Any] = {"embed": emb, "ephemeral": True}
+    if view is not None:
+        send_kwargs["view"] = view
+    await interaction.followup.send(**send_kwargs)
+
+@bot.tree.command(name="start", description="Begin your journey with Professor Oak.")
+@app_commands.guild_only()
+async def start_cmd(interaction: discord.Interaction):
+    # Defer early to avoid "Unknown interaction" if processing exceeds 3s
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=False)
+    except Exception:
+        pass
+
+    uid = str(interaction.user.id)
+
+    # Ensure there is a users row + user_rulesets(gen=1) for the player.
+    try:
+        await _ensure_user_in_gen1(uid)
+    except Exception as e:
+        return await interaction.response.send_message(f"Init error: {e}", ephemeral=True)
+
+    # Check if they already started (have a starter OR any stored Pokémon).
+    try:
+        existing = await db.get_user(uid)
+    except Exception as e:
+        return await interaction.response.send_message(f"DB error: {e}", ephemeral=True)
+
+    has_starter = False
+    if existing:
+        row = dict(existing) if not isinstance(existing, dict) else existing
+        try:
+            if hasattr(db, "has_starter"):
+                has_starter = await db.has_starter(uid)
+            else:
+                has_starter = bool(row.get("starter"))
+        except Exception:
+            has_starter = bool(row.get("starter"))
+
+    has_any_mon = False
+    conn = await db.connect()
+    try:
+        cur = await conn.execute("SELECT 1 FROM pokemons WHERE owner_id=? LIMIT 1", (uid,))
+        has_any_mon = bool(await cur.fetchone())
+        await cur.close()
+    except Exception:
+        pass
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+    if has_starter or has_any_mon:
+        try:
+            if not interaction.response.is_done():
+                return await interaction.response.send_message(
+                    "❌ You already started your journey. Use `/profile` to view your Pokémon!",
+                    ephemeral=True
+                )
+            else:
+                return await interaction.followup.send(
+                    "❌ You already started your journey. Use `/profile` to view your Pokémon!",
+                    ephemeral=True
+                )
+        except Exception:
+            return
+
+    # Not started yet → ALWAYS show Oak intro (gender + Yes/No)
+    emb = discord.Embed(title="Welcome Trainer to Kanto")
+    emb.description = (
+        f"Hello, I am **Professor Oak** and you must be **{interaction.user.display_name}**!\n"
+        "Welcome to the world of pokemon where you can encounter, catch, train, "
+        "and most importantly create bonds with your future partners!\n\n"
+        "Less about me—let’s talk about you. Are you a girl or a boy?"
+    )
+    emb.set_thumbnail(url=OAK_IMAGE_URL)
+
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                embed=emb,
+                view=OakIntroView(interaction.user.id),
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                embed=emb,
+                view=OakIntroView(interaction.user.id),
+                ephemeral=True
+            )
+    except Exception:
+        try:
+            await interaction.followup.send(
+                embed=emb,
+                view=OakIntroView(interaction.user.id),
+                ephemeral=True
+            )
+        except Exception:
+            pass
+@bot.tree.command(name="profile", description="Show your saved profile.")
+async def profile_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+    user = None
+    async with db.session() as conn:
+        cur = await conn.execute("SELECT * FROM users WHERE user_id = ? LIMIT 1", (uid,))
+        row = await cur.fetchone()
+        await cur.close()
+        if row:
+            user = dict(row)
+            user["coins"] = db.get_currency_from_row(user, "coins")
+
+    if not user:
+        return await interaction.followup.send(
+            "No profile yet. Use `/start` first.",
+            ephemeral=True
+        )
+
+    embed = discord.Embed(title=f"{interaction.user.display_name}'s Profile")
+    embed.add_field(name="User ID", value=user["user_id"], inline=False)
+    embed.add_field(name="Created at (UTC)", value=user["created_at"], inline=False)
+    embed.add_field(name="Starter", value=user["starter"] or "Not chosen", inline=True)
+    embed.add_field(name="PokéDollars", value=f"{int(user.get('coins') or 0):,} {PKDollar_NAME}", inline=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="wallet", description="Show your wallet and currencies.")
+async def wallet_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+    u = await db.get_user(uid)
+    if not u:
+        return await interaction.followup.send("No wallet yet. Use `/start` first.", ephemeral=True)
+    currencies = u.get("currencies") or {}
+    user = interaction.user
+    avatar_url = user.display_avatar.url if getattr(user, "display_avatar", None) else (user.avatar.url if user.avatar else None)
+
+    emb = discord.Embed(title="Wallet", colour=discord.Colour.blurple())
+    emb.set_author(name=user.display_name, icon_url=avatar_url)
+    # Currency list from currencies JSON (add more currencies later)
+    emb.add_field(
+        name="\u200b",
+        value=f"{COIN} **{int(currencies.get('coins', 0)):,}** {PKDollar_NAME}",
+        inline=False,
+    )
+    # Optional: add more currency lines here, e.g. for key in currencies if key != 'coins'
+
+    await interaction.followup.send(embed=emb, ephemeral=True)
+
+async def _ruleset_gen(conn, guild: discord.Guild | None) -> int:
+    """Pick generation from rulesets table, preferring guild scope, else global, else 6."""
+    if db_cache:
+        rules = db_cache.get_cached_rulesets()
+        if rules:
+            if guild:
+                for r in rules:
+                    if str(r.get("scope") or "") == f"guild:{guild.id}":
+                        return int(r.get("generation") or 6)
+            for r in rules:
+                if str(r.get("scope") or "").lower() == "global":
+                    return int(r.get("generation") or 6)
+    try:
+        if guild:
+            cur = await conn.execute("SELECT generation FROM rulesets WHERE scope = ? LIMIT 1", (f"guild:{guild.id}",))
+            row = await cur.fetchone(); await cur.close()
+            if row: return int(row["generation"])
+        cur = await conn.execute("SELECT generation FROM rulesets WHERE scope = 'global' LIMIT 1")
+        row = await cur.fetchone(); await cur.close()
+        if row: return int(row["generation"])
+    except Exception:
+        pass
+    return 6  # default baseline
+def _gender_icon(g: str | None) -> str:
+    if not g: return ""
+    g = g.lower()
+    return "♂️" if g == "male" else ("♀️" if g == "female" else "")
+def pretty_item_name(name_or_id: str) -> str:
+    try:
+        return pretty_item(name_or_id)  # you already defined pretty_item elsewhere
+    except Exception:
+        import re
+        s = re.sub(r"[_\-]+", " ", str(name_or_id)).strip().title()
+        return s
+
+SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "sprites"
+
+def _species_folder_name(species: str) -> str:
+    """Normalize folder name to match on-disk layout."""
+    s = str(species or "").strip().lower()
+    s = s.replace(" ", "-").replace("_", "-")
+    return s
+
+def pokemon_sprite_attachment(
+    species: str,
+    *,
+    shiny: bool = False,
+    gender: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[discord.File]]:
+    """
+    Returns (attachment_url, discord.File) for the best local FRONT sprite, or (None, None)
+    if nothing is found.
+
+    Rules:
+      - Use female sprite ONLY if gender == 'female'; else normal.
+      - Use shiny sprite ONLY if shiny is True; else non-shiny.
+      - Prefer animated GIFs over static PNGs.
+      - If female sprite missing, fall back to normal sprite set.
+      - If shiny sprite missing, fall back to non-shiny.
+      - Last resort: icon.png if present.
+    """
+    folder = SPRITES_DIR / _species_folder_name(species)
+    if not folder.is_dir():
+        return None, None
+
+    def _exists(name: str) -> Optional[Path]:
+        p = folder / name
+        try:
+            return p if p.exists() and p.stat().st_size > 0 else None
+        except Exception:
+            return None
+
+    is_female = (str(gender or "").strip().lower() == "female")
+
+    candidates: List[str] = []
+    if is_female:
+        if shiny:
+            candidates += ["female-animated-shiny-front.gif", "female-shiny-front.png"]
+        candidates += ["female-animated-front.gif", "female-front.png"]
+
+    if shiny:
+        candidates += ["animated-shiny-front.gif", "shiny-front.png"]
+    candidates += ["animated-front.gif", "front.png", "icon.png"]  # icon last
+
+    for fname in candidates:
+        fp = _exists(fname)
+        if fp:
+            # Use an attachment:// URL so Embed thumbnail can reference the file
+            return f"attachment://{fp.name}", discord.File(fp, filename=fp.name)
+
+    return None, None
+
+
+def attach_sprite_to_embed(
+    emb: discord.Embed,
+    *,
+    species: str,
+    shiny: bool,
+    gender: Optional[str],
+    form_key: Optional[str] = None,
+) -> List[discord.File]:
+    """
+    Convenience wrapper for mpokeinfo (and others).
+    Sets embed thumbnail and returns a list of files to pass to send().
+    If form_key is provided, looks for sprites in {species}-{form_key}/ folder.
+    """
+    files: List[discord.File] = []
+    # If form_key is provided, determine the correct folder name
+    if form_key:
+        sp_norm = str(species or "").strip().lower()
+        fk_norm = str(form_key or "").strip().lower().replace(" ", "-").replace("_", "-")
+        
+        # Special-case: Greninja Ash/Battle Bond normalization
+        if sp_norm == "greninja" and ("ash" in fk_norm or "battle" in fk_norm or "bond" in fk_norm):
+            fk_norm = "battle-bond"
+        
+        # Special-case: Missing n0 forms - normalize species name first
+        if sp_norm == "missing n0" or sp_norm == "missing-n0":
+            sp_norm = "missing-n0"  # Normalize to hyphenated version
+            if fk_norm in ["n1", "n2", "n3", "n4", "n5"]:
+                lookup_species = f"{sp_norm}-{fk_norm}"
+            else:
+                lookup_species = sp_norm
+        # If form_key already contains the species name (e.g., "shaymin-sky"), use it as-is
+        # Otherwise, prepend species (e.g., species="shaymin", form_key="land" → "shaymin-land")
+        elif fk_norm.startswith(f"{sp_norm}-"):
+            lookup_species = fk_norm
+        else:
+            lookup_species = f"{sp_norm}-{fk_norm}"
+    else:
+        # Normalize Missing n0 species name
+        sp_norm = str(species or "").strip().lower()
+        if sp_norm == "missing n0" or sp_norm == "missing-n0":
+            lookup_species = "missing-n0"
+        else:
+            lookup_species = species
+    att_url, att_file = pokemon_sprite_attachment(species=lookup_species, shiny=shiny, gender=gender)
+    if att_file:
+        emb.set_thumbnail(url=att_url)
+        files.append(att_file)
+    return files
+PRIVATE_EMOJI_GUILD_ID = globals().get("DEV_GUILD_ID", None)
+
+def _normalize_stats_keys(stats: dict) -> dict:
+    """
+    Normalize stat keys to use atk/def/spa/spd/spe instead of attack/defense/special-attack/etc.
+    """
+    if not isinstance(stats, dict):
+        return {}
+    
+    key_map = {
+        "hp": "hp",
+        "attack": "atk",
+        "atk": "atk",
+        "defense": "def",
+        "def": "def",
+        "special-attack": "spa",
+        "special_attack": "spa",
+        "spa": "spa",
+        "special-defense": "spd",
+        "special_defense": "spd",
+        "spd": "spd",
+        "speed": "spe",
+        "spe": "spe"
+    }
+    
+    normalized = {}
+    for k, v in stats.items():
+        norm_key = key_map.get(str(k).lower().replace("_", "-"), k)
+        normalized[norm_key] = v
+    return normalized
+
+# === Form Selection View for /pokeinfo ===
+class PokeInfoFormView(discord.ui.View):
+    """Interactive form selection buttons for /pokeinfo"""
+    def __init__(self, species_id: int, species_name: str, available_forms: List[dict], 
+                 current_form: Optional[str], shiny: bool, gender: Optional[str], gen: Optional[int]):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.species_id = species_id
+        self.species_name = species_name
+        self.available_forms = available_forms
+        self.current_form = current_form
+        self.shiny = shiny
+        self.gender = gender
+        self.gen = gen
+        
+        # Add buttons for each form (max 25 buttons, 5 per row)
+        for i, form_data in enumerate(available_forms[:25]):
+            is_current = (form_data['form_key'] == current_form) if current_form else (form_data['form_key'] is None)
+            button = discord.ui.Button(
+                label=form_data['display_name'],
+                style=discord.ButtonStyle.primary if is_current else discord.ButtonStyle.secondary,
+                row=i // 5,  # 5 buttons per row
+                custom_id=f"piform_{form_data['form_key'] or 'base'}"
+            )
+            button.callback = self._make_callback(form_data['form_key'])
+            self.add_item(button)
+    
+    def _make_callback(self, form_key: Optional[str]):
+        async def callback(interaction: discord.Interaction):
+            # Re-run pokeinfo with the selected form
+            await interaction.response.defer()
+            # Build the command to simulate clicking the form
+            form_param = form_key if form_key else ""
+            # Redirect to pokeinfo command - we'll need to call it programmatically
+            # For now, just send a message
+            await interaction.followup.send(
+                f"🔄 Use `/pokeinfo name_or_id:{self.species_name} form:{form_key or 'base'}` to see this form!",
+                ephemeral=True
+            )
+        return callback
+
+class MPokeInfo(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        # local sprites location (adjust if yours differs)
+        self.sprites_base = Path(__file__).resolve().parent / "pvp" / "_common" / "sprites"
+
+    # --------------------- tiny utils ---------------------
+    @staticmethod
+    def _as_mapping(x: Any) -> dict:
+        if isinstance(x, Mapping): return dict(x)
+        if isinstance(x, dict):    return x
+        if isinstance(x, str):
+            try:
+                v = json.loads(x)
+                return v if isinstance(v, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    @staticmethod
+    def _as_dict(x: Any) -> dict:
+        if isinstance(x, dict): return x
+        if isinstance(x, str):
+            try:
+                v = json.loads(x)
+                return v if isinstance(v, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    @staticmethod
+    def _as_list(x: Any) -> list:
+        if isinstance(x, list): return x
+        if isinstance(x, str):
+            try:
+                v = json.loads(x)
+                if isinstance(v, list):
+                    return v
+            except Exception:
+                pass
+            return [p.strip() for p in x.split(",") if p.strip()]
+        return []
+
+    @staticmethod
+    def _species_folder_name(species: str) -> str:
+        return str(species or "").strip().lower().replace(" ", "-").replace("_", "-")
+
+    @staticmethod
+    def _gender_icon_local(g: Optional[str]) -> str:
+        g = (g or "").lower()
+        return "♂️" if g == "male" else "♀️" if g == "female" else "∅" if g == "genderless" else ""
+
+    def _pick_sprite_file(self, species: str, gender: Optional[str], shiny: bool, form: Optional[str] = None) -> Optional[discord.File]:
+        """
+        Load a sprite file for the given Pokemon species and form.
+        Returns a discord.File object or None if not found.
+        """
+        # Build the folder name
+        if form:
+            # If form already includes species name (e.g., "kyurem-white"), use as-is
+            # Otherwise prepend species (e.g., "meloetta" + "aria" → "meloetta-aria")
+            if form.startswith(f"{species}-"):
+                folder_name = form
+            else:
+                folder_name = f"{species}-{form}"
+        else:
+            folder_name = species
+        
+        folder_name = self._species_folder_name(folder_name)
+        folder = self.sprites_base / folder_name
+        
+        if not folder.is_dir():
+            return None
+        
+        # Priority order for sprite files
+        is_female = (str(gender or "").strip().lower() == "female")
+        candidates: List[str] = []
+        
+        if is_female:
+            if shiny:
+                candidates += ["female-animated-shiny-front.gif", "female-shiny-front.png"]
+            candidates += ["female-animated-front.gif", "female-front.png"]
+        
+        if shiny:
+            candidates += ["animated-shiny-front.gif", "shiny-front.png"]
+        candidates += ["animated-front.gif", "front.png", "icon.png"]
+        
+        for fname in candidates:
+            fp = folder / fname
+            try:
+                if fp.exists() and fp.stat().st_size > 0:
+                    return discord.File(fp, filename=fp.name)
+            except Exception:
+                continue
+        
+        return None
+
+    # --------------------- emoji helpers ---------------------
+    @staticmethod
+    def _emoji_by_name(guild: Optional[discord.Guild], name: Optional[str]) -> str:
+        """Find a custom emoji by (approx) name in a guild."""
+        if not guild or not name:
+            return ""
+        base = name.lower()
+        variants = {base, base.replace("-", ""), base.replace("-", " "), base.split("-")[0]}
+        try:
+            for e in guild.emojis:
+                if e.name.lower() in variants:
+                    return str(e)  # <:name:id>
+        except Exception:
+            pass
+        return ""
+
+    async def _get_emoji_global(self, guild: Optional[discord.Guild], key: Optional[str]) -> str:
+        """
+        General emoji getter:
+        1) Items table (items.emoji) by id or name match
+        2) Current guild custom emoji by name
+        3) PRIVATE_EMOJI_GUILD_ID custom emoji by name (if set)
+        """
+        if not key:
+            return ""
+        name = str(key).lower()
+
+        # 1) DB items.emoji
+        try:
+            db_mod = globals().get("db")
+            if db_mod:
+                conn = await db_mod.connect()
+                # try id then name
+                cur = await conn.execute(
+                    "SELECT emoji FROM items WHERE LOWER(id)=? OR LOWER(name)=? LIMIT 1",
+                    (name, name.title())
+                )
+                row = await cur.fetchone(); await cur.close()
+                if row and row.get("emoji"):
+                    raw = str(row["emoji"])
+                    # <a:name:123> / <:name:123>
+                    m = re.search(r":(\d+)>$", raw)
+                    if m:
+                        if guild and (em := guild.get_emoji(int(m.group(1)))):
+                            return str(em)
+                        # private guild
+                        if PRIVATE_EMOJI_GUILD_ID:
+                            g2 = self.bot.get_guild(int(PRIVATE_EMOJI_GUILD_ID))
+                            if g2 and (em2 := g2.get_emoji(int(m.group(1)))):
+                                return str(em2)
+                    if raw.isdigit():
+                        # stored as just the emoji id
+                        if guild and (em := guild.get_emoji(int(raw))):
+                            return str(em)
+                        if PRIVATE_EMOJI_GUILD_ID:
+                            g2 = self.bot.get_guild(int(PRIVATE_EMOJI_GUILD_ID))
+                            if g2 and (em2 := g2.get_emoji(int(raw))):
+                                return str(em2)
+                    if raw.startswith("<") and raw.endswith(">"):
+                        return raw  # already a full emoji tag
+                    # try by name
+                    emn = self._emoji_by_name(guild, raw) or (
+                        self._emoji_by_name(self.bot.get_guild(int(PRIVATE_EMOJI_GUILD_ID)), raw)
+                        if PRIVATE_EMOJI_GUILD_ID else ""
+                    )
+                    if emn:
+                        return emn
+        except Exception:
+            pass
+
+        # 2) Current guild by name
+        em = self._emoji_by_name(guild, name)
+        if em:
+            return em
+
+        # 3) Private emoji guild by name
+        if PRIVATE_EMOJI_GUILD_ID:
+            g2 = self.bot.get_guild(int(PRIVATE_EMOJI_GUILD_ID))
+            em = self._emoji_by_name(g2, name)
+            if em:
+                return em
+
+        return ""
+
+    async def _label_with_emoji(self, guild: Optional[discord.Guild], key: Optional[str]) -> str:
+        """For Ball/Held Item fields: '🟠 Poké Ball' if emoji found, else 'pokeball'."""
+        if not key:
+            return "—"
+        em = await self._get_emoji_global(guild, key)
+        nice = str(key).replace("_", " ").replace("-", " ").title()
+        return f"{em} {nice}" if em else nice
+
+    # --------------------- types / stats helpers ---------------------
+    async def _extract_types(self, species: str, mon: dict, dex: Optional[dict]) -> List[str]:
+        def _norm_list(x) -> list[str]:
+            li = self._as_list(x)
+            out = []
+            for t in li:
+                if t is None:
+                    continue
+                s = str(t).strip()
+                if s and s.lower() != "none":
+                    out.append(s)
+            return out
+
+        # 1) Prefer dex (pokedex / ensure_species) as source of truth for fixed info
+        d = self._as_mapping(dex) if dex else {}
+        for cand in (
+            d.get("types"), d.get("typing"), d.get("type"),
+            [d.get("type1") or d.get("type_1"), d.get("type2") or d.get("type_2")] if (d.get("type1") or d.get("type_1") or d.get("type2") or d.get("type_2")) else None,
+            [d.get("primary_type"), d.get("secondary_type")] if (d.get("primary_type") or d.get("secondary_type")) else None,
+            (d.get("species") or {}).get("types") if isinstance(d.get("species"), dict) else None,
+        ):
+            if cand is None:
+                continue
+            li = _norm_list(cand)
+            if li:
+                return [s.title() for s in li]
+
+        # 2) If dex was None or missing types, fetch from pokedex table by species
+        try:
+            db_mod = globals().get("db")
+            if db_mod:
+                pokedex_row = await db_mod.get_pokedex_by_name(species.lower())
+                if pokedex_row:
+                    tlist = _norm_list(pokedex_row.get("types"))
+                    if tlist:
+                        return [s.title() for s in tlist]
+                # Direct query fallback (pokedex has types JSONB only)
+                conn = await db_mod.connect()
+                try:
+                    cur = await conn.execute(
+                        "SELECT types FROM pokedex WHERE LOWER(name)=? LIMIT 1",
+                        (species.lower(),)
+                    )
+                    row = await cur.fetchone()
+                    await cur.close()
+                    if row and row.get("types"):
+                        tlist = _norm_list(row.get("types"))
+                        if tlist:
+                            return [s.title() for s in tlist]
+                finally:
+                    await conn.close()
+        except Exception:
+            pass
+        return []
+
+    def _pick_sprite_file(self, species: str, gender: str, shiny: bool, form: Optional[str] = None) -> Optional[discord.File]:
+        # Try form-specific folder first, then fall back to base species
+        folder_name = self._species_folder_name(species)
+        if form and form != "normal":
+            # Try form-specific folder (e.g., "rotom-heat", "deoxys-attack")
+            form_folder = self.sprites_base / f"{folder_name}-{form}"
+            if form_folder.is_dir():
+                folder = form_folder
+            else:
+                folder = self.sprites_base / folder_name
+        else:
+            folder = self.sprites_base / folder_name
+
+        def exists(name: str) -> Optional[Path]:
+            p = folder / name
+            try:
+                return p if p.exists() and p.stat().st_size > 0 else None
+            except Exception:
+                return None
+
+        is_female = (str(gender).lower() == "female")
+        cand: List[str] = []
+        if is_female:
+            if shiny: cand += ["female-animated-shiny-front.gif", "female-shiny-front.png"]
+            cand += ["female-animated-front.gif", "female-front.png"]
+        if shiny: cand += ["animated-shiny-front.gif", "shiny-front.png"]
+        cand += ["animated-front.gif", "front.png", "icon.png"]
+
+        for fname in cand:
+            fp = exists(fname)
+            if fp:
+                return discord.File(fp, filename=fp.name)
+        return None
+
+    @staticmethod
+    def _format_ot(bot: commands.Bot, owner_id: Optional[str]) -> str:
+        if not owner_id:
+            return "—"
+        try:
+            uid = int(owner_id)
+        except Exception:
+            return f"<@{owner_id}>"
+        u = bot.get_user(uid)
+        return u.mention if u else f"<@{uid}>"
+
+    # --------------------- command ---------------------
+    @app_commands.command(name="mpokeinfo", description="Show details for a Pokémon on your team.")
+    @app_commands.describe(
+        name="Pokémon species (e.g. pikachu)",
+        slot="Team slot (1–6) if you have duplicates"
+    )
+    async def mpokeinfo(self, interaction: Interaction, name: str, slot: Optional[int] = None):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=False)
+        uid = str(interaction.user.id)
+        user_gen = await _user_selected_gen(uid)
+
+        # Single DB session: resolve + fetch full row. Parallel dex fetch overlapped with get_pokemon.
+        async with db.session() as conn:
+            mon = await resolve_team_mon(interaction, name, slot, conn=conn)  # noqa: F405
+            if not mon:
+                return
+            species = str(mon.get("species") or "unknown")
+            dex_task = asyncio.create_task(ensure_species_and_learnsets(species))
+            full = await db.get_pokemon(uid, int(mon["id"]), conn=conn)
+            if not full:
+                dex_task.cancel()
+                try:
+                    await dex_task
+                except asyncio.CancelledError:
+                    pass
+                await interaction.followup.send("Could not load Pokémon data.", ephemeral=True)
+                return
+            mon = full
+            # EXP to next level (uses cache when available)
+            exp_to_next_val: Optional[int] = None
+            cur_exp = int(mon.get("exp") or 0)
+            exp_group = (mon.get("exp_group") or "medium_fast").strip().lower()
+            cur_level = int(mon.get("level") or 1)
+            if cur_level < 100:
+                exp_next_total = await _get_exp_total_for_level(conn, exp_group, cur_level + 1)
+                if exp_next_total is not None and exp_next_total > 0:
+                    exp_to_next_val = max(0, exp_next_total - cur_exp)
+            # Await dex_task *inside* session so ensure_species doesn't use conn after release
+            try:
+                dex = await dex_task
+            except asyncio.CancelledError:
+                dex = None
+            except Exception:
+                dex = None
+
+        level   = int(mon.get("level") or 1)
+        shiny   = bool(mon.get("shiny"))
+        gender  = str(mon.get("gender") or "").lower()
+
+        # Phone-friendly title: ★ Species Lv N (shiny star like reference image)
+        title = f"{'★ ' if shiny else ''}{species.replace('-', ' ').title()} Lv {level}"
+
+        emb = discord.Embed(title=title, colour=discord.Colour.blurple())
+
+        # Form for sprite and optional title
+        current_form = mon.get("form")
+        if not current_form and dex:
+            current_form = dex.get("form_name")
+        if current_form and current_form != "normal":
+            title = f"{'★ ' if shiny else ''}{species.replace('-', ' ').title()} ({current_form.title()}) Lv {level}"
+            emb.title = title
+
+        # Held item + Ball (same as original)
+        held_field = await self._label_with_emoji(interaction.guild, mon.get("held_item"))
+        if not held_field or held_field.strip() in ("", "—"):
+            held_field = "None"
+        ball_key = (mon.get("pokeball") or "pokeball")
+        ball_field = await self._label_with_emoji(interaction.guild, ball_key)
+
+        # Types (emojis + names, same as original)
+        types = await self._extract_types(species, mon, dex)
+        type_parts = []
+        for t in types:
+            em = await get_emoji_global(self.bot, interaction.guild, t)
+            type_parts.append(f"{em} {t}" if em else t)
+        type_text = " / ".join(type_parts) if type_parts else "Unknown"
+
+        # Tera type
+        tera_raw = mon.get("tera_type")
+        tera_text = "—"
+        if tera_raw:
+            tera_name = str(tera_raw).replace("-", " ").replace("_", " ").title()
+            tera_emoji = await get_emoji_global(self.bot, interaction.guild, tera_name)
+            tera_text = f"{tera_emoji} {tera_name}" if tera_emoji else tera_name
+
+        # OT / gender
+        ot_text = self._format_ot(self.bot, str(mon.get("owner_id") or mon.get("user_id") or ""))
+        gender_icon_fn = globals().get("_gender_icon", None)
+        gender_icon = gender_icon_fn(gender) if callable(gender_icon_fn) else self._gender_icon_local(gender)
+        gender_display = "Male ♂" if gender == "male" else "Female ♀" if gender == "female" else (gender_icon or "—")
+
+        # Friendship (same as original: heart + value)
+        fr = mon.get("friendship", mon.get("happiness", 0))
+        try: fr = int(fr or 0)
+        except Exception: fr = 0
+        fr = max(0, min(255, fr))
+        friendship_text = f"❤️ {fr}/255"
+
+        # Team slot
+        team_slot = mon.get("team_slot")
+        team_text = f"Slot {team_slot}" if team_slot else "—"
+
+        # Current stats: HP as current/max, then Atk, Def, ...
+        stats_obj = self._as_dict(mon.get("final_stats"))
+        hp_max = int(stats_obj.get("hp", mon.get("hp", 0))) or 1
+        hp_now = int(mon.get("hp_now", hp_max))
+        hp_display = f"{hp_now}/{hp_max}"
+        stats_line = (
+            f"HP: {hp_display}, Atk: {int(stats_obj.get('attack', mon.get('atk', 0)))}, "
+            f"Def: {int(stats_obj.get('defense', mon.get('def', 0)))}, SpA: {int(stats_obj.get('special_attack', mon.get('spa', 0)))}, "
+            f"SpD: {int(stats_obj.get('special_defense', mon.get('spd', 0)))}, Spe: {int(stats_obj.get('speed', mon.get('spe', 0)))}"
+        )
+
+        # IVs/EVs single line: HP: 21, Atk: 28, ...
+        def _stat6(d: dict | None) -> dict:
+            d = d if isinstance(d, dict) else {}
+            return {
+                "hp": int(d.get("hp", 0)),
+                "atk": int(d.get("attack", d.get("atk", 0))),
+                "def": int(d.get("defense", d.get("def", 0))),
+                "spa": int(d.get("special_attack", d.get("spa", 0))),
+                "spd": int(d.get("special_defense", d.get("spd", 0))),
+                "spe": int(d.get("speed", d.get("spe", 0))),
+            }
+        def _fmt6_line(d: dict | None) -> str:
+            s = _stat6(d)
+            return f"HP: {s['hp']}, Atk: {s['atk']}, Def: {s['def']}, SpA: {s['spa']}, SpD: {s['spd']}, Spe: {s['spe']}"
+        ivs_line = _fmt6_line(self._as_dict(mon.get("ivs")))
+        evs_line = _fmt6_line(self._as_dict(mon.get("evs")))
+
+        # Moves with PP: Move1 (current/base) — base for adventure; cap current at base so display never shows current > base
+        moves = self._as_list(mon.get("moves"))
+        pps_raw = mon.get("moves_pp")
+        if isinstance(pps_raw, str):
+            try:
+                pps_list = json.loads(pps_raw) if pps_raw else []
+            except Exception:
+                pps_list = []
+        else:
+            pps_list = list(pps_raw)[:4] if pps_raw else []
+        if moves:
+            parts = []
+            for i, m in enumerate(moves[:4]):
+                name = str(m).replace("-", " ").title()
+                cur_pp = pps_list[i] if i < len(pps_list) and pps_list[i] is not None else None
+                try:
+                    total_pp = _base_pp(m, generation=user_gen)  # base PP for adventure; PP Maxes max it out later
+                except Exception:
+                    total_pp = cur_pp if cur_pp is not None else 20
+                if cur_pp is not None and total_pp is not None:
+                    cur_pp = min(int(cur_pp), total_pp)  # cap so we never show e.g. 56/35
+                cur_str = str(cur_pp) if cur_pp is not None else "?"
+                parts.append(f"{name} ({cur_str}/{total_pp})")
+            moves_line = " | ".join(parts)
+        else:
+            moves_line = "—"
+
+        # Sprite thumbnail (right side on phone)
+        files: List[discord.File] = []
+        try:
+            files = attach_sprite_to_embed(
+                emb, species=species, shiny=shiny, gender=gender, form_key=current_form
+            )
+        except Exception:
+            try:
+                sprites = (dex or {}).get("sprites")
+                if isinstance(sprites, dict):
+                    sprite_url = (sprites.get("shinyFront") if shiny else sprites.get("front")) or sprites.get("icon")
+                    if sprite_url:
+                        emb.set_thumbnail(url=str(sprite_url))
+            except Exception:
+                pass
+
+        # 3-column inline grid (original fields, phone-friendly layout)
+        emb.add_field(name="OT", value=ot_text, inline=True)
+        emb.add_field(name="Type", value=type_text, inline=True)
+        emb.add_field(name="Tera Type", value=tera_text, inline=True)
+
+        emb.add_field(name="Nature", value=str(mon.get("nature") or "Unknown").title(), inline=True)
+        emb.add_field(name="Ability", value=str(mon.get("ability") or "Unknown").replace("-", " ").title(), inline=True)
+        emb.add_field(name="Held Item", value=held_field, inline=True)
+
+        emb.add_field(name="Ball", value=ball_field, inline=True)
+        emb.add_field(name="Gender", value=gender_display, inline=True)
+        emb.add_field(name="Team", value=team_text, inline=True)
+
+        exp_next_text = "Max" if exp_to_next_val is None else f"{exp_to_next_val:,}"
+        emb.add_field(name="HP", value=hp_display, inline=True)
+        emb.add_field(name="EXP to next", value=exp_next_text, inline=True)
+        emb.add_field(name="Friendship", value=friendship_text, inline=True)
+        emb.add_field(name="Stats", value=stats_line[:1024], inline=False)
+
+        emb.add_field(name="IVs", value=ivs_line, inline=True)
+        emb.add_field(name="EVs", value=evs_line, inline=True)
+        emb.add_field(name="Moves", value=moves_line[:1024] or "—", inline=False)
+
+        if AdminGivePokemon.can_gigantamax(species):
+            can_gmax = bool(mon.get("can_gigantamax", 0))
+            emb.add_field(name="Can Gigantamax", value="✅ Yes" if can_gmax else "❌ No", inline=True)
+
+        await interaction.followup.send(embed=emb, files=files, ephemeral=True)
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(MPokeInfo(bot))
+## Friendship :
+def item_id_from_user(s: str) -> str:
+    """Normalize user text -> canonical item id (lowercase + underscores)."""
+    s = s.strip().lower()
+    s = re.sub(r"[\s\-]+", "_", s)
+    s = re.sub(r"[^a-z0-9_]", "", s)
+    return s
+def pretty_item(item_id: str | None) -> str:
+    if not item_id:
+        return "None"
+    return item_id.replace("_", " ").title()
+
+# Helpers: ISO parsing and cooldown/daily-cap checks using event_log
+def _now_utc(): return dt.datetime.now(dt.timezone.utc)
+def _parse_iso_z(s: str): return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+async def _action_window(user_id: str, mon_id: int, action: str, since_hours: int = 24):
+    conn = await db.connect()
+    try:
+        cur = await conn.execute(
+            "SELECT payload, created_at FROM event_log WHERE user_id=? AND type=? "
+            "ORDER BY id DESC LIMIT 200",
+            (user_id, action),
+        )
+        rows = await cur.fetchall(); await cur.close()
+        cutoff = _now_utc() - dt.timedelta(hours=since_hours)
+        last_time, count_in_window = None, 0
+        for r in rows:
+            created = _parse_iso_z(r["created_at"])
+            if created < cutoff:
+                break
+            try:
+                payload = json.loads(r["payload"])
+            except Exception:
+                payload = {}
+            if str(payload.get("mon_id")) == str(mon_id):
+                count_in_window += 1
+                if last_time is None:
+                    last_time = created
+        return last_time, count_in_window
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+async def _check_limit_and_cooldown(user_id: str, mon_id: int, action: str,
+                                    cooldown_seconds: int, daily_cap: int):
+    last_time, used_today = await _action_window(user_id, mon_id, action, 24)
+    remain = 0
+    if last_time:
+        elapsed = (_now_utc() - last_time).total_seconds()
+        if elapsed < cooldown_seconds:
+            remain = int(cooldown_seconds - elapsed)
+    ok = (remain == 0) and (used_today < daily_cap)
+    return ok, remain, used_today
+
+async def _award_friendship(inter: discord.Interaction, mon_id: int, delta: int,
+                            action: str, extra: dict | None = None):
+    uid = str(inter.user.id)
+    new_val = await db.bump_friendship(uid, mon_id, delta)
+    payload = {"mon_id": mon_id, "delta": delta}
+    if extra: payload.update(extra)
+    await db.log_event(uid, action, payload)
+    return new_val
+
+
+# ---------- /pet ----------
+@bot.tree.command(name="pet", description="Pet a Pokémon in your team.")
+@app_commands.describe(name="Pokémon name in your team (e.g. pikachu)", slot="If duplicates, which team slot (1–6)")
+async def pet_cmd(inter: discord.Interaction, name: str, slot: int | None = None):
+    mon = await resolve_team_mon(inter, name, slot)
+    if not mon:
+        return
+
+    # Set friendship to max (255)
+    await _set_friendship(str(inter.user.id), mon["id"], 255)
+    auto = f" (autocorrected to **{mon['_autocorrected_to']}**)" if mon.get("_autocorrected_to") else ""
+    await inter.followup.send(f"✨ **{mon['species'].title()}** enjoys the pats{auto}! Friendship set to **255** (max).", ephemeral=True)
+
+# ---------- /feed ----------
+_FEED_ITEMS = {
+    "oran_berry": 2,
+    "sitrus_berry": 4,
+    "poffin_sweet": 6,
+    "poffin_dry": 6,
+    "poffin_spicy": 6,
+}
+
+@bot.tree.command(name="feed", description="Feed a berry/poffin to a Pokémon in your team (15m cd, 10/day).")
+@app_commands.describe(
+    name="Pokémon name in your team (e.g. pikachu)",
+    item="Item name (e.g., Oran Berry, Sitrus Berry, Poffin Sweet …)",
+    slot="If duplicates, which team slot (1–6)"
+)
+async def feed_cmd(inter: discord.Interaction, name: str, item: str, slot: int | None = None):
+    mon = await resolve_team_mon(inter, name, slot)
+    if not mon:
+        return
+
+    item_id = item_id_from_user(item)  # normalize text -> id
+    if item_id not in _FEED_ITEMS:
+        return await inter.followup.send(
+            "That item can’t be used for friendship. Try **Oran Berry**, **Sitrus Berry**, or a **Poffin**.",
+            ephemeral=True
+        )
+
+    ok, remain, used = await _check_limit_and_cooldown(str(inter.user.id), mon["id"], "friend_feed",
+                                                       cooldown_seconds=900, daily_cap=10)
+    if not ok:
+        if used >= 10:
+            return await inter.followup.send("You’ve reached today’s feeding limit for this Pokémon (10/day).", ephemeral=True)
+        mm, ss = divmod(remain, 60)
+        return await inter.followup.send(f"You can feed again in **{mm}m {ss}s**.", ephemeral=True)
+
+    had = await db.take_item(str(inter.user.id), item_id, qty=1)
+    if not had:
+        return await inter.followup.send(f"You don’t have a **{pretty_item(item_id)}**.", ephemeral=True)
+
+    gain = _FEED_ITEMS[item_id]
+    new_val = await _award_friendship(inter, mon["id"], gain, "friend_feed", {"item": item_id})
+    auto = f" (autocorrected to **{mon['_autocorrected_to']}**)" if mon.get("_autocorrected_to") else ""
+    await inter.followup.send(
+        f"🍓 **{mon['species'].title()}** ate the {pretty_item(item_id)}{auto}! Friendship **+{gain}** → **{new_val}**.",
+        ephemeral=True
+    )
+
+# ---------- /walk ----------
+@bot.tree.command(name="walk", description="Walk with a Pokémon in your team.")
+@app_commands.describe(name="Pokémon name in your team (e.g. pikachu)", slot="If duplicates, which team slot (1–6)")
+async def walk_cmd(inter: discord.Interaction, name: str, slot: int | None = None):
+    mon = await resolve_team_mon(inter, name, slot)
+    if not mon:
+        return
+
+    # Set friendship to 0
+    await _set_friendship(str(inter.user.id), mon["id"], 0)
+    auto = f" (autocorrected to **{mon['_autocorrected_to']}**)" if mon.get("_autocorrected_to") else ""
+    await inter.followup.send(
+        f"👟 You walked with **{mon['species'].title()}**{auto}. Friendship set to **0**.",
+        ephemeral=True
+    )
+@bot.tree.command(name="team", description="Show your current team (6 slots).")
+@app_commands.describe(user="View another user's team (optional)")
+async def team(interaction: discord.Interaction, user: discord.User | None = None):
+    # Defer IMMEDIATELY before any database work
+    try:
+        await interaction.response.defer(ephemeral=False)
+    except discord.errors.NotFound:
+        print(f"[WARNING] /team command started too late (interaction expired)")
+        return
+    
+    target = user or interaction.user
+    uid = str(target.id)
+
+    rows = None
+    if db_cache is not None:
+        try:
+            cached = db_cache.get_cached_pokemons(uid)
+            if cached is None:
+                # Populate cache on miss (for /team, mpokeinfo, etc.)
+                await db.list_pokemons(uid, limit=2000, offset=0)
+                cached = db_cache.get_cached_pokemons(uid)
+            if cached is not None:
+                team_mons = [p for p in cached if p.get("team_slot") and 1 <= int(p.get("team_slot") or 0) <= 6]
+                team_mons.sort(key=lambda p: (int(p.get("team_slot") or 0), int(p.get("id") or 0)))
+                if team_mons:
+                    rows = []
+                    for p in team_mons:
+                        item_emoji = None
+                        if p.get("held_item") and db_cache:
+                            item_row = db_cache.get_cached_item(str(p["held_item"]))
+                            if item_row:
+                                item_emoji = (item_row.get("emoji") or "").strip()
+                        rows.append({
+                            "id": p.get("id"), "species": p.get("species"), "level": p.get("level"),
+                            "gender": p.get("gender"), "shiny": p.get("shiny"), "team_slot": p.get("team_slot"),
+                            "held_item": p.get("held_item"), "item_emoji": item_emoji,
+                        })
+        except Exception:
+            pass
+    if rows is None:
+        async with db.session() as conn:
+            cur = await conn.execute("""
+            SELECT p.id, p.species, p.level, p.gender, p.shiny, p.team_slot, p.held_item, i.emoji AS item_emoji
+            FROM pokemons p
+            LEFT JOIN items i ON i.id = p.held_item
+            WHERE p.owner_id = ? AND p.team_slot BETWEEN 1 AND 6
+            ORDER BY p.team_slot
+            """, (uid,))
+            rows = [dict(r) for r in await cur.fetchall()]
+            await cur.close()
+        # Populate cache for future /team, mpokeinfo calls (db.list_pokemons fetches and caches)
+        try:
+            await db.list_pokemons(uid, limit=2000, offset=0)
+        except Exception:
+            pass
+
+    # Map slots
+    slots: dict[int, dict | None] = {i: None for i in range(1, 7)}
+    for r in rows:
+        row = dict(r) if hasattr(r, "keys") else {
+            "id": r[0], "species": r[1], "level": r[2], "gender": r[3],
+            "shiny": r[4], "team_slot": r[5], "held_item": r[6],
+            "item_emoji": r[7] if len(r) > 7 else None,
+        }
+        slots[int(row["team_slot"])] = row
+
+    emb = discord.Embed(title=f"{target.display_name}'s Team (6 slots)")
+    EM_SPACE = "\u2003"  # wide spacing
+
+    for i in range(1, 7):
+        row = slots[i]
+        if not row:
+            value = "No pokemon \n\u200b"  # spacer line to add height
+        else:
+            star  = " ⭐" if bool(int(row.get("shiny") or 0)) else ""
+            gicon = _gender_icon(row.get("gender"))
+            item_emoji = (row.get("item_emoji") or "").strip()
+            # Fallback: held_item stored as name — use cache only (no DB)
+            if not item_emoji and row.get("held_item") and db_cache:
+                cached = db_cache.get_cached_item(str(row["held_item"]))
+                if cached:
+                    item_emoji = (cached.get("emoji") or "").strip()
+            # Only show when displayable (unicode or <:name:id>). Skip bare :shortcode:.
+            if not _is_displayable_item_emoji(item_emoji):
+                item_emoji = ""
+
+            # More spacious two-line layout + a blank spacer line
+            line1 = f"**{gicon} {str(row['species']).title()}{star}**"
+            item_pad = f"{item_emoji} {EM_SPACE}" if item_emoji else ""
+            line2 = f"{item_pad}Lv {row['level']}  ·  ID #{row['id']}"
+            value = f"{line1}\n{line2}\n\u200b"
+
+        # inline=False => each slot gets full width = less condensed
+        emb.add_field(name=f"Slot {i}", value=value, inline=True)
+
+    await interaction.followup.send(embed=emb, ephemeral=True)
+
+
+async def _create_pokemon_from_parsed(
+    owner_id: str,
+    parsed: ParsedPokemon,
+    species_entry: dict,
+    base_stats: dict
+) -> tuple[int, list[str]]:
+    """Create a Pokémon from a parsed Showdown format entry.
+    
+    Returns:
+        Tuple of (mon_id, warnings) where warnings is a list of warning messages.
+    """
+    warnings = []
+    # Normalize base stats to long keys
+    base_stats_long = normalize_base_stats(base_stats)
+    
+    # Get IVs and EVs (default to 31 IVs, 0 EVs if not specified)
+    ivs = parsed.ivs.copy()
+    evs = parsed.evs.copy()
+    
+    # Ensure all stat keys are present
+    for stat in ["hp", "attack", "defense", "special_attack", "special_defense", "speed"]:
+        if stat not in ivs:
+            ivs[stat] = 31
+        if stat not in evs:
+            evs[stat] = 0
+    
+    # Get nature (default to random if not specified)
+    nature = parsed.nature or "hardy"
+    
+    # Calculate final stats
+    final_stats = calc_all_stats(base_stats_long, ivs, evs, parsed.level, nature)
+    
+    # Get and validate ability
+    # First, try to get form-specific abilities if form is specified
+    abilities_raw = species_entry.get("abilities") or []
+    
+    # Check for form-specific abilities
+    if parsed.form:
+        species_id = species_entry.get("id")
+        if species_id:
+            try:
+                async with db.session() as conn:
+                    form_normalized = parsed.form.lower().strip()
+                    species_normalized = parsed.species.lower().strip()
+                    form_keys_to_try = [
+                        form_normalized,
+                        f"{species_normalized}-{form_normalized}",
+                        form_normalized.replace("-", ""),
+                        form_normalized.replace("_", "-"),
+                        f"{form_normalized}-form",
+                        f"{form_normalized}-forme"
+                    ]
+                    form_abilities = None
+                    for form_key in form_keys_to_try:
+                        cur = await conn.execute(
+                            "SELECT abilities FROM pokedex_forms WHERE species_id = ? AND LOWER(form_key) = LOWER(?)",
+                            (species_id, form_key)
+                        )
+                        form_row = await cur.fetchone()
+                        await cur.close()
+                        if form_row and form_row.get("abilities"):
+                            form_abilities = form_row.get("abilities")
+                            break
+                    if form_abilities:
+                        abilities_raw = form_abilities
+            except Exception:
+                pass
+
+    regs, hides = parse_abilities(abilities_raw)
+    all_valid_abilities = regs + hides
+    # Normalize all valid abilities for comparison
+    valid_abilities_normalized = {a.lower().replace(" ", "-").replace("_", "-") for a in all_valid_abilities}
+    
+    ability = parsed.ability
+    
+    if ability:
+        # Normalize the parsed ability for comparison
+        ability_normalized = ability.lower().replace(" ", "-").replace("_", "-")
+        if ability_normalized not in valid_abilities_normalized:
+            # Invalid ability - fall back to first valid ability
+            original_ability = ability
+            ability = regs[0] if regs else (hides[0] if hides else None)
+            if ability:
+                ability = ability.lower().replace(" ", "-")
+            warnings.append(f"⚠️ {parsed.species} cannot have ability '{original_ability}'. Using '{ability}' instead.")
+        else:
+            # Valid ability - normalize it
+            ability = ability_normalized
+    else:
+        # No ability specified - get default from species
+        ability = regs[0] if regs else (hides[0] if hides else None)
+        if ability:
+            ability = ability.lower().replace(" ", "-")
+    
+    # Get gender (default to random if not specified)
+    gender = parsed.gender
+    if not gender:
+        gender_ratio = species_entry.get("gender_ratio") or {}
+        if isinstance(gender_ratio, str):
+            try:
+                gender_ratio = json.loads(gender_ratio)
+            except Exception:
+                gender_ratio = {}
+        if gender_ratio.get("genderless"):
+            gender = "genderless"
+        else:
+            # Roll gender based on ratio
+            male = gender_ratio.get("male", 50)
+            if random.randint(1, 100) <= male:
+                gender = "male"
+            else:
+                gender = "female"
+    
+    # Create the Pokémon (cloud DB)
+    mon_id = await db.add_pokemon_with_stats(
+        owner_id=owner_id,
+        species=parsed.species,
+        level=parsed.level,
+        final_stats=final_stats,
+        ivs=ivs,
+        evs=evs,
+        nature=nature,
+        ability=ability,
+        gender=gender,
+        form=parsed.form,
+        tera_type=parsed.tera_type
+    )
+
+    # Set exp/exp_group from pokedex, shiny, held_item — one session for cloud DB
+    try:
+        async with db.session() as conn:
+            exp_group = await _get_exp_group_for_species(conn, parsed.species)
+            initial_exp = await _get_exp_total_for_level(conn, exp_group, parsed.level)
+            await conn.execute(
+                "UPDATE pokemons SET exp=?, exp_group=? WHERE owner_id=? AND id=?",
+                (initial_exp, exp_group, owner_id, mon_id),
+            )
+            if parsed.shiny:
+                await conn.execute(
+                    "UPDATE pokemons SET shiny=1 WHERE owner_id=? AND id=?",
+                    (owner_id, mon_id),
+                )
+            if parsed.item:
+                item_id = parsed.item.lower().replace(" ", "-")
+                try:
+                    await conn.execute(
+                        "UPDATE pokemons SET held_item=? WHERE owner_id=? AND id=?",
+                        (item_id, owner_id, mon_id),
+                    )
+                except Exception:
+                    pass
+            await conn.commit()
+            db.invalidate_pokemons_cache(owner_id)
+    except Exception:
+        pass
+
+    try:
+        if parsed.moves:
+            await db.set_pokemon_moves(owner_id, mon_id, parsed.moves)
+        
+        # Set friendship (default to max 255 if not specified)
+        # Use getattr to safely handle missing friendship attribute
+        friendship_value = getattr(parsed, 'friendship', None)
+        if friendship_value is None:
+            friendship_value = 255  # Default to max friendship
+        await _set_friendship(owner_id, mon_id, friendship_value)
+    except Exception as e:
+        # Log but don't fail the import
+        print(f"[Import] Error setting additional properties: {e}")
+    
+    return mon_id, warnings
+
+
+@bot.tree.command(name="import_team", description="Import a team from Pokémon Showdown format.")
+@app_commands.describe(
+    team_text="The team in Showdown format (paste the entire team export)"
+)
+async def import_team(interaction: discord.Interaction, team_text: str):
+    """Import a team from Pokémon Showdown format."""
+    await interaction.response.defer(ephemeral=False)
+    
+    uid = str(interaction.user.id)
+    
+    try:
+        # Parse the team
+        parsed_team = parse_showdown_team(team_text)
+        
+        if not parsed_team:
+            await interaction.followup.send("❌ No valid Pokémon found in the team text. Please check the format.", ephemeral=True)
+            return
+        
+        if len(parsed_team) > 6:
+            await interaction.followup.send(f"❌ Team has {len(parsed_team)} Pokémon. Maximum is 6.", ephemeral=True)
+            return
+
+        # Clear existing team (remove all Pokemon from team slots) — use session for cloud DB
+        async with db.session() as conn:
+            await conn.execute(
+                "UPDATE pokemons SET team_slot = NULL WHERE owner_id=? AND team_slot BETWEEN 1 AND 6",
+                (uid,)
+            )
+            await conn.commit()
+            db.invalidate_pokemons_cache(uid)
+
+        species_lookups = [(p, p.species.lower().replace(" ", "-"), p.species.lower()) for p in parsed_team]
+        all_coros = []
+        for _, n, f in species_lookups:
+            all_coros.append(db.get_pokedex_by_name(n))
+            all_coros.append(db.get_pokedex_by_name(f))
+        species_results = await asyncio.gather(*all_coros)
+        
+        created = []
+        errors = []
+        warnings = []
+        for i, (parsed, norm, fallback) in enumerate(species_lookups):
+            try:
+                species_entry = species_results[2 * i] or species_results[2 * i + 1]
+                if not species_entry:
+                    errors.append(f"{parsed.species}: not found in Pokédex")
+                    continue
+                parsed.species = species_entry.get("name", norm)
+                base_stats = species_entry.get("stats") or {}
+                if isinstance(base_stats, str):
+                    try:
+                        base_stats = json.loads(base_stats)
+                    except Exception:
+                        base_stats = {}
+                mon_id, mon_warnings = await _create_pokemon_from_parsed(uid, parsed, species_entry, base_stats)
+                slot = i + 1
+                await db.set_team_slot(uid, mon_id, slot)
+                created.append(f"{parsed.species} (slot {slot})")
+                if mon_warnings:
+                    warnings.extend(mon_warnings)
+            except Exception as e:
+                errors.append(f"{parsed.species}: {str(e)}")
+        
+        response_parts = []
+        if created:
+            response_parts.append(f"✅ Successfully imported {len(created)} Pokémon:\n" + "\n".join(f"  • {name}" for name in created))
+        if warnings:
+            response_parts.append(f"⚠️ Warnings ({len(warnings)}):\n" + "\n".join(f"  • {w}" for w in warnings))
+        if errors:
+            response_parts.append(f"❌ Errors ({len(errors)}):\n" + "\n".join(f"  • {err}" for err in errors))
+        
+        await interaction.followup.send("\n\n".join(response_parts), ephemeral=True)
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error importing team: {str(e)}", ephemeral=True)
+
+
+@bot.tree.command(name="save_preset", description="Save your current team as a preset.")
+@app_commands.describe(
+    preset_name="Name for this preset"
+)
+async def save_preset(interaction: discord.Interaction, preset_name: str):
+    """Save the current team as a preset."""
+    await interaction.response.defer(ephemeral=False)
+    
+    uid = str(interaction.user.id)
+    
+    try:
+        # Get current team — use session for cloud DB
+        async with db.session() as conn:
+            cur = await conn.execute("""
+                SELECT species, level, hp, atk, def, spa, spd, spe, ivs, evs, nature, ability,
+                       gender, held_item, moves, form, tera_type, shiny, friendship
+                FROM pokemons
+                WHERE owner_id=? AND team_slot BETWEEN 1 AND 6
+                ORDER BY team_slot
+            """, (uid,))
+            rows = await cur.fetchall()
+            await cur.close()
+
+        if not rows:
+            await interaction.followup.send("❌ You don't have any Pokémon in your team to save.", ephemeral=True)
+            return
+        
+        # Convert team to Showdown format
+        team_lines = []
+        for row in rows:
+            r = dict(row)
+            species = r["species"]
+            if r.get("form"):
+                species = f"{species}-{r['form']}"
+            
+            line = species
+            if r.get("held_item"):
+                line += f" @ {r['held_item']}"
+            team_lines.append(line)
+            
+            if r.get("ability"):
+                team_lines.append(f"Ability: {r['ability']}")
+            
+            team_lines.append(f"Level: {r['level']}")
+            
+            # EVs
+            evs = json.loads(r["evs"]) if isinstance(r["evs"], str) else r["evs"]
+            ev_parts = []
+            for stat, val in evs.items():
+                if val > 0:
+                    stat_abbrev = {
+                        "hp": "HP", "attack": "Atk", "defense": "Def",
+                        "special_attack": "SpA", "special_defense": "SpD", "speed": "Spe"
+                    }.get(stat, stat.title())
+                    ev_parts.append(f"{val} {stat_abbrev}")
+            if ev_parts:
+                team_lines.append(f"EVs: {' / '.join(ev_parts)}")
+            
+            # Nature
+            if r.get("nature"):
+                team_lines.append(f"{r['nature'].title()} Nature")
+            
+            # IVs (only if not all 31)
+            ivs = json.loads(r["ivs"]) if isinstance(r["ivs"], str) else r["ivs"]
+            iv_parts = []
+            for stat, val in ivs.items():
+                if val != 31:
+                    stat_abbrev = {
+                        "hp": "HP", "attack": "Atk", "defense": "Def",
+                        "special_attack": "SpA", "special_defense": "SpD", "speed": "Spe"
+                    }.get(stat, stat.title())
+                    iv_parts.append(f"{val} {stat_abbrev}")
+            if iv_parts:
+                team_lines.append(f"IVs: {' / '.join(iv_parts)}")
+            
+            # Moves
+            moves = json.loads(r["moves"]) if isinstance(r["moves"], str) else r["moves"]
+            for move in moves:
+                if move:
+                    team_lines.append(f"- {move}")
+            
+            # Friendship (custom field, not in standard Showdown format)
+            if r.get("friendship") is not None:
+                team_lines.append(f"Friendship: {r['friendship']}")
+            
+            team_lines.append("")  # Blank line between Pokémon
+        
+        team_text = "\n".join(team_lines).strip()
+        
+        # Save preset
+        await db.save_team_preset(uid, preset_name, team_text)
+        
+        await interaction.followup.send(f"✅ Team saved as preset '{preset_name}'!", ephemeral=True)
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error saving preset: {str(e)}", ephemeral=True)
+
+
+@bot.tree.command(name="load_preset", description="Load a saved team preset.")
+@app_commands.describe(
+    preset_name="Name of the preset to load"
+)
+async def load_preset(interaction: discord.Interaction, preset_name: str):
+    """Load a saved team preset."""
+    await interaction.response.defer(ephemeral=False)
+    
+    uid = str(interaction.user.id)
+    
+    try:
+        # Get preset
+        team_text = await db.get_team_preset(uid, preset_name)
+        if not team_text:
+            await interaction.followup.send(f"❌ Preset '{preset_name}' not found.", ephemeral=True)
+            return
+        
+        # Use the same import logic as import_team
+        parsed_team = parse_showdown_team(team_text)
+        
+        if not parsed_team:
+            await interaction.followup.send("❌ Preset contains no valid Pokémon.", ephemeral=True)
+            return
+        
+        if len(parsed_team) > 6:
+            await interaction.followup.send(f"❌ Preset has {len(parsed_team)} Pokémon. Maximum is 6.", ephemeral=True)
+            return
+
+        # Clear existing team (remove all Pokemon from team slots) — use session for cloud DB
+        async with db.session() as conn:
+            await conn.execute(
+                "UPDATE pokemons SET team_slot = NULL WHERE owner_id=? AND team_slot BETWEEN 1 AND 6",
+                (uid,)
+            )
+            await conn.commit()
+            db.invalidate_pokemons_cache(uid)
+
+        species_lookups = [(p, p.species.lower().replace(" ", "-"), p.species.lower()) for p in parsed_team]
+        all_coros = []
+        for _, n, f in species_lookups:
+            all_coros.append(db.get_pokedex_by_name(n))
+            all_coros.append(db.get_pokedex_by_name(f))
+        species_results = await asyncio.gather(*all_coros)
+        
+        created = []
+        errors = []
+        warnings = []
+        for i, (parsed, norm, fallback) in enumerate(species_lookups):
+            try:
+                species_entry = species_results[2 * i] or species_results[2 * i + 1]
+                if not species_entry:
+                    errors.append(f"{parsed.species}: not found in Pokédex")
+                    continue
+                parsed.species = species_entry.get("name", norm)
+                base_stats = species_entry.get("stats") or {}
+                if isinstance(base_stats, str):
+                    try:
+                        base_stats = json.loads(base_stats)
+                    except Exception:
+                        base_stats = {}
+                mon_id, mon_warnings = await _create_pokemon_from_parsed(uid, parsed, species_entry, base_stats)
+                slot = i + 1
+                await db.set_team_slot(uid, mon_id, slot)
+                created.append(f"{parsed.species} (slot {slot})")
+                if mon_warnings:
+                    warnings.extend(mon_warnings)
+            except Exception as e:
+                errors.append(f"{parsed.species}: {str(e)}")
+        
+        response_parts = []
+        if created:
+            response_parts.append(f"✅ Successfully loaded preset '{preset_name}' ({len(created)} Pokémon):\n" + "\n".join(f"  • {name}" for name in created))
+        if warnings:
+            response_parts.append(f"⚠️ Warnings ({len(warnings)}):\n" + "\n".join(f"  • {w}" for w in warnings))
+        if errors:
+            response_parts.append(f"❌ Errors ({len(errors)}):\n" + "\n".join(f"  • {err}" for err in errors))
+        
+        await interaction.followup.send("\n\n".join(response_parts), ephemeral=True)
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error loading preset: {str(e)}", ephemeral=True)
+
+
+@bot.tree.command(name="list_presets", description="List your saved team presets.")
+async def list_presets(interaction: discord.Interaction):
+    """List all saved team presets."""
+    await interaction.response.defer(ephemeral=False)
+    
+    uid = str(interaction.user.id)
+    
+    try:
+        presets = await db.list_team_presets(uid)
+        
+        if not presets:
+            await interaction.followup.send("❌ You don't have any saved presets. Use `/save_preset` to save your current team.", ephemeral=True)
+            return
+        
+        embed = discord.Embed(title="Your Team Presets", color=0x2b2d31)
+        preset_list = []
+        for preset in presets:
+            name = preset["preset_name"]
+            created = preset.get("created_at", "Unknown")
+            preset_list.append(f"• **{name}** (saved {created})")
+        
+        embed.description = "\n".join(preset_list)
+        embed.set_footer(text=f"Total: {len(presets)} preset(s)")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error listing presets: {str(e)}", ephemeral=True)
+
+
+@bot.tree.command(name="delete_preset", description="Delete a saved team preset.")
+@app_commands.describe(
+    preset_name="Name of the preset to delete"
+)
+async def delete_preset(interaction: discord.Interaction, preset_name: str):
+    """Delete a saved team preset."""
+    await interaction.response.defer(ephemeral=False)
+    
+    uid = str(interaction.user.id)
+    
+    try:
+        deleted = await db.delete_team_preset(uid, preset_name)
+        
+        if deleted:
+            await interaction.followup.send(f"✅ Preset '{preset_name}' deleted.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ Preset '{preset_name}' not found.", ephemeral=True)
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error deleting preset: {str(e)}", ephemeral=True)
+
+
+@bot.tree.command(name="preset_team", description="Import a preset team.")
+@app_commands.describe(
+    preset_name="The name of the preset team to import (gen1_ou, gen2_ou, gen3_ou)"
+)
+async def preset_team(interaction: discord.Interaction, preset_name: str):
+    """Import a preset team (legacy global presets)."""
+    await interaction.response.defer(ephemeral=False)
+    
+    uid = str(interaction.user.id)
+    
+    try:
+        # First check if it's a user preset
+        user_preset = await db.get_team_preset(uid, preset_name)
+        if user_preset:
+            # Load user preset
+            parsed_team = parse_showdown_team(user_preset)
+        else:
+            # Try global preset
+            preset = get_preset_team(preset_name)
+            if not preset:
+                await interaction.followup.send(f"❌ Preset team '{preset_name}' not found. Use `/list_presets` to see your saved presets.", ephemeral=True)
+                return
+            
+            # Convert global preset to Showdown format for parsing
+            preset_lines = []
+            for pokemon_data in preset:
+                preset_lines.append(f"{pokemon_data['species']} @ {pokemon_data.get('item', '')}" if pokemon_data.get('item') else pokemon_data['species'])
+                if pokemon_data.get('ability'):
+                    preset_lines.append(f"Ability: {pokemon_data['ability']}")
+                preset_lines.append(f"Level: {pokemon_data.get('level', 100)}")
+                evs = pokemon_data.get('evs', {})
+                ev_parts = [f"{v} {k.title()}" for k, v in evs.items() if v > 0]
+                if ev_parts:
+                    preset_lines.append(f"EVs: {' / '.join(ev_parts)}")
+                if pokemon_data.get('nature'):
+                    preset_lines.append(f"{pokemon_data['nature'].title()} Nature")
+                for move in pokemon_data.get('moves', []):
+                    preset_lines.append(f"- {move}")
+                preset_lines.append("")
+            
+            preset_text = "\n".join(preset_lines).strip()
+            parsed_team = parse_showdown_team(preset_text)
+        
+        if not parsed_team:
+            await interaction.followup.send("❌ Preset contains no valid Pokémon.", ephemeral=True)
+            return
+        
+        if len(parsed_team) > 6:
+            await interaction.followup.send(f"❌ Preset team has {len(parsed_team)} Pokémon. Maximum is 6.", ephemeral=True)
+            return
+        
+        # Check available team slots
+        conn = await db.connect()
+        try:
+            cur = await conn.execute(
+                "SELECT COUNT(*) as count FROM pokemons WHERE owner_id=? AND team_slot BETWEEN 1 AND 6",
+                (uid,)
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            current_team_size = row["count"] if row else 0
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+        available_slots = 6 - current_team_size
+
+        if len(parsed_team) > available_slots:
+            await interaction.followup.send(
+                f"❌ Not enough team slots available. You have {available_slots} free slot(s), but the preset team has {len(parsed_team)} Pokémon.",
+                ephemeral=True
+            )
+            return
+        
+        # Process each Pokémon
+        created = []
+        errors = []
+        warnings = []
+        
+        for i, parsed in enumerate(parsed_team):
+            try:
+                # Get species data from local database only (no PokeAPI)
+                # Normalize species name: convert spaces to hyphens for database lookup
+                # (e.g., "Tapu Bulu" -> "tapu-bulu")
+                species_name_normalized = parsed.species.lower().replace(" ", "-")
+                species_entry = await db.get_pokedex_by_name(species_name_normalized)
+                
+                # If not found, also try the original lowercase version (for backwards compatibility)
+                if not species_entry:
+                    species_entry = await db.get_pokedex_by_name(parsed.species.lower())
+                
+                if not species_entry:
+                    errors.append(f"{parsed.species}: not found in Pokédex")
+                    continue
+                
+                # Update parsed.species to use the normalized name from database
+                parsed.species = species_entry.get("name", species_name_normalized)
+                
+                # Get base stats
+                base_stats = species_entry.get("stats") or {}
+                if isinstance(base_stats, str):
+                    try:
+                        base_stats = json.loads(base_stats)
+                    except Exception:
+                        base_stats = {}
+                
+                # Create the Pokémon
+                mon_id, mon_warnings = await _create_pokemon_from_parsed(uid, parsed, species_entry, base_stats)
+                
+                # Add to team (find next free slot)
+                slot = await db.next_free_team_slot(uid)
+                if slot:
+                    await db.set_team_slot(uid, mon_id, slot)
+                    created.append(f"{parsed.species} (slot {slot})")
+                else:
+                    errors.append(f"{parsed.species} (no team slot available)")
+                
+                # Collect any warnings
+                if mon_warnings:
+                    warnings.extend(mon_warnings)
+                    
+            except Exception as e:
+                errors.append(f"{parsed.species}: {str(e)}")
+        
+        # Build response
+        response_parts = []
+        if created:
+            response_parts.append(f"✅ Successfully imported preset team '{preset_name}' ({len(created)} Pokémon):\n" + "\n".join(f"  • {name}" for name in created))
+        if warnings:
+            response_parts.append(f"⚠️ Warnings ({len(warnings)}):\n" + "\n".join(f"  • {w}" for w in warnings))
+        if errors:
+            response_parts.append(f"❌ Errors ({len(errors)}):\n" + "\n".join(f"  • {err}" for err in errors))
+        
+        await interaction.followup.send("\n\n".join(response_parts), ephemeral=True)
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Error importing preset team: {str(e)}", ephemeral=True)
+
+
+## BAG
+# --- Bag view and item helpers ---
+import discord
+from discord import ui, Interaction, Embed, SelectOption
+from discord.ext import commands
+from discord import app_commands
+
+
+class BagView(ui.View):
+    def __init__(self, owner_id: int, page: int, max_pages: int):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.page = page
+        self.max_pages = max_pages
+
+        # Buttons
+        self.prev_btn = ui.Button(label="Prev", style=discord.ButtonStyle.secondary, disabled=(page <= 1))
+        self.next_btn = ui.Button(label="Next", style=discord.ButtonStyle.secondary, disabled=(page >= max_pages))
+        self.add_item(self.prev_btn)
+        self.add_item(self.next_btn)
+
+        # Jump select
+        options = [SelectOption(label=f"Page {i}", value=str(i), default=(i == page))
+                   for i in range(1, max_pages + 1)]
+        self.page_select = ui.Select(placeholder="Jump to…", options=options, min_values=1, max_values=1)
+        self.add_item(self.page_select)
+
+        # Bind callbacks
+        self.prev_btn.callback = self.on_prev
+        self.next_btn.callback = self.on_next
+        self.page_select.callback = self.on_jump
+
+    async def _refresh(self, interaction: Interaction, new_page: int):
+        # Shared connection (WAL + busy_timeout) to reduce connection churn under load
+        conn = await db.connect()
+        try:
+            items, max_pages, total_distinct = await db.get_inventory_page(conn, self.owner_id, new_page)
+
+            self.page = new_page
+            self.max_pages = max_pages
+
+            # Update controls
+            self.prev_btn.disabled = (self.page <= 1)
+            self.next_btn.disabled = (self.page >= self.max_pages)
+            self.page_select.options = [
+                SelectOption(label=f"Page {i}", value=str(i), default=(i == self.page))
+                for i in range(1, self.max_pages + 1)
+            ]
+
+            embed, files = build_bag_embed(self.owner_id, items, self.page, self.max_pages, total_distinct)
+            try:
+                await interaction.response.edit_message(embed=embed, view=self, attachments=files)
+            finally:
+                _close_discord_files(files)
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+    async def on_prev(self, interaction: Interaction):
+        if interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("This isn’t your bag.", ephemeral=True)
+        await self._refresh(interaction, max(1, self.page - 1))
+
+    async def on_next(self, interaction: Interaction):
+        if interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("This isn’t your bag.", ephemeral=True)
+        await self._refresh(interaction, min(self.max_pages, self.page + 1))
+
+    async def on_jump(self, interaction: Interaction):
+        if interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("This isn’t your bag.", ephemeral=True)
+        choice = int(self.page_select.values[0])
+        await self._refresh(interaction, choice)
+
+def format_item_line(row: dict) -> str:
+    qty = row["qty"]
+    name = pretty_item_name(row.get("name") or row["item_id"])
+
+    if row.get("emoji"):  # already contains <:name:id>
+        return f"{row['emoji']} **{name}** ×{qty}"
+
+    return f"**{name}** ×{qty}"
+
+def build_bag_embed(owner_id: int, items: list[dict], page: int, max_pages: int, total_distinct: int):
+    e = discord.Embed(title=f"Bag — Page {page}/{max_pages}", color=0x2b2d31)
+
+    if not items:
+        e.description = "_This page is empty._"
+    else:
+        lines = [format_item_line(it) for it in items]
+        e.description = "\n".join(lines)
+
+    e.set_footer(text=f"Distinct items: {total_distinct} • Pages owned: {max_pages}")
+
+    # 👇 Use the same item icon logic for the bag
+    att_url, att_file = item_icon_file("bag")
+    files = []
+    if att_file:
+        e.set_thumbnail(url=att_url)
+        files.append(att_file)
+
+    return e, files
+
+
+async def _build_bag_embed_for_battle(owner_id: int | str, page: int = 1):
+    """Build the same bag embed as /bag for in-battle use. Returns (embed, files)."""
+    async with db.session() as conn:
+        items, max_pages, total_distinct = await db.get_inventory_page(conn, str(owner_id), page)
+    page = max(1, min(page, max_pages))
+    return build_bag_embed(int(owner_id) if isinstance(owner_id, str) else owner_id, items, page, max_pages, total_distinct)
+
+
+
+
+class BagCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    async def _decorate_items_with_usage(self, owner_id: int | str, items: list) -> list:
+        """
+        Mutates rows so that row['qty'] becomes 'free/total' (string) for display.
+        'free' = total - how many are currently held by your Pokémon.
+        Runs _count_item_in_use in parallel for all items.
+        """
+        uid = str(owner_id)
+        rows_data = []
+        for r in items:
+            asdict = dict(r) if hasattr(r, "keys") else {
+                "id": r[0] if len(r) > 0 else None,
+                "name": r[1] if len(r) > 1 else None,
+                "qty": r[2] if len(r) > 2 else 0,
+            }
+            item_id = (asdict.get("id") or asdict.get("item_id") or asdict.get("name") or "").strip()
+            total = int((asdict.get("qty") or 0) or 0)
+            rows_data.append((asdict, item_id, total))
+        async def _zero():
+            return 0
+        coros = [_count_item_in_use(uid, iid) if iid else _zero() for _, iid, _ in rows_data]
+        used_list = await asyncio.gather(*coros)
+        out = []
+        for (asdict, _, total), used in zip(rows_data, used_list):
+            used = int(used) if isinstance(used, (int, float)) else 0
+            free = max(0, total - used)
+            asdict["qty"] = f"{free}/{total}"
+            out.append(asdict)
+        return out
+
+    @app_commands.command(name="bag", description="View your items (6 pages by default).")
+    async def bag(self, interaction: Interaction, page: int = 1):
+        await interaction.response.defer(ephemeral=False)
+        owner_id = interaction.user.id
+        conn = await db.connect()
+        try:
+            items, max_pages, total_distinct = await db.get_inventory_page(conn, owner_id, page)
+
+            # keep page within bounds
+            page = max(1, min(page, max_pages))
+            view = BagView(owner_id, page=page, max_pages=max_pages)
+
+            # ---- NEW: decorate items so qty shows "free/total" ----
+            items = await self._decorate_items_with_usage(owner_id, items)
+
+            embed, files = build_bag_embed(owner_id, items, view.page, view.max_pages, total_distinct)
+            try:
+                await interaction.followup.send(embed=embed, view=view, files=files, ephemeral=True)
+            finally:
+                _close_discord_files(files)
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+# =========================
+#  equipment
+# =========================
+GEAR_SLOTS = ("mega", "z", "dmax", "tera")
+_equipment_ensured = False
+
+def _gear_slot_for_item_id(s: str | None) -> str | None:
+    if not s:
+        return None
+    t = str(s).strip().lower().replace(" ", "_").replace("-", "_")
+    if t.endswith("ite") or "mega_bracelet" in t or "mega_ring" in t or "key_stone" in t:
+        return "mega"
+    if t.endswith("_z") or "z_ring" in t or "z_power_ring" in t:
+        return "z"
+    if "dynamax" in t or "max_band" in t or t.startswith("max_"):
+        return "dmax"
+    if "tera_orb" in t or "terastal_orb" in t:
+        return "tera"
+    return None
+
+async def _ensure_equipment_table(*, _skip_if_done: bool = True):
+    global _equipment_ensured
+    if _skip_if_done and _equipment_ensured:
+        return
+    conn = await db.connect()
+    try:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_equipment (
+                owner_id      TEXT PRIMARY KEY,
+                mega_gear     TEXT,
+                z_gear        TEXT,
+                dmax_gear     TEXT,
+                tera_gear     TEXT,
+                mega_unlocked INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        # idempotent migration: add mega_unlocked if older table exists
+        if getattr(db, "DB_IS_POSTGRES", False):
+            cur = await conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=?",
+                ("user_equipment",),
+            )
+            cols = {r[0] for r in await cur.fetchall()}
+            await cur.close()
+        else:
+            cur = await conn.execute("PRAGMA table_info(user_equipment)")
+            cols = {r[1] for r in await cur.fetchall()}
+            await cur.close()
+        if "mega_unlocked" not in cols:
+            await conn.execute("ALTER TABLE user_equipment ADD COLUMN mega_unlocked INTEGER NOT NULL DEFAULT 0")
+        await conn.commit()
+        _equipment_ensured = True
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+async def _set_gear(owner_id: str, slot: str, item_id: str | None, *, skip_ensure: bool = False):
+    if not skip_ensure:
+        await _ensure_equipment_table()
+    conn = await db.connect()
+    try:
+        await conn.execute("INSERT OR IGNORE INTO user_equipment (owner_id) VALUES (?)", (owner_id,))
+        col = f"{slot}_gear"
+        await conn.execute(f"UPDATE user_equipment SET {col}=? WHERE owner_id=?", (item_id, owner_id))
+        await conn.commit()
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+async def _set_mega_unlocked(owner_id: str, unlocked: bool, *, skip_ensure: bool = False):
+    if not skip_ensure:
+        await _ensure_equipment_table()
+    conn = await db.connect()
+    try:
+        await conn.execute("UPDATE user_equipment SET mega_unlocked=? WHERE owner_id=?", (1 if unlocked else 0, owner_id))
+        await conn.commit()
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+async def _get_all_gear(owner_id: str, *, skip_ensure: bool = False) -> dict:
+    if not skip_ensure:
+        await _ensure_equipment_table()
+    conn = await db.connect()
+    try:
+        cur = await conn.execute("""
+            SELECT mega_gear, z_gear, dmax_gear, tera_gear, mega_unlocked
+            FROM user_equipment
+            WHERE owner_id=?
+        """, (owner_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return {"mega": None, "z": None, "dmax": None, "tera": None, "mega_unlocked": 0}
+        asdict = dict(row) if hasattr(row, "keys") else {
+            "mega_gear": row[0], "z_gear": row[1], "dmax_gear": row[2], "tera_gear": row[3], "mega_unlocked": row[4]
+        }
+        return {
+            "mega": asdict.get("mega_gear"),
+            "z": asdict.get("z_gear"),
+            "dmax": asdict.get("dmax_gear"),
+            "tera": asdict.get("tera_gear"),
+            "mega_unlocked": int(asdict.get("mega_unlocked") or 0),
+        }
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+async def _item_emoji_and_name(q: str | None) -> tuple[str, str]:
+    if not q:
+        return "", "—"
+    conn = await db.connect()
+    try:
+        row = await _fetch_item_by_query(conn, q)
+        if row:
+            emoji_raw = (row.get("emoji") or "").strip()
+            emoji = emoji_raw if _is_displayable_item_emoji(emoji_raw) else ""
+            name = pretty_item_name(row.get("name") or row.get("id") or q)
+            return emoji, name
+        return "", pretty_item_name(q)
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+def _slot_human(slot: str) -> str:
+    return {
+        "mega": "Mega Bracelet / Key Stone",
+        "z": "Z-Ring",
+        "dmax": "Dynamax Band",
+        "tera": "Tera Orb",
+    }.get(slot, slot)
+
+def _slot_active_for_gen(slot: str, gen: int, gear: dict) -> bool:
+    """
+    Mega is special per your rule:
+      - requires: mega_unlocked == 1  AND  gen <= 7
+      - once unlocked (you got the bracelet in Gen6), it's usable back in Gen1–7
+      - never usable in Gen8+
+    Other gimmicks: strict single-gen
+    """
+    if slot == "mega":
+        return gear.get("mega") and gear.get("mega_unlocked", 0) == 1 and _rules.mega_allowed_in_gen(gen)
+    if slot == "z":
+        return gear.get("z") and gen == 7
+    if slot == "dmax":
+        return gear.get("dmax") and gen == 8
+    if slot == "tera":
+        return gear.get("tera") and gen == 9
+    return False
+
+async def _user_has_item(owner_id: str, item_id: str) -> int:
+    """
+    Return the quantity of item_id in the user's bag.
+    Used to require owning gear before equipping it.
+    """
+    conn = await db.connect()
+    try:
+        cur = await conn.execute(
+            "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
+            (owner_id, item_id),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return 0
+        # support either Row or tuple
+        qty = row["qty"] if hasattr(row, "keys") else row[0]
+        try:
+            return int(qty or 0)
+        except Exception:
+            return 0
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+@bot.tree.command(
+    name="equipgear",
+    description="Equip trainer gear (Mega/Z/Dyna/Tera). Wrong-gen inactive; Mega unlocks in Gen6."
+)
+@app_commands.describe(item="Item id or name (e.g., mega bracelet, z-ring, dynamax band, tera orb)")
+async def equipgear(interaction: discord.Interaction, item: str):
+    await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+    await _ensure_equipment_table()
+
+    # Resolve to a known item in DB (must be in your bag)
+    conn = await db.connect()
+    try:
+        row = await _fetch_item_by_query(conn, item)
+        if not row:
+            return await interaction.followup.send(
+            "❌ I don’t recognize that item. Import it first or use its exact id/name.",
+            ephemeral=True
+        )
+        item_id = (row.get("id") or "").strip()
+        if not item_id:
+            return await interaction.followup.send("❌ Invalid item.", ephemeral=True)
+
+        # Require ownership in bag
+        qty = await _user_has_item(uid, item_id)
+        if qty <= 0:
+            emoji = row.get("emoji") or ""
+            disp  = pretty_item_name(row.get("name") or row.get("id") or item)
+            return await interaction.followup.send(
+                f"❌ You don’t have {(emoji + ' ') if emoji else ''}**{disp}** in your bag.",
+                ephemeral=True
+            )
+
+        # Determine gear slot
+        slot = _gear_slot_for_item_id(item_id)
+        if not slot:
+            return await interaction.followup.send(
+                "❌ That item isn’t valid trainer gear (Mega/Z/Dynamax/Tera).",
+                ephemeral=True
+            )
+
+        # If already equipped with the same item, don't consume again
+        current = await _get_all_gear(uid, skip_ensure=True)
+        already_equipped_same = (str(current.get(slot) or "").lower() == item_id.lower())
+        if already_equipped_same:
+                emoji_raw = (row.get("emoji") or "").strip()
+                emoji = emoji_raw if _is_displayable_item_emoji(emoji_raw) else ""
+                disp  = pretty_item_name(row.get("name") or row.get("id") or item_id)
+                user_gen = await db.get_user_gen(uid)
+                emb = discord.Embed(
+                    title=f"Trainer Gear for {interaction.user.display_name} (Gen {user_gen})",
+                    description=f"ℹ️ You already have {(emoji + ' ') if emoji else ''}**{disp}** equipped. Nothing consumed.",
+                    color=0x2b2d31
+                )
+                slot_values = [current.get(sl) for sl in GEAR_SLOTS]
+                ei = await asyncio.gather(*[_item_emoji_and_name(q) for q in slot_values])
+                for sl, (e, d) in zip(GEAR_SLOTS, ei):
+                    active = _slot_active_for_gen(sl, user_gen, current)
+                    status = "ACTIVE ✅" if active else ("inactive ⚪" if current.get(sl) else "empty —")
+                    emb.add_field(name=_slot_human(sl), value=f"{(e + ' ') if e else ''}{d} · {status}", inline=False)
+                return await interaction.followup.send(embed=emb, ephemeral=True)
+
+        # Consume 1x from bag
+        ok = await _decrement_user_item(uid, item_id, 1)
+        if not ok:
+            return await interaction.followup.send("❌ You no longer have one to equip.", ephemeral=True)
+
+        # Save gear selection (ensure already done above)
+        await _set_gear(uid, slot, item_id, skip_ensure=True)
+
+        # Auto-unlock Megas if equipping bracelet/ring/keystone while in Gen ≥ 6
+        user_gen = await db.get_user_gen(uid)
+        if slot == "mega" and user_gen >= 6:
+            await _set_mega_unlocked(uid, True, skip_ensure=True)
+
+        # Build status embed
+        gear = await _get_all_gear(uid, skip_ensure=True)
+        emoji_raw = (row.get("emoji") or "").strip()
+        emoji = emoji_raw if _is_displayable_item_emoji(emoji_raw) else ""
+        disp  = pretty_item_name(row.get("name") or row.get("id") or item_id)
+        emb = discord.Embed(
+            title=f"Trainer Gear for {interaction.user.display_name} (Gen {user_gen})",
+            description=f"Consumed **1×** {(emoji + ' ') if emoji else ''}**{disp}** from your bag.\n"
+                        "Wrong-gen gear stays equipped but inactive. Mega unlocks in Gen6; then usable in Gen1–7.",
+            color=0x2b2d31
+        )
+        slot_values = [gear.get(sl) for sl in GEAR_SLOTS]
+        ei = await asyncio.gather(*[_item_emoji_and_name(q) for q in slot_values])
+        for sl, (e, d) in zip(GEAR_SLOTS, ei):
+            active = _slot_active_for_gen(sl, user_gen, gear)
+            status = "ACTIVE ✅" if active else ("inactive ⚪" if gear.get(sl) else "empty —")
+            emb.add_field(name=_slot_human(sl), value=f"{(e + ' ') if e else ''}{d} · {status}", inline=False)
+
+        await interaction.followup.send(embed=emb, ephemeral=True)
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+@bot.tree.command(
+    name="mygear",
+    description="Show your trainer gear and whether it’s active this gen."
+)
+async def mygear(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+    await _ensure_equipment_table()
+    user_gen = await db.get_user_gen(uid)
+    gear = await _get_all_gear(uid, skip_ensure=True)
+
+    emb = discord.Embed(
+        title=f"Trainer Gear for {interaction.user.display_name} (Gen {user_gen})",
+        color=0x2b2d31
+    )
+    emb.set_footer(text="Mega unlocks in Gen6; usable in Gen1–7. Z=Gen7, Dyna=Gen8, Tera=Gen9.")
+    slot_values = [gear.get(sl) for sl in GEAR_SLOTS]
+    ei = await asyncio.gather(*[_item_emoji_and_name(q) for q in slot_values])
+    for sl, (emoji, disp) in zip(GEAR_SLOTS, ei):
+        active = _slot_active_for_gen(sl, user_gen, gear)
+        gid = gear.get(sl)
+        status = "ACTIVE ✅" if active else ("inactive ⚪" if gid else "empty —")
+        emb.add_field(
+            name=_slot_human(sl),
+            value=f"{(emoji + ' ') if emoji else ''}{disp} · {status}",
+            inline=False
+        )
+    await interaction.followup.send(embed=emb, ephemeral=True)
+# =========================
+#  fetching emojis
+# =========================
+EMOJI_CODE_RE = re.compile(r"<a?:([A-Za-z0-9_]+):(\d+)>")
+
+def _norm(s: str) -> str:
+    """Normalize names to compare emoji names to item ids/names."""
+    return (
+        str(s or "")
+        .lower()
+        .replace("é", "e")
+        .replace("&", "and")
+        .replace("’", "'")
+        .replace("'", "")
+        .replace("’", "")
+        .replace(".", "")
+        .replace(" ", "-")
+        .replace("_", "-")
+    )
+
+async def _open_db():
+    # Reuse the shared WAL connection for consistency and fewer FDs
+    return await db.connect()
+
+
+class EmojiLinkCog(commands.Cog):
+    """Tools to link your server's custom emojis to items (DB: items.emoji)."""
+
+    EMOJI_CODE_RE = re.compile(r"<a?:([A-Za-z0-9_]+):(\d+)>")
+
+    # ---------- helpers ----------
+    @staticmethod
+    def _norm(s: str) -> str:
+        return (
+            str(s or "")
+            .lower()
+            .replace("é", "e")
+            .replace("&", "and")
+            .replace("’", "")
+            .replace("'", "")
+            .replace(".", "")
+            .replace(" ", "-")
+            .replace("_", "-")
+        )
+
+    @staticmethod
+    async def _open_db():
+        return await db.connect()
+
+    async def _resolve_item_fuzzy_local(self, conn, query: str):
+        """
+        Fallback fuzzy resolver if your project doesn't expose _resolve_item_fuzzy.
+        Returns (row_dict, autocorrect_to, suggestions)
+        """
+        q = self._norm(query)
+        like = f"%{q.replace('-', '%')}%"
+        # pull a small candidate set
+        sql = """
+        SELECT id, name FROM items
+        WHERE LOWER(id) LIKE ? OR LOWER(name) LIKE ?
+        LIMIT 50
+        """
+        cur = await conn.execute(sql, (like, like))
+        rows = await cur.fetchall()
+        await cur.close()
+
+        if not rows:
+            return None, None, []
+
+        # simple score: exact id, exact name, startswith, contains
+        def score(r):
+            rid = self._norm(r["id"])
+            rnm = self._norm(r["name"] or "")
+            if rid == q or rnm == q: return (0, len(rid))
+            if rid.startswith(q) or rnm.startswith(q): return (1, len(rid))
+            if q in rid or q in rnm: return (2, len(rid))
+            # distant match
+            return (3, len(rid))
+
+        rows.sort(key=score)
+        best = rows[0]
+        # suggestions (pretty)
+        sugg = []
+        for r in rows[:10]:
+            nm = r["name"] or r["id"]
+            sugg.append(nm)
+        # fetch full row
+        cur = await conn.execute("SELECT * FROM items WHERE id = ?", (best["id"],))
+        full = await cur.fetchone()
+        await cur.close()
+        return (dict(full) if full else None,
+                (best["name"] or best["id"]),
+                sugg[1:])
+
+    async def _resolve_item_any(self, conn, query: str):
+        """
+        Use your project's _resolve_item_fuzzy(conn, query) if available,
+        otherwise fallback to the local resolver above.
+        """
+        try:
+            # if your project defines this helper at module level, use it
+            row, autocorrect_to, suggestions = await _resolve_item_fuzzy(conn, query)  # type: ignore
+            return row, autocorrect_to, suggestions
+        except Exception:
+            return await self._resolve_item_fuzzy_local(conn, query)
+    # ---------- end helpers ----------
+
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    # ========== /emoji_autolink ==========
+    @app_commands.command(
+        name="emoji_autolink",
+        description="Auto-link server custom emojis to items by name/id."
+    )
+    @app_commands.describe(
+        dry_run="If true, only show what would change (no DB writes)."
+    )
+    async def emoji_autolink(self, interaction: discord.Interaction, dry_run: bool = True):
+        if not interaction.guild:
+            return await interaction.response.send_message("Run this in a server.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # normalized emoji name -> full code
+        emoji_map = {self._norm(e.name): f"<:{e.name}:{e.id}>" for e in interaction.guild.emojis}
+
+        matched = already = 0
+        missing = []
+        to_update = []
+
+        conn = await self._open_db()
+        try:
+            cur = await conn.execute("SELECT id, name, COALESCE(emoji,'') AS emoji FROM items")
+            rows = await cur.fetchall()
+            await cur.close()
+
+            for r in rows:
+                item_id = r["id"]
+                item_name = r["name"]
+                current = (r["emoji"] or "").strip()
+
+                if current:
+                    already += 1
+                    continue
+
+                keys = [
+                    self._norm(item_id),
+                    self._norm(item_name),
+                    self._norm(item_name).replace("-", ""),
+                ]
+                found = next((emoji_map[k] for k in keys if k in emoji_map), None)
+
+                if found:
+                    to_update.append((found, item_id))
+                    matched += 1
+                else:
+                    missing.append(item_name or item_id)
+
+            if not dry_run and to_update:
+                await conn.executemany("UPDATE items SET emoji = ? WHERE id = ?", to_update)
+                await conn.commit()
+        finally:
+            await conn.close()
+
+        lines = [
+            f"Matched: **{matched}**",
+            f"Already had emoji: **{already}**",
+            f"Unmatched: **{len(missing)}**",
+            "(dry run — no changes saved)" if dry_run else "(saved to DB)",
+        ]
+        if missing:
+            lines.append("Examples not found: " + ", ".join(missing[:12]))
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    # ========== /set_item_emoji (FUZZY) ==========
+    @app_commands.command(
+        name="set_item_emoji",
+        description="Set or override the custom emoji for an item (fuzzy item search)."
+    )
+    @app_commands.describe(
+        item="Item id or name (e.g. 'poke ball', 'choice scarf')",
+        emoji="Paste <:name:id> or type :name: (I'll resolve it)"
+    )
+    async def set_item_emoji(self, interaction: discord.Interaction, item: str, emoji: str):
+        if not interaction.guild:
+            return await interaction.response.send_message("Run this in a server.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=False)
+
+        # resolve item fuzzily
+        conn = await self._open_db()
+        try:
+            row, autocorrect_to, suggestions = await self._resolve_item_any(conn, item)
+        finally:
+            await conn.close()
+
+        if not row:
+            if suggestions:
+                return await interaction.followup.send(
+                    "❌ Item not found. Did you mean: " + ", ".join(suggestions) + " ?",
+                    ephemeral=True
+                )
+            return await interaction.followup.send("❌ Item not found.", ephemeral=True)
+
+        item_id = row["id"]
+        pretty_name = row.get("name") or item_id
+
+        # normalize emoji input to <:name:id>
+        code = emoji.strip()
+        if code.startswith(":") and code.endswith(":"):
+            short = code.strip(":")
+            em = discord.utils.get(interaction.guild.emojis, name=short)
+            if not em:
+                return await interaction.followup.send(
+                    f"Emoji `:{short}:` not found in this server.",
+                    ephemeral=True
+                )
+            code = f"<:{em.name}:{em.id}>"
+
+        if not self.EMOJI_CODE_RE.fullmatch(code):
+            return await interaction.followup.send(
+                "Please paste a custom emoji like `<:name:id>` or `:name:`.",
+                ephemeral=True
+            )
+
+        conn = await self._open_db()
+        try:
+            await conn.execute("UPDATE items SET emoji = ? WHERE id = ?", (code, item_id))
+            await conn.commit()
+        finally:
+            await conn.close()
+
+        suffix = f" (autocorrected to {autocorrect_to})" if autocorrect_to else ""
+        await interaction.followup.send(
+            f"✅ Set emoji for **{pretty_name}** → {code}{suffix}",
+            ephemeral=True
+        )
+
+    # ---------- autocomplete for 'item' ----------
+    @set_item_emoji.autocomplete("item")
+    async def set_item_emoji_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str
+    ) -> list[app_commands.Choice[str]]:
+        q = (current or "").strip().lower()
+        like = f"%{q}%"
+        sql = """
+        SELECT id, name FROM items
+        WHERE LOWER(id) LIKE ? OR LOWER(name) LIKE ?
+        ORDER BY
+            CASE WHEN LOWER(id) = ? OR LOWER(name) = ? THEN 0
+                 WHEN LOWER(id) LIKE ? OR LOWER(name) LIKE ? THEN 1
+                 ELSE 2
+            END,
+            id
+        LIMIT 25
+        """
+        choices: list[app_commands.Choice[str]] = []
+        conn = await self._open_db()
+        try:
+            cur = await conn.execute(sql, (like, like, q, q, like, like))
+            rows = await cur.fetchall()
+            await cur.close()
+        finally:
+            await conn.close()
+
+        for r in rows:
+            _id = r["id"]
+            _name = r["name"]
+            label = f"{_name} ({_id})" if _name and _name.lower() != _id else _id
+            choices.append(app_commands.Choice(name=label, value=_id))
+        return choices
+async def setup(bot: commands.Bot):
+    await bot.add_cog(EmojiLinkCog(bot))
+# =========================
+#  import pokemons and rules
+# =========================
+
+@bot.tree.command(name="dexcache", description="Cache a Pokémon from PokeAPI into SQLite")
+@app_commands.describe(name_or_id="e.g., bulbasaur or 1")
+async def dexcache(interaction: discord.Interaction, name_or_id: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    key = name_or_id.strip().lower()
+    existing = await (db.get_pokedex_by_id(int(key)) if key.isdigit()
+                      else db.get_pokedex_by_name(key))
+
+    if existing:
+        return await interaction.followup.send(
+            f"✅ Pokémon already registered: **#{existing['id']} {existing['name'].title()}**.",
+            ephemeral=True
+        )
+
+    entry = await ensure_species_and_learnsets(key)
+    await interaction.followup.send(
+        f"📥 Cached **#{entry['id']} {entry['name'].title()}** (Gen {entry['introduced_in']}).",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="legalmoves", description="List legal moves for a species at a generation")
+async def legalmoves_cmd(interaction: discord.Interaction, species_id: int, gen: int):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    rows = await legal_moves(species_id, gen)
+    txt = "\n".join(f"- {r['name']} [{r['method']}] lv{r['level_learned'] or '-'}" for r in rows[:40]) or "No moves."
+    await interaction.followup.send(txt, ephemeral=True)
+def _j(v, default):
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except Exception:
+            return default
+    return v if v is not None else default
+
+def _r(row, key, default=None):
+    """Safe getter for row-like (dict or Record)."""
+    try:
+        v = row[key]
+        return default if v is None else v
+    except Exception:
+        return default
+
+# helper so abilities can be dicts or strings, and to detect hidden ability
+def _split_abilities(abilities_list):
+    """
+    Returns (regular_abilities, hidden_abilities) as lists of names.
+    Accepts:
+      - ["overgrow","chlorophyll"]
+      - [{"name":"overgrow"},{"ability":{"name":"chlorophyll"},"is_hidden":true}]
+      - [{"ability":{"name":"overgrow"},"slot":1}, {"ability":{"name":"chlorophyll"},"slot":3}]
+    """
+    regs, hides = [], []
+    for a in abilities_list or []:
+        if isinstance(a, str):
+            regs.append(a)
+            continue
+        if isinstance(a, dict):
+            name = a.get("name") or (a.get("ability") or {}).get("name") or ""
+            is_hidden = bool(a.get("is_hidden") or a.get("hidden") or (a.get("slot") == 3))
+            if name:
+                (hides if is_hidden else regs).append(name)
+    return regs, hides
+
+_FORM_ALIASES = {
+    "alola": "alola", "alolan": "alola",
+    "galar": "galar", "galarian": "galar",
+    "hisui": "hisui", "hisuian": "hisui",
+    "paldea": "paldea", "paldean": "paldea",
+}
+
+def _norm_token(s: str) -> str:
+    return re.sub(r"[^a-z0-9-]+", "-", (s or "").strip().lower()).strip("-")
+
+def normalize_form_key(form_key: Optional[str]) -> Optional[str]:
+    if not form_key:
+        return None
+    key = _norm_token(form_key)
+    parts = [p for p in key.split("-") if p]
+    if not parts:
+        return None
+    parts[0] = _FORM_ALIASES.get(parts[0], parts[0])  # alolan -> alola, etc.
+    return "-".join(parts)
+
+def parse_form_from_name(input_name: str) -> Tuple[str, Optional[str]]:
+    """
+    Flexible parser:
+      'alolan raichu' -> ('raichu','alola')
+      'raichu alola' -> ('raichu','alola')
+      'tauros paldea aqua breed' -> ('tauros','paldea-aqua-breed')
+    """
+    txt = _norm_token(input_name)
+    toks = txt.split("-")
+    idx = next((i for i,t in enumerate(toks) if t in _FORM_ALIASES), None)
+    if idx is None:
+        return input_name.strip(), None
+    head = toks[idx]
+    tail = "-".join(toks[idx+1:]) if (idx+1) < len(toks) else ""
+    fkey = normalize_form_key(f"{head}-{tail}".strip("-"))
+    species_tokens = toks[:idx] or toks[idx+1:]
+    species = " ".join(species_tokens).replace("-", " ").strip() or input_name
+    return species, fkey
+
+# ---------- FUZZY name -> species row (uses your _fuzzy_best) ----------
+async def fuzzy_species_row(con, name: str):
+    """
+    Try exact by name; if not found, use your _fuzzy_best() to find the closest species.
+    Returns (row, suggestions_or_empty_list) where row may be None.
+    """
+    q = (name or "").strip().lower()
+    cur = await con.execute("SELECT * FROM pokedex WHERE LOWER(name)=?", (q,))
+    row = await cur.fetchone(); await cur.close()
+    if row:
+        return row, []
+
+    cur = await con.execute("SELECT id, name FROM pokedex")
+    all_rows = await cur.fetchall(); await cur.close()
+    choices = [r["name"] for r in all_rows]
+    best, ratio, suggestions = _fuzzy_best(q, choices)  # <-- your corrector
+    if not best or ratio < 0.82:
+        return None, suggestions
+    cur = await con.execute("SELECT * FROM pokedex WHERE LOWER(name)=?", (best.lower(),))
+    row = await cur.fetchone(); await cur.close()
+    return row, [] if row else suggestions
+
+# ---------- Sprite helpers (form-aware + fuzzy folder) ----------
+try:
+    SPRITES_DIR  # type: ignore
+except NameError:
+    # Fallback in case you don’t have a global set elsewhere
+    SPRITES_DIR = Path(__file__).resolve().parent / "sprites"
+
+def _species_folder_name(species: str) -> str:
+    s = str(species or "").strip().lower()
+    return s.replace(" ", "-").replace("_", "-")
+
+def _candidate_filenames(shiny: bool = False, gender: Optional[str] = None) -> List[str]:
+    # Same exact priority as your bot
+    female = (str(gender or "").strip().lower() == "female")
+    cand: List[str] = []
+    if female:
+        if shiny:
+            cand += ["female-animated-shiny-front.gif", "female-shiny-front.png"]
+        cand += ["female-animated-front.gif", "female-front.png"]
+    if shiny:
+        cand += ["animated-shiny-front.gif", "shiny-front.png"]
+    cand += ["animated-front.gif", "front.png", "icon.png"]
+    return cand
+
+def _form_folder_candidates(species: str, form_key: str) -> list[Path]:
+    """
+    Generate folder candidates using both hyphen and space styles:
+      - "<species>-<form-key>"
+      - "<species> <form key with spaces>"
+      - "<species> <form-key>" (keeps hyphens in tail)
+    """
+    # Special handling for Missing n0 forms
+    sp_norm = str(species or "").strip().lower()
+    if (sp_norm == "missing n0" or sp_norm == "missing-n0") and form_key in ["n1", "n2", "n3", "n4", "n5"]:
+        return [SPRITES_DIR / f"missing-n0-{form_key}"]
+    
+    sdir = _species_folder_name(species)
+    fkey = normalize_form_key(form_key) or ""
+    if not fkey:
+        return []
+    hyphen_join = SPRITES_DIR / f"{sdir}-{fkey}"
+    space_tail  = " ".join(fkey.split("-"))
+    space_join  = SPRITES_DIR / f"{sdir} {space_tail}"
+    mixed_join  = SPRITES_DIR / f"{sdir} {fkey}"
+    return [hyphen_join, space_join, mixed_join]
+
+def _fuzzy_pick_existing_folder(species: str, form_key: str) -> Optional[Path]:
+    """
+    If exact form folders aren't found, fuzzy-pick the closest folder
+    among those starting with '<species>' (space or hyphen).
+    """
+    sdir = _species_folder_name(species)
+    fkey = normalize_form_key(form_key) or ""
+    if not fkey:
+        return None
+    try:
+        basenames = [d.name for d in SPRITES_DIR.iterdir()
+                     if d.is_dir() and (d.name.startswith(sdir + " ") or d.name.startswith(sdir + "-"))]
+    except Exception:
+        basenames = []
+    ideal1 = f"{sdir}-{fkey}"
+    ideal2 = f"{sdir} " + " ".join(fkey.split("-"))
+    best1, r1, _ = _fuzzy_best(ideal1, basenames)
+    best2, r2, _ = _fuzzy_best(ideal2, basenames)
+    best = best1 if r1 >= r2 else best2
+    ratio = max(r1, r2)
+    if best and ratio >= 0.80:
+        p = SPRITES_DIR / best
+        return p if p.exists() else None
+    return None
+
+def form_aware_species_dirs(species: str, form_key: Optional[str]) -> list[Path]:
+    """
+    Search order:
+      1) exact form folders (if any)
+      2) fuzzy-picked form folder
+      3) base species folder
+    """
+    dirs: list[Path] = []
+    if form_key:
+        for cand in _form_folder_candidates(species, form_key):
+            if cand.is_dir():
+                dirs.append(cand)
+        if not dirs:
+            fuzzy = _fuzzy_pick_existing_folder(species, form_key)
+            if fuzzy:
+                dirs.append(fuzzy)
+    dirs.append(SPRITES_DIR / _species_folder_name(species))
+    # dedupe preserving order
+    out, seen = [], set()
+    for d in dirs:
+        if d not in seen:
+            out.append(d); seen.add(d)
+    return out
+
+def pokemon_sprite_attachment(
+    species: str,
+    *,
+    shiny: bool = False,
+    gender: Optional[str] = None,
+    form_key: Optional[str] = None,
+):
+    """
+    Returns (attachment_url, discord.File) or (None, None).
+    Looks in form folders first (hyphen/space + fuzzy), then base species.
+    """
+    from discord import File  # local import to avoid issues if module order changes
+    for folder in form_aware_species_dirs(species, form_key):
+        for fname in _candidate_filenames(shiny=shiny, gender=gender):
+            p = folder / fname
+            try:
+                if p.exists() and p.stat().st_size > 0:
+                    return f"attachment://{p.name}", File(p, filename=p.name)
+            except Exception:
+                pass
+    return None, None
+
+def attach_sprite_to_embed(
+    emb,
+    *,
+    species: str,
+    shiny: bool,
+    gender: Optional[str],
+    form_key: Optional[str] = None,
+):
+    files = []
+    # If form_key already contains the species name (e.g., "kyurem-white"), 
+    # pass it as species directly with form_key=None
+    if form_key and form_key.startswith(f"{species}-"):
+        url, file = pokemon_sprite_attachment(form_key, shiny=shiny, gender=gender, form_key=None)
+    else:
+        url, file = pokemon_sprite_attachment(species, shiny=shiny, gender=gender, form_key=form_key)
+    if file:
+        emb.set_thumbnail(url=url)
+        files.append(file)
+    return files
+def _normalize_stats_keys(d: dict | None) -> dict:
+    """
+    Convert PokeAPI-style keys to your short keys.
+      attack -> atk
+      defense -> def
+      special-attack -> spa
+      special-defense -> spd
+      speed -> spe
+    Leaves hp as hp. Also tolerates spaces/variants.
+    """
+    if not isinstance(d, dict):
+        return {}
+    out = {}
+    for k, v in d.items():
+        if k is None:
+            continue
+        kk = str(k).strip().lower().replace(" ", "-")
+        if   kk in ("attack",):                                 out["atk"] = v
+        elif kk in ("defense",):                                out["def"] = v
+        elif kk in ("special-attack","special_attack","sp-attack","spatk","spa"): out["spa"] = v
+        elif kk in ("special-defense","special_defense","sp-defense","spdef","spd"): out["spd"] = v
+        elif kk in ("speed","spe"):                           out["spe"] = v
+        else:                              out[kk] = v  # keeps 'hp' etc.
+    return out
+# ---------- /pokeinfo (full fields, form-aware, fuzzy-aware) ----------
+# === Helper function to generate pokeinfo embed ===
+async def generate_pokeinfo_embed(
+    species_id: int, 
+    species_name: str,
+    form_key: Optional[str],
+    shiny: bool,
+    gender: Optional[str],
+    gen: Optional[int]
+) -> tuple[discord.Embed, List[discord.File]]:
+    """Generate embed and files for a Pokémon species/form"""
+    
+    # Get base row
+    con = await db_connect()
+    try:
+        cur = await con.execute("SELECT * FROM pokedex WHERE id=?", (species_id,))
+        base_row = await cur.fetchone()
+        await cur.close()
+    finally:
+        await con.close()
+    
+    if not base_row:
+        raise ValueError(f"Species ID {species_id} not found")
+    
+    # Get form row if needed
+    form_row = None
+    if form_key:
+        con = await db_connect()
+        try:
+            cur = await con.execute(
+                "SELECT * FROM pokedex_forms WHERE species_id=? AND form_key=?",
+                (species_id, form_key)
+            )
+            form_row = await cur.fetchone()
+            await cur.close()
+
+            # Fallback: if not found in pokedex_forms, try mega_evolution overrides
+            if not form_row:
+                cur = await con.execute(
+                    """
+                    SELECT stats, types, abilities
+                    FROM mega_evolution
+                    WHERE base_species_id = ? AND mega_form = ?
+                    """,
+                    (species_id, form_key)
+                )
+                mrow = await cur.fetchone()
+                await cur.close()
+                if mrow:
+                    mrow = dict(mrow)
+                    form_row = {
+                        "stats": mrow.get("stats"),
+                        "types": mrow.get("types"),
+                        "abilities": mrow.get("abilities"),
+                        "display_name": form_key.replace(str(_r(base_row, "name")) + "-", "").replace("-", " ").title()
+                    }
+        finally:
+            await con.close()
+    
+    # Get learnset counts
+    con = await db_connect()
+    try:
+        cur = await con.execute("SELECT COUNT(*) AS c FROM learnsets WHERE species_id=?", (species_id,))
+        total_learn = (await cur.fetchone())["c"]
+        await cur.close()
+
+        cur = await con.execute("""
+            SELECT generation, COUNT(*) AS c
+            FROM learnsets
+            WHERE species_id=?
+            GROUP BY generation
+            ORDER BY generation
+        """, (species_id,))
+        per_gen_rows = await cur.fetchall()
+        await cur.close()
+    finally:
+        await con.close()
+    
+    # Unpack + apply overrides
+    def j_or(row, key, default):
+        return _j(_r(row, key), default)
+    
+    stats        = j_or(base_row, "stats", {})
+    types        = j_or(base_row, "types", [])
+    abilities    = j_or(base_row, "abilities", [])
+    egg_groups   = j_or(base_row, "egg_groups", [])
+    ev_yield     = j_or(base_row, "ev_yield", {})
+    gender_ratio = j_or(base_row, "gender_ratio", {})
+    flavor       = _r(base_row, "flavor", "")
+    color        = _r(base_row, "color", "")
+    
+    base_experience = _r(base_row, "base_experience")
+    height_m        = _r(base_row, "height_m")
+    weight_kg       = _r(base_row, "weight_kg")
+    
+    if form_row:
+        # Prefer form values when present; otherwise keep base
+        stats           = j_or(form_row, "stats", stats) or stats
+        types           = j_or(form_row, "types", types) or types
+        abilities       = j_or(form_row, "abilities", abilities) or abilities
+        v = _r(form_row, "base_experience"); base_experience = base_experience if v in (None, "") else v
+        v = _r(form_row, "height_m");        height_m        = height_m        if v in (None, "") else v
+        v = _r(form_row, "weight_kg");       weight_kg       = weight_kg       if v in (None, "") else v
+        v = _r(form_row, "flavor");          flavor          = flavor          if v in (None, "") else v
+        v = _r(form_row, "color");           color           = color           if v in (None, "") else v
+    
+    # Normalize stats keys
+    stats = _normalize_stats_keys(stats)
+    ev_yield = _normalize_stats_keys(ev_yield)
+    
+    # Build embed
+    title_name = _r(base_row, "name", "").title()
+    if form_row and _r(form_row, "display_name"):
+        title_name = f"{title_name} — {_r(form_row, 'display_name')}"
+    title = f"{title_name}  (#{_r(base_row, 'id')})"
+    
+    emb = discord.Embed(title=title, description=flavor)
+    
+    types_txt = ", ".join((t["name"] if isinstance(t, dict) else str(t)).replace("-", " ").title() for t in types) or "—"
+    emb.add_field(name="Types", value=types_txt, inline=True)
+    emb.add_field(name="Gen", value=str(_r(base_row, "introduced_in", "—")), inline=True)
+    emb.add_field(name="Base Exp", value=str(base_experience if base_experience is not None else "—"), inline=True)
+    
+    S = lambda k: stats.get(k, "?")
+    stats_txt = (
+        f"HP {S('hp')} | Atk {S('atk')} | Def {S('def')}\n"
+        f"SpA {S('spa')} | SpD {S('spd')} | Spe {S('spe')}"
+    )
+    emb.add_field(name="Base Stats", value=stats_txt, inline=False)
+    
+    size_txt = f"{height_m} m, {weight_kg} kg" if (height_m is not None and weight_kg is not None) else "—"
+    emb.add_field(name="Size", value=size_txt, inline=True)
+    emb.add_field(name="Capture Rate", value=str(_r(base_row, "capture_rate", "—")), inline=True)
+    emb.add_field(
+        name="Base Friendship",
+        value=str(_r(base_row, "base_friendship", _r(base_row, "base_happiness", "—"))),
+        inline=True
+    )
+    
+    egg_txt = ", ".join((x["name"] if isinstance(x, dict) else str(x)).replace("-", " ").title() for x in egg_groups) or "—"
+    growth = str(_r(base_row, "growth_rate", "—")).replace("-", " ").title()
+    emb.add_field(name="Egg Groups", value=egg_txt, inline=True)
+    emb.add_field(name="Growth Rate", value=growth, inline=True)
+    
+    regs, hides = _split_abilities(abilities)
+    abil_txt   = ", ".join(a.replace("-", " ").title() for a in regs) or "—"
+    hidden_txt = ", ".join(a.replace("-", " ").title() for a in hides) or "—"
+    ev_txt     = ", ".join(f"{k.upper()} {v}" for k, v in (ev_yield.items() if isinstance(ev_yield, dict) else []) if int(v or 0) > 0) or "—"
+    
+    if isinstance(gender_ratio, dict):
+        male = int(round(100 * (gender_ratio.get("male", 0) or 0)))
+        female = int(round(100 * (gender_ratio.get("female", 0) or 0)))
+        gender_txt = (f"♂ {male}% / ♀ {female}%" if (male or female)
+                      else ("Genderless" if (gender_ratio.get("genderless") or 0) else "—"))
+    else:
+        gender_txt = "—"
+    
+    emb.add_field(name="Abilities", value=abil_txt, inline=False)
+    emb.add_field(name="Hidden Ability", value=hidden_txt, inline=True)
+    emb.add_field(name="EV Yield", value=ev_txt, inline=True)
+    emb.add_field(name="Gender Ratio", value=gender_txt, inline=True)
+    
+    color_genus = f"{str(color).title()} · {str(_r(base_row, 'genus', '—'))}"
+    emb.add_field(name="Color · Genus", value=color_genus, inline=True)
+    emb.add_field(name="Evolution", value=_r(base_row, "evolution", "—"), inline=False)
+    
+    per_gen = ", ".join(f"G{r['generation']}:{r['c']}" for r in per_gen_rows) or "—"
+    if gen is not None:
+        gcount = next((r['c'] for r in per_gen_rows if int(r['generation']) == int(gen)), 0)
+        per_gen += f"  |  G{int(gen)}: {gcount}"
+    emb.add_field(name="Learnsets", value=f"Total moves: {total_learn}\n{per_gen}", inline=False)
+    
+    # Sprite
+    try:
+        files = attach_sprite_to_embed(
+            emb, species=str(_r(base_row, "name")), shiny=bool(shiny), gender=gender, form_key=form_key
+        )
+    except TypeError:
+        files = attach_sprite_to_embed(
+            emb, species=str(_r(base_row, "name")), shiny=bool(shiny), gender=gender
+        )
+    
+    return emb, files
+
+# === Form Selection View for /pokeinfo ===
+class PokeInfoFormView(discord.ui.View):
+    """Interactive form selection buttons for /pokeinfo"""
+    def __init__(self, species_id: int, species_name: str, available_forms: List[dict], 
+                 current_form: Optional[str], shiny: bool, gender: Optional[str], gen: Optional[int]):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.species_id = species_id
+        self.species_name = species_name
+        self.available_forms = available_forms
+        self.current_form = current_form
+        self.shiny = shiny
+        self.gender = gender
+        self.gen = gen
+        
+        # Add buttons for each form (max 25 buttons, 5 per row)
+        for i, form_data in enumerate(available_forms[:25]):
+            button = discord.ui.Button(
+                label=form_data['display_name'],
+                style=discord.ButtonStyle.primary if form_data['form_key'] == current_form else discord.ButtonStyle.secondary,
+                row=i // 5,  # 5 buttons per row
+                # Ensure uniqueness to avoid 'custom id cannot be duplicated'
+                custom_id=f"form_{self.species_id}_{i}_{(form_data['form_key'] or 'base').replace(' ', '-')}"
+            )
+            button.callback = self._make_callback(form_data['form_key'])
+            self.add_item(button)
+    
+    def _make_callback(self, form_key: Optional[str]):
+        async def callback(interaction: discord.Interaction):
+            try:
+                await interaction.response.defer()
+                # Re-generate embed for the selected form (will be implemented inline)
+                await self._update_for_form(interaction, form_key)
+            except Exception as e:
+                print(f"[ERROR] Form button callback failed: {e}")
+                import traceback
+                traceback.print_exc()
+                try:
+                    await interaction.followup.send(f"Failed to update form: {e}", ephemeral=True)
+                except:
+                    pass
+        return callback
+    
+    async def _update_for_form(self, interaction: discord.Interaction, new_form_key: Optional[str]):
+        """Regenerate the embed for a different form"""
+        # Re-fetch the species data with the new form
+        con = await db_connect()
+        try:
+            cur = await con.execute("SELECT * FROM pokedex WHERE id=?", (self.species_id,))
+            base_row = await cur.fetchone()
+            await cur.close()
+            
+            if not base_row:
+                await interaction.followup.send("Species not found.", ephemeral=True)
+                return
+            
+            # Fetch form overrides if applicable
+            form_row = None
+            mrow = None
+            prow = None
+            if new_form_key:
+                cur = await con.execute(
+                    "SELECT * FROM pokedex_forms WHERE species_id=? AND form_key=?",
+                    (self.species_id, new_form_key)
+                )
+                form_row_raw = await cur.fetchone()
+                form_row = dict(form_row_raw) if form_row_raw else None
+                await cur.close()
+
+                # Fallback to mega_evolution overrides when not present in pokedex_forms
+                if not form_row:
+                    cur = await con.execute(
+                        """
+                        SELECT stats, types, abilities
+                        FROM mega_evolution
+                        WHERE base_species_id = ? AND mega_form = ?
+                        """,
+                        (self.species_id, new_form_key)
+                    )
+                    mrow = await cur.fetchone()
+                    await cur.close()
+                if mrow:
+                        mrow = dict(mrow)
+                        form_row = {
+                            "stats": mrow.get("stats"),
+                            "types": mrow.get("types"),
+                            "abilities": mrow.get("abilities"),
+                            "display_name": new_form_key.replace(str(base_row["name"]) + "-", "").replace("-", " ").title()
+                        }
+
+            # Second fallback for button view: primal_reversion
+            if not form_row:
+                cur = await con.execute(
+                    """
+                    SELECT stats, types, abilities
+                    FROM primal_reversion
+                    WHERE base_species_id = ? AND primal_form = ?
+                    """,
+                    (self.species_id, new_form_key)
+                )
+                prow = await cur.fetchone()
+                await cur.close()
+                if prow:
+                    prow = dict(prow)
+                    form_row = {
+                        "stats": prow.get("stats"),
+                        "types": prow.get("types"),
+                        "abilities": prow.get("abilities"),
+                        "display_name": new_form_key.replace(str(base_row["name"]) + "-", "").replace("-", " ").title()
+                    }
+            
+            # Fetch learnset counts
+            cur = await con.execute("SELECT COUNT(*) AS c FROM learnsets WHERE species_id=?", (self.species_id,))
+            total_learn = (await cur.fetchone())["c"]
+            await cur.close()
+            
+            cur = await con.execute("""
+                SELECT generation, COUNT(*) AS c
+                FROM learnsets
+                WHERE species_id=?
+                GROUP BY generation
+                ORDER BY generation
+            """, (self.species_id,))
+            per_gen_rows_raw = await cur.fetchall()
+            per_gen_rows = [dict(row) for row in per_gen_rows_raw]
+            await cur.close()
+        finally:
+            await con.close()
+        
+        # Unpack base stats
+        # Convert Row to dict first
+        base_row = dict(base_row) if base_row else {}
+        
+        def _r(row, key, default=None):
+            if isinstance(row, dict):
+                return row.get(key, default)
+            return default
+        
+        def _j(val, default):
+            if isinstance(val, dict): return val
+            if isinstance(val, str):
+                try:
+                    return json.loads(val)
+                except:
+                    pass
+            return default
+        
+        def j_or(row, key, default):
+            return _j(_r(row, key), default)
+        
+        stats        = j_or(base_row, "stats", {})
+        types        = j_or(base_row, "types", [])
+        abilities    = j_or(base_row, "abilities", [])
+        egg_groups   = j_or(base_row, "egg_groups", [])
+        ev_yield     = j_or(base_row, "ev_yield", {})
+        gender_ratio = j_or(base_row, "gender_ratio", {})
+        flavor       = _r(base_row, "flavor", "")
+        color        = _r(base_row, "color", "")
+        
+        base_experience = _r(base_row, "base_experience")
+        height_m        = _r(base_row, "height_m")
+        weight_kg       = _r(base_row, "weight_kg")
+        
+        # Apply form overrides
+        if form_row:
+            stats           = j_or(form_row, "stats", stats) or stats
+            types           = j_or(form_row, "types", types) or types
+            abilities       = j_or(form_row, "abilities", abilities) or abilities
+            v = _r(form_row, "base_experience"); base_experience = base_experience if v in (None, "") else v
+            v = _r(form_row, "height_m");        height_m        = height_m        if v in (None, "") else v
+            v = _r(form_row, "weight_kg");       weight_kg       = weight_kg       if v in (None, "") else v
+            v = _r(form_row, "flavor");          flavor          = flavor          if v in (None, "") else v
+            v = _r(form_row, "color");           color           = color           if v in (None, "") else v
+        
+        # Normalize stats keys
+        stats = _normalize_stats_keys(stats)
+        ev_yield = _normalize_stats_keys(ev_yield)
+        
+        # Build embed title
+        title_name = _r(base_row, "name", "").title()
+        if form_row and _r(form_row, "display_name"):
+            title_name = f"{title_name} — {_r(form_row, 'display_name')}"
+        elif not new_form_key and _r(base_row, "form_name"):
+            form_display = _r(base_row, "form_name").replace("-", " ").title()
+            title_name = f"{title_name}-{form_display}"
+        title = f"{title_name}  (#{_r(base_row, 'id')})"
+        
+        emb = discord.Embed(title=title, description=flavor)
+        
+        # Types
+        types_txt = ", ".join((t["name"] if isinstance(t, dict) else str(t)).replace("-", " ").title() for t in types) or "—"
+        emb.add_field(name="Types", value=types_txt, inline=True)
+        emb.add_field(name="Gen", value=str(_r(base_row, "introduced_in", "—")), inline=True)
+        emb.add_field(name="Base Exp", value=str(base_experience if base_experience is not None else "—"), inline=True)
+        
+        # Base Stats
+        S = lambda k: stats.get(k, "?")
+        stats_txt = (
+            f"HP {S('hp')} | Atk {S('atk')} | Def {S('def')}\n"
+            f"SpA {S('spa')} | SpD {S('spd')} | Spe {S('spe')}"
+        )
+        emb.add_field(name="Base Stats", value=stats_txt, inline=False)
+        
+        # Size
+        size_txt = f"{height_m} m, {weight_kg} kg" if (height_m is not None and weight_kg is not None) else "—"
+        emb.add_field(name="Size", value=size_txt, inline=True)
+        emb.add_field(name="Capture Rate", value=str(_r(base_row, "capture_rate", "—")), inline=True)
+        emb.add_field(
+            name="Base Friendship",
+            value=str(_r(base_row, "base_friendship", _r(base_row, "base_happiness", "—"))),
+            inline=True
+        )
+        
+        # Egg groups and growth
+        egg_txt = ", ".join((x["name"] if isinstance(x, dict) else str(x)).replace("-", " ").title() for x in egg_groups) or "—"
+        growth = str(_r(base_row, "growth_rate", "—")).replace("-", " ").title()
+        emb.add_field(name="Egg Groups", value=egg_txt, inline=True)
+        emb.add_field(name="Growth Rate", value=growth, inline=True)
+        
+        # Abilities
+        def _split_abilities(abilities):
+            regular = []
+            hidden = []
+            for a in abilities:
+                if isinstance(a, dict):
+                    if a.get("is_hidden"):
+                        hidden.append(a.get("name", ""))
+                    else:
+                        regular.append(a.get("name", ""))
+                else:
+                    regular.append(str(a))
+            return regular, hidden
+        
+        regs, hides = _split_abilities(abilities)
+        abil_txt   = ", ".join(a.replace("-", " ").title() for a in regs) or "—"
+        hidden_txt = ", ".join(a.replace("-", " ").title() for a in hides) or "—"
+        ev_txt     = ", ".join(f"{k.upper()} {v}" for k, v in (ev_yield.items() if isinstance(ev_yield, dict) else []) if int(v or 0) > 0) or "—"
+        
+        if isinstance(gender_ratio, dict):
+            male = int(round(100 * (gender_ratio.get("male", 0) or 0)))
+            female = int(round(100 * (gender_ratio.get("female", 0) or 0)))
+            gender_txt = (f"♂ {male}% / ♀ {female}%" if (male or female)
+                          else ("Genderless" if (gender_ratio.get("genderless") or 0) else "—"))
+        else:
+            gender_txt = "—"
+        
+        emb.add_field(name="Abilities", value=abil_txt, inline=False)
+        emb.add_field(name="Hidden Ability", value=hidden_txt, inline=True)
+        emb.add_field(name="EV Yield", value=ev_txt, inline=True)
+        emb.add_field(name="Gender Ratio", value=gender_txt, inline=True)
+        
+        # Color and evolution
+        color_genus = f"{str(color).title()} · {str(_r(base_row, 'genus', '—'))}"
+        emb.add_field(name="Color · Genus", value=color_genus, inline=True)
+        emb.add_field(name="Evolution", value=_r(base_row, "evolution", "—"), inline=False)
+        
+        # Learnsets
+        per_gen = ", ".join(f"G{r['generation']}:{r['c']}" for r in per_gen_rows) or "—"
+        if self.gen is not None:
+            gcount = next((r['c'] for r in per_gen_rows if int(r['generation']) == int(self.gen)), 0)
+            per_gen += f"  |  G{int(self.gen)}: {gcount}"
+        emb.add_field(name="Learnsets", value=f"Total moves: {total_learn}\n{per_gen}", inline=False)
+        
+        # Attach sprite - need to get fresh File objects for editing
+        sprite_form = new_form_key
+        if sprite_form is None and _r(base_row, "form_name"):
+            sprite_form = _r(base_row, "form_name")
+        
+        # Build sprite folder path
+        species_name = str(_r(base_row, "name")).strip().lower()
+        form_norm = (str(sprite_form or "").strip().lower().replace(" ", "-").replace("_", "-")) if sprite_form else None
+        
+        # Special-case: Greninja Ash/Battle Bond normalization
+        if species_name == "greninja" and form_norm and ("ash" in form_norm or "battle" in form_norm or "bond" in form_norm):
+            form_norm = "battle-bond"
+        
+        # Special-case: Missing n0 forms - normalize species name first
+        if species_name == "missing n0" or species_name == "missing-n0":
+            species_name = "missing-n0"  # Normalize to hyphenated version
+            if form_norm and form_norm in ["n1", "n2", "n3", "n4", "n5"]:
+                lookup_species = f"{species_name}-{form_norm}"
+            else:
+                lookup_species = species_name
+        elif form_norm:
+            if form_norm.startswith(f"{species_name}-"):
+                lookup_species = form_norm
+            else:
+                lookup_species = f"{species_name}-{form_norm}"
+        else:
+            lookup_species = species_name
+        
+        # Get sprite file path and create fresh File object
+        from pathlib import Path
+        sprites_base = Path(__file__).resolve().parent / "pvp" / "_common" / "sprites"
+        lookup_folder = lookup_species.lower().replace(" ", "-").replace("_", "-")
+        sprite_folder = sprites_base / lookup_folder
+        
+        files = []
+        sprite_found = False
+        if sprite_folder.is_dir():
+            is_female = (str(self.gender or "").strip().lower() == "female")
+            
+            # First try animated sprites
+            animated_candidates = []
+            if is_female:
+                if self.shiny:
+                    animated_candidates += ["female-animated-shiny-front.gif"]
+                animated_candidates += ["female-animated-front.gif"]
+            
+            if self.shiny:
+                animated_candidates += ["animated-shiny-front.gif"]
+            animated_candidates += ["animated-front.gif"]
+            
+            # Try animated first
+            for fname in animated_candidates:
+                fp = sprite_folder / fname
+                try:
+                    if fp.exists() and fp.stat().st_size > 0:
+                        files.append(discord.File(fp, filename=fp.name))
+                        emb.set_thumbnail(url=f"attachment://{fp.name}")
+                        sprite_found = True
+                        break
+                except Exception:
+                    continue
+            
+            # If no animated sprite found, try static sprites
+            if not sprite_found:
+                static_candidates = []
+                if is_female:
+                    if self.shiny:
+                        static_candidates += ["female-shiny-front.png"]
+                    static_candidates += ["female-front.png"]
+                
+                if self.shiny:
+                    static_candidates += ["shiny-front.png"]
+                static_candidates += ["front.png", "icon.png"]
+                
+                for fname in static_candidates:
+                    fp = sprite_folder / fname
+                    try:
+                        if fp.exists() and fp.stat().st_size > 0:
+                            files.append(discord.File(fp, filename=fp.name))
+                            emb.set_thumbnail(url=f"attachment://{fp.name}")
+                            sprite_found = True
+                            break
+                    except Exception:
+                        continue
+        
+        # If still not found, try base species folder as fallback
+        if not sprite_found:
+            base_folder = sprites_base / "missing-n0"
+            if base_folder.is_dir():
+                # Try static sprites from base folder
+                static_candidates = []
+                if self.shiny:
+                    static_candidates += ["shiny-front.png"]
+                static_candidates += ["front.png", "icon.png"]
+                
+                for fname in static_candidates:
+                    fp = base_folder / fname
+                    try:
+                        if fp.exists() and fp.stat().st_size > 0:
+                            files.append(discord.File(fp, filename=fp.name))
+                            emb.set_thumbnail(url=f"attachment://{fp.name}")
+                            sprite_found = True
+                            break
+                    except Exception:
+                        continue
+        
+        if not sprite_found:
+            print(f"[DEBUG] No sprite found for {lookup_species} (shiny={self.shiny}, gender={self.gender}), tried folder: {lookup_folder}")
+        
+        # Update the view with new current form
+        new_view = PokeInfoFormView(
+            species_id=self.species_id,
+            species_name=self.species_name,
+            available_forms=self.available_forms,
+            current_form=new_form_key,
+            shiny=self.shiny,
+            gender=self.gender,
+            gen=self.gen
+        )
+        
+        try:
+            await interaction.edit_original_response(embed=emb, attachments=files, view=new_view)
+        finally:
+            _close_discord_files(files)
+
+@bot.tree.command(name="pokeinfo", description="Show Pokédex info from the DB (sprite, shiny, gender).")
+@app_commands.describe(
+    name_or_id="Name or National Dex number (e.g., bulbasaur or 1). Names like 'alolan raichu' are okay.",
+    shiny="Show shiny sprite (default: off)",
+    gender="Force sprite gender (optional)",
+    gen="Also show how many moves are legal in this generation (1–9)"
+)
+@app_commands.choices(
+    gender=[
+        app_commands.Choice(name="male", value="male"),
+        app_commands.Choice(name="female", value="female"),
+    ]
+)
+async def pokeinfo(
+    interaction: discord.Interaction,
+    name_or_id: str,
+    shiny: bool = False,
+    gender: Optional[str] = None,
+    gen: Optional[int] = None,
+):
+    """Full /pokeinfo with forms + fuzzy name + stats-key normalization."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # ---------- resolve base species row (+ form_key) ----------
+    target = name_or_id.strip()
+    form_key: Optional[str] = None
+
+    if target.isdigit():
+        species_id = int(target)
+        form_key = None  # No explicit form parameter, will use base form
+        base_row = None
+        if db_cache:
+            base_row = db_cache.get_cached_pokedex(target)
+            if not base_row or species_id == 72635:
+                base_row = db_cache.get_cached_pokedex("72635") or db_cache.get_cached_pokedex("missing n0") or base_row
+        if base_row is None:
+            con = await db_connect()
+            try:
+                cur = await con.execute("SELECT * FROM pokedex WHERE id=?", (species_id,))
+                base_row = await cur.fetchone(); await cur.close()
+                if not base_row or species_id == 72635:
+                    cur = await con.execute("SELECT * FROM pokedex WHERE id=72635 OR name='missing n0' LIMIT 1", ())
+                    base_row = await cur.fetchone(); await cur.close()
+            finally:
+                await con.close()
+        if base_row and hasattr(base_row, "keys") and not isinstance(base_row, dict):
+            base_row = dict(base_row)
+    else:
+        # name path: auto-detect form words + fuzzy-correct species name
+        species_guess, parsed_form = parse_form_from_name(target)
+        form_key = parsed_form  # Only use parsed form from name, no explicit parameter
+        base_row = None
+        if db_cache:
+            base_row = db_cache.get_cached_pokedex(species_guess)
+        if base_row is None:
+            con = await db_connect()
+            try:
+                cur = await con.execute("SELECT * FROM pokedex WHERE LOWER(name)=LOWER(?)", (species_guess.lower(),))
+                base_row = await cur.fetchone(); await cur.close()
+                if not base_row:
+                    base_row, _ = await fuzzy_species_row(con, species_guess)  # uses your _fuzzy_best()
+                if not base_row:
+                    cur = await con.execute(
+                        "SELECT * FROM pokedex WHERE LOWER(name) LIKE ? ORDER BY id LIMIT 1",
+                        (species_guess.lower() + "%",)
+                    )
+                    base_row = await cur.fetchone(); await cur.close()
+            finally:
+                await con.close()
+        if base_row and hasattr(base_row, "keys") and not isinstance(base_row, dict):
+            base_row = dict(base_row)
+
+    if not base_row:
+        # If not found, try to show Missing n0 as fallback
+        if db_cache:
+            base_row = db_cache.get_cached_pokedex("72635") or db_cache.get_cached_pokedex("missing n0")
+        if base_row is None:
+            con = await db_connect()
+            try:
+                cur = await con.execute("SELECT * FROM pokedex WHERE id=72635 OR name='missing n0' LIMIT 1", ())
+                base_row = await cur.fetchone(); await cur.close()
+            finally:
+                await con.close()
+        if not base_row:
+            return await interaction.followup.send("Not found in Pokédex cache. Try another name/ID.", ephemeral=True)
+        if hasattr(base_row, "keys") and not isinstance(base_row, dict):
+            base_row = dict(base_row)
+
+    # ---------- optional per-form overrides ----------
+    form_row = None
+    if form_key:
+        sid = _r(base_row, "id")
+        sname = _r(base_row, "name")
+        if db_cache:
+            forms = db_cache.get_cached_pokedex_forms()
+            if forms:
+                for f in forms:
+                    if f.get("species_id") != sid:
+                        continue
+                    if (f.get("form_key") or "").strip().lower() == (form_key or "").strip().lower():
+                        form_row = dict(f)
+                        break
+                if not form_row and not (form_key or "").startswith(f"{sname}-"):
+                    species_form_key = f"{sname}-{form_key}"
+                    for f in forms:
+                        if f.get("species_id") != sid:
+                            continue
+                        if (f.get("form_key") or "").strip().lower() == species_form_key.strip().lower():
+                            form_row = dict(f)
+                            form_key = species_form_key
+                            break
+
+        if form_row is None:
+            con = await db_connect()
+            try:
+                cur = await con.execute(
+                    "SELECT * FROM pokedex_forms WHERE species_id=? AND form_key=?",
+                    (sid, form_key))
+                form_row = await cur.fetchone()
+                await cur.close()
+                if form_row:
+                    form_row = dict(form_row) if hasattr(form_row, "keys") and not isinstance(form_row, dict) else form_row
+                if not form_row and not (form_key or "").startswith(f"{sname}-"):
+                    species_form_key = f"{sname}-{form_key}"
+                    cur = await con.execute(
+                        "SELECT * FROM pokedex_forms WHERE species_id=? AND form_key=?",
+                        (sid, species_form_key))
+                    form_row = await cur.fetchone()
+                    await cur.close()
+                    if form_row:
+                        form_row = dict(form_row) if hasattr(form_row, "keys") and not isinstance(form_row, dict) else form_row
+                        form_key = species_form_key
+
+                # Fallback: mega_evolution overrides if still not found
+                if not form_row:
+                    cur = await con.execute(
+                        """
+                        SELECT stat_changes, type_changes, ability_change
+                        FROM mega_evolution
+                        WHERE base_species_id = ? AND mega_form = ?
+                        """,
+                        (_r(base_row, "id"), form_key)
+                    )
+                    mrow = await cur.fetchone()
+                    await cur.close()
+                    if mrow:
+                        mrow = dict(mrow)
+                        raw_stats = _r(base_row, "stats")
+                        try:
+                            base_stats = json.loads(raw_stats) if isinstance(raw_stats, str) else (raw_stats or {})
+                        except Exception:
+                            base_stats = raw_stats or {}
+                        raw_diffs = mrow.get("stat_changes")
+                        try:
+                            diffs = json.loads(raw_diffs) if isinstance(raw_diffs, str) else (raw_diffs or {})
+                        except Exception:
+                            diffs = raw_diffs or {}
+                        merged_stats = {}
+                        mapping = {
+                            "hp": ("hp",),
+                            "attack": ("attack","atk"),
+                            "defense": ("defense","def"),
+                            "special_attack": ("special_attack","special-attack","spa"),
+                            "special_defense": ("special_defense","special-defense","spd"),
+                            "speed": ("speed","spe"),
+                        }
+                        for out_key, keys in mapping.items():
+                            base_v = int(base_stats.get(out_key, 0))
+                            diff_v = 0
+                            for k in keys:
+                                if k in diffs:
+                                    try:
+                                        diff_v = int(diffs[k])
+                                    except Exception:
+                                        diff_v = 0
+                                    break
+                            merged_stats[out_key] = base_v + diff_v
+                        form_row = {
+                            "stats": json.dumps(merged_stats, ensure_ascii=False),
+                            "types": mrow.get("type_changes"),
+                            "abilities": mrow.get("ability_change"),
+                            "display_name": form_key.replace(str(_r(base_row, "name")) + "-", "").replace("-", " ").title()
+                        }
+
+                # Second fallback: primal_reversion overrides
+                if not form_row:
+                    cur = await con.execute(
+                        """
+                        SELECT stat_changes, type_changes, ability_change
+                        FROM primal_reversion
+                        WHERE base_species_id = ? AND primal_form = ?
+                        """,
+                        (_r(base_row, "id"), form_key)
+                    )
+                    prow = await cur.fetchone()
+                    await cur.close()
+                    if prow:
+                        prow = dict(prow)
+                        raw_stats = _r(base_row, "stats")
+                        try:
+                            base_stats = json.loads(raw_stats) if isinstance(raw_stats, str) else (raw_stats or {})
+                        except Exception:
+                            base_stats = raw_stats or {}
+                        raw_diffs = prow.get("stat_changes")
+                        try:
+                            diffs = json.loads(raw_diffs) if isinstance(raw_diffs, str) else (raw_diffs or {})
+                        except Exception:
+                            diffs = raw_diffs or {}
+                        merged_stats = {}
+                        mapping = {
+                            "hp": ("hp",),
+                            "attack": ("attack","atk"),
+                            "defense": ("defense","def"),
+                            "special_attack": ("special_attack","special-attack","spa"),
+                            "special_defense": ("special_defense","special-defense","spd"),
+                            "speed": ("speed","spe"),
+                        }
+                        for out_key, keys in mapping.items():
+                            base_v = int(base_stats.get(out_key, 0))
+                            diff_v = 0
+                            for k in keys:
+                                if k in diffs:
+                                    try:
+                                        diff_v = int(diffs[k])
+                                    except Exception:
+                                        diff_v = 0
+                                    break
+                            merged_stats[out_key] = base_v + diff_v
+                        form_row = {
+                            "stats": json.dumps(merged_stats, ensure_ascii=False),
+                            "types": prow.get("type_changes"),
+                            "abilities": prow.get("ability_change"),
+                            "display_name": form_key.replace(str(_r(base_row, "name")) + "-", "").replace("-", " ").title()
+                        }
+            finally:
+                await con.close()
+
+    # ---------- learnset counts ----------
+    species_id = _r(base_row, "id")
+    total_learn = None
+    per_gen_rows = None
+    if db_cache:
+        ls = db_cache.get_cached_learnsets()
+        if ls:
+            from collections import defaultdict
+            filt = [r for r in ls if r.get("species_id") == species_id]
+            total_learn = len(filt)
+            gcnt = defaultdict(int)
+            for r in filt:
+                g = r.get("generation")
+                if g is not None:
+                    gcnt[int(g)] += 1
+            per_gen_rows = [{"generation": g, "c": c} for g, c in sorted(gcnt.items())]
+    if total_learn is None:
+        con = await db_connect()
+        try:
+            cur = await con.execute("SELECT COUNT(*) AS c FROM learnsets WHERE species_id=?", (species_id,))
+            total_learn = (await cur.fetchone())["c"]
+            await cur.close()
+            cur = await con.execute("""
+                SELECT generation, COUNT(*) AS c
+                FROM learnsets
+                WHERE species_id=?
+                GROUP BY generation
+                ORDER BY generation
+            """, (species_id,))
+            per_gen_rows = await cur.fetchall()
+            await cur.close()
+            per_gen_rows = [dict(r) if hasattr(r, "keys") and not isinstance(r, dict) else r for r in per_gen_rows]
+        finally:
+            await con.close()
+
+    # ---------- unpack + apply overrides ----------
+    def j_or(row, key, default):
+        return _j(_r(row, key), default)
+
+    stats        = j_or(base_row, "stats", {})
+    types        = j_or(base_row, "types", [])
+    abilities    = j_or(base_row, "abilities", [])
+    egg_groups   = j_or(base_row, "egg_groups", [])
+    ev_yield     = j_or(base_row, "ev_yield", {})
+    gender_ratio = j_or(base_row, "gender_ratio", {})
+    flavor       = _r(base_row, "flavor", "")
+    color        = _r(base_row, "color", "")
+
+    base_experience = _r(base_row, "base_experience")
+    height_m        = _r(base_row, "height_m")
+    weight_kg       = _r(base_row, "weight_kg")
+
+    if form_row:
+        stats           = j_or(form_row, "stats", stats) or stats
+        types           = j_or(form_row, "types", types) or types
+        abilities       = j_or(form_row, "abilities", abilities) or abilities
+        v = _r(form_row, "base_experience"); base_experience = base_experience if v in (None, "") else v
+        v = _r(form_row, "height_m");        height_m        = height_m        if v in (None, "") else v
+        v = _r(form_row, "weight_kg");       weight_kg       = weight_kg       if v in (None, "") else v
+        v = _r(form_row, "flavor");          flavor          = flavor          if v in (None, "") else v
+        v = _r(form_row, "color");           color           = color           if v in (None, "") else v
+
+    # ---------- normalize keys so embed uses atk/def/spa/spd/spe ----------
+    stats = _normalize_stats_keys(stats)
+    ev_yield = _normalize_stats_keys(ev_yield)
+
+    # ---------- embed ----------
+    title_name = _r(base_row, "name", "").title()
+    if form_row and _r(form_row, "display_name"):
+        title_name = f"{title_name} — {_r(form_row, 'display_name')}"
+    elif not form_key and _r(base_row, "form_name"):
+        # If no explicit form was requested but base has form_name (e.g., Meloetta-Aria, Shaymin-Land)
+        form_display = _r(base_row, "form_name").replace("-", " ").title()
+        title_name = f"{title_name}-{form_display}"
+    title = f"{title_name}  (#{_r(base_row, 'id')})"
+
+    # Check if this is Missing n0 - show "unknown" for unspecified fields
+    is_missing_n0 = _r(base_row, "name", "").lower() == "missing n0"
+
+    emb = discord.Embed(title=title, description=flavor if flavor else ("Unknown" if is_missing_n0 else ""))
+
+    types_txt = ", ".join((t["name"] if isinstance(t, dict) else str(t)).replace("-", " ").title() for t in types) or ("Unknown" if is_missing_n0 else "—")
+    emb.add_field(name="Types", value=types_txt, inline=True)
+    gen_val = _r(base_row, "introduced_in", "Unknown" if is_missing_n0 else "—")
+    emb.add_field(name="Gen", value=str(gen_val), inline=True)
+    base_exp_val = base_experience if base_experience is not None else ("Unknown" if is_missing_n0 else "—")
+    emb.add_field(name="Base Exp", value=str(base_exp_val), inline=True)
+
+    # For Missing n0, show total base stats instead of individual values
+    if is_missing_n0:
+        stats_txt = "720 base stats (rolled at battle start)"
+    else:
+        S = lambda k: stats.get(k, "?")
+        stats_txt = (
+            f"HP {S('hp')} | Atk {S('atk')} | Def {S('def')}\n"
+            f"SpA {S('spa')} | SpD {S('spd')} | Spe {S('spe')}"
+        )
+    emb.add_field(name="Base Stats", value=stats_txt, inline=False)
+
+    size_txt = f"{height_m} m, {weight_kg} kg" if (height_m is not None and weight_kg is not None) else ("Unknown" if is_missing_n0 else "—")
+    emb.add_field(name="Size", value=size_txt, inline=True)
+    capture_rate_val = _r(base_row, "capture_rate", "Unknown" if is_missing_n0 else "—")
+    emb.add_field(name="Capture Rate", value=str(capture_rate_val), inline=True)
+    base_friendship_val = _r(base_row, "base_friendship", _r(base_row, "base_happiness", "Unknown" if is_missing_n0 else "—"))
+    emb.add_field(
+        name="Base Friendship",
+        value=str(base_friendship_val),
+        inline=True
+    )
+
+    egg_txt = ", ".join((x["name"] if isinstance(x, dict) else str(x)).replace("-", " ").title() for x in egg_groups) or ("Unknown" if is_missing_n0 else "—")
+    growth = str(_r(base_row, "growth_rate", "Unknown" if is_missing_n0 else "—")).replace("-", " ").title()
+    emb.add_field(name="Egg Groups", value=egg_txt, inline=True)
+    emb.add_field(name="Growth Rate", value=growth, inline=True)
+
+    regs, hides = _split_abilities(abilities)
+    # For Missing n0, show that abilities are rolled at battle start
+    if is_missing_n0:
+        abil_txt = "Rolled at battle start"
+        hidden_txt = "—"
+    else:
+        abil_txt   = ", ".join(a.replace("-", " ").title() for a in regs) or "—"
+        hidden_txt = ", ".join(a.replace("-", " ").title() for a in hides) or "—"
+    ev_txt     = ", ".join(f"{k.upper()} {v}" for k, v in (ev_yield.items() if isinstance(ev_yield, dict) else []) if int(v or 0) > 0) or ("Unknown" if is_missing_n0 else "—")
+
+    if isinstance(gender_ratio, dict):
+        male = int(round(100 * (gender_ratio.get("male", 0) or 0)))
+        female = int(round(100 * (gender_ratio.get("female", 0) or 0)))
+        gender_txt = (f"♂ {male}% / ♀ {female}%" if (male or female)
+                      else ("Genderless" if (gender_ratio.get("genderless") or 0) else "—"))
+    else:
+        gender_txt = "—"
+
+    emb.add_field(name="Abilities", value=abil_txt, inline=False)
+    emb.add_field(name="Hidden Ability", value=hidden_txt, inline=True)
+    emb.add_field(name="EV Yield", value=ev_txt, inline=True)
+    emb.add_field(name="Gender Ratio", value=gender_txt, inline=True)
+
+    color_val = str(color).title() if color else ("Unknown" if is_missing_n0 else "—")
+    genus_val = str(_r(base_row, 'genus', 'Unknown' if is_missing_n0 else '—'))
+    color_genus = f"{color_val} · {genus_val}"
+    emb.add_field(name="Color · Genus", value=color_genus, inline=True)
+    evolution_val = _r(base_row, "evolution", "Unknown" if is_missing_n0 else "—")
+    emb.add_field(name="Evolution", value=evolution_val, inline=False)
+
+    per_gen = ", ".join(f"G{r['generation']}:{r['c']}" for r in per_gen_rows) or "—"
+    if gen is not None:
+        gcount = next((r['c'] for r in per_gen_rows if int(r['generation']) == int(gen)), 0)
+        per_gen += f"  |  G{int(gen)}: {gcount}"
+    emb.add_field(name="Learnsets", value=f"Total moves: {total_learn}\n{per_gen}", inline=False)
+
+    # ---------- sprite (form-aware if your helper supports it) ----------
+    # If form_key is None but base has form_name, use that for sprite lookup
+    sprite_form = form_key
+    if sprite_form is None and _r(base_row, "form_name"):
+        sprite_form = _r(base_row, "form_name")
+    
+    # Use find_sprite from pvp/sprites.py for proper Missing n0 form handling
+    try:
+        from pvp.sprites import find_sprite
+        species_name_for_sprite = str(_r(base_row, "name"))
+        is_female_sprite = (str(gender or "").strip().lower() == "female")
+        
+        # Try to find sprite using the proper sprite loading function
+        sprite_path = find_sprite(
+            species_name_for_sprite,
+            gen=9,  # Default gen
+            perspective="front",
+            shiny=bool(shiny),
+            female=is_female_sprite,
+            prefer_animated=True,
+            form=sprite_form
+        )
+        
+        if sprite_path and sprite_path.exists():
+            from discord import File
+            files = [File(sprite_path, filename=sprite_path.name)]
+            emb.set_thumbnail(url=f"attachment://{sprite_path.name}")
+        else:
+            # Fallback to attach_sprite_to_embed
+            files = attach_sprite_to_embed(
+                emb, species=species_name_for_sprite, shiny=bool(shiny), gender=gender, form_key=sprite_form
+            )
+    except Exception as e:
+        # Log error and try fallback
+        print(f"[DEBUG] Sprite loading error for {_r(base_row, 'name')} (form={sprite_form}): {e}")
+        try:
+            files = attach_sprite_to_embed(
+                emb, species=str(_r(base_row, "name")), shiny=bool(shiny), gender=gender, form_key=sprite_form
+            )
+        except Exception:
+            files = []
+
+    # ---------- Check for available forms and add buttons ----------
+    view = None
+    con = await db_connect()
+    try:
+        # Regular forms from pokedex_forms
+        cur = await con.execute(
+            "SELECT form_key, display_name FROM pokedex_forms WHERE species_id = ? ORDER BY form_key",
+            (_r(base_row, "id"),)
+        )
+        form_rows = await cur.fetchall()
+        await cur.close()
+        
+        # Mega Evolution forms
+        cur = await con.execute(
+            "SELECT mega_form, form_key FROM mega_evolution WHERE base_species_id = ? ORDER BY mega_form",
+            (_r(base_row, "id"),)
+        )
+        mega_rows = await cur.fetchall()
+        await cur.close()
+        
+        # Gigantamax forms
+        cur = await con.execute(
+            "SELECT gmax_form, form_key FROM gigantamax WHERE base_species_id = ? ORDER BY gmax_form",
+            (_r(base_row, "id"),)
+        )
+        gmax_rows = await cur.fetchall()
+        await cur.close()
+        
+        # Primal Reversion forms
+        cur = await con.execute(
+            "SELECT primal_form, form_key FROM primal_reversion WHERE base_species_id = ? ORDER BY primal_form",
+            (_r(base_row, "id"),)
+        )
+        primal_rows = await cur.fetchall()
+        await cur.close()
+        
+        # Combine all forms
+        all_forms = []
+        
+        # Add regular forms
+        all_forms.extend([{'form_key': row['form_key'], 'display_name': row['display_name']} for row in form_rows])
+        
+        # Add Mega forms
+        for row in mega_rows:
+            form_name = row['mega_form'].replace(_r(base_row, "name") + "-", "").replace("-", " ").title()
+            all_forms.append({
+                'form_key': row['mega_form'],
+                'display_name': f"{_r(base_row, 'name').title()} — {form_name} ⚡"
+            })
+        
+        # Add Gigantamax forms
+        for row in gmax_rows:
+            form_name = row['gmax_form'].replace(_r(base_row, "name") + "-", "").replace("-", " ").title()
+            all_forms.append({
+                'form_key': row['gmax_form'],
+                'display_name': f"{_r(base_row, 'name').title()} — {form_name} 💫"
+            })
+        
+        # Add Primal forms
+        for row in primal_rows:
+            form_name = row['primal_form'].replace(_r(base_row, "name") + "-", "").replace("-", " ").title()
+            all_forms.append({
+                'form_key': row['primal_form'],
+                'display_name': f"{_r(base_row, 'name').title()} — {form_name} 🔥"
+            })
+        
+        # Deduplicate by form_key and label (avoid duplicate generic 'Mega' if specific exists)
+        dedup: dict[str, dict] = {}
+        for f in all_forms:
+            fk = f.get('form_key') or 'base'
+            # prefer longer/more descriptive labels
+            if fk not in dedup or len(str(f.get('display_name') or '')) > len(str(dedup[fk].get('display_name') or '')):
+                dedup[fk] = f
+        all_forms = list(dedup.values())
+
+        if all_forms:
+            # Add base form as first option
+            # If the base Pokemon has a form_name (e.g., Shaymin-Land, Meloetta-Aria), use that as the form_key
+            base_form_key = _r(base_row, "form_name")
+            base_form_display = _r(base_row, "name").title()
+            if base_form_key:
+                base_form_display = f"{base_form_display} — {base_form_key.replace('-', ' ').title()}"
+            else:
+                base_form_display = f"{base_form_display} (Base)"
+            
+            available_forms = [{'form_key': base_form_key, 'display_name': base_form_display}]
+            # Limit to 7 extra forms to avoid overcrowding
+            available_forms.extend(all_forms[:7])
+            
+            if len(available_forms) > 1:  # Only show buttons if there are multiple forms
+                view = PokeInfoFormView(
+                    species_id=_r(base_row, "id"),
+                    species_name=_r(base_row, "name"),
+                    available_forms=available_forms,
+                    current_form=form_key,
+                    shiny=shiny,
+                    gender=gender,
+                    gen=gen
+                )
+    finally:
+        await con.close()
+
+    try:
+        if view is not None:
+            await interaction.followup.send(embed=emb, files=files, view=view, ephemeral=True)
+        else:
+            await interaction.followup.send(embed=emb, files=files, ephemeral=True)
+    finally:
+        _close_discord_files(files)
+# Symbol per method (change these if you want different icons)
+# ---------------- emoji & formatting helpers ----------------
+
+async def _pokeball_emoji(guild: discord.Guild | None) -> str:
+    """
+    Try to find a custom pokéball emoji in this guild by common names or stored IDs.
+    Returns a usable emoji string (e.g., '<:pokeball:123...>') or '' if not found.
+    """
+    if not guild:
+        return ""
+    # Try common names first
+    common_names = ("pokeball", "poke-ball", "poke_ball", "poke ball")
+    # exact match over guild emojis
+    for e in guild.emojis:
+        nm = e.name.lower().replace("_", "").replace("-", "")
+        if nm in {n.replace("_", "").replace("-", "").replace(" ", "") for n in common_names}:
+            return str(e)
+    return ""  # fallback to nothing; you can replace with a unicode like '◓' if you want
+
+METHOD_SYMBOL: Dict[str, str] = {
+    "level-up": "L",
+    "machine":  "Ｍ",
+    "tutor":    "Ｔ",
+    "egg":      "🥚",
+}
+METHOD_ORDER: Dict[str, int] = {"level-up": 0, "machine": 1, "tutor": 2, "egg": 3}
+
+TYPES = ["normal","fire","water","electric","grass","ice","fighting","poison","ground","flying",
+         "psychic","bug","rock","ghost","dragon","dark","steel","fairy"]
+CATEGORIES = ["physical","special","status"]
+
+def _tc(s: str) -> str:
+    return s.replace("-", " ").title()
+
+def _fmt_line(name: str, method: str, level: Optional[int], form_label: str) -> str:
+    """
+    Compact single line with **bold method**, power hidden.
+      • level-up: '[Form] Razor Leaf **L**19'
+      • others:   '[Form] Brick Break **Ｍ**' / 'Spore **🥚**'
+    """
+    sym = METHOD_SYMBOL.get(method, "?")
+    prefix = f"[{_tc(form_label)}] " if form_label and form_label != "(default)" else ""
+    if method == "level-up" and level is not None:
+        return f"{prefix}{_tc(name)} **{sym}**{level}"
+    return f"{prefix}{_tc(name)} **{sym}**"
+
+def _paginate_15(flat: List[str]) -> List[List[str]]:
+    """Make pages of exactly 15 lines (pad the last one)."""
+    pages = []
+    for i in range(0, len(flat), 15):
+        chunk = flat[i:i+15]
+        if len(chunk) < 15:
+            chunk += [""] * (15 - len(chunk))
+        pages.append(chunk)
+    return pages or [[""] * 15]
+
+def _split_cols_3x5(lines15: List[str]) -> List[str]:
+    """
+    Take a 15-line page and return three strings (5 lines each),
+    trimming trailing empties so columns look tight.
+    """
+    c0, c1, c2 = lines15[0:5], lines15[5:10], lines15[10:15]
+    def _trim(col):
+        while col and col[-1] == "":
+            col.pop()
+        return col
+    c0, c1, c2 = _trim(c0), _trim(c1), _trim(c2)
+    return ["\n".join(c) if c else "—" for c in (c0, c1, c2)]
+
+# ---------------- pagination view (no code block; 3 embed fields) ----------------
+
+class MovesPager(discord.ui.View):
+    def __init__(self, pages: List[List[str]], title_prefix: str, footer_text: str, species: str):
+        super().__init__(timeout=180)
+        self.pages = pages
+        self.page = 0
+        self.title_prefix = title_prefix
+        self.footer_text = footer_text
+        self.species = species  # for sprite
+
+    def _embed_and_files(self) -> tuple[discord.Embed, list]:
+        col_texts = _split_cols_3x5(self.pages[self.page])
+        emb = discord.Embed(
+            title=f"{self.title_prefix} — Page {self.page+1}/{len(self.pages)}",
+            color=discord.Color.blurple()
+        )
+        # three neat inline columns (no gray code block)
+        for txt in col_texts:
+            emb.add_field(name="\u200b", value=txt, inline=True)
+        # ensure row completes
+        if len(col_texts) < 3:
+            for _ in range(3 - len(col_texts)):
+                emb.add_field(name="\u200b", value="—", inline=True)
+
+        emb.set_footer(text=self.footer_text + " | Click ◀️ ▶️ or ⏮ ⏭ to navigate.")
+        files = []
+        try:
+            # your own helper that returns List[discord.File]
+            files = attach_sprite_to_embed(emb, species=self.species, shiny=False, gender=None)
+        except Exception:
+            pass
+        return emb, files
+
+    async def send_initial(self, itx: discord.Interaction):
+        emb, files = self._embed_and_files()
+        try:
+            await itx.followup.send(embed=emb, files=files, view=self, ephemeral=False)
+        finally:
+            _close_discord_files(files)
+
+    @discord.ui.button(label="⏮", style=discord.ButtonStyle.secondary)
+    async def first(self, itx: discord.Interaction, _):
+        self.page = 0
+        emb, files = self._embed_and_files()
+        try:
+            await itx.response.edit_message(embed=emb, attachments=files, view=self)
+        finally:
+            _close_discord_files(files)
+
+    @discord.ui.button(label="◀️", style=discord.ButtonStyle.secondary)
+    async def prev(self, itx: discord.Interaction, _):
+        self.page = (self.page - 1) % len(self.pages)
+        emb, files = self._embed_and_files()
+        try:
+            await itx.response.edit_message(embed=emb, attachments=files, view=self)
+        finally:
+            _close_discord_files(files)
+
+    @discord.ui.button(label="▶️", style=discord.ButtonStyle.secondary)
+    async def next(self, itx: discord.Interaction, _):
+        self.page = (self.page + 1) % len(self.pages)
+        emb, files = self._embed_and_files()
+        try:
+            await itx.response.edit_message(embed=emb, attachments=files, view=self)
+        finally:
+            _close_discord_files(files)
+
+    @discord.ui.button(label="⏭", style=discord.ButtonStyle.secondary)
+    async def last(self, itx: discord.Interaction, _):
+        self.page = len(self.pages) - 1
+        emb, files = self._embed_and_files()
+        try:
+            await itx.response.edit_message(embed=emb, attachments=files, view=self)
+        finally:
+            _close_discord_files(files)
+
+# ---------------- /moves command (gen required; others optional) ----------------
+
+@bot.tree.command(
+    name="moves",
+    description="List a Pokémon's moves for a generation in a clean 3×5 grid. Method/type/category optional."
+)
+@app_commands.describe(
+    name_or_id="Pokémon name or National Dex number",
+    gen="Generation number (1–9)",
+    method="Optional: level-up, machine, tutor, egg (default: all methods)",
+    move_category="Optional: Physical, Special or Status",
+    move_type="Optional: move type (Fire, Water, etc.)"
+)
+@app_commands.choices(
+    method=[
+        app_commands.Choice(name="level-up", value="level-up"),
+        app_commands.Choice(name="machine",  value="machine"),
+        app_commands.Choice(name="tutor",    value="tutor"),
+        app_commands.Choice(name="egg",      value="egg"),
+    ],
+    move_category=[app_commands.Choice(name=x.title(), value=x) for x in CATEGORIES],
+    move_type=[app_commands.Choice(name=x.title(), value=x) for x in TYPES]
+)
+async def moves(
+    interaction: discord.Interaction,
+    name_or_id: str,
+    gen: int,
+    method: Optional[str] = None,
+    move_category: Optional[str] = None,
+    move_type: Optional[str] = None,
+):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # --- lookup species in your pokedex table
+    target = name_or_id.strip()
+    con = await db_connect()
+    try:
+        if target.isdigit():
+            cur = await con.execute('SELECT id, name, introduced_in FROM pokedex WHERE id=?', (int(target),))
+        else:
+            cur = await con.execute('SELECT id, name, introduced_in FROM pokedex WHERE LOWER(name)=LOWER(?)', (target.lower(),))
+        row = await cur.fetchone(); await cur.close()
+        if not row and not target.isdigit():
+            cur = await con.execute('SELECT id, name, introduced_in FROM pokedex WHERE LOWER(name) LIKE ? ORDER BY id LIMIT 1', (target.lower()+'%',))
+            row = await cur.fetchone(); await cur.close()
+    finally:
+        await con.close()
+
+    if not row:
+        return await interaction.followup.send("Pokémon not found in your Pokédex cache.", ephemeral=True)
+
+    sid, sname, intro = row["id"], row["name"], row["introduced_in"]
+    if intro is not None and gen < int(intro):
+        return await interaction.followup.send(
+            f"**{_tc(sname)}** wasn’t in **Gen {gen}** (introduced in **Gen {intro}**).",
+            ephemeral=True
+        )
+
+    # --- build SQL filters
+    where = ["l.species_id = ?", "l.generation = ?"]
+    params: List[object] = [sid, gen]
+    if method:
+        where.append("l.method = ?"); params.append(method)
+    if move_category:
+        where.append("LOWER(m.damage_class) = ?"); params.append(move_category.lower())
+    if move_type:
+        where.append("LOWER(m.type) = ?"); params.append(move_type.lower())
+
+    # --- fetch learnset lines
+    con = await db_connect()
+    try:
+        sql = f"""
+            SELECT
+              COALESCE(NULLIF(l.form_name,''), '(default)') AS form_label,
+              m.name AS move_name,
+              l.method,
+              l.level_learned
+            FROM learnsets l
+            JOIN moves m ON m.id = l.move_id
+            WHERE {' AND '.join(where)}
+        """
+        cur = await con.execute(sql, tuple(params))
+        rows = await cur.fetchall(); await cur.close()
+    finally:
+        await con.close()
+
+    if not rows:
+        bits = [f"Gen {gen}"]
+        if method:        bits.append(method)
+        if move_category: bits.append(move_category.title())
+        if move_type:     bits.append(move_type.title())
+        return await interaction.followup.send(
+            f"No moves for **{_tc(sname)}** ({' · '.join(bits)}).",
+            ephemeral=True
+        )
+
+    # --- order & flatten to text lines
+    from collections import defaultdict
+    per_form: Dict[str, List[Tuple[int, Optional[int], str, str]]] = defaultdict(list)
+    counts = {"level-up":0,"machine":0,"tutor":0,"egg":0}
+    for r in rows:
+        mo = r["method"]; counts[mo] = counts.get(mo, 0) + 1
+        lvl = r["level_learned"] if mo == "level-up" else None
+        per_form[r["form_label"]].append((METHOD_ORDER.get(mo, 99), lvl, r["move_name"], mo))
+
+    def form_key(lbl: str): return (0, "") if lbl == "(default)" else (1, lbl.lower())
+
+    flat: List[str] = []
+    for form_lbl in sorted(per_form.keys(), key=form_key):
+        entries = per_form[form_lbl]
+        entries.sort(key=lambda t: (t[0], (t[1] is None, t[1] if t[1] is not None else 999), t[2].lower()))
+        for _, lvl, name, mo in entries:
+            flat.append(_fmt_line(name, mo, lvl, form_lbl))
+
+    pages = _paginate_15(flat)
+
+    # --- title with your server's pokéball emoji & bold method name (if chosen)
+    ball = await _pokeball_emoji(interaction.guild)
+    method_txt = ("all methods" if not method else f"**{method.lower()}**")
+    title_prefix = " · ".join(
+        [f"{(ball + ' ') if ball else ''}{_tc(sname)}", f"Gen {gen}", method_txt]
+        + ([move_category.title()] if move_category else [])
+        + ([move_type.title()] if move_type else [])
+    )
+
+    # footer legend with bold symbols
+    legend = "Symbols — " + "  ".join(f"**{v}**={k}" for k, v in METHOD_SYMBOL.items())
+    totals = "  ".join(f"{METHOD_SYMBOL[k]}×{v}" for k, v in counts.items() if v)
+    if totals:
+        legend += f"  |  Totals: {totals}"
+
+    view = MovesPager(pages, title_prefix, legend, species=sname)
+    await view.send_initial(interaction)
+# =========================
+#  fect message
+# =========================
+async def safe_fetch_message(
+    client: discord.Client, channel_id: int, message_id: int
+) -> Optional[discord.Message]:
+    """Fetch a message if the channel type actually supports it."""
+    chan = client.get_channel(channel_id)
+    if chan is None:
+        try:
+            chan = await client.fetch_channel(channel_id)
+        except Exception:
+            chan = None
+    if isinstance(chan, (discord.TextChannel, discord.Thread, discord.DMChannel, discord.GroupChannel)):
+        try:
+            return await chan.fetch_message(message_id)
+        except Exception:
+            return None
+    return None
+
+
+async def safe_edit_interaction_message(
+    interaction: discord.Interaction,
+    *,
+    content: str | None = None,
+    embed: discord.Embed | None = None,
+    view: discord.ui.View | None = None,
+) -> None:
+    """Edit the message tied to this interaction if it exists."""
+    if interaction.message is None:
+        return
+    try:
+        await interaction.message.edit(content=content, embed=embed, view=view)
+    except Exception:
+        pass
+class SafeView(discord.ui.View):
+    def __init__(self, *, timeout: float | None = 180):
+        super().__init__(timeout=timeout)
+
+    def disable_all_buttons(self) -> None:
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+
+class VerifyRulesView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="✅ I agree to the rules",
+        style=discord.ButtonStyle.success,
+        custom_id=VERIFY_BUTTON_CUSTOM_ID,
+    )
+    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or interaction.guild.id != VERIFY_GUILD_ID:
+            await interaction.response.send_message("Run this in the server.", ephemeral=True)
+            return
+        if interaction.channel and interaction.channel.id != VERIFY_CHANNEL_ID:
+            await interaction.response.send_message("Please verify in the rules channel.", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(VERIFY_ROLE_ID)
+        if role is None:
+            await interaction.response.send_message("Role not found. Tell an admin.", ephemeral=True)
+            return
+
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member is None:
+            await interaction.response.send_message("Could not resolve your member record.", ephemeral=True)
+            return
+
+        if role in member.roles:
+            await interaction.response.send_message("You already have the role.", ephemeral=True)
+            return
+
+        try:
+            await member.add_roles(role, reason="Accepted rules via verification button")
+            await interaction.response.send_message("✅ Verified! Role assigned.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("I don't have permission to assign that role.", ephemeral=True)
+        except Exception:
+            await interaction.response.send_message("An error occurred while assigning the role.", ephemeral=True)
+# =========================
+#  Events (single, clean)
+# =========================
+
+async def _periodic_cleanup_old_battle_media():
+    """Periodically clean up old battle media files (GIFs) older than 1 hour."""
+    import asyncio
+    try:
+        from pvp.renderer import cleanup_old_battle_media
+        while True:
+            try:
+                # Wait 1 hour between cleanups
+                await asyncio.sleep(3600)
+                # Clean up files older than 1 hour
+                cleanup_old_battle_media(max_age_hours=1)
+                print("[Cleanup] Old battle media cleaned up")
+            except Exception as e:
+                print(f"[Cleanup] Error cleaning up old battle media: {e}")
+    except ImportError:
+        print("[Cleanup] cleanup_old_battle_media not available")
+
+async def _periodic_pool_stats_logging():
+    """Periodically log DB pool statistics to detect leaks."""
+    import asyncio
+    try:
+        from pvp.db_pool import get_pool_stats
+        while True:
+            try:
+                # Wait 5 minutes between logs
+                await asyncio.sleep(300)
+                stats = get_pool_stats()
+                # Only log if pool utilization is high (>80%) or if there are leaks
+                if stats.get("pool_utilization_pct", 0) > 80 or stats.get("in_use_connections", 0) > stats.get("pool_size", 0):
+                    print(f"[DB Pool Stats] {stats}")
+                # Always log if there are temporary connections (potential leak)
+                if stats.get("total_connections", 0) > stats.get("pool_size", 0):
+                    print(f"[DB Pool] WARNING: Potential connection leak detected! {stats}")
+            except Exception as e:
+                print(f"[DB Pool Stats] Error logging pool stats: {e}")
+    except ImportError:
+        print("[DB Pool Stats] get_pool_stats not available")
+
+@bot.event
+async def on_ready():
+    # Prevent double-run on reconnects
+    if getattr(bot, "_ready_once", False):
+        print(f"[reconnect] Reconnected as {bot.user} (id={bot.user.id})")
+        return
+    bot._ready_once = True
+    _enable_embed_only_messages()
+    try:
+        bot.add_view(VerifyRulesView())
+        print("[verify] Verification view registered")
+    except Exception as e:
+        print(f"[verify] add_view error: {e}")
+    try:
+        bot.beta_claim_view = BetaClaimView()
+        bot.add_view(bot.beta_claim_view)
+        print("[beta] Beta claim view registered")
+    except Exception as e:
+        print(f"[beta] add_view error: {e}")
+    try:
+        await bot.load_extension("pvp.pvprules")
+        print("[PvP] pvp.pvprules loaded")
+    except Exception as e:
+        print("[PvP] Failed to load pvp.pvprules:", e)
+    try:
+        await bot.load_extension("pvp.commands")
+        print("[PvP] pvp.commands loaded")
+    except Exception as e:
+        print("[PvP] Failed to load pvp.commands:", e)
+    # 1) DB init / migrations
+    try:
+        await db.init_schema()
+    except Exception as e:
+        print(f"[on_ready] db.init_schema error: {e}")
+
+    # 1a) Warm the DB connection pool for faster first queries (/team, /mpokeinfo, etc.)
+    #     Tune via env: DB_POOL_MIN, DB_POOL_MAX, DB_POOL_ACQUIRE_TIMEOUT, DB_STICKY_CONN=0 to avoid pinning.
+    try:
+        warmed = await db.warm_pool(3)
+        if warmed:
+            print(f"[on_ready] DB pool warmed: {warmed} conns")
+    except Exception as e:
+        print(f"[on_ready] db.warm_pool error: {e}")
+
+    # 1b) Warm db_cache at startup (pokedex, moves, items, static tables, pokemons for active teams).
+    if warm_cache is not None:
+        try:
+            counts = await warm_cache()
+            parts_main = [f"pokedex={counts['pokedex']}", f"moves={counts['moves']}", f"items={counts['items']}"]
+            if counts.get("pokemons_owners"):
+                parts_main.append(f"pokemons(team)={counts['pokemons_owners']}")
+            print(f"[on_ready] Cache warmed: {' '.join(parts_main)}")
+            parts = []
+            for t in STATIC_TABLES + ["config"]:
+                n = counts.get(t, 0)
+                if n:
+                    parts.append(f"{t}={n}")
+            if parts:
+                print(f"[on_ready] Cache warmed (static): {' '.join(parts)}")
+        except Exception as e:
+            print(f"[on_ready] warm_cache error: {e}")
+
+    # 2) Load cogs once
+    for Cog in (BagCog, AdminItems, EmojiLinkCog, AdminGivePokemon, OwnerShinyOddsCog, MPokeInfo):
+        try:
+            if not any(isinstance(c, Cog) for c in bot.cogs.values()):
+                await bot.add_cog(Cog(bot))
+                print(f"Loaded {Cog.__name__}")
+        except Exception as e:
+            print(f"[on_ready] Failed to load {Cog.__name__}: {e}")
+
+    # 3) Sync slash commands
+    try:
+        cmds = await bot.tree.sync()
+        print(f"[slash] Globally synced {len(cmds)} cmds: {[c.name for c in cmds]}")
+    except Exception as e:
+        print(f"[slash] sync failed: {e}")
+
+    # 4) Banner
+    try:
+        guilds = len(bot.guilds)
+    except Exception:
+        guilds = "?"
+    print(f"Logged in as {bot.user} (id={bot.user.id}) · guilds={guilds}")
+    sys.stdout.flush()
+
+    # 5) Start periodic cleanup task for old battle media
+    if not hasattr(bot, "_cleanup_task_started"):
+        bot._cleanup_task_started = True
+        bot.loop.create_task(_periodic_cleanup_old_battle_media())
+        print("[Cleanup] Periodic battle media cleanup task started")
+
+    # 6) Start periodic DB pool stats logging (every 5 minutes)
+    if not hasattr(bot, "_pool_stats_task_started"):
+        bot._pool_stats_task_started = True
+        bot.loop.create_task(_periodic_pool_stats_logging())
+        print("[DB Pool] Periodic pool stats logging started")
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Always ignore bot messages to prevent loops
+    if message.author.bot:
+        return
+
+    if EMBED_ECHO_CHANNEL_IDS and message.channel.id in EMBED_ECHO_CHANNEL_IDS:
+        if EMBED_ECHO_GUILD_ID is not None:
+            if not message.guild or message.guild.id != EMBED_ECHO_GUILD_ID:
+                await bot.process_commands(message)
+                return
+
+        if EMBED_ECHO_USER_IDS is not None and message.author.id not in EMBED_ECHO_USER_IDS:
+            await bot.process_commands(message)
+            return
+
+        if EMBED_ECHO_IGNORE_PREFIX_COMMANDS:
+            prefix = bot.command_prefix
+            if isinstance(prefix, str) and message.content.startswith(prefix):
+                await bot.process_commands(message)
+                return
+
+        content = message.content or ""
+        if content.strip() or message.attachments:
+            embed = discord.Embed(description=content.strip() or None)
+            embed.set_author(
+                name=message.author.display_name,
+                icon_url=message.author.display_avatar.url,
+            )
+            files = None
+            if message.attachments:
+                try:
+                    files = [await a.to_file() for a in message.attachments]
+                except Exception:
+                    files = None
+            try:
+                await message.channel.send(embed=embed, files=files)
+                if EMBED_ECHO_DELETE_SOURCE:
+                    await message.delete()
+            except Exception:
+                pass
+            finally:
+                _close_discord_files(files)
+
+    await bot.process_commands(message)
+# ---------- /learn (add-or-replace with buttons) ----------
+def _norm_move_name(s: str) -> str:
+    return str(s).strip().lower().replace("  ", " ").replace(" ", "-")
+
+def _parse_moves_text(txt: str | None) -> list[str]:
+    if not txt:
+        return []
+    try:
+        arr = json.loads(txt)
+        if isinstance(arr, list):
+            return [str(x) for x in arr][:4]
+    except Exception:
+        pass
+    parts = [p.strip() for p in str(txt).split(",")]
+    return [p for p in parts if p][:4]
+
+async def _get_current_moves(owner_id: str, mon_id: int) -> list[str]:
+    conn = await db.connect()
+    try:
+        cur = await conn.execute("SELECT moves FROM pokemons WHERE owner_id=? AND id=?", (owner_id, mon_id))
+        row = await cur.fetchone(); await cur.close()
+        return _parse_moves_text(row["moves"] if row else None)
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+async def _save_moves(owner_id: str, mon_id: int, moves: list[str]) -> None:
+    await _set_pokemon_moves(owner_id, mon_id, moves[:4])
+
+async def _highest_unlocked_gen(user_id: str) -> int:
+    """Return user's highest unlocked generation from user_rulesets.max_unlocked_gen (default 1)."""
+    conn = await db.connect()
+    try:
+        c = await conn.execute("SELECT max_unlocked_gen FROM user_rulesets WHERE user_id=?", (user_id,))
+        r = await c.fetchone(); await c.close()
+        if r and r["max_unlocked_gen"]:
+            return int(r["max_unlocked_gen"])
+        return 1
+    except Exception:
+        return 1
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+async def _resolve_team_mon_by_name_or_slot(user_id: str, token: str) -> tuple[int | None, dict | None, str | None]:
+    """
+    token: '1'..'6' (slot) OR species name.
+    Returns (pokemon_id, row, err_msg)
+    row has columns: id, species, level, team_slot
+    """
+    conn = await db.connect()
+    try:
+        # slot?
+        tok = token.strip()
+        if tok.isdigit():
+            slot = int(tok)
+            if not (1 <= slot <= 6):
+                return None, None, "Team slot must be from 1 to 6."
+            cur = await conn.execute(
+                "SELECT id, species, level, team_slot FROM pokemons WHERE owner_id=? AND team_slot=?",
+                (user_id, slot),
+            )
+            row = await cur.fetchone(); await cur.close()
+            if not row:
+                return None, None, f"No Pokémon in team slot {slot}."
+            return int(row["id"]), row, None
+
+        # species name on team
+        cur = await conn.execute(
+            "SELECT id, species, level, team_slot FROM pokemons WHERE owner_id=? AND LOWER(species)=LOWER(?) AND team_slot IS NOT NULL",
+            (user_id, tok),
+        )
+        rows = await cur.fetchall(); await cur.close()
+        if not rows:
+            return None, None, f"No **{tok.title()}** in your current team."
+        if len(rows) > 1:
+            slots = ", ".join(str(r["team_slot"]) for r in rows if r["team_slot"] is not None)
+            return None, None, f"You have multiple **{tok.title()}** in your team (slots {slots}). Use the **slot number** instead."
+        row = rows[0]
+        return int(row["id"]), row, None
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+async def _species_id_from_name(name: str) -> int | None:
+    conn = await db.connect()
+    try:
+        c = await conn.execute("SELECT id FROM pokedex WHERE LOWER(name)=LOWER(?) LIMIT 1", (name,))
+        r = await c.fetchone(); await c.close()
+        return int(r["id"]) if r else None
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+async def _move_id_from_name(move: str) -> tuple[int | None, str | None]:
+    """Return (move_id, canonical_name) by flexible name match."""
+    nm = _norm_move_name(move)
+    conn = await db.connect()
+    try:
+        # exact (hyphen style) or space style
+        c = await conn.execute(
+            "SELECT id, name FROM moves WHERE LOWER(name)=LOWER(?) OR LOWER(REPLACE(name,'-',' '))=LOWER(?) LIMIT 1",
+            (nm, move.strip().lower())
+        )
+        r = await c.fetchone(); await c.close()
+        if r:
+            return int(r["id"]), r["name"]
+        # prefix fallback
+        c = await conn.execute(
+            "SELECT id, name FROM moves WHERE LOWER(name) LIKE ? ORDER BY LENGTH(name) LIMIT 1",
+            (f"{nm}%",)
+        )
+        r = await c.fetchone(); await c.close()
+        return (int(r["id"]), r["name"]) if r else (None, None)
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+class OverrideMoveView(discord.ui.View):
+    def __init__(self, owner_id: str, mon_id: int, old_moves: list[str], new_move: str, *, timeout: float = 60.0):
+        super().__init__(timeout=timeout)
+        self.owner_id = owner_id
+        self.mon_id   = mon_id
+        self.old      = old_moves[:4]
+        self.new      = new_move
+        for i, mv in enumerate(self.old):
+            btn = discord.ui.Button(label=mv.replace("-", " ").title(), style=discord.ButtonStyle.primary, custom_id=f"ovr:{i}")
+            btn.callback = self._make_cb(i)
+            self.add_item(btn)
+
+    def _lock(self):
+        for c in self.children:
+            if isinstance(c, discord.ui.Button):
+                c.disabled = True
+
+    def _make_cb(self, idx: int):
+        async def cb(inter: discord.Interaction):
+            if not inter.response.is_done():
+                await inter.response.defer(ephemeral=True)
+            new_list = self.old[:]
+            new_list[idx] = self.new
+            await _save_moves(str(inter.user.id), self.mon_id, new_list)
+            self._lock()
+            try:
+                await inter.edit_original_response(view=self)
+            except Exception:
+                pass
+            await inter.followup.send(
+                f"✅ Replaced **{self.old[idx].replace('-', ' ').title()}** with **{self.new.replace('-', ' ').title()}**.",
+                ephemeral=True
+            )
+        return cb
+
+# ---------------- /learn command ----------------
+@bot.tree.command(name="learn", description="Teach a level-up move from your highest unlocked generation.")
+@app_commands.describe(
+    mon="Team slot (1-6) OR Pokémon name on your team",
+    move="Move name (level-up move, must be legal for your highest unlocked gen)",
+)
+async def learn_cmd(interaction: discord.Interaction, mon: str, move: str):
+    uid = str(interaction.user.id)
+    await interaction.response.defer(ephemeral=False)
+
+    # Resolve team Pokémon by slot or name
+    mon_id, mon_row, err = await _resolve_team_mon_by_name_or_slot(uid, mon)
+    if err:
+        return await interaction.followup.send(f"❌ {err}", ephemeral=True)
+    species_name = mon_row["species"]
+    level        = int(mon_row["level"])
+
+    # Get species_id
+    species_id = await _species_id_from_name(species_name)
+    if not species_id:
+        return await interaction.followup.send("❌ Could not resolve species in Pokédex.", ephemeral=True)
+
+    # Fuzzy match move - no legality restrictions, just check if move exists
+    conn = await db.connect()
+    try:
+        # Allow any move to be taught as long as it exists
+        canon_move, confidence, suggestions = await FuzzyMatcher.fuzzy_move(conn, move)
+        
+        if not canon_move or confidence < 0.70:
+            sugg_text = f"\n\n**Did you mean:** {', '.join(suggestions[:5])}" if suggestions else ""
+            return await interaction.followup.send(
+                f"❌ Move **{move}** not found.{sugg_text}",
+                ephemeral=True
+            )
+        
+        # Get move ID from the matched canonical move name
+        cur = await conn.execute("SELECT id FROM moves WHERE LOWER(name) = LOWER(?)", (canon_move,))
+        move_row = await cur.fetchone()
+        await cur.close()
+        
+        if not move_row:
+            return await interaction.followup.send(f"❌ Move **{canon_move}** not found in database.", ephemeral=True)
+        
+        move_id = move_row['id']
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+    # Current moves
+    current = await _get_current_moves(uid, mon_id)
+    nm = _norm_move_name(canon_move)
+    if nm in [m.lower() for m in current]:
+        return await interaction.followup.send(
+            f"ℹ️ **{species_name}** already knows **{canon_move.replace('-', ' ').title()}**.",
+            ephemeral=True
+        )
+
+    # Teach (append if < 4; else ask which to forget)
+    if len(current) < 4:
+        new_list = current + [nm]
+        await _save_moves(uid, mon_id, new_list)
+        return await interaction.followup.send(
+            f"✅ **{species_name}** learned **{canon_move.replace('-', ' ').title()}**!",
+            ephemeral=True
+        )
+
+    # Need to forget one — show 4 buttons
+    view = OverrideMoveView(uid, mon_id, current[:4], nm)
+    await interaction.followup.send(
+        f"Your **{species_name}** already knows 4 moves. Choose one to forget:",
+        view=view,
+        ephemeral=True
+    )
+# =========================
+#  /release command
+# =========================
+
+class ReleaseConfirmView(discord.ui.View):
+    """Confirmation view for releasing a Pokémon"""
+    def __init__(self, mon_data: dict, timeout: float = 60.0):
+        super().__init__(timeout=timeout)
+        self.mon_data = mon_data
+        self.confirmed = False
+    
+    @discord.ui.button(label="✅ Confirm Release", style=discord.ButtonStyle.danger)
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = True
+        self.stop()
+        await interaction.response.edit_message(content="✅ Confirmed. Releasing Pokémon...", view=None)
+    
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = False
+        self.stop()
+        await interaction.response.edit_message(content="❌ Release cancelled.", view=None)
+
+@bot.tree.command(name="release", description="Release a Pokémon from your team")
+@app_commands.describe(slot="Team slot (1-6) to release")
+async def release_pokemon(interaction: discord.Interaction, slot: app_commands.Range[int, 1, 6]):
+    """Release a Pokémon from the specified team slot after confirmation"""
+    await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+    
+    # Check if user is admin (admins bypass safety checks)
+    is_admin = await db.is_admin(uid)
+    
+    # Get the Pokémon in the specified slot
+    conn = await db.connect()
+    try:
+        cur = await conn.execute(
+            "SELECT * FROM pokemons WHERE owner_id = ? AND team_slot = ? LIMIT 1",
+            (uid, slot)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+
+        if not row:
+            return await interaction.followup.send(
+                f"❌ No Pokémon found in slot **{slot}**.",
+                ephemeral=True
+            )
+
+        mon = dict(row)
+
+        # Safety checks (only for non-admins)
+        if not is_admin:
+            # Check if this is the user's starter
+            cur = await conn.execute(
+                "SELECT starter FROM users WHERE user_id = ? LIMIT 1",
+                (uid,)
+            )
+            starter_row = await cur.fetchone()
+            await cur.close()
+
+            if starter_row and starter_row['starter']:
+                starter_species = starter_row['starter'].lower()
+                if mon['species'].lower() == starter_species:
+                    return await interaction.followup.send(
+                        f"❌ You cannot release your starter Pokémon (**{mon['species']}**)!",
+                        ephemeral=True
+                    )
+
+            # Check if this is the user's last Pokémon in team
+            cur = await conn.execute(
+                "SELECT COUNT(*) as count FROM pokemons WHERE owner_id = ? AND team_slot IS NOT NULL",
+                (uid,)
+            )
+            count_row = await cur.fetchone()
+            await cur.close()
+
+            team_count = count_row['count'] if count_row else 0
+
+            if team_count <= 1:
+                return await interaction.followup.send(
+                    f"❌ You cannot release your last Pokémon! You must always have at least one Pokémon in your team.",
+                    ephemeral=True
+                )
+
+        # Create preview embed
+        description = f"Are you sure you want to release this Pokémon? **This cannot be undone!**"
+        if is_admin:
+            description += f"\n\n🔧 *Admin mode: Safety checks bypassed*"
+
+        embed = discord.Embed(
+            title=f"⚠️ Release {mon['species']}?",
+            description=description,
+            color=discord.Color.red()
+        )
+
+        # Add Pokémon details
+        embed.add_field(name="Species", value=mon['species'], inline=True)
+        embed.add_field(name="Level", value=str(mon['level']), inline=True)
+        embed.add_field(name="Slot", value=str(slot), inline=True)
+
+        # Add nature if available
+        if mon.get('nature'):
+            embed.add_field(name="Nature", value=mon['nature'].title(), inline=True)
+
+        # Add shiny status
+        if mon.get('shiny'):
+            embed.add_field(name="✨ Shiny", value="Yes", inline=True)
+
+        # Add held item if any
+        if mon.get('held_item'):
+            embed.add_field(name="Held Item", value=mon['held_item'], inline=True)
+
+        # Create confirmation view
+        view = ReleaseConfirmView(mon)
+        msg = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+        # Wait for user response
+        await view.wait()
+
+        if view.confirmed:
+            # Return held item to bag if any
+            held_item = mon.get('held_item')
+            item_msg = ""
+            if held_item:
+                # Clear the held item
+                await conn.execute(
+                    "UPDATE pokemons SET held_item = NULL WHERE id = ?",
+                    (mon['id'],)
+                )
+                await conn.commit()
+
+                # Get item display name
+                cur = await conn.execute(
+                    "SELECT name, emoji FROM items WHERE id = ?",
+                    (held_item,)
+                )
+                item_row = await cur.fetchone()
+                await cur.close()
+
+                if item_row:
+                    item_name = item_row['name'] if hasattr(item_row, 'keys') else item_row[1]
+                    item_emoji = item_row['emoji'] if hasattr(item_row, 'keys') else (item_row[0] if len(item_row) > 1 else "")
+                    item_display = f"{item_emoji} {item_name}" if item_emoji else item_name
+                    item_msg = f"\n📦 Returned {item_display} to your bag."
+                else:
+                    item_msg = f"\n📦 Returned held item to your bag."
+
+            # Remove from team (set team_slot to NULL)
+            await conn.execute(
+                "UPDATE pokemons SET team_slot = NULL WHERE id = ?",
+                (mon['id'],)
+            )
+            await conn.commit()
+            db.invalidate_pokemons_cache(uid)
+
+            await interaction.followup.send(
+                f"✅ Successfully released **{mon['species']}** from slot **{slot}**.{item_msg}",
+                ephemeral=True
+            )
+    # else: cancellation message already sent by button callback
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+# =========================
+#  /clearteam command
+# =========================
+
+@bot.tree.command(name="clearteam", description="Release all Pokémon in your team (slots 1-6).")
+async def clear_team(interaction: discord.Interaction):
+    """Release all Pokémon in the user's team."""
+    await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+    
+    # Check if user is admin (admins bypass safety checks)
+    is_admin = await db.is_admin(uid)
+    
+    conn = await db.connect()
+    try:
+        # Get all Pokémon in the team
+        cur = await conn.execute(
+            "SELECT id, species, team_slot, held_item FROM pokemons WHERE owner_id = ? AND team_slot BETWEEN 1 AND 6 ORDER BY team_slot",
+            (uid,)
+        )
+        team_mons = await cur.fetchall()
+        await cur.close()
+        
+        if not team_mons:
+            return await interaction.followup.send(
+                "❌ Your team is already empty!",
+                ephemeral=True
+            )
+        
+        # Safety checks (only for non-admins)
+        if not is_admin:
+            # Check if any of these are the user's starter
+            cur = await conn.execute(
+                "SELECT starter FROM users WHERE user_id = ? LIMIT 1",
+                (uid,)
+            )
+            starter_row = await cur.fetchone()
+            await cur.close()
+            
+            starter_species = None
+            if starter_row and starter_row.get('starter'):
+                starter_species = starter_row['starter'].lower()
+            
+            # Check if any team member is the starter
+            for mon in team_mons:
+                mon_dict = dict(mon)
+                if starter_species and mon_dict['species'].lower() == starter_species:
+                    return await interaction.followup.send(
+                        f"❌ You cannot release your starter Pokémon (**{mon_dict['species']}**)! Use `/release` on individual slots to exclude it.",
+                        ephemeral=True
+                    )
+        
+        # Release all Pokémon in the team
+        released_count = 0
+        items_returned = []
+        
+        for mon in team_mons:
+            mon_dict = dict(mon)
+            mon_id = mon_dict['id']
+            held_item = mon_dict.get('held_item')
+            
+            # Track items to return
+            if held_item:
+                items_returned.append(held_item)
+            
+            # Remove from team (set team_slot to NULL, which effectively "releases" it from the team)
+            await conn.execute(
+                "UPDATE pokemons SET team_slot = NULL, held_item = NULL WHERE id = ?",
+                (mon_id,)
+            )
+            released_count += 1
+        
+        # Commit the team changes first
+        await conn.commit()
+        db.invalidate_pokemons_cache(uid)
+        
+        # Now return items to bag (in a separate transaction to avoid locks)
+        for held_item in items_returned:
+            try:
+                await db.give_item(uid, held_item, 1)
+            except Exception as item_err:
+                print(f"[clearteam] Warning: Failed to return item {held_item}: {item_err}")
+        
+        # Build response message
+        response_parts = [f"✅ Successfully released **{released_count}** Pokémon from your team."]
+        
+        if items_returned:
+            unique_items = list(set(items_returned))
+            item_count = len(unique_items)
+            if item_count == 1:
+                response_parts.append(f"📦 Returned **{unique_items[0]}** to your bag.")
+            else:
+                response_parts.append(f"📦 Returned **{item_count}** items to your bag.")
+        
+        await interaction.followup.send("\n".join(response_parts), ephemeral=True)
+        
+    except Exception as e:
+        await conn.rollback()
+        import traceback
+        traceback.print_exc()
+        await interaction.followup.send(
+            f"❌ Error clearing team: {str(e)}",
+            ephemeral=True
+        )
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
+# =========================
+#  /swap command
+# =========================
+
+@bot.tree.command(name="swap", description="Swap two Pokémon in your team")
+@app_commands.describe(
+    slot1="First team slot (1-6)",
+    slot2="Second team slot (1-6)"
+)
+async def swap_pokemon(
+    interaction: discord.Interaction,
+    slot1: app_commands.Range[int, 1, 6],
+    slot2: app_commands.Range[int, 1, 6]
+):
+    """Swap the positions of two Pokémon in the team"""
+    await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+    
+    if slot1 == slot2:
+        return await interaction.followup.send(
+            "❌ You must specify two different slots!",
+            ephemeral=True
+        )
+    
+    conn = await db.connect()
+    try:
+        # Get both Pokémon
+        cur = await conn.execute(
+            "SELECT id, species, team_slot FROM pokemons WHERE owner_id = ? AND team_slot IN (?, ?)",
+            (uid, slot1, slot2)
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+
+        # Map slots to Pokémon
+        pokemon_by_slot = {row['team_slot']: dict(row) for row in rows}
+
+        mon1 = pokemon_by_slot.get(slot1)
+        mon2 = pokemon_by_slot.get(slot2)
+
+        # Check if both slots have Pokémon
+        if not mon1 and not mon2:
+            return await interaction.followup.send(
+                f"❌ No Pokémon found in slots **{slot1}** and **{slot2}**.",
+                ephemeral=True
+            )
+
+        # Perform the swap
+        if mon1 and mon2:
+            # Both slots occupied - swap them
+            # Use a temporary slot to avoid constraint violations
+            await conn.execute("UPDATE pokemons SET team_slot = -1 WHERE id = ?", (mon1['id'],))
+            await conn.execute("UPDATE pokemons SET team_slot = ? WHERE id = ?", (slot1, mon2['id']))
+            await conn.execute("UPDATE pokemons SET team_slot = ? WHERE id = ?", (slot2, mon1['id']))
+            await conn.commit()
+            db.invalidate_pokemons_cache(uid)
+            
+            await interaction.followup.send(
+                f"✅ Swapped **{mon1['species']}** (slot {slot1}) with **{mon2['species']}** (slot {slot2}).",
+                ephemeral=True
+            )
+        elif mon1:
+            # Only slot1 occupied - move to slot2
+            await conn.execute("UPDATE pokemons SET team_slot = ? WHERE id = ?", (slot2, mon1['id']))
+            await conn.commit()
+            db.invalidate_pokemons_cache(uid)
+            
+            await interaction.followup.send(
+                f"✅ Moved **{mon1['species']}** from slot **{slot1}** to slot **{slot2}**.",
+                ephemeral=True
+            )
+        elif mon2:
+            # Only slot2 occupied - move to slot1
+            await conn.execute("UPDATE pokemons SET team_slot = ? WHERE id = ?", (slot1, mon2['id']))
+            await conn.commit()
+            db.invalidate_pokemons_cache(uid)
+            
+            await interaction.followup.send(
+                f"✅ Moved **{mon2['species']}** from slot **{slot2}** to slot **{slot1}**.",
+                ephemeral=True
+            )
+    except Exception as e:
+        await conn.rollback()
+        await interaction.followup.send(
+            f"❌ Error swapping Pokémon: {e}",
+            ephemeral=True
+        )
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+# =========================
+#  /transform - Transform Pokémon Forms
+# =========================
+
+# Form transformation data
+TRANSFORM_DATA = {
+    "rotom": {
+        "forms": ["normal", "heat", "wash", "frost", "fan", "mow"],
+        "items": {
+            "heat": "oven",
+            "wash": "washing-machine",
+            "frost": "refrigerator",
+            "fan": "fan",
+            "mow": "lawnmower"
+        },
+        "types": {
+            "normal": ["Electric", "Ghost"],
+            "heat": ["Electric", "Fire"],
+            "wash": ["Electric", "Water"],
+            "frost": ["Electric", "Ice"],
+            "fan": ["Electric", "Flying"],
+            "mow": ["Electric", "Grass"]
+        }
+    },
+    "deoxys": {
+        "forms": ["normal", "attack", "defense", "speed"],
+        "items": {
+            "attack": "meteorite",
+            "defense": "meteorite",
+            "speed": "meteorite"
+        },
+        "types": {"normal": ["Psychic"], "attack": ["Psychic"], "defense": ["Psychic"], "speed": ["Psychic"]}
+    },
+    "shaymin": {
+        "forms": ["land", "sky"],
+        "items": {"sky": "gracidea"},
+        "types": {"land": ["Grass"], "sky": ["Grass", "Flying"]}
+    },
+    "necrozma": {
+        "forms": ["normal", "dusk-mane", "dawn-wings"],
+        "items": {
+            "dusk-mane": "n-solarizer--merge",
+            "dawn-wings": "n-lunarizer--merge"
+        },
+        "types": {"normal": ["Psychic"], "dusk-mane": ["Psychic", "Steel"], "dawn-wings": ["Psychic", "Ghost"]},
+        "requires_fusion": {
+            "dusk-mane": "solgaleo",
+            "dawn-wings": "lunala"
+        }
+    },
+    "kyurem": {
+        "forms": ["normal", "white", "black"],
+        "items": {"white": "dna-splicers", "black": "dna-splicers"},
+        "types": {"normal": ["Dragon", "Ice"], "white": ["Dragon", "Ice"], "black": ["Dragon", "Ice"]},
+        "requires_fusion": {
+            "white": "reshiram",
+            "black": "zekrom"
+        }
+    },
+    "calyrex": {
+        "forms": ["normal", "ice-rider", "shadow-rider"],
+        "items": {"ice-rider": "reins-of-unity", "shadow-rider": "reins-of-unity"},
+        "types": {"normal": ["Psychic", "Grass"], "ice-rider": ["Psychic", "Ice"], "shadow-rider": ["Psychic", "Ghost"]},
+        "requires_fusion": {
+            "ice-rider": "glastrier",
+            "shadow-rider": "spectrier"
+        }
+    },
+    "hoopa": {
+        "forms": ["confined", "unbound"],
+        "items": {"unbound": "prison-bottle"},
+        "types": {"confined": ["Psychic", "Ghost"], "unbound": ["Psychic", "Dark"]}
+    },
+    "tornadus": {
+        "forms": ["incarnate", "therian"],
+        "items": {"therian": "reveal-glass"},
+        "types": {"incarnate": ["Flying"], "therian": ["Flying"]}
+    },
+    "thundurus": {
+        "forms": ["incarnate", "therian"],
+        "items": {"therian": "reveal-glass"},
+        "types": {"incarnate": ["Electric", "Flying"], "therian": ["Electric", "Flying"]}
+    },
+    "landorus": {
+        "forms": ["incarnate", "therian"],
+        "items": {"therian": "reveal-glass"},
+        "types": {"incarnate": ["Ground", "Flying"], "therian": ["Ground", "Flying"]}
+    },
+    "enamorus": {
+        "forms": ["incarnate", "therian"],
+        "items": {"therian": "reveal-glass"},
+        "types": {"incarnate": ["Fairy", "Flying"], "therian": ["Fairy", "Flying"]}
+    }
+}
+
+async def form_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Autocomplete for forme selection based on species"""
+    # Get the current pokemon parameter value
+    namespace = interaction.namespace
+    pokemon_name = getattr(namespace, 'pokemon', '').lower()
+    
+    if not pokemon_name or pokemon_name not in TRANSFORM_DATA:
+        return []
+    
+    forms = TRANSFORM_DATA[pokemon_name]["forms"]
+    return [
+        app_commands.Choice(name=form.title(), value=form)
+        for form in forms
+        if current.lower() in form.lower()
+    ][:25]
+
+@bot.tree.command(name="transform", description="Transform a Pokémon into a different forme")
+@app_commands.describe(
+    pokemon="The Pokémon species to transform (e.g., Rotom, Deoxys, Shaymin)",
+    slot="Team slot (1-6)",
+    form="The forme to transform into"
+)
+@app_commands.autocomplete(form=form_autocomplete)
+async def transform_pokemon(
+    interaction: discord.Interaction,
+    pokemon: str,
+    slot: app_commands.Range[int, 1, 6],
+    form: str
+):
+    """Transform a Pokémon into a different forme using transformation items"""
+    await interaction.response.defer(ephemeral=False)
+    uid = str(interaction.user.id)
+    
+    pokemon_lower = pokemon.lower().strip()
+    form_lower = form.lower().strip()
+    
+    # Check if this Pokémon can be transformed
+    if pokemon_lower not in TRANSFORM_DATA:
+        return await interaction.followup.send(
+            f"❌ **{pokemon.title()}** cannot be transformed using this command.\n"
+            f"Transformable Pokémon: {', '.join([p.title() for p in TRANSFORM_DATA.keys()])}",
+            ephemeral=True
+        )
+    
+    transform_info = TRANSFORM_DATA[pokemon_lower]
+    
+    # Check if the forme is valid
+    if form_lower not in transform_info["forms"]:
+        valid_forms = ", ".join([f.title() for f in transform_info["forms"]])
+        return await interaction.followup.send(
+            f"❌ Invalid forme for **{pokemon.title()}**!\n"
+            f"Available formes: {valid_forms}",
+            ephemeral=True
+        )
+    
+    conn = await db.connect()
+    
+    try:
+        # Get the Pokémon from the specified slot
+        cur = await conn.execute(
+            "SELECT id, species, form FROM pokemons WHERE owner_id = ? AND team_slot = ?",
+            (uid, slot)
+        )
+        mon_row = await cur.fetchone()
+        await cur.close()
+    
+        if not mon_row:
+            return await interaction.followup.send(
+                f"❌ No Pokémon found in slot **{slot}**!",
+                ephemeral=True
+            )
+    
+        mon = dict(mon_row)
+    
+        # Check if species matches
+        if mon['species'].lower() != pokemon_lower:
+            return await interaction.followup.send(
+                f"❌ The Pokémon in slot **{slot}** is **{mon['species']}**, not **{pokemon.title()}**!",
+                ephemeral=True
+            )
+    
+        # Check if already in this form
+        current_form = mon['form'] or transform_info["forms"][0]  # Default to first form if None
+        if current_form == form_lower:
+            return await interaction.followup.send(
+                f"❌ Your **{mon['species']}** is already in **{form_lower.title()}** forme!",
+                ephemeral=True
+            )
+    
+        # Check if reverting to normal (free action)
+        is_reverting = form_lower == transform_info["forms"][0]
+    
+        # Initialize fusion partner variables
+        fusion_partner_id = None
+        fusion_partner_species = None
+    
+        if not is_reverting:
+            # Check if user has the required item
+            required_item = transform_info["items"].get(form_lower)
+            if not required_item:
+                return await interaction.followup.send(
+                    f"❌ Cannot transform to **{form_lower.title()}** forme!",
+                    ephemeral=True
+                )
+        
+            # Check inventory
+            cur = await conn.execute(
+                "SELECT qty FROM user_items WHERE owner_id = ? AND item_id = ?",
+                (uid, required_item)
+            )
+            item_row = await cur.fetchone()
+            await cur.close()
+        
+            if not item_row or item_row['qty'] < 1:
+                # Get item name for display
+                cur = await conn.execute("SELECT name FROM items WHERE id = ?", (required_item,))
+                item_name_row = await cur.fetchone()
+                await cur.close()
+                item_name = item_name_row['name'] if item_name_row else required_item
+            
+                return await interaction.followup.send(
+                    f"❌ You don't have a **{item_name}** to transform your {mon['species']}!\n"
+                    f"This item is required to transform into **{form_lower.title()}** forme.",
+                    ephemeral=True
+                )
+        
+            # Check if fusion partner is required (Kyurem, Necrozma, Calyrex)
+            requires_fusion = transform_info.get("requires_fusion", {})
+            fusion_partner_species = requires_fusion.get(form_lower)
+        
+            if fusion_partner_species:
+                # Find all Pokémon of the required species
+                cur = await conn.execute(
+                    """SELECT id, species, team_slot, box_no, box_pos, level, shiny 
+                       FROM pokemons 
+                       WHERE owner_id = ? AND LOWER(species) = ?""",
+                    (uid, fusion_partner_species.lower())
+                )
+                fusion_candidates = await cur.fetchall()
+                await cur.close()
+            
+                if not fusion_candidates:
+                    return await interaction.followup.send(
+                        f"❌ You need a **{fusion_partner_species.title()}** to fuse with your {pokemon.title()}!",
+                        ephemeral=True
+                    )
+            
+                # If multiple candidates, ask user to choose
+                if len(fusion_candidates) > 1:
+                    class FusionPartnerSelect(ui.View):
+                        def __init__(self, candidates, timeout=60):
+                            super().__init__(timeout=timeout)
+                            self.selected_id = None
+                            self.candidates = candidates
+                        
+                            # Create dropdown with candidates
+                            options = []
+                            for cand in candidates[:25]:  # Discord limit
+                                cand_dict = dict(cand)
+                                location = f"Slot {cand_dict['team_slot']}" if cand_dict.get('team_slot') else f"Box {cand_dict.get('box_no', '?')}"
+                                shiny_marker = "✨ " if cand_dict.get('shiny') else ""
+                                options.append(
+                                    discord.SelectOption(
+                                        label=f"{shiny_marker}{fusion_partner_species.title()} - Lv.{cand_dict['level']} ({location})",
+                                        value=str(cand_dict['id'])
+                                    )
+                                )
+                        
+                            select = ui.Select(placeholder=f"Choose which {fusion_partner_species.title()} to fuse with...", options=options)
+                        
+                            async def select_callback(interaction: discord.Interaction):
+                                self.selected_id = int(select.values[0])
+                                await interaction.response.edit_message(
+                                    content=f"✅ Selected {fusion_partner_species.title()}! Proceeding with fusion...",
+                                    view=None
+                                )
+                                self.stop()
+                        
+                            select.callback = select_callback
+                            self.add_item(select)
+                
+                    view = FusionPartnerSelect(fusion_candidates)
+                    await interaction.followup.send(
+                        f"❓ You have multiple **{fusion_partner_species.title()}**. Please choose which one to fuse with:",
+                        view=view,
+                        ephemeral=True
+                    )
+                
+                    await view.wait()
+                
+                    if view.selected_id is None:
+                        return await interaction.followup.send("❌ Fusion cancelled (timed out).", ephemeral=True)
+                
+                    fusion_partner_id = view.selected_id
+                else:
+                    # Only one candidate, use it
+                    fusion_partner_id = fusion_candidates[0]['id']
+    
+        # Perform the transformation
+        try:
+            # Get current Pokémon data (IVs, EVs, nature, level for stat recalculation)
+            cur = await conn.execute(
+                "SELECT id, species, level, ivs, evs, nature FROM pokemons WHERE owner_id = ? AND team_slot = ?",
+                (uid, slot)
+            )
+            full_mon = await cur.fetchone()
+            await cur.close()
+        
+            if not full_mon:
+                return await interaction.followup.send("❌ Pokémon not found!", ephemeral=True)
+        
+            full_mon = dict(full_mon)
+        
+            # Fetch base stats for the new forme
+            # First try database, then PokeAPI if needed
+            forme_key = f"{pokemon_lower}-{form_lower}" if form_lower != transform_info["forms"][0] else pokemon_lower
+        
+            # 1. Try to fetch from local database first (fastest)
+            forme_data = await db.get_pokedex_by_name(forme_key)
+        
+            if not forme_data:
+                # 2. Try to fetch from PokeAPI and cache it
+                print(f"[TRANSFORM] Fetching {forme_key} from PokeAPI...")
+                try:
+                    forme_data = await ensure_species_and_learnsets(forme_key)
+                except Exception as api_err:
+                    print(f"[TRANSFORM] PokeAPI fetch failed for {forme_key}: {api_err}")
+                    forme_data = None
+        
+            if not forme_data:
+                # 3. Fallback to base species
+                print(f"[TRANSFORM] Using base species stats for {pokemon_lower}...")
+                forme_data = await db.get_pokedex_by_name(pokemon_lower)
+            
+                if not forme_data:
+                    # Last resort: try PokeAPI for base species
+                    try:
+                        forme_data = await ensure_species_and_learnsets(pokemon_lower)
+                    except Exception:
+                        pass
+        
+            if not forme_data:
+                return await interaction.followup.send(
+                    f"❌ Could not find base stats for {pokemon.title()}!",
+                    ephemeral=True
+                )
+        
+            # Extract stats from database/API row
+            new_base_stats = forme_data.get("stats") or {}
+            if isinstance(new_base_stats, str):
+                import json
+                new_base_stats = json.loads(new_base_stats)
+        
+            # Normalize base stats to long keys
+            base_stats_long = normalize_base_stats(new_base_stats)
+        
+            # Parse IVs and EVs from JSON
+            import json
+            ivs = json.loads(full_mon['ivs']) if isinstance(full_mon['ivs'], str) else full_mon['ivs']
+            evs = json.loads(full_mon['evs']) if isinstance(full_mon['evs'], str) else full_mon['evs']
+        
+            # Recalculate stats with new base stats (using existing IVs, EVs, nature, level)
+            final_stats = stats.calc_all_stats(
+                base_stats=base_stats_long,
+                ivs=ivs,
+                evs=evs,
+                level=full_mon['level'],
+                nature=full_mon['nature']
+            )
+        
+            # Update form AND stats in database
+            # NOTE: This ONLY updates form and stats. All other attributes are preserved:
+            # shiny, gender, friendship, ivs, evs, held_item, moves, ability, nature, level, pokeball, etc.
+            # IVs from the base Pokemon are kept (this matches official game mechanics for fusions)
+            await conn.execute(
+                """UPDATE pokemons 
+                   SET form = ?, hp = ?, atk = ?, def = ?, spa = ?, spd = ?, spe = ?
+                   WHERE id = ?""",
+                (
+                    form_lower if form_lower != transform_info["forms"][0] else None,
+                    final_stats['hp'],
+                    final_stats['attack'],
+                    final_stats['defense'],
+                    final_stats['special_attack'],
+                    final_stats['special_defense'],
+                    final_stats['speed'],
+                    mon['id']
+                )
+            )
+        
+            # Handle fusion partner (Kyurem/Necrozma/Calyrex fusions)
+            if fusion_partner_id and not is_reverting:
+                # Store fusion partner data before absorbing
+                cur = await conn.execute(
+                    """SELECT species, level, hp, atk, def, spa, spd, spe, ivs, evs, nature, 
+                              ability, gender, friendship, held_item, moves, shiny, pokeball
+                       FROM pokemons WHERE id = ?""",
+                    (fusion_partner_id,)
+                )
+                partner_data = await cur.fetchone()
+                await cur.close()
+            
+                if partner_data:
+                    partner_dict = dict(partner_data)
+                    # Store partner data as JSON in the base Pokémon
+                    import json
+                    fusion_data_json = json.dumps(partner_dict)
+                
+                    await conn.execute(
+                        "UPDATE pokemons SET fusion_data = ? WHERE id = ?",
+                        (fusion_data_json, mon['id'])
+                    )
+                
+                    # Remove fusion partner from team/box (absorbed)
+                    await conn.execute(
+                        "DELETE FROM pokemons WHERE id = ?",
+                        (fusion_partner_id,)
+                    )
+        
+            # Handle defusion (reverting from fused forme)
+            if is_reverting and transform_info.get("requires_fusion"):
+                # Check if this was a fused forme
+                cur = await conn.execute(
+                    "SELECT fusion_data FROM pokemons WHERE id = ?",
+                    (mon['id'],)
+                )
+                fusion_row = await cur.fetchone()
+                await cur.close()
+            
+                if fusion_row and fusion_row['fusion_data']:
+                    # Restore the absorbed Pokémon
+                    import json
+                    partner_data = json.loads(fusion_row['fusion_data'])
+                
+                    # Insert the partner back into the PC (box 1)
+                    await conn.execute(
+                        """INSERT INTO pokemons 
+                           (owner_id, species, level, hp, atk, def, spa, spd, spe, ivs, evs, nature,
+                            ability, gender, friendship, held_item, moves, shiny, pokeball, box_no, box_pos)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            uid,
+                            partner_data['species'],
+                            partner_data['level'],
+                            partner_data['hp'],
+                            partner_data['atk'],
+                            partner_data['def'],
+                            partner_data['spa'],
+                            partner_data['spd'],
+                            partner_data['spe'],
+                            partner_data['ivs'],
+                            partner_data['evs'],
+                            partner_data['nature'],
+                            partner_data.get('ability'),
+                            partner_data.get('gender'),
+                            partner_data.get('friendship', 50),
+                            partner_data.get('held_item'),
+                            partner_data['moves'],
+                            partner_data.get('shiny', 0),
+                            partner_data.get('pokeball'),
+                            1,  # box_no
+                            None  # box_pos will be determined by system
+                        )
+                    )
+                
+                    # Clear fusion data from base Pokémon
+                    await conn.execute(
+                        "UPDATE pokemons SET fusion_data = NULL WHERE id = ?",
+                        (mon['id'],)
+                    )
+        
+            await conn.commit()
+            db.invalidate_pokemons_cache(uid)
+        
+            # Success message
+            if is_reverting:
+                message = f"✅ Your **{mon['species']}** has reverted to its **{form_lower.title()}** forme!"
+            
+                # Check if we restored a fusion partner
+                if transform_info.get("requires_fusion"):
+                    cur = await conn.execute(
+                        "SELECT species FROM pokemons WHERE owner_id = ? ORDER BY id DESC LIMIT 1",
+                        (uid,)
+                    )
+                    last_pokemon = await cur.fetchone()
+                    await cur.close()
+                
+                    if last_pokemon:
+                        restored_species = last_pokemon['species'].title()
+                        message += f"\n🔓 **{restored_species}** has been restored and placed in Box 1!"
+            else:
+                message = f"✅ Your **{mon['species']}** has transformed into **{form_lower.title()}** forme!"
+            
+                # Add fusion partner info if applicable
+                if fusion_partner_id:
+                    message += f"\n🔗 **{fusion_partner_species.title()}** has been absorbed into the fusion!"
+        
+            # Add type and stat info
+            new_types = transform_info["types"].get(form_lower, [])
+            if new_types:
+                type_str = "/".join(new_types)
+                message += f"\n**Type:** {type_str}"
+        
+            message += f"\n**Stats Updated:** HP: {final_stats['hp']}, Atk: {final_stats['attack']}, Def: {final_stats['defense']}, SpA: {final_stats['special_attack']}, SpD: {final_stats['special_defense']}, Spe: {final_stats['speed']}"
+            message += f"\n\n📊 **IVs/EVs from base {pokemon.title()} are preserved** (official game mechanic)"
+        
+            await interaction.followup.send(message, ephemeral=True)
+        
+        except Exception as e:
+            await conn.rollback()
+            await interaction.followup.send(
+                f"❌ Error transforming Pokémon: {e}",
+                ephemeral=True
+            )
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
+# =========================
+#  Clean startup with DB
+# =========================
+async def main():
+    await db.init_schema()
+    try:
+        await bot.start(TOKEN)
+    finally:
+        await db.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass  # Ctrl+C: exit cleanly without traceback
+
+# yo yo yo yo
