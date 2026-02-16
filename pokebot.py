@@ -12162,22 +12162,143 @@ def _team_hp_bar(pct: int, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def _team_overview_icon_path(row: dict) -> Optional[Path]:
-    species = _daycare_norm_species(row.get("species"))
-    form = _daycare_norm_species(row.get("form"))
-    candidates: list[str] = []
-    if species and form:
-        if form.startswith(f"{species}-"):
-            candidates.append(form)
-        else:
-            candidates.append(f"{species}-{form}")
-    if species:
-        candidates.append(species)
-    for key in candidates:
-        p = _daycare_icon_path_for_species(key)
-        if p is not None:
-            return p
+TEAM_TEMPLATE_PATHS: tuple[Path, ...] = (
+    ASSETS_DIR / "ui" / "team-template.png",
+    ASSETS_DIR / "ui" / "team_panel_template.png",
+    ASSETS_DIR / "team-template.png",
+)
+TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
+    {"box_xy": (236, 93), "box_wh": (177, 197), "sprite_c": (324, 173), "label_xy": (246, 256), "level_right": (402, 256)},
+    {"box_xy": (415, 93), "box_wh": (177, 197), "sprite_c": (503, 173), "label_xy": (425, 256), "level_right": (581, 256)},
+    {"box_xy": (593, 93), "box_wh": (177, 197), "sprite_c": (681, 173), "label_xy": (603, 256), "level_right": (759, 256)},
+    {"box_xy": (236, 294), "box_wh": (177, 197), "sprite_c": (324, 374), "label_xy": (246, 457), "level_right": (402, 457)},
+    {"box_xy": (415, 294), "box_wh": (177, 197), "sprite_c": (503, 374), "label_xy": (425, 457), "level_right": (581, 457)},
+    {"box_xy": (593, 294), "box_wh": (177, 197), "sprite_c": (681, 374), "label_xy": (603, 457), "level_right": (759, 457)},
+)
+
+
+def _team_template_path() -> Optional[Path]:
+    for p in TEAM_TEMPLATE_PATHS:
+        try:
+            if p.exists() and p.is_file() and p.stat().st_size > 0:
+                return p
+        except Exception:
+            continue
     return None
+
+
+def _team_pick_sprite_path(row: dict) -> Optional[Path]:
+    species = _species_folder_name(str(row.get("species") or ""))
+    form = _species_folder_name(str(row.get("form") or ""))
+    shiny = bool(int(row.get("shiny") or 0))
+    is_female = str(row.get("gender") or "").strip().lower() == "female"
+
+    folders: list[Path] = []
+    if species and form:
+        form_folder = form if form.startswith(f"{species}-") else f"{species}-{form}"
+        folders.append(SPRITES_DIR / form_folder)
+    if species:
+        folders.append(SPRITES_DIR / species)
+
+    candidates: list[str] = []
+    if is_female:
+        if shiny:
+            candidates += ["female-animated-shiny-front.gif", "female-shiny-front.png"]
+        candidates += ["female-animated-front.gif", "female-front.png"]
+    if shiny:
+        candidates += ["animated-shiny-front.gif", "shiny-front.png"]
+    candidates += ["animated-front.gif", "front.png", "icon.png"]
+
+    for folder in folders:
+        try:
+            if not folder.is_dir():
+                continue
+        except Exception:
+            continue
+        for name in candidates:
+            p = folder / name
+            try:
+                if p.exists() and p.is_file() and p.stat().st_size > 0:
+                    return p
+            except Exception:
+                continue
+    return None
+
+
+def _team_font(size: int, *, bold: bool = False):
+    if Image is None:
+        return None
+    try:
+        from PIL import ImageFont  # type: ignore
+    except Exception:
+        return None
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
+    for fp in candidates:
+        try:
+            return ImageFont.truetype(fp, int(size))
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+
+def _team_text_width(draw, text: str, font) -> int:
+    try:
+        box = draw.textbbox((0, 0), text, font=font)
+        return max(0, int(box[2] - box[0]))
+    except Exception:
+        try:
+            return int(draw.textlength(text, font=font))
+        except Exception:
+            return len(text) * 8
+
+
+def _team_fit_font(draw, text: str, *, max_width: int, start_size: int, min_size: int = 10, bold: bool = False):
+    for size in range(int(start_size), int(min_size) - 1, -1):
+        f = _team_font(size, bold=bold)
+        if f is None:
+            continue
+        if _team_text_width(draw, text, f) <= int(max_width):
+            return f
+    return _team_font(min_size, bold=bold)
+
+
+def _team_load_sprite_frames(path: Optional[Path], *, max_size: tuple[int, int], resample) -> tuple[list[Any], int]:
+    if path is None or Image is None:
+        return [], 100
+    try:
+        from PIL import ImageSequence  # type: ignore
+    except Exception:
+        ImageSequence = None  # type: ignore
+    try:
+        img = Image.open(str(path))
+    except Exception:
+        return [], 100
+    duration = int(img.info.get("duration") or 100)
+    frames: list[Any] = []
+    if ImageSequence is not None and bool(getattr(img, "is_animated", False)):
+        try:
+            for i, fr in enumerate(ImageSequence.Iterator(img)):
+                if i >= 24:
+                    break
+                sprite = fr.convert("RGBA")
+                sprite.thumbnail(max_size, resample=resample)
+                frames.append(sprite)
+        except Exception:
+            frames = []
+    if not frames:
+        try:
+            sprite = img.convert("RGBA")
+            sprite.thumbnail(max_size, resample=resample)
+            frames = [sprite]
+        except Exception:
+            frames = []
+    return frames, max(40, min(180, duration))
 
 
 def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -> Optional[discord.File]:
@@ -12192,67 +12313,108 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
             resample = Image.Resampling.NEAREST
         except Exception:
             resample = Image.NEAREST
+        template = _team_template_path()
+        if template is not None:
+            base = Image.open(str(template)).convert("RGBA")
+        else:
+            # Fallback: generate a simple empty template if custom one isn't provided yet.
+            base = Image.new("RGBA", (808, 537), (92, 56, 106, 255))
 
-        width, height = 840, 360
-        canvas = Image.new("RGBA", (width, height), (17, 20, 27, 255))
-        draw = ImageDraw.Draw(canvas)
-        draw.rectangle((0, 0, width, 56), fill=(35, 41, 54, 255))
-        draw.text((18, 18), f"{target_name} - Team Panel", fill=(240, 244, 255, 255))
+        draw = ImageDraw.Draw(base)
 
-        cols, rows = 3, 2
-        card_w, card_h = 252, 132
-        x_gap, y_gap = 18, 16
-        x0, y0 = 18, 72
+        # Clear trainer card area, then re-draw a generic "Trainer" header + scaled player name.
+        draw.rectangle((42, 34, 212, 84), fill=(20, 18, 27, 245))
+        draw.rectangle((42, 85, 212, 410), fill=(28, 22, 35, 240))
+        draw.rectangle((42, 430, 212, 491), fill=(20, 18, 27, 245))
+        trainer_font = _team_font(26, bold=True)
+        name_font = _team_fit_font(draw, target_name, max_width=158, start_size=24, min_size=12, bold=True)
+        if trainer_font:
+            tw = _team_text_width(draw, "Trainer", trainer_font)
+            draw.text((127 - tw // 2, 38), "Trainer", font=trainer_font, fill=(240, 240, 248, 255))
+        if name_font:
+            nw = _team_text_width(draw, target_name, name_font)
+            draw.text((127 - nw // 2, 62), target_name, font=name_font, fill=(220, 228, 250, 255))
 
+        # Clear each slot's pokemon/text regions so user template can be reused safely.
+        for geom in TEAM_SLOT_LAYOUT:
+            bx, by = geom["box_xy"]
+            bw, bh = geom["box_wh"]
+            draw.rectangle((bx + 4, by + 4, bx + bw - 4, by + bh - 4), fill=(96, 65, 117, 220))
+            cx, cy = geom["sprite_c"]
+            draw.ellipse((cx - 60, cy - 60, cx + 60, cy + 60), fill=(120, 92, 145, 230))
+            draw.rectangle((bx + 4, by + bh - 45, bx + bw - 4, by + bh - 4), fill=(28, 22, 35, 245))
+
+        # Preload sprite frames (animated front preferred).
+        sprite_data: dict[int, dict[str, Any]] = {}
+        max_anim_frames = 1
+        base_duration = 100
         for slot in range(1, 7):
-            row_idx = (slot - 1) // cols
-            col_idx = (slot - 1) % cols
-            cx = x0 + col_idx * (card_w + x_gap)
-            cy = y0 + row_idx * (card_h + y_gap)
-            card = slots.get(slot)
-            fill = (30, 36, 48, 255) if card else (23, 27, 36, 255)
-            edge = (84, 98, 125, 255) if card else (64, 74, 95, 255)
-            try:
-                draw.rounded_rectangle((cx, cy, cx + card_w, cy + card_h), radius=12, fill=fill, outline=edge, width=2)
-            except Exception:
-                draw.rectangle((cx, cy, cx + card_w, cy + card_h), fill=fill, outline=edge, width=2)
-
-            draw.text((cx + 12, cy + 10), f"Slot {slot}", fill=(196, 206, 230, 255))
-            if not card:
-                draw.text((cx + 12, cy + 50), "Empty", fill=(150, 162, 190, 255))
+            row = slots.get(slot)
+            if not row:
+                sprite_data[slot] = {"frames": [], "duration": 100}
                 continue
+            path = _team_pick_sprite_path(row)
+            frames, duration = _team_load_sprite_frames(path, max_size=(88, 88), resample=resample)
+            sprite_data[slot] = {"frames": frames, "duration": duration}
+            if len(frames) > 1:
+                max_anim_frames = max(max_anim_frames, min(len(frames), 24))
+                base_duration = min(base_duration, duration)
 
-            name = _team_species_label(card)
-            if len(name) > 20:
-                name = name[:19] + "…"
-            lvl = int(card.get("level") or 1)
-            shiny = bool(int(card.get("shiny") or 0))
-            star = " *" if shiny else ""
-            draw.text((cx + 12, cy + 32), name, fill=(238, 244, 255, 255))
-            draw.text((cx + 12, cy + 52), f"Lv {lvl}{star}", fill=(208, 222, 255, 255))
+        name_font_slot = _team_font(19, bold=True)
+        lvl_font_slot = _team_font(18, bold=False)
+        out_frames: list[Any] = []
+        frame_count = max(1, int(max_anim_frames))
+        for fi in range(frame_count):
+            frame = base.copy()
+            frame_draw = ImageDraw.Draw(frame)
+            for slot in range(1, 7):
+                geom = TEAM_SLOT_LAYOUT[slot - 1]
+                row = slots.get(slot)
+                if not row:
+                    if name_font_slot:
+                        frame_draw.text(geom["label_xy"], "Empty", font=name_font_slot, fill=(195, 194, 210, 255))
+                    continue
 
-            hp_now, hp_max, pct = _team_hp_values(card)
-            bar_x, bar_y, bar_w, bar_h = cx + 12, cy + 80, 140, 12
-            draw.rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + bar_h), fill=(52, 58, 74, 255), outline=(92, 102, 128, 255))
-            if pct > 0:
-                fill_w = max(2, int((bar_w - 2) * (pct / 100.0)))
-                hp_color = (97, 220, 121, 255) if pct >= 50 else ((243, 194, 68, 255) if pct >= 20 else (239, 102, 102, 255))
-                draw.rectangle((bar_x + 1, bar_y + 1, bar_x + fill_w, bar_y + bar_h - 1), fill=hp_color)
-            draw.text((bar_x, bar_y + 16), f"HP {hp_now}/{hp_max}", fill=(189, 205, 235, 255))
+                data = sprite_data.get(slot) or {}
+                frames = data.get("frames") or []
+                if frames:
+                    sprite = frames[fi % len(frames)]
+                    sx = int(geom["sprite_c"][0] - (sprite.width // 2))
+                    sy = int(geom["sprite_c"][1] - (sprite.height // 2))
+                    try:
+                        frame.alpha_composite(sprite, dest=(sx, sy))
+                    except Exception:
+                        pass
 
-            icon_path = _team_overview_icon_path(card)
-            if icon_path is not None:
-                try:
-                    icon = Image.open(str(icon_path)).convert("RGBA")
-                    icon.thumbnail((64, 64), resample=resample)
-                    canvas.alpha_composite(icon, dest=(cx + card_w - 78, cy + 14))
-                except Exception:
-                    pass
+                label = _team_species_label(row)
+                if len(label) > 11:
+                    label = label[:10] + "..."
+                if name_font_slot:
+                    frame_draw.text(geom["label_xy"], label, font=name_font_slot, fill=(238, 240, 252, 255))
+                lvl = f"Lv {int(row.get('level') or 1)}"
+                if lvl_font_slot:
+                    lw = _team_text_width(frame_draw, lvl, lvl_font_slot)
+                    lx = int(geom["level_right"][0] - lw)
+                    frame_draw.text((lx, geom["level_right"][1]), lvl, font=lvl_font_slot, fill=(230, 230, 240, 255))
+            out_frames.append(frame)
 
         buf = BytesIO()
-        canvas.save(buf, format="PNG")
+        if frame_count > 1:
+            out_frames[0].save(
+                buf,
+                format="GIF",
+                save_all=True,
+                append_images=out_frames[1:],
+                duration=max(50, int(base_duration)),
+                loop=0,
+                disposal=2,
+            )
+            ext = "gif"
+        else:
+            out_frames[0].save(buf, format="PNG")
+            ext = "png"
         buf.seek(0)
-        fname = f"team_panel_{int(time.time())}_{random.randint(1000, 9999)}.png"
+        fname = f"team_panel_{int(time.time())}_{random.randint(1000, 9999)}.{ext}"
         return discord.File(fp=buf, filename=fname)
     except Exception:
         return None
