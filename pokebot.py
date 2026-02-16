@@ -13719,6 +13719,768 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
                 pass
 
 
+# =========================
+#  /box command + PC box management
+# =========================
+BOX_DEFAULT_COUNT = 8
+BOX_FALLBACK_CAPACITY = 30
+BOX_MIN_CAPACITY = 10
+BOX_MAX_CAPACITY = 90
+
+# Includes legendary, mythical, ultra beast, and major special legends for sorting.
+BOX_LEGENDARY_SPECIES = {
+    "articuno", "zapdos", "moltres", "mewtwo", "mew",
+    "raikou", "entei", "suicune", "lugia", "ho-oh", "celebi",
+    "regirock", "regice", "registeel", "latias", "latios",
+    "kyogre", "groudon", "rayquaza", "jirachi", "deoxys",
+    "uxie", "mesprit", "azelf", "dialga", "palkia", "heatran",
+    "regigigas", "giratina", "cresselia", "phione", "manaphy",
+    "darkrai", "shaymin", "arceus",
+    "victini", "cobalion", "terrakion", "virizion",
+    "tornadus", "thundurus", "landorus", "reshiram", "zekrom", "kyurem",
+    "keldeo", "meloetta", "genesect",
+    "xerneas", "yveltal", "zygarde", "diancie", "hoopa", "volcanion",
+    "type-null", "silvally", "tapu-koko", "tapu-lele", "tapu-bulu", "tapu-fini",
+    "cosmog", "cosmoem", "solgaleo", "lunala", "nihilego", "buzzwole", "pheromosa",
+    "xurkitree", "celesteela", "kartana", "guzzlord", "necrozma",
+    "magearna", "marshadow", "poipole", "naganadel", "stakataka", "blacephalon",
+    "zeraora", "meltan", "melmetal",
+    "zacian", "zamazenta", "eternatus", "kubfu", "urshifu", "zarude",
+    "regieleki", "regidrago", "glastrier", "spectrier", "calyrex",
+    "enamorus",
+    "wo-chien", "chien-pao", "ting-lu", "chi-yu",
+    "koraidon", "miraidon", "walking-wake", "iron-leaves",
+    "okidogi", "munkidori", "fezandipiti", "ogerpon", "terapagos",
+    "gouging-fire", "raging-bolt", "iron-boulder", "iron-crown",
+    "pecharunt",
+}
+
+
+def _box_species_key(species: str | None) -> str:
+    return str(species or "").strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def _box_base_species_key(species: str | None) -> str:
+    sp = _box_species_key(species)
+    if not sp:
+        return ""
+    toks = [t for t in sp.split("-") if t]
+    while len(toks) > 1 and toks[-1] in {
+        "mega", "gmax", "galar", "alola", "hisui", "paldea", "crowned", "therian",
+        "incarnate", "origin", "attack", "defense", "speed", "complete", "ice", "shadow",
+        "rapid", "single", "dusk", "midnight", "school", "solo",
+    }:
+        toks.pop()
+    return "-".join(toks) if toks else sp
+
+
+def _box_is_legendary_species(species: str | None) -> bool:
+    sp = _box_species_key(species)
+    if not sp:
+        return False
+    if sp in BOX_LEGENDARY_SPECIES:
+        return True
+    base = _box_base_species_key(sp)
+    return bool(base and base in BOX_LEGENDARY_SPECIES)
+
+
+def _box_total_ivs(row: Mapping[str, Any]) -> int:
+    raw = row.get("ivs")
+    if raw is None:
+        return 0
+    data = raw
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return 0
+    if not isinstance(data, dict):
+        return 0
+    keys = ("hp", "atk", "def", "spa", "spd", "spe", "attack", "defense", "special_attack", "special_defense", "speed")
+    total = 0
+    seen = set()
+    for k in keys:
+        if k in seen:
+            continue
+        if k in data:
+            try:
+                total += int(data.get(k) or 0)
+                seen.add(k)
+            except Exception:
+                pass
+    return max(0, total)
+
+
+def _box_gender_rank(g: str | None) -> int:
+    x = str(g or "").strip().lower()
+    if x in ("f", "female"):
+        return 0
+    if x in ("m", "male"):
+        return 1
+    if x in ("genderless", "none"):
+        return 2
+    return 3
+
+
+def _box_parse_sort_methods(raw: str | None) -> list[str]:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return ["level"]
+    text = text.replace("total ivs", "total_ivs").replace("totalivs", "total_ivs")
+    text = text.replace("/", ",").replace("+", ",").replace("&", ",")
+    tokens = [t.strip().replace("-", "_").replace(" ", "_") for t in text.split(",") if t.strip()]
+    alias = {
+        "iv": "total_ivs",
+        "ivs": "total_ivs",
+        "total_iv": "total_ivs",
+        "lvl": "level",
+    }
+    out: list[str] = []
+    for t in tokens:
+        t2 = alias.get(t, t)
+        if t2 in {"gender", "total_ivs", "level", "shiny", "legendary"} and t2 not in out:
+            out.append(t2)
+    return out or ["level"]
+
+
+async def _box_get_box_count_and_capacity(owner_id: str) -> tuple[int, int]:
+    box_count = BOX_DEFAULT_COUNT
+    capacity = BOX_FALLBACK_CAPACITY
+    async with db.session() as conn:
+        # Ensure user_meta exists
+        try:
+            await conn.execute(
+                "INSERT OR IGNORE INTO user_meta (owner_id, box_count) VALUES (?, ?)",
+                (owner_id, BOX_DEFAULT_COUNT),
+            )
+        except Exception:
+            pass
+        try:
+            cur = await conn.execute("SELECT box_count FROM user_meta WHERE owner_id=? LIMIT 1", (owner_id,))
+            row = await cur.fetchone()
+            await cur.close()
+            if row:
+                box_count = int((row["box_count"] if hasattr(row, "keys") else row[0]) or BOX_DEFAULT_COUNT)
+        except Exception:
+            box_count = BOX_DEFAULT_COUNT
+        try:
+            cur = await conn.execute("SELECT value FROM config WHERE key='box_capacity' LIMIT 1")
+            row = await cur.fetchone()
+            await cur.close()
+            if row:
+                capacity = int((row["value"] if hasattr(row, "keys") else row[0]) or BOX_FALLBACK_CAPACITY)
+        except Exception:
+            capacity = BOX_FALLBACK_CAPACITY
+        await conn.commit()
+    box_count = max(1, min(64, int(box_count or BOX_DEFAULT_COUNT)))
+    capacity = max(BOX_MIN_CAPACITY, min(BOX_MAX_CAPACITY, int(capacity or BOX_FALLBACK_CAPACITY)))
+    return box_count, capacity
+
+
+async def _box_compact_positions_conn(conn: Any, owner_id: str, box_no: int) -> None:
+    cur = await conn.execute(
+        """
+        SELECT id
+        FROM pokemons
+        WHERE owner_id=? AND team_slot IS NULL AND box_no=?
+        ORDER BY box_pos, id
+        """,
+        (owner_id, int(box_no)),
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    next_pos = 1
+    for row in rows:
+        mon_id = int(row["id"] if hasattr(row, "keys") else row[0])
+        await conn.execute(
+            "UPDATE pokemons SET box_pos=? WHERE owner_id=? AND id=?",
+            (next_pos, owner_id, mon_id),
+        )
+        next_pos += 1
+
+
+async def _box_prepare_storage(owner_id: str) -> None:
+    """
+    Ensure all PC mons have valid box_no/box_pos.
+    Any mon with team_slot NULL and missing/invalid box placement is auto-assigned.
+    """
+    box_count, capacity = await _box_get_box_count_and_capacity(owner_id)
+    async with db.session() as conn:
+        cur = await conn.execute(
+            """
+            SELECT id, box_no, box_pos
+            FROM pokemons
+            WHERE owner_id=? AND team_slot IS NULL
+            ORDER BY id
+            """,
+            (owner_id,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+
+        used: dict[int, set[int]] = {b: set() for b in range(1, box_count + 1)}
+        unplaced: list[int] = []
+        for row in rows:
+            mon_id = int(row["id"] if hasattr(row, "keys") else row[0])
+            box_no = int((row["box_no"] if hasattr(row, "keys") else row[1]) or 0)
+            box_pos = int((row["box_pos"] if hasattr(row, "keys") else row[2]) or 0)
+            if 1 <= box_no <= box_count and 1 <= box_pos <= capacity and box_pos not in used[box_no]:
+                used[box_no].add(box_pos)
+            else:
+                unplaced.append(mon_id)
+
+        changed = False
+        for mon_id in unplaced:
+            placed = False
+            for b in range(1, box_count + 1):
+                for p in range(1, capacity + 1):
+                    if p not in used[b]:
+                        await conn.execute(
+                            "UPDATE pokemons SET box_no=?, box_pos=? WHERE owner_id=? AND id=?",
+                            (b, p, owner_id, mon_id),
+                        )
+                        used[b].add(p)
+                        placed = True
+                        changed = True
+                        break
+                if placed:
+                    break
+            if not placed:
+                # If full, auto-expand box_count up to 64 so storage never collides.
+                if box_count < 64:
+                    box_count += 1
+                    used[box_count] = {1}
+                    await conn.execute(
+                        "UPDATE user_meta SET box_count=? WHERE owner_id=?",
+                        (box_count, owner_id),
+                    )
+                    await conn.execute(
+                        "UPDATE pokemons SET box_no=?, box_pos=? WHERE owner_id=? AND id=?",
+                        (box_count, 1, owner_id, mon_id),
+                    )
+                    changed = True
+
+        if changed:
+            await conn.commit()
+            db.invalidate_pokemons_cache(owner_id)
+
+
+def _box_icon_path_for_species(species: str) -> Optional[Path]:
+    sp = _daycare_norm_species(species)
+    if not sp:
+        return None
+    # Prefer uploaded pokesprite zip extraction (menu-style sprite sheet).
+    p = _daycare_extract_pokesprite_box(sp)
+    if p is not None:
+        try:
+            if p.exists() and p.stat().st_size > 0:
+                return p
+        except Exception:
+            pass
+    for folder in _daycare_sprite_folder_candidates(sp):
+        for root in (BOX_SPRITES_DIR, LEGACY_SPRITES_DIR):
+            for fname in ("box.png", "icon.png"):
+                cand = root / folder / fname
+                try:
+                    if cand.exists() and cand.stat().st_size > 0:
+                        return cand
+                except Exception:
+                    pass
+    return None
+
+
+def _box_panel_file(owner_id: str, box_no: int, box_count: int, box_capacity: int, mons: list[dict]) -> Optional[discord.File]:
+    if Image is None:
+        return None
+    try:
+        from PIL import ImageDraw, ImageFont  # type: ignore
+    except Exception:
+        return None
+
+    cols = 6
+    rows = max(1, math.ceil(max(1, int(box_capacity)) / cols))
+    cell_w, cell_h = 130, 88
+    grid_x, grid_y = 26, 92
+    W = grid_x * 2 + cols * cell_w
+    H = grid_y + rows * cell_h + 34
+    base = Image.new("RGBA", (W, H), (20, 24, 34, 255))
+    draw = ImageDraw.Draw(base)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    # Header bar
+    draw.rounded_rectangle((14, 14, W - 14, 74), radius=14, fill=(34, 42, 62, 255), outline=(88, 106, 148, 255), width=2)
+    title = f"PC BOX {box_no}/{box_count}"
+    subtitle = f"Owner: {owner_id} • Capacity: {box_capacity}"
+    draw.text((30, 30), title, fill=(235, 240, 255, 255), font=font)
+    draw.text((30, 52), subtitle, fill=(166, 180, 210, 255), font=font)
+
+    by_pos: dict[int, dict] = {}
+    for row in mons:
+        try:
+            p = int(row.get("box_pos") or 0)
+            if p > 0 and p not in by_pos:
+                by_pos[p] = row
+        except Exception:
+            continue
+
+    for pos in range(1, int(box_capacity) + 1):
+        idx = pos - 1
+        r = idx // cols
+        c = idx % cols
+        x0 = grid_x + c * cell_w
+        y0 = grid_y + r * cell_h
+        x1 = x0 + cell_w - 8
+        y1 = y0 + cell_h - 8
+        draw.rounded_rectangle((x0, y0, x1, y1), radius=10, fill=(28, 34, 49, 255), outline=(64, 79, 112, 255), width=2)
+        draw.text((x0 + 8, y0 + 6), f"{pos:02d}", fill=(150, 166, 195, 255), font=font)
+
+        mon = by_pos.get(pos)
+        if not mon:
+            continue
+
+        species = str(mon.get("species") or "Unknown")
+        level = int(mon.get("level") or 1)
+        shiny = bool(int(mon.get("shiny") or 0))
+        icon_path = _box_icon_path_for_species(species)
+        if icon_path:
+            try:
+                ico = Image.open(str(icon_path))
+                if str(icon_path.suffix).lower() == ".gif":
+                    try:
+                        ico.seek(0)
+                    except Exception:
+                        pass
+                ico = ico.convert("RGBA")
+                try:
+                    res = Image.Resampling.NEAREST
+                except Exception:
+                    res = Image.NEAREST
+                ico.thumbnail((52, 52), resample=res)
+                px = x0 + 8
+                py = y0 + 22
+                base.alpha_composite(ico, (px, py))
+            except Exception:
+                pass
+        name = species.replace("-", " ").title()
+        if len(name) > 12:
+            name = name[:11] + "…"
+        draw.text((x0 + 64, y0 + 24), f"{'★ ' if shiny else ''}{name}", fill=(226, 233, 248, 255), font=font)
+        draw.text((x0 + 64, y0 + 46), f"Lv {level}", fill=(174, 190, 219, 255), font=font)
+        held = str(mon.get("held_item") or "").strip()
+        if held:
+            held_txt = pretty_item_name(held)
+            if len(held_txt) > 12:
+                held_txt = held_txt[:11] + "…"
+            draw.text((x0 + 64, y0 + 64), held_txt, fill=(132, 214, 170, 255), font=font)
+
+    buf = BytesIO()
+    base.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return discord.File(buf, filename="box-panel.png")
+
+
+async def _box_render_payload(owner_id: str, box_no: int) -> tuple[discord.Embed, list[discord.File], int, int]:
+    await _box_prepare_storage(owner_id)
+    box_count, box_capacity = await _box_get_box_count_and_capacity(owner_id)
+    box_no = max(1, min(int(box_no), int(box_count)))
+    async with db.session() as conn:
+        cur = await conn.execute(
+            """
+            SELECT id, species, level, shiny, gender, held_item, box_no, box_pos, ivs
+            FROM pokemons
+            WHERE owner_id=? AND team_slot IS NULL AND box_no=?
+            ORDER BY box_pos, id
+            """,
+            (owner_id, box_no),
+        )
+        mons = [dict(r) for r in await cur.fetchall()]
+        await cur.close()
+
+    emb = discord.Embed(
+        title=f"PC Box {box_no}/{box_count}",
+        description=(
+            "Manage your boxed Pokémon with the buttons below.\n"
+            "Actions: **Box Swap**, **Box Release**, **Box Move**, **Box Sort**, **Box Take**"
+        ),
+        color=0x5865F2,
+    )
+    emb.add_field(name="Filled Slots", value=f"{len(mons)}/{box_capacity}", inline=True)
+    emb.add_field(name="Total PC Mons", value=str(len(mons)), inline=True)
+    emb.add_field(name="Sort Keys", value="gender • total_ivs • level • shiny • legendary", inline=False)
+    f = _box_panel_file(owner_id, box_no, box_count, box_capacity, mons)
+    files: list[discord.File] = []
+    if f is not None:
+        emb.set_image(url=f"attachment://box-panel.png")
+        files.append(f)
+    return emb, files, box_no, box_count
+
+
+def _close_files(files: list[discord.File]) -> None:
+    for f in files or []:
+        try:
+            f.close()
+        except Exception:
+            pass
+
+
+def _parse_box_int(v: str | None) -> Optional[int]:
+    try:
+        n = int(str(v or "").strip())
+        return n
+    except Exception:
+        return None
+
+
+async def _box_swap_positions(owner_id: str, box_no: int, pos_a: int, pos_b: int) -> tuple[bool, str]:
+    if pos_a == pos_b:
+        return False, "Positions must be different."
+    async with db.session() as conn:
+        q = "SELECT id, species, box_pos FROM pokemons WHERE owner_id=? AND team_slot IS NULL AND box_no=? AND box_pos=? LIMIT 1"
+        cur = await conn.execute(q, (owner_id, int(box_no), int(pos_a)))
+        a = await cur.fetchone()
+        await cur.close()
+        cur = await conn.execute(q, (owner_id, int(box_no), int(pos_b)))
+        b = await cur.fetchone()
+        await cur.close()
+        if not a or not b:
+            return False, "One or both slots are empty in this box."
+        aid = int(a["id"] if hasattr(a, "keys") else a[0])
+        bid = int(b["id"] if hasattr(b, "keys") else b[0])
+        await conn.execute("UPDATE pokemons SET box_pos=0 WHERE owner_id=? AND id=?", (owner_id, aid))
+        await conn.execute("UPDATE pokemons SET box_pos=? WHERE owner_id=? AND id=?", (int(pos_a), owner_id, bid))
+        await conn.execute("UPDATE pokemons SET box_pos=? WHERE owner_id=? AND id=?", (int(pos_b), owner_id, aid))
+        await conn.commit()
+    db.invalidate_pokemons_cache(owner_id)
+    return True, f"Swapped positions **{pos_a}** and **{pos_b}** in Box {box_no}."
+
+
+async def _box_move_mon(owner_id: str, src_box: int, src_pos: int, dst_box: int, dst_pos: Optional[int]) -> tuple[bool, str]:
+    if int(src_box) == int(dst_box):
+        return False, "Box Move only moves Pokémon to a different box."
+    box_count, box_capacity = await _box_get_box_count_and_capacity(owner_id)
+    if not (1 <= int(dst_box) <= box_count):
+        return False, f"Destination box must be between 1 and {box_count}."
+    async with db.session() as conn:
+        cur = await conn.execute(
+            "SELECT id, species FROM pokemons WHERE owner_id=? AND team_slot IS NULL AND box_no=? AND box_pos=? LIMIT 1",
+            (owner_id, int(src_box), int(src_pos)),
+        )
+        src = await cur.fetchone()
+        await cur.close()
+        if not src:
+            return False, "No Pokémon found in that source slot."
+        mon_id = int(src["id"] if hasattr(src, "keys") else src[0])
+        species = str(src["species"] if hasattr(src, "keys") else src[1])
+
+        if dst_pos is None:
+            cur = await conn.execute(
+                "SELECT box_pos FROM pokemons WHERE owner_id=? AND team_slot IS NULL AND box_no=?",
+                (owner_id, int(dst_box)),
+            )
+            used = {int((r["box_pos"] if hasattr(r, "keys") else r[0]) or 0) for r in await cur.fetchall()}
+            await cur.close()
+            pick = None
+            for p in range(1, box_capacity + 1):
+                if p not in used:
+                    pick = p
+                    break
+            if pick is None:
+                return False, f"Box {dst_box} is full."
+            dst_pos = pick
+        else:
+            if not (1 <= int(dst_pos) <= box_capacity):
+                return False, f"Destination position must be between 1 and {box_capacity}."
+            cur = await conn.execute(
+                "SELECT 1 FROM pokemons WHERE owner_id=? AND team_slot IS NULL AND box_no=? AND box_pos=? LIMIT 1",
+                (owner_id, int(dst_box), int(dst_pos)),
+            )
+            occupied = await cur.fetchone()
+            await cur.close()
+            if occupied:
+                return False, "Destination position is already occupied."
+
+        await conn.execute(
+            "UPDATE pokemons SET box_no=?, box_pos=? WHERE owner_id=? AND id=?",
+            (int(dst_box), int(dst_pos), owner_id, mon_id),
+        )
+        await _box_compact_positions_conn(conn, owner_id, int(src_box))
+        await conn.commit()
+    db.invalidate_pokemons_cache(owner_id)
+    return True, f"Moved **{species.replace('-', ' ').title()}** to Box **{dst_box}**, Slot **{dst_pos}**."
+
+
+async def _box_release_mon(owner_id: str, box_no: int, box_pos: int) -> tuple[bool, str]:
+    async with db.session() as conn:
+        cur = await conn.execute(
+            "SELECT id, species, held_item FROM pokemons WHERE owner_id=? AND team_slot IS NULL AND box_no=? AND box_pos=? LIMIT 1",
+            (owner_id, int(box_no), int(box_pos)),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return False, "No Pokémon found in that box slot."
+        mon_id = int(row["id"] if hasattr(row, "keys") else row[0])
+        species = str(row["species"] if hasattr(row, "keys") else row[1])
+        held_item = str((row["held_item"] if hasattr(row, "keys") else row[2]) or "").strip()
+
+        await conn.execute("DELETE FROM pokemons WHERE owner_id=? AND id=?", (owner_id, mon_id))
+        await _box_compact_positions_conn(conn, owner_id, int(box_no))
+        await conn.commit()
+    db.invalidate_pokemons_cache(owner_id)
+    extra = ""
+    if held_item:
+        try:
+            await db.give_item(owner_id, held_item, 1)
+            extra = f" Returned held item **{pretty_item_name(held_item)}** to your bag."
+        except Exception:
+            pass
+    return True, f"Released **{species.replace('-', ' ').title()}** from Box {box_no}, Slot {box_pos}.{extra}"
+
+
+async def _box_take_item(owner_id: str, box_no: int, box_pos: int) -> tuple[bool, str]:
+    async with db.session() as conn:
+        cur = await conn.execute(
+            "SELECT id, species, held_item FROM pokemons WHERE owner_id=? AND team_slot IS NULL AND box_no=? AND box_pos=? LIMIT 1",
+            (owner_id, int(box_no), int(box_pos)),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return False, "No Pokémon found in that box slot."
+        mon_id = int(row["id"] if hasattr(row, "keys") else row[0])
+        species = str(row["species"] if hasattr(row, "keys") else row[1])
+        held_item = str((row["held_item"] if hasattr(row, "keys") else row[2]) or "").strip()
+        if not held_item:
+            return False, f"**{species.replace('-', ' ').title()}** is not holding an item."
+
+        await conn.execute("UPDATE pokemons SET held_item=NULL WHERE owner_id=? AND id=?", (owner_id, mon_id))
+        await conn.commit()
+    db.invalidate_pokemons_cache(owner_id)
+    try:
+        await db.give_item(owner_id, held_item, 1)
+    except Exception:
+        pass
+    return True, f"Took **{pretty_item_name(held_item)}** from **{species.replace('-', ' ').title()}** and placed it in your bag."
+
+
+async def _box_sort(owner_id: str, box_no: int, raw_methods: str | None) -> tuple[bool, str]:
+    methods = _box_parse_sort_methods(raw_methods)
+    async with db.session() as conn:
+        cur = await conn.execute(
+            """
+            SELECT id, species, level, gender, shiny, ivs, box_pos
+            FROM pokemons
+            WHERE owner_id=? AND team_slot IS NULL AND box_no=?
+            ORDER BY box_pos, id
+            """,
+            (owner_id, int(box_no)),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        await cur.close()
+        if not rows:
+            return False, "This box is empty."
+
+        def sort_key(row: dict) -> tuple:
+            keys: list[Any] = []
+            for m in methods:
+                if m == "gender":
+                    keys.append(_box_gender_rank(row.get("gender")))
+                elif m == "total_ivs":
+                    keys.append(-_box_total_ivs(row))
+                elif m == "level":
+                    keys.append(-int(row.get("level") or 0))
+                elif m == "shiny":
+                    keys.append(-int(row.get("shiny") or 0))
+                elif m == "legendary":
+                    keys.append(0 if _box_is_legendary_species(row.get("species")) else 1)
+            keys.append(int(row.get("box_pos") or 9999))
+            keys.append(int(row.get("id") or 0))
+            return tuple(keys)
+
+        rows_sorted = sorted(rows, key=sort_key)
+        for i, row in enumerate(rows_sorted, start=1):
+            await conn.execute(
+                "UPDATE pokemons SET box_pos=? WHERE owner_id=? AND id=?",
+                (i, owner_id, int(row.get("id") or 0)),
+            )
+        await conn.commit()
+    db.invalidate_pokemons_cache(owner_id)
+    return True, f"Sorted Box {box_no} by **{', '.join(methods)}**."
+
+
+class BoxSwapModal(ui.Modal, title="Box Swap"):
+    pos_a = ui.TextInput(label="First slot position", placeholder="e.g. 3", required=True, max_length=3)
+    pos_b = ui.TextInput(label="Second slot position", placeholder="e.g. 14", required=True, max_length=3)
+
+    def __init__(self, owner_id: str, box_no: int):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.box_no = int(box_no)
+
+    async def on_submit(self, interaction: Interaction):
+        if str(interaction.user.id) != self.owner_id:
+            return await interaction.response.send_message("This isn't your box.", ephemeral=True)
+        a = _parse_box_int(str(self.pos_a.value))
+        b = _parse_box_int(str(self.pos_b.value))
+        if not a or not b:
+            return await interaction.response.send_message("Please enter valid slot numbers.", ephemeral=True)
+        ok, msg = await _box_swap_positions(self.owner_id, self.box_no, a, b)
+        await interaction.response.send_message(("✅ " if ok else "❌ ") + msg + "\nUse **Refresh** on your box panel to update.", ephemeral=True)
+
+
+class BoxReleaseModal(ui.Modal, title="Box Release"):
+    pos = ui.TextInput(label="Slot position to release", placeholder="e.g. 5", required=True, max_length=3)
+
+    def __init__(self, owner_id: str, box_no: int):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.box_no = int(box_no)
+
+    async def on_submit(self, interaction: Interaction):
+        if str(interaction.user.id) != self.owner_id:
+            return await interaction.response.send_message("This isn't your box.", ephemeral=True)
+        p = _parse_box_int(str(self.pos.value))
+        if not p:
+            return await interaction.response.send_message("Please enter a valid slot number.", ephemeral=True)
+        ok, msg = await _box_release_mon(self.owner_id, self.box_no, p)
+        await interaction.response.send_message(("✅ " if ok else "❌ ") + msg + "\nUse **Refresh** on your box panel to update.", ephemeral=True)
+
+
+class BoxMoveModal(ui.Modal, title="Box Move"):
+    src_pos = ui.TextInput(label="Source slot position", placeholder="e.g. 4", required=True, max_length=3)
+    dst_box = ui.TextInput(label="Destination box number", placeholder="e.g. 2", required=True, max_length=3)
+    dst_pos = ui.TextInput(label="Destination slot (optional)", placeholder="blank = first free", required=False, max_length=3)
+
+    def __init__(self, owner_id: str, box_no: int):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.box_no = int(box_no)
+
+    async def on_submit(self, interaction: Interaction):
+        if str(interaction.user.id) != self.owner_id:
+            return await interaction.response.send_message("This isn't your box.", ephemeral=True)
+        s = _parse_box_int(str(self.src_pos.value))
+        b = _parse_box_int(str(self.dst_box.value))
+        p = _parse_box_int(str(self.dst_pos.value)) if str(self.dst_pos.value or "").strip() else None
+        if not s or not b:
+            return await interaction.response.send_message("Please enter valid source slot and destination box.", ephemeral=True)
+        ok, msg = await _box_move_mon(self.owner_id, self.box_no, s, b, p)
+        await interaction.response.send_message(("✅ " if ok else "❌ ") + msg + "\nUse **Refresh** on your box panel to update.", ephemeral=True)
+
+
+class BoxSortModal(ui.Modal, title="Box Sort"):
+    methods = ui.TextInput(
+        label="Sort methods",
+        placeholder="level, total_ivs, gender, shiny, legendary",
+        required=True,
+        max_length=80,
+    )
+
+    def __init__(self, owner_id: str, box_no: int):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.box_no = int(box_no)
+
+    async def on_submit(self, interaction: Interaction):
+        if str(interaction.user.id) != self.owner_id:
+            return await interaction.response.send_message("This isn't your box.", ephemeral=True)
+        ok, msg = await _box_sort(self.owner_id, self.box_no, str(self.methods.value))
+        await interaction.response.send_message(("✅ " if ok else "❌ ") + msg + "\nUse **Refresh** on your box panel to update.", ephemeral=True)
+
+
+class BoxTakeModal(ui.Modal, title="Box Take Item"):
+    pos = ui.TextInput(label="Slot position to take item from", placeholder="e.g. 7", required=True, max_length=3)
+
+    def __init__(self, owner_id: str, box_no: int):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.box_no = int(box_no)
+
+    async def on_submit(self, interaction: Interaction):
+        if str(interaction.user.id) != self.owner_id:
+            return await interaction.response.send_message("This isn't your box.", ephemeral=True)
+        p = _parse_box_int(str(self.pos.value))
+        if not p:
+            return await interaction.response.send_message("Please enter a valid slot number.", ephemeral=True)
+        ok, msg = await _box_take_item(self.owner_id, self.box_no, p)
+        await interaction.response.send_message(("✅ " if ok else "❌ ") + msg + "\nUse **Refresh** on your box panel to update.", ephemeral=True)
+
+
+class BoxMainView(discord.ui.View):
+    def __init__(self, owner_discord_id: int, owner_id: str, box_no: int, box_count: int):
+        super().__init__(timeout=300)
+        self.owner_discord_id = int(owner_discord_id)
+        self.owner_id = owner_id
+        self.box_no = int(box_no)
+        self.box_count = int(box_count)
+        self.prev_button.disabled = self.box_no <= 1
+        self.next_button.disabled = self.box_no >= self.box_count
+
+    async def interaction_check(self, itx: Interaction) -> bool:
+        if int(itx.user.id) != self.owner_discord_id:
+            await itx.response.send_message("This isn't your box panel.", ephemeral=True)
+            return False
+        return True
+
+    async def _rerender(self, itx: Interaction, new_box_no: int):
+        emb, files, box_no, box_count = await _box_render_payload(self.owner_id, new_box_no)
+        new_view = BoxMainView(self.owner_discord_id, self.owner_id, box_no, box_count)
+        try:
+            await itx.response.edit_message(embed=emb, attachments=files, view=new_view)
+        except TypeError:
+            await itx.response.edit_message(embed=emb, files=files, view=new_view)
+        finally:
+            _close_files(files)
+
+    @ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, row=0)
+    async def prev_button(self, itx: Interaction, _btn: ui.Button):
+        await self._rerender(itx, max(1, self.box_no - 1))
+
+    @ui.button(label="Next ▶", style=discord.ButtonStyle.secondary, row=0)
+    async def next_button(self, itx: Interaction, _btn: ui.Button):
+        await self._rerender(itx, min(self.box_count, self.box_no + 1))
+
+    @ui.button(label="Refresh", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh_button(self, itx: Interaction, _btn: ui.Button):
+        await self._rerender(itx, self.box_no)
+
+    @ui.button(label="Box Swap", style=discord.ButtonStyle.primary, row=1)
+    async def swap_button(self, itx: Interaction, _btn: ui.Button):
+        await itx.response.send_modal(BoxSwapModal(self.owner_id, self.box_no))
+
+    @ui.button(label="Box Move", style=discord.ButtonStyle.primary, row=1)
+    async def move_button(self, itx: Interaction, _btn: ui.Button):
+        await itx.response.send_modal(BoxMoveModal(self.owner_id, self.box_no))
+
+    @ui.button(label="Box Sort", style=discord.ButtonStyle.primary, row=1)
+    async def sort_button(self, itx: Interaction, _btn: ui.Button):
+        await itx.response.send_modal(BoxSortModal(self.owner_id, self.box_no))
+
+    @ui.button(label="Box Release", style=discord.ButtonStyle.danger, row=2)
+    async def release_button(self, itx: Interaction, _btn: ui.Button):
+        await itx.response.send_modal(BoxReleaseModal(self.owner_id, self.box_no))
+
+    @ui.button(label="Box Take", style=discord.ButtonStyle.success, row=2)
+    async def take_button(self, itx: Interaction, _btn: ui.Button):
+        await itx.response.send_modal(BoxTakeModal(self.owner_id, self.box_no))
+
+
+@bot.tree.command(name="box", description="Open your PC boxes and manage stored Pokémon.")
+@app_commands.describe(box_no="Box number to open (default 1)")
+async def box_command(interaction: discord.Interaction, box_no: app_commands.Range[int, 1, 64] = 1):
+    await interaction.response.defer(ephemeral=True)
+    uid = str(interaction.user.id)
+    emb, files, box_no, box_count = await _box_render_payload(uid, int(box_no))
+    view = BoxMainView(interaction.user.id, uid, box_no, box_count)
+    try:
+        await interaction.followup.send(embed=emb, files=files, view=view, ephemeral=True)
+    finally:
+        _close_files(files)
+
+
 async def _create_pokemon_from_parsed(
     owner_id: str,
     parsed: ParsedPokemon,

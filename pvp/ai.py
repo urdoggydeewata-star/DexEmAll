@@ -920,6 +920,8 @@ def _calculate_general_bonuses(
     - Win condition evaluation
     """
     bonus = 0.0
+    move_category = (move_data.get("category") or move_data.get("damage_class") or "status").lower()
+    move_power = int(move_data.get("power", 0) or 0)
     
     # === PP Management ===
     # Prefer moves with more PP remaining (but don't penalize too heavily)
