@@ -3582,13 +3582,14 @@ class BattleState:
     def _action_order(self, c1: Dict[str, Any], c2: Dict[str, Any]) -> List[int]:
         """Return [first_user_id, second_user_id] using (action kind) > move priority > Speed > coinflip."""
         def rank(uid: int, c: Dict[str, Any]) -> tuple:
-            # Higher first: forfeit(3) > switch(2) > move(1) > none(0)
-            if c.get("kind") == "forfeit": return (3, 0, 0)
+            # Higher first: forfeit(4) > switch(3) > throw(2) > move/heal(1) > none(0)
+            if c.get("kind") == "forfeit": return (4, 0, 0)
             # Pass side effects and field effects to speed_value for Tailwind and weather abilities
             side = self.p1_side if uid == self.p1_id else self.p2_side
-            if c.get("kind") == "switch":  return (2, 0, speed_value(self._active(uid), side, self.field))
-            if c.get("kind") in ("move", "heal", "throw"):
-                # Only move choices have a string value; heal/throw have dict value
+            if c.get("kind") == "switch":  return (3, 0, speed_value(self._active(uid), side, self.field))
+            if c.get("kind") == "throw":   return (2, 0, speed_value(self._active(uid), side, self.field))
+            if c.get("kind") in ("move", "heal"):
+                # Only move choices have a string value; heal has dict value
                 move_val = c.get("value")
                 move_name = move_val if isinstance(move_val, str) else ""
                 pr = action_priority(move_name or "", self._active(uid), self.field, self)
@@ -4175,18 +4176,18 @@ class BattleState:
                             if shakes == 0:
                                 msg = f"**{self.p1_name}** threw a {ball_name.title()}! Oh no! The Pokémon broke free!"
                             elif shakes == 1:
-                                msg = f"**{self.p1_name}** threw a {ball_name.title()}! Aargh! Almost had it!"
+                                msg = f"**{self.p1_name}** threw a {ball_name.title()}! Aww! It appeared to be caught!"
                             elif shakes == 2:
-                                msg = f"**{self.p1_name}** threw a {ball_name.title()}! So close!"
+                                msg = f"**{self.p1_name}** threw a {ball_name.title()}! Aargh! Almost had it!"
                             else:  # 3 shakes
-                                msg = f"**{self.p1_name}** threw a {ball_name.title()}! Aww! It almost appeared to be caught!"
+                                msg = f"**{self.p1_name}** threw a {ball_name.title()}! Shoot! It was so close, too!"
                             log.append(msg)
                             self._throw_shakes = shakes  # for shake-by-shake embeds
                     except Exception as capture_err:
                         # Do not abort the whole battle when a throw-specific error occurs.
                         print(f"[PvP] Capture resolution error: {capture_err}")
                         self._throw_shakes = 0
-                        log.append(f"**{self.p1_name}** threw a {ball_name.title()}! But the Poké Ball failed to lock in. Try again.")
+                        log.append(f"**{self.p1_name}** threw a {ball_name.title()}! Oh no! The Pokémon broke free!")
                     continue
                 continue
             if act.get("_processed"):
