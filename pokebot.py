@@ -6360,6 +6360,13 @@ BOX_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "box_spr
 LEGACY_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "sprites"
 POKESPRITE_MASTER_ZIP = Path(__file__).resolve().parent / "pokesprite-master.zip"
 DAYCARE_ZIP_CACHE_DIR = BOX_SPRITES_DIR / "_pokesprite_zip_cache"
+ASSETS_BOX_BACKGROUNDS_DIR = ASSETS_DIR / "ui" / "box-backgrounds"
+BOX_SPRITES_BACKGROUNDS_DIR = BOX_SPRITES_DIR / "backgrounds"
+BOX_BACKGROUND_FILENAMES: tuple[str, ...] = (
+    "box-bg-meadow.png",
+    "box-bg-space.png",
+    "box-bg-pond.png",
+)
 
 ADVENTURE_CITIES = {
     "pallet-town": {
@@ -12973,7 +12980,7 @@ TEAM_DEFAULT_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
 TEAM_MIN_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
 TEAM_MAX_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
 TEAM_MAX_SPRITE_FRAMES = 32
-TEAM_MAX_COMPOSITE_FRAMES = 16
+TEAM_MAX_COMPOSITE_FRAMES = 32
 TEAM_FETCH_SHOWDOWN_FOR_TEAM = False
 TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
     {"box_xy": (236, 93), "box_wh": (177, 197), "sprite_c": (324, 173), "label_xy": (246, 256), "level_right": (402, 256)},
@@ -13541,12 +13548,19 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
 
         out_frames: list[Any] = []
         frame_count = 1
+        max_cycle_len = 1
         if cycle_lengths:
             try:
-                frame_count = min(TEAM_MAX_COMPOSITE_FRAMES, max(max(1, int(n)) for n in cycle_lengths))
+                max_cycle_len = max(max(1, int(n)) for n in cycle_lengths)
+                frame_count = min(TEAM_MAX_COMPOSITE_FRAMES, max_cycle_len)
             except Exception:
-                frame_count = min(TEAM_MAX_COMPOSITE_FRAMES, max(cycle_lengths))
+                max_cycle_len = max(max(1, int(n)) for n in cycle_lengths)
+                frame_count = min(TEAM_MAX_COMPOSITE_FRAMES, max_cycle_len)
         frame_count = max(1, int(frame_count))
+        # Preserve battle-equivalent animation speed even when we downsample frames
+        # to keep /team rendering responsive.
+        duration_scale = float(max_cycle_len) / float(frame_count) if frame_count > 0 else 1.0
+        save_duration = max(40, min(500, int(round(base_duration * duration_scale))))
         for fi in range(frame_count):
             frame = base.copy()
             for slot in range(1, 7):
@@ -13579,7 +13593,7 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                 format="GIF",
                 save_all=True,
                 append_images=out_frames[1:],
-                duration=int(base_duration),
+                duration=int(save_duration),
                 loop=0,
                 disposal=2,
             )
@@ -14173,6 +14187,68 @@ def _box_icon_path_for_species(species: str) -> Optional[Path]:
     return None
 
 
+def _box_background_paths() -> list[Path]:
+    """Locate available box background art files (sprites bundle first, then assets)."""
+    roots = (BOX_SPRITES_BACKGROUNDS_DIR, ASSETS_BOX_BACKGROUNDS_DIR)
+    out: list[Path] = []
+    seen: set[str] = set()
+    for fname in BOX_BACKGROUND_FILENAMES:
+        for root in roots:
+            p = root / fname
+            try:
+                if p.exists() and p.is_file() and p.stat().st_size > 0:
+                    key = str(p.resolve())
+                    if key not in seen:
+                        seen.add(key)
+                        out.append(p)
+            except Exception:
+                continue
+    # Also allow additional custom PNG backgrounds in either root.
+    for root in roots:
+        try:
+            if not root.exists() or not root.is_dir():
+                continue
+        except Exception:
+            continue
+        for p in sorted(root.glob("*.png")):
+            try:
+                if not p.is_file() or p.stat().st_size <= 0:
+                    continue
+                key = str(p.resolve())
+            except Exception:
+                continue
+            if key not in seen:
+                seen.add(key)
+                out.append(p)
+    return out
+
+
+def _box_load_background_image(box_no: int, size: tuple[int, int]) -> Optional[Any]:
+    if Image is None:
+        return None
+    cands = _box_background_paths()
+    if not cands:
+        return None
+    try:
+        idx = (max(1, int(box_no)) - 1) % len(cands)
+    except Exception:
+        idx = 0
+    bg_path = cands[idx]
+    try:
+        try:
+            resample = Image.Resampling.LANCZOS
+        except Exception:
+            resample = Image.BICUBIC
+        bg = Image.open(str(bg_path)).convert("RGBA")
+        target_w = max(1, int(size[0]))
+        target_h = max(1, int(size[1]))
+        if bg.size != (target_w, target_h):
+            bg = bg.resize((target_w, target_h), resample=resample)
+        return bg
+    except Exception:
+        return None
+
+
 def _box_panel_file(
     owner_id: str,
     box_no: int,
@@ -14200,30 +14276,46 @@ def _box_panel_file(
     W = margin * 3 + grid_w + side_w
     H = header_h + margin * 2 + grid_h + margin
 
-    base = Image.new("RGBA", (W, H), (20, 44, 73, 255))
+    base = Image.new("RGBA", (W, H), (30, 33, 67, 255))
     draw = ImageDraw.Draw(base)
     try:
         font = ImageFont.load_default()
     except Exception:
         font = None
 
-    # Outer/game-like shell
-    draw.rounded_rectangle((9, 9, W - 9, H - 9), radius=18, fill=(32, 74, 118, 255), outline=(165, 211, 246, 255), width=3)
-    draw.rounded_rectangle((margin, 18, W - margin, header_h), radius=14, fill=(239, 247, 255, 255), outline=(73, 130, 183, 255), width=3)
-    draw.text((margin + 14, 34), "POKEMON STORAGE SYSTEM", fill=(39, 84, 132, 255), font=font)
-    owner_tail = owner_id[-6:] if len(owner_id) > 6 else owner_id
-    subtitle = f"Box {box_no}/{box_count}  |  Capacity {box_capacity}  |  Trainer {owner_tail}"
-    draw.text((margin + 14, 56), subtitle, fill=(72, 114, 161, 255), font=font)
+    # Outer shell + header bar (closer to in-game/myuu style).
+    draw.rounded_rectangle((8, 8, W - 8, H - 8), radius=18, fill=(31, 58, 101, 255), outline=(173, 212, 250, 255), width=3)
+    draw.rounded_rectangle((margin, 18, W - margin, header_h), radius=12, fill=(48, 52, 66, 255), outline=(100, 110, 140, 255), width=2)
+    owner_tail = owner_id[-8:] if len(owner_id) > 8 else owner_id
+    draw.text((margin + 12, 36), "Box", fill=(242, 195, 62, 255), font=font)
+    draw.text((margin + 54, 36), f"Trainer {owner_tail}", fill=(255, 182, 62, 255), font=font)
+    subtitle = f"{box_no}/{box_count}   Capacity {box_capacity}"
+    draw.text((margin + 12, 56), subtitle, fill=(196, 210, 232, 255), font=font)
 
     grid_x = margin
     grid_y = header_h + margin
     draw.rounded_rectangle(
         (grid_x - 10, grid_y - 10, grid_x + grid_w + 10, grid_y + grid_h + 10),
         radius=12,
-        fill=(214, 234, 252, 255),
-        outline=(115, 164, 210, 255),
+        fill=(221, 236, 198, 255),
+        outline=(188, 165, 88, 255),
         width=2,
     )
+    bg_img = _box_load_background_image(int(box_no), (grid_w, grid_h))
+    if bg_img is not None:
+        try:
+            base.alpha_composite(bg_img, dest=(grid_x, grid_y))
+        except Exception:
+            pass
+    else:
+        # Fallback grassy tone if no themed backgrounds are available.
+        draw.rectangle((grid_x, grid_y, grid_x + grid_w, grid_y + grid_h), fill=(213, 230, 174, 255))
+    # Soften contrast while preserving the artwork.
+    try:
+        tint = Image.new("RGBA", (grid_w, grid_h), (255, 255, 255, 32))
+        base.alpha_composite(tint, dest=(grid_x, grid_y))
+    except Exception:
+        pass
 
     by_pos: dict[int, dict] = {}
     for row in mons:
@@ -14242,9 +14334,9 @@ def _box_panel_file(
         y0 = grid_y + r * (cell_h + gap_y)
         x1 = x0 + cell_w
         y1 = y0 + cell_h
-        slot_fill = (245, 251, 255, 255) if pos % 2 else (236, 246, 255, 255)
-        draw.rounded_rectangle((x0, y0, x1, y1), radius=9, fill=slot_fill, outline=(120, 172, 217, 255), width=2)
-        draw.text((x0 + 6, y0 + 5), f"{pos:02d}", fill=(46, 99, 149, 255), font=font)
+        slot_fill = (248, 252, 255, 168) if pos % 2 else (238, 248, 255, 156)
+        draw.rounded_rectangle((x0, y0, x1, y1), radius=9, fill=slot_fill, outline=(116, 156, 188, 255), width=2)
+        draw.text((x0 + 6, y0 + 5), f"{pos:02d}", fill=(44, 80, 110, 255), font=font)
 
         mon = by_pos.get(pos)
         if not mon:
@@ -14276,14 +14368,14 @@ def _box_panel_file(
         name = species.replace("-", " ").title()
         if len(name) > 11:
             name = name[:10] + "…"
-        draw.text((x0 + 54, y0 + 21), f"{'★ ' if shiny else ''}{name}", fill=(37, 63, 97, 255), font=font)
-        draw.text((x0 + 54, y0 + 38), f"Lv {level}", fill=(69, 108, 150, 255), font=font)
+        draw.text((x0 + 54, y0 + 21), f"{'★ ' if shiny else ''}{name}", fill=(27, 51, 74, 255), font=font)
+        draw.text((x0 + 54, y0 + 38), f"Lv {level}", fill=(58, 90, 120, 255), font=font)
         held = str(mon.get("held_item") or "").strip()
         if held:
             held_txt = pretty_item_name(held)
             if len(held_txt) > 10:
                 held_txt = held_txt[:9] + "…"
-            draw.text((x0 + 54, y0 + 54), held_txt, fill=(46, 134, 90, 255), font=font)
+            draw.text((x0 + 54, y0 + 54), held_txt, fill=(42, 116, 80, 255), font=font)
 
     # Right-side team strip (Myuu-style utility panel).
     team_rows = team_rows or []
@@ -14301,11 +14393,11 @@ def _box_panel_file(
     draw.rounded_rectangle(
         (side_x, side_y, side_x + side_w, side_y + side_h),
         radius=12,
-        fill=(237, 247, 255, 255),
-        outline=(116, 167, 210, 255),
+        fill=(59, 61, 69, 255),
+        outline=(142, 146, 160, 255),
         width=2,
     )
-    draw.text((side_x + 66, side_y + 10), "TEAM", fill=(40, 86, 134, 255), font=font)
+    draw.text((side_x + 72, side_y + 10), "TEAM", fill=(214, 220, 232, 255), font=font)
 
     slot_h = max(50, int((side_h - 52 - (5 * 8)) / 6))
     for slot in range(1, 7):
@@ -14314,14 +14406,14 @@ def _box_panel_file(
         draw.rounded_rectangle(
             (side_x + 10, y0, side_x + side_w - 10, y1),
             radius=8,
-            fill=(247, 252, 255, 255),
-            outline=(152, 191, 226, 255),
+            fill=(72, 76, 90, 255),
+            outline=(160, 165, 177, 255),
             width=2,
         )
-        draw.text((side_x + 16, y0 + 5), f"{slot}", fill=(59, 104, 151, 255), font=font)
+        draw.text((side_x + 16, y0 + 5), f"{slot}", fill=(205, 212, 226, 255), font=font)
         trow = team_by_slot.get(slot)
         if not trow:
-            draw.text((side_x + 34, y0 + 18), "Empty", fill=(121, 154, 188, 255), font=font)
+            draw.text((side_x + 34, y0 + 18), "Empty", fill=(163, 171, 186, 255), font=font)
             continue
         sp = str(trow.get("species") or "Unknown")
         lv = int(trow.get("level") or 1)
@@ -14346,8 +14438,8 @@ def _box_panel_file(
         nm = sp.replace("-", " ").title()
         if len(nm) > 10:
             nm = nm[:9] + "…"
-        draw.text((side_x + 74, y0 + 12), nm, fill=(43, 78, 117, 255), font=font)
-        draw.text((side_x + 74, y0 + 27), f"Lv {lv}", fill=(73, 111, 149, 255), font=font)
+        draw.text((side_x + 74, y0 + 12), nm, fill=(228, 232, 240, 255), font=font)
+        draw.text((side_x + 74, y0 + 27), f"Lv {lv}", fill=(182, 193, 212, 255), font=font)
 
     buf = BytesIO()
     base.save(buf, format="PNG", optimize=True)
