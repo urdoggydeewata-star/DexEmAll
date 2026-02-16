@@ -9392,6 +9392,36 @@ async def _run_rival_battle(itx: discord.Interaction, area_id: str, state: dict)
     await _send_adventure_panel(itx, state, edit_original=False)
     return won
 
+
+def _itx_select_values(itx: discord.Interaction) -> list[str]:
+    """Return selected values from component interactions across discord.py/forks."""
+    values: Any = None
+    data = getattr(itx, "data", None)
+    if isinstance(data, dict):
+        values = data.get("values")
+    if values is None:
+        try:
+            values = getattr(data, "values", None)
+            # dict.values method guard
+            if callable(values):
+                values = None
+        except Exception:
+            values = None
+    if values is None:
+        try:
+            values = getattr(itx, "values", None)
+        except Exception:
+            values = None
+    if not isinstance(values, (list, tuple)):
+        return []
+    out: list[str] = []
+    for v in values:
+        s = str(v).strip()
+        if s:
+            out.append(s)
+    return out
+
+
 class TMSellerView(discord.ui.View):
     """TM Seller (Surf easter egg): sell Gen 1 TMs for coins. TMs are consumable."""
     def __init__(self, author_id: int, user_id: str):
@@ -9415,7 +9445,7 @@ class TMSellerView(discord.ui.View):
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
         if self._handled:
             return await itx.response.send_message("Already handled.", ephemeral=True)
-        values = getattr(itx.data, "values", None) or []
+        values = _itx_select_values(itx)
         if not values:
             return await itx.response.send_message("Pick a TM.", ephemeral=True)
         item_id = values[0]
@@ -9721,7 +9751,7 @@ class DaycareParentSelectView(discord.ui.View):
     async def _on_pick(self, itx: discord.Interaction):
         if not self._guard(itx):
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
-        values = getattr(itx.data, "values", None) or []
+        values = _itx_select_values(itx)
         if not values:
             return await itx.response.send_message("Choose a Pokémon first.", ephemeral=True)
         try:
@@ -10940,7 +10970,7 @@ class UseTMHMSelectView(discord.ui.View):
     async def _on_select(self, itx: discord.Interaction):
         if not self._guard(itx):
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
-        values = getattr(itx.data, "values", None) or []
+        values = _itx_select_values(itx)
         if not values:
             return await itx.response.send_message("Pick a TM or HM.", ephemeral=True)
         item_id = values[0]
