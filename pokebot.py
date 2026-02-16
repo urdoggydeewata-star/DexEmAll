@@ -6290,6 +6290,9 @@ DAYCARE_HATCH_MIN = 45.0
 DAYCARE_HATCH_MAX = 80.0
 DAYCARE_HATCH_BOOST_ABILITIES = {"flame-body", "magma-armor"}
 DAYCARE_MAX_ANIM_FRAMES = 16
+DAYCARE_GIF_MAX_SIZE: tuple[int, int] = (30, 30)
+DAYCARE_BOX_MAX_SIZE: tuple[int, int] = (26, 20)
+DAYCARE_STATIC_MAX_SIZE: tuple[int, int] = (26, 26)
 BOX_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "box_sprites"
 LEGACY_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "sprites"
 
@@ -7861,14 +7864,15 @@ def _daycare_icon_path_for_species(species: str) -> Optional[Path]:
 
 
 def _daycare_random_positions(count: int) -> list[tuple[int, int]]:
-    # Random movement zones around the grassy daycare lawn.
+    # Random movement zones constrained to the inside grass only.
+    # Coordinates are top-left anchors for daycare sprites.
     zones = [
-        (26, 102, 154, 236),   # left lawn
-        (236, 104, 368, 238),  # right lawn
-        (162, 110, 226, 176),  # center top patch
+        (60, 132, 140, 214),   # left grass patch
+        (244, 136, 334, 218),  # right grass patch
+        (172, 116, 226, 166),  # center-top grass near house
     ]
     out: list[tuple[int, int]] = []
-    min_dist = 38
+    min_dist = 30
     tries = 0
     while len(out) < max(0, int(count)) and tries < 240:
         tries += 1
@@ -7878,7 +7882,8 @@ def _daycare_random_positions(count: int) -> list[tuple[int, int]]:
         if all(((x - ox) ** 2 + (y - oy) ** 2) >= (min_dist ** 2) for ox, oy in out):
             out.append((x, y))
     while len(out) < count:
-        out.append((40 + 42 * len(out), 165))
+        zx0, zy0, zx1, zy1 = zones[len(out) % len(zones)]
+        out.append(((zx0 + zx1) // 2, (zy0 + zy1) // 2))
     return out
 
 
@@ -7915,18 +7920,19 @@ def _embed_with_daycare_panel(
                 is_box_icon = str(getattr(icon_path, "name", "")).lower() == "box.png"
                 is_gif = str(getattr(icon_path, "suffix", "")).lower() == ".gif"
                 if is_gif:
-                    max_size = (54, 54)
+                    max_size = DAYCARE_GIF_MAX_SIZE
                     sprite_resample = resample_pixel
                 elif is_box_icon:
-                    max_size = (44, 34)
+                    max_size = DAYCARE_BOX_MAX_SIZE
                     sprite_resample = resample_pixel
                 else:
-                    max_size = (42, 42)
+                    max_size = DAYCARE_STATIC_MAX_SIZE
                     sprite_resample = resample_smooth
 
                 src = Image.open(str(icon_path))
                 frames: list[Any] = []
-                if is_gif and ImageSequence is not None and bool(getattr(src, "is_animated", False)):
+                n_frames = int(getattr(src, "n_frames", 1) or 1)
+                if is_gif and ImageSequence is not None and n_frames > 1:
                     try:
                         for i, fr in enumerate(ImageSequence.Iterator(src)):
                             if i >= DAYCARE_MAX_ANIM_FRAMES:
