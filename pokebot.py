@@ -39,6 +39,7 @@ from discord import app_commands, ui, Interaction, Embed
 from db_async import connect as db_connect
 from pvp.engine import build_mon
 from pvp.panel import _base_pp, _max_pp
+import pvp.panel as _pvp_panel
 if TYPE_CHECKING:
     from pvp.engine import Mon
     from pvp.panel import BattleState
@@ -115,6 +116,57 @@ try:
     _warm_renderer_once()
 except Exception:
     pass
+
+# Adventure privacy patch:
+# Keep opponent move names hidden in the "Swapping" panel for adventure/rival battles.
+def _patch_adventure_switch_embed_privacy() -> None:
+    try:
+        original = getattr(_pvp_panel, "_team_switch_embed", None)
+        if not callable(original):
+            return
+        if getattr(original, "_dex_patch_hide_opponent_moves", False):
+            return
+
+        def _wrapped_team_switch_embed(user_id: int, st, description_override: Optional[str] = None):
+            em = original(user_id, st, description_override)
+            try:
+                fmt = str(getattr(st, "fmt_label", "") or "").lower()
+                hide_opp_moves = (
+                    bool(getattr(st, "_hide_opponent_moves", False))
+                    or fmt.startswith("adventure")
+                    or fmt == "rival"
+                )
+                if not hide_opp_moves or em is None:
+                    return em
+
+                opp_id = st.p2_id if user_id == st.p1_id else st.p1_id
+                opp_active = st._active(opp_id)
+                if opp_active is None:
+                    masked_block = "—"
+                else:
+                    name = _pvp_panel._format_pokemon_name(opp_active)
+                    hp_bar = _pvp_panel._hp_bar_simple(opp_active.hp, opp_active.max_hp)
+                    masked_block = (
+                        f"**{name}** Lv{opp_active.level}\n"
+                        f"{hp_bar}\n"
+                        "**1.** ???　**2.** ???\n"
+                        "**3.** ???　**4.** ???"
+                    )
+
+                for i, field in enumerate(list(em.fields)):
+                    if str(getattr(field, "name", "")).strip().lower() == "opponent":
+                        em.set_field_at(i, name=field.name, value=masked_block, inline=field.inline)
+                        break
+            except Exception:
+                pass
+            return em
+
+        _wrapped_team_switch_embed._dex_patch_hide_opponent_moves = True  # type: ignore[attr-defined]
+        _pvp_panel._team_switch_embed = _wrapped_team_switch_embed
+    except Exception:
+        pass
+
+_patch_adventure_switch_embed_privacy()
 
 # =========================
 #  Terastallization helpers
@@ -5688,6 +5740,8 @@ class StarterView(discord.ui.View):
 
     async def _finalize_pick(self, itx: discord.Interaction, species: str):
         uid = str(itx.user.id)
+        starter_ball_item_id = item_id_from_user("poke ball")
+        starter_balls_granted = False
         
         # Prevent double-pick (instance-level)
         if self.picked:
@@ -5892,7 +5946,19 @@ class StarterView(discord.ui.View):
                                 pid = int(cur.lastrowid)
                                 await cur.close()
 
-                                # give 6 Poké Balls (use canonical id from items table: poke_ball)
+                                # Give 6 Poké Balls (ensure item master row exists first to satisfy FK).
+                                try:
+                                    await conn.execute(
+                                        """
+                                        INSERT INTO items (id, name)
+                                        VALUES (?, ?)
+                                        ON CONFLICT (id) DO UPDATE SET
+                                            name = COALESCE(items.name, EXCLUDED.name)
+                                        """,
+                                        (starter_ball_item_id, "Poké Ball"),
+                                    )
+                                except Exception:
+                                    pass
                                 try:
                                     await conn.execute(
                                         """
@@ -5901,11 +5967,12 @@ class StarterView(discord.ui.View):
                                         ON CONFLICT(owner_id, item_id)
                                         DO UPDATE SET qty = user_items.qty + excluded.qty
                                         """,
-                                        (uid, "poke_ball", 6),
+                                        (uid, starter_ball_item_id, 6),
                                     )
                                     db.invalidate_bag_cache(uid)
+                                    starter_balls_granted = True
                                 except Exception:
-                                    pass
+                                    starter_balls_granted = False
 
                                 # learn level-up moves for user's selected gen
                                 try:
@@ -6016,16 +6083,29 @@ class StarterView(discord.ui.View):
             except Exception:
                 pass
 
+            # Fallback safety net for starter balls if the in-transaction insert failed.
+            if not starter_balls_granted:
+                try:
+                    await db.upsert_item_master(starter_ball_item_id, name="Poké Ball")
+                    await db.give_item(uid, starter_ball_item_id, 6)
+                    db.invalidate_bag_cache(uid)
+                    starter_balls_granted = True
+                except Exception:
+                    starter_balls_granted = False
+
             # remove the view and confirm
             try:
                 await itx.edit_original_response(view=None)
             except Exception:
                 pass
+            balls_line = "🎁 You also received **6× Poké Balls**."
+            if not starter_balls_granted:
+                balls_line = "⚠️ Could not grant starter Poké Balls automatically. Please run `/bag` and report this if still missing."
             await itx.followup.send(
                 f"✅ You received **{entry['name']}** as your starter!"
                 f"{' ✨ (Shiny!)' if is_shiny else ''}"
                 f"{' (Hidden Ability)' if is_hidden else ''}\n"
-                f"🎁 You also received **6× Poké Balls**.",
+                f"{balls_line}",
                 ephemeral=True
             )
 
@@ -8054,13 +8134,92 @@ async def _heal_party(user_id: str) -> int:
     user_gen = await _user_selected_gen(user_id)
     async with db.session() as conn:
         cur = await conn.execute(
-            "SELECT id, hp, moves FROM pokemons WHERE owner_id=? AND team_slot IS NOT NULL ORDER BY team_slot",
+            "SELECT id, species, level, nature, ivs, evs, hp, moves FROM pokemons WHERE owner_id=? AND team_slot IS NOT NULL ORDER BY team_slot",
             (user_id,),
         )
         rows = await cur.fetchall()
         await cur.close()
+        cached_base_stats: Dict[str, dict] = {}
+
+        async def _base_stats_for_species(species_key: str) -> dict:
+            if species_key in cached_base_stats:
+                return cached_base_stats[species_key]
+
+            raw_stats: Any = None
+            if db_cache is not None:
+                try:
+                    entry = (
+                        db_cache.get_cached_pokedex(species_key)
+                        or db_cache.get_cached_pokedex(species_key.replace("-", " "))
+                        or db_cache.get_cached_pokedex(species_key.replace("-", "_"))
+                    )
+                    if entry:
+                        raw_stats = entry.get("stats")
+                except Exception:
+                    raw_stats = None
+
+            if raw_stats is None:
+                try:
+                    cur_stats = await conn.execute(
+                        "SELECT stats FROM pokedex WHERE LOWER(name)=LOWER(?) OR LOWER(REPLACE(name,' ','-'))=LOWER(?) LIMIT 1",
+                        (species_key, species_key),
+                    )
+                    srow = await cur_stats.fetchone()
+                    await cur_stats.close()
+                    if srow:
+                        raw_stats = srow.get("stats")
+                except Exception:
+                    raw_stats = None
+
+            if isinstance(raw_stats, str):
+                try:
+                    raw_stats = json.loads(raw_stats)
+                except Exception:
+                    raw_stats = {}
+            if not isinstance(raw_stats, dict):
+                raw_stats = {}
+
+            cached_base_stats[species_key] = raw_stats
+            return raw_stats
+
         for row in rows:
-            hp_max = int(row["hp"])
+            hp_max = max(1, int(row.get("hp") or 1))
+            try:
+                species_key = str(row.get("species") or "").strip().lower().replace(" ", "-")
+                level = max(1, int(row.get("level") or 1))
+                nature = str(row.get("nature") or "hardy").strip().lower() or "hardy"
+
+                ivs_raw = row.get("ivs")
+                if isinstance(ivs_raw, str):
+                    try:
+                        ivs_raw = json.loads(ivs_raw)
+                    except Exception:
+                        ivs_raw = {}
+                evs_raw = row.get("evs")
+                if isinstance(evs_raw, str):
+                    try:
+                        evs_raw = json.loads(evs_raw)
+                    except Exception:
+                        evs_raw = {}
+                ivs = _normalize_ivs_evs(ivs_raw, default_val=0)
+                evs = _normalize_ivs_evs(evs_raw, default_val=0)
+
+                if species_key:
+                    raw_stats = await _base_stats_for_species(species_key)
+                    base_long = _normalize_stats_for_generator(raw_stats or {})
+                    ivs_long = {
+                        "hp": ivs["hp"], "attack": ivs["atk"], "defense": ivs["defn"],
+                        "special_attack": ivs["spa"], "special_defense": ivs["spd"], "speed": ivs["spe"],
+                    }
+                    evs_long = {
+                        "hp": evs["hp"], "attack": evs["atk"], "defense": evs["defn"],
+                        "special_attack": evs["spa"], "special_defense": evs["spd"], "speed": evs["spe"],
+                    }
+                    final_stats = calc_all_stats(base_long, ivs_long, evs_long, level, nature)
+                    hp_max = max(hp_max, int(final_stats.get("hp") or hp_max or 1))
+            except Exception:
+                pass
+
             moves = []
             try:
                 moves = json.loads(row["moves"]) if row.get("moves") else []
@@ -8068,8 +8227,8 @@ async def _heal_party(user_id: str) -> int:
                 moves = []
             max_pp = [_max_pp(m, generation=user_gen) for m in moves[:4]] if moves else []
             await conn.execute(
-                "UPDATE pokemons SET hp_now=?, moves_pp=? WHERE id=?",
-                (hp_max, json.dumps(max_pp, ensure_ascii=False), int(row["id"])),
+                "UPDATE pokemons SET hp=?, hp_now=?, moves_pp=? WHERE id=?",
+                (hp_max, hp_max, json.dumps(max_pp, ensure_ascii=False), int(row["id"])),
             )
             healed += 1
         await conn.commit()
@@ -8127,6 +8286,8 @@ async def _start_pve_battle(
         st.trainer_challenge = trainer_challenge
     if trainer_quote is not None:
         st.trainer_quote = trainer_quote
+    if fmt_label.lower().startswith("adventure") or fmt_label.lower() == "rival":
+        st._hide_opponent_moves = True
     if area_id is not None:
         st.adventure_area_id = area_id
     if route_display_name is not None:
