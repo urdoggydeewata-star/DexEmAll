@@ -7197,6 +7197,55 @@ def _daycare_norm_species(species: str) -> str:
     return str(species or "").strip().lower().replace("_", "-").replace(" ", "-")
 
 
+def _daycare_showdown_keys(species: str) -> list[str]:
+    """
+    Build robust Pokemon Showdown sprite keys for daycare rendering.
+    Prefers form-specific keys first, then progressively falls back to base species.
+    """
+    sp = _daycare_norm_species(species)
+    if not sp:
+        return []
+
+    # Prefer exact species/form first, then trim trailing form tokens.
+    seeds: list[str] = [sp]
+    toks = [t for t in sp.split("-") if t]
+    for i in range(len(toks) - 1, 0, -1):
+        base = "-".join(toks[:i])
+        if base and base not in seeds:
+            seeds.append(base)
+
+    out: list[str] = []
+    variant_fn = globals().get("_team_showdown_key_variants")
+    for seed in seeds:
+        variants: list[str]
+        if callable(variant_fn):
+            try:
+                variants = list(variant_fn(seed))  # type: ignore[misc]
+            except Exception:
+                variants = [seed]
+        else:
+            variants = [seed]
+        for k in variants:
+            k2 = str(k or "").strip().lower()
+            if k2 and k2 not in out:
+                out.append(k2)
+    return out
+
+
+def _daycare_sprite_folder_candidates(species: str) -> list[str]:
+    """Folder candidates for local on-disk fallback, form-first then base."""
+    sp = _daycare_norm_species(species)
+    if not sp:
+        return []
+    out: list[str] = [sp]
+    toks = [t for t in sp.split("-") if t]
+    for i in range(len(toks) - 1, 0, -1):
+        base = "-".join(toks[:i])
+        if base and base not in out:
+            out.append(base)
+    return out
+
+
 def _daycare_norm_item(item_id: str | None) -> str:
     return str(item_id or "").strip().lower().replace("_", "-").replace(" ", "-")
 
@@ -7779,15 +7828,34 @@ def _daycare_icon_path_for_species(species: str) -> Optional[Path]:
     if not sp:
         return None
 
-    # Daycare should prioritize menu/box-style icons.
-    for root in (BOX_SPRITES_DIR, LEGACY_SPRITES_DIR, Path(__file__).resolve().parent / "sprites"):
-        for fname in ("box.png", "icon.png", "front.png"):
-            p = root / sp / fname
+    # Primary source: Pokemon Showdown Gen 5 animated sprites (cached locally).
+    download_fn = globals().get("_team_download_showdown_gif")
+    if callable(download_fn):
+        for key in _daycare_showdown_keys(sp):
             try:
-                if p.exists() and p.stat().st_size > 0:
-                    return p
+                p = download_fn(key, shiny=False)  # type: ignore[misc]
             except Exception:
-                pass
+                p = None
+            if p is None:
+                continue
+            try:
+                pp = Path(p)
+                if pp.exists() and pp.stat().st_size > 0:
+                    return pp
+            except Exception:
+                continue
+
+    # Local fallback: animated/static sprites if already present on disk.
+    folder_candidates = _daycare_sprite_folder_candidates(sp)
+    for root in (LEGACY_SPRITES_DIR, Path(__file__).resolve().parent / "sprites", BOX_SPRITES_DIR):
+        for folder in folder_candidates:
+            for fname in ("animated-front.gif", "front.png", "icon.png", "box.png"):
+                p = root / folder / fname
+                try:
+                    if p.exists() and p.stat().st_size > 0:
+                        return p
+                except Exception:
+                    pass
     return None
 
 
@@ -7839,9 +7907,13 @@ def _embed_with_daycare_panel(
                 continue
             try:
                 icon = Image.open(str(icon_path)).convert("RGBA")
-                # Dedicated box sprites are menu icons (40x30); keep them crisp.
+                # Keep pixel-art sprites crisp when scaling on the daycare panel.
                 is_box_icon = str(getattr(icon_path, "name", "")).lower() == "box.png"
-                if is_box_icon:
+                is_gif = str(getattr(icon_path, "suffix", "")).lower() == ".gif"
+                if is_gif:
+                    # Gen5 animated sprites are pixel art; scale with nearest-neighbor.
+                    icon.thumbnail((54, 54), resample=resample_pixel)
+                elif is_box_icon:
                     icon.thumbnail((44, 34), resample=resample_pixel)
                 else:
                     icon.thumbnail((42, 42), resample=resample_smooth)
