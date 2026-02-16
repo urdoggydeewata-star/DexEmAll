@@ -1948,8 +1948,12 @@ def _wrap_content_into_embed(kwargs: dict) -> None:
         kwargs["content"] = None
 
 def _wrap_send_func(func):
+    func_name = getattr(func, "__name__", "")
+    accepts_positional_content = func_name in {"send", "send_message"}
+
     async def wrapped(self, *args, **kwargs):
-        if args and "content" not in kwargs:
+        # Preserve positional IDs for edit_message(message_id=...) calls.
+        if accepts_positional_content and args and "content" not in kwargs:
             kwargs["content"] = args[0]
             args = args[1:]
         _wrap_content_into_embed(kwargs)
