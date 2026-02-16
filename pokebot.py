@@ -56,11 +56,90 @@ from lib.team_import import parse_showdown_team, get_preset_team_names, get_pres
 from lib.legality import legal_moves, species_allowed
 from lib.rules import rules_for
 import lib.rules as _rules
+import pvp.sprites as _pvp_sprites
 try:
     from tools.cache_everything import warm_cache, STATIC_TABLES
 except ImportError:
     warm_cache = None
     STATIC_TABLES = []
+
+
+def _patch_pvp_sprite_icon_fallback() -> None:
+    """
+    Ensure PvP panel rendering still produces an image when full front/back assets
+    are missing and only icon sprites exist on disk.
+
+    This patch wraps pvp.sprites.find_sprite and also updates pvp.renderer.find_sprite
+    (renderer imports find_sprite by name), so render_turn_gif can fall back to icon.png.
+    """
+    try:
+        original = getattr(_pvp_sprites, "find_sprite", None)
+        if not callable(original):
+            return
+        if getattr(original, "_dex_icon_fallback_patch", False):
+            return
+
+        def _wrapped_find_sprite(
+            species: str,
+            *,
+            gen: int,
+            perspective: str,
+            shiny: bool,
+            female: bool,
+            prefer_animated: bool = True,
+            form: Optional[str] = None,
+        ) -> Optional[Path]:
+            p = original(
+                species,
+                gen=gen,
+                perspective=perspective,
+                shiny=shiny,
+                female=female,
+                prefer_animated=prefer_animated,
+                form=form,
+            )
+            try:
+                if p and Path(p).exists():
+                    return Path(p)
+            except Exception:
+                pass
+
+            # Fallback: use icon from form-specific folder first, then base species folder.
+            try:
+                candidates: list[Path] = []
+                base_species = _pvp_sprites._norm_species(species)
+
+                if form:
+                    norm_form = _pvp_sprites._norm_species(form)
+                    if norm_form.startswith(f"{base_species}-"):
+                        form_folder_name = norm_form
+                    else:
+                        form_folder_name = f"{base_species}-{norm_form}"
+                    candidates.append(_pvp_sprites.BASE_SPRITES_DIR / form_folder_name / "icon.png")
+
+                candidates.append(_pvp_sprites.BASE_SPRITES_DIR / base_species / "icon.png")
+
+                for icon_path in candidates:
+                    if icon_path.exists() and icon_path.stat().st_size > 0:
+                        return icon_path
+            except Exception:
+                pass
+            return None
+
+        _wrapped_find_sprite._dex_icon_fallback_patch = True  # type: ignore[attr-defined]
+        _pvp_sprites.find_sprite = _wrapped_find_sprite
+
+        # renderer imports find_sprite by value; patch renderer symbol too
+        try:
+            import pvp.renderer as _pvp_renderer
+            _pvp_renderer.find_sprite = _wrapped_find_sprite
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+_patch_pvp_sprite_icon_fallback()
 
 # Warm up renderer once to avoid first-GIF stall (no-op if renderer missing)
 try:
