@@ -179,6 +179,212 @@ def _append_forced_switch_to_turn_log(st: "BattleState", uid: int, fainted_displ
     st._last_turn_log = log
 
 
+_AI_THINK_TIMEOUT_MIN = 5.0
+_AI_THINK_TIMEOUT_MAX = 10.0
+_AI_FORCED_SWITCH_TIMEOUT = 4.0
+
+
+def _norm_move_key(move_name: Any) -> str:
+    return str(move_name or "").strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def _legal_ai_moves(st: "BattleState", ai_user_id: int) -> List[str]:
+    """Return legal move names with PP remaining for AI fallback/validation."""
+    active = st._active(ai_user_id)
+    out: List[str] = []
+    for raw in (st.moves_for(ai_user_id) or []):
+        mv = str(raw or "").strip()
+        if not mv:
+            continue
+        try:
+            if active is not None and st._pp_left(ai_user_id, mv, active) <= 0:
+                continue
+        except Exception:
+            pass
+        out.append(mv)
+    return out
+
+
+def _choose_quick_fallback_move(st: "BattleState", ai_user_id: int, field_effects: Any) -> Dict[str, Any]:
+    """
+    Fast deterministic fallback move picker for AI timeout/error cases.
+    Uses lightweight scoring (power/priority/accuracy + context).
+    """
+    legal_moves = _legal_ai_moves(st, ai_user_id)
+    if not legal_moves:
+        return {"kind": "move", "value": "Tackle"}
+
+    ai_mon = st._active(ai_user_id)
+    target_mon = st._opp_active(ai_user_id)
+    ai_hp_pct = 1.0
+    if ai_mon and getattr(ai_mon, "max_hp", 0):
+        try:
+            ai_hp_pct = max(0.0, min(1.0, float(ai_mon.hp) / float(ai_mon.max_hp)))
+        except Exception:
+            ai_hp_pct = 1.0
+
+    recovery_moves = {
+        "recover", "roost", "slack-off", "soft-boiled", "heal-order",
+        "strength-sap", "moonlight", "synthesis", "morning-sun", "wish",
+    }
+    setup_moves = {"swords-dance", "dragon-dance", "calm-mind", "nasty-plot", "quiver-dance", "bulk-up"}
+
+    best_move = legal_moves[0]
+    best_score = float("-inf")
+    for mv in legal_moves:
+        md = _get_move_with_cache(mv, battle_state=st, generation=getattr(st, "gen", None)) or {}
+        power = float(md.get("power") or 0.0)
+        priority = float(md.get("priority") or 0.0)
+        accuracy = float(md.get("accuracy") or 100.0)
+        move_key = _norm_move_key(mv)
+        category = str(md.get("category") or md.get("damage_class") or "status").lower()
+        score = (power * 1.15) + (priority * 38.0) + max(0.0, min(100.0, accuracy)) * 0.12
+        if category == "status" and power <= 0:
+            score -= 8.0
+        if move_key in recovery_moves and ai_hp_pct <= 0.42:
+            score += 26.0
+        if move_key in setup_moves and ai_hp_pct >= 0.72:
+            score += 7.0
+        if move_key in setup_moves and ai_hp_pct <= 0.45:
+            score -= 18.0
+
+        # Mild preference for STAB in fallback mode.
+        try:
+            m_type = str(md.get("type") or "").lower()
+            ai_types = [str(t).lower() for t in (getattr(ai_mon, "types", None) or [])]
+            if m_type and m_type in ai_types and power > 0:
+                score += 11.0
+        except Exception:
+            pass
+
+        # Mild preference for super-effective hit if quickly known.
+        if power > 0 and ai_mon is not None and target_mon is not None:
+            try:
+                from .engine import type_multiplier
+                mult, _ = type_multiplier(md.get("type", "Normal"), target_mon, field_effects=field_effects, user=ai_mon)
+                if float(mult) >= 2.0:
+                    score += 14.0
+                elif float(mult) < 1.0:
+                    score -= 8.0
+            except Exception:
+                pass
+
+        if score > best_score:
+            best_score = score
+            best_move = mv
+    return {"kind": "move", "value": str(best_move)}
+
+
+async def _ai_best_switch_with_timeout(st: "BattleState", ai_user_id: int, field_effects: Any, timeout_s: float = _AI_FORCED_SWITCH_TIMEOUT) -> Optional[int]:
+    """Compute best switch on a worker thread with timeout."""
+    switch_opts = st.switch_options(ai_user_id) or []
+    if not switch_opts:
+        return None
+    try:
+        from .ai import _choose_best_switch
+        current = st._active(ai_user_id)
+        target = st._opp_active(ai_user_id)
+        if not current or not target:
+            return int(switch_opts[0])
+
+        def _runner() -> Optional[int]:
+            try:
+                return _choose_best_switch(
+                    current_mon=current,
+                    target_mon=target,
+                    switch_options=switch_opts,
+                    battle_state=st,
+                    field_effects=field_effects,
+                    switching_user_id=ai_user_id,
+                )
+            except Exception:
+                return None
+
+        choice = await asyncio.wait_for(asyncio.to_thread(_runner), timeout=max(0.2, float(timeout_s)))
+        if choice is None:
+            return int(switch_opts[0])
+        c = int(choice)
+        return c if c in switch_opts else int(switch_opts[0])
+    except Exception:
+        return int(switch_opts[0]) if switch_opts else None
+
+
+def _normalize_ai_choice(st: "BattleState", ai_user_id: int, raw_choice: Any, field_effects: Any) -> Dict[str, Any]:
+    """
+    Ensure AI choice is legal; invalid choices are converted to legal move fallback.
+    This prevents dead turns from malformed AI responses.
+    """
+    choice = raw_choice if isinstance(raw_choice, dict) else {}
+    kind = str(choice.get("kind") or "").strip().lower()
+    legal_moves = _legal_ai_moves(st, ai_user_id)
+    switch_opts = st.switch_options(ai_user_id) or []
+
+    if kind == "switch":
+        try:
+            idx = int(choice.get("value"))
+            if idx in switch_opts:
+                # Validate switch legality against trapping effects.
+                from .engine import can_switch_out
+                ai_mon = st._active(ai_user_id)
+                target_mon = st._opp_active(ai_user_id)
+                if ai_mon and target_mon:
+                    can_sw, _ = can_switch_out(
+                        ai_mon, target_mon, force_switch=False, field_effects=field_effects, battle_state=st
+                    )
+                    if can_sw:
+                        return {"kind": "switch", "value": idx}
+        except Exception:
+            pass
+
+    if kind == "move":
+        mv = str(choice.get("value") or "").strip()
+        if mv:
+            wanted = _norm_move_key(mv)
+            for lm in legal_moves:
+                if _norm_move_key(lm) == wanted:
+                    return {"kind": "move", "value": lm}
+
+    # Fallback to a legal move.
+    return _choose_quick_fallback_move(st, ai_user_id, field_effects)
+
+
+async def _compute_ai_choice_with_timeout(st: "BattleState", ai_user_id: int, field_effects: Any) -> Dict[str, Any]:
+    """
+    Run full AI on a worker thread with bounded think time.
+    AI gets up to 5-10 seconds per decision; timeout/error falls back to legal action.
+    """
+    think_budget = random.uniform(_AI_THINK_TIMEOUT_MIN, _AI_THINK_TIMEOUT_MAX)
+    try:
+        from .ai import choose_ai_action
+    except Exception:
+        return _choose_quick_fallback_move(st, ai_user_id, field_effects)
+
+    try:
+        raw_choice = await asyncio.wait_for(
+            asyncio.to_thread(choose_ai_action, ai_user_id, st, field_effects),
+            timeout=think_budget,
+        )
+        return _normalize_ai_choice(st, ai_user_id, raw_choice, field_effects)
+    except asyncio.TimeoutError:
+        print(f"[AI] Decision timeout for {ai_user_id} after {think_budget:.2f}s; using fallback action.")
+        # On timeout, prefer a defensive switch when under visible pressure.
+        try:
+            ai_mon = st._active(ai_user_id)
+            opp_mon = st._opp_active(ai_user_id)
+            if ai_mon and opp_mon:
+                hp_ratio = (float(ai_mon.hp) / float(ai_mon.max_hp)) if getattr(ai_mon, "max_hp", 0) else 1.0
+                if hp_ratio <= 0.35:
+                    sw = await _ai_best_switch_with_timeout(st, ai_user_id, field_effects, timeout_s=2.5)
+                    if sw is not None:
+                        return {"kind": "switch", "value": int(sw)}
+        except Exception:
+            pass
+        return _choose_quick_fallback_move(st, ai_user_id, field_effects)
+    except Exception as e:
+        print(f"[AI] Error generating choice for {ai_user_id}: {e}")
+        return _choose_quick_fallback_move(st, ai_user_id, field_effects)
+
+
 def _format_move_name(move_name: str) -> str:
     """Format move name with capitalized first letter."""
     if not move_name:
@@ -7228,12 +7434,26 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
         embed.description = "Battle in progress..."
     
     # Send new stream message (don't delete old ones - create a new message each turn)
+    msg = None
     try:
         msg = await channel.send(embed=embed, file=file)
         return msg
     except Exception as e:
         print(f"[Stream] Error sending stream: {e}")
         return None
+    finally:
+        # Close stream attachment and best-effort cleanup of legacy render path.
+        if file is not None:
+            try:
+                file.close()
+            except Exception:
+                pass
+        if gif_path_to_cleanup is not None:
+            try:
+                if gif_path_to_cleanup.exists():
+                    gif_path_to_cleanup.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 # Helper function to safely send messages that handles webhook token expiration
@@ -7730,23 +7950,14 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
             else:
                 # Multiple options - if bot, use AI logic to pick best switch; if human, show UI
                 if st.p1_is_bot:
-                    # Bot: use AI logic to choose best switch
-                    try:
-                        from .ai import _choose_best_switch
-                        opp_mon = st._opp_active(st.p1_id)
-                        chosen_switch = _choose_best_switch(
-                            current_mon=p1_active_mon,
-                            target_mon=opp_mon,
-                            switch_options=switch_opts,
-                            battle_state=st,
-                            field_effects=st.field,
-                            switching_user_id=st.p1_id
-                        )
-                        if chosen_switch is None or chosen_switch not in switch_opts:
-                            # Fallback to first available
-                            chosen_switch = switch_opts[0]
-                    except Exception as e:
-                        print(f"[AI] Error choosing switch for P1 bot: {e}")
+                    opp_mon = st._opp_active(st.p1_id)
+                    chosen_switch = await _ai_best_switch_with_timeout(
+                        st,
+                        st.p1_id,
+                        st.field,
+                        timeout_s=_AI_FORCED_SWITCH_TIMEOUT,
+                    )
+                    if chosen_switch is None or chosen_switch not in switch_opts:
                         chosen_switch = switch_opts[0]
                     
                     p1_fainted_display = _format_pokemon_name(p1_active_mon)
@@ -7814,23 +8025,14 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
             else:
                 # Multiple options - if bot, use AI logic to pick best switch; if human, show UI
                 if st.p2_is_bot:
-                    # Bot: use AI logic to choose best switch
-                    try:
-                        from .ai import _choose_best_switch
-                        opp_mon = st._opp_active(st.p2_id)
-                        chosen_switch = _choose_best_switch(
-                            current_mon=p2_active_mon,
-                            target_mon=opp_mon,
-                            switch_options=switch_opts,
-                            battle_state=st,
-                            field_effects=st.field,
-                            switching_user_id=st.p2_id
-                        )
-                        if chosen_switch is None or chosen_switch not in switch_opts:
-                            # Fallback to first available
-                            chosen_switch = switch_opts[0]
-                    except Exception as e:
-                        print(f"[AI] Error choosing switch for P2 bot: {e}")
+                    opp_mon = st._opp_active(st.p2_id)
+                    chosen_switch = await _ai_best_switch_with_timeout(
+                        st,
+                        st.p2_id,
+                        st.field,
+                        timeout_s=_AI_FORCED_SWITCH_TIMEOUT,
+                    )
+                    if chosen_switch is None or chosen_switch not in switch_opts:
                         chosen_switch = switch_opts[0]
                     
                     p2_fainted_display = _format_pokemon_name(p2_active_mon)
@@ -7930,28 +8132,12 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
 
     # Check for bot players and auto-generate their choices
     if st.p1_is_bot and not ev1.is_set():
-        try:
-            from .ai import choose_ai_action
-            p1_choice = choose_ai_action(st.p1_id, st, st.field)
-            if not p1_choice:
-                p1_choice = {"kind": "move", "value": "Tackle"}
-            ev1.set()
-        except Exception as e:
-            print(f"[AI] Error generating P1 bot choice: {e}")
-            p1_choice = {"kind": "forfeit"}
-            ev1.set()
+        p1_choice = await _compute_ai_choice_with_timeout(st, st.p1_id, st.field)
+        ev1.set()
     
     if st.p2_is_bot and not ev2.is_set():
-        try:
-            from .ai import choose_ai_action
-            p2_choice = choose_ai_action(st.p2_id, st, st.field)
-            if not p2_choice:
-                p2_choice = {"kind": "move", "value": "Tackle"}
-            ev2.set()
-        except Exception as e:
-            print(f"[AI] Error generating P2 bot choice: {e}")
-            p2_choice = {"kind": "forfeit"}
-            ev2.set()
+        p2_choice = await _compute_ai_choice_with_timeout(st, st.p2_id, st.field)
+        ev2.set()
     
     # Only show move selection UI if players haven't auto-executed and aren't bots
     if not ev1.is_set() or not ev2.is_set():
@@ -8018,23 +8204,11 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
     
     # Safety net: if a bot somehow didn't lock an action (rare edge case), pick one now
     if st.p1_is_bot and not ev1.is_set():
-        try:
-            from .ai import choose_ai_action
-            p1_choice = choose_ai_action(st.p1_id, st, st.field) or {"kind": "move", "value": "Tackle"}
-            ev1.set()
-        except Exception as e:
-            print(f"[AI] Late fallback for P1 bot: {e}")
-            p1_choice = {"kind": "forfeit"}
-            ev1.set()
+        p1_choice = await _compute_ai_choice_with_timeout(st, st.p1_id, st.field)
+        ev1.set()
     if st.p2_is_bot and not ev2.is_set():
-        try:
-            from .ai import choose_ai_action
-            p2_choice = choose_ai_action(st.p2_id, st, st.field) or {"kind": "move", "value": "Tackle"}
-            ev2.set()
-        except Exception as e:
-            print(f"[AI] Late fallback for P2 bot: {e}")
-            p2_choice = {"kind": "forfeit"}
-            ev2.set()
+        p2_choice = await _compute_ai_choice_with_timeout(st, st.p2_id, st.field)
+        ev2.set()
 
     # Send timeout messages if needed
     # Check if interactions are still valid before sending (webhook tokens expire after 15 minutes)
@@ -8214,37 +8388,41 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                 can_switch, switch_reason = can_switch_out(p1_mon, p2_mon, force_switch=False, field_effects=st.field, is_pivot_move=False)
             
             if not can_switch:
-                # Switch is blocked - unlock player, notify them, and let them choose a move
+                # Switch is blocked. Bots should auto-pick a move; humans get re-prompted UI.
                 st.unlock(st.p1_id)
                 p1_mon_display = _format_pokemon_name(p1_mon)
-                await safe_send_message(
-                    p1_itx,
-                    embed=discord.Embed(
-                        title="🚫 Switch Blocked!",
-                        description=f"You tried to switch out **{p1_mon_display}**!\n{switch_reason}\n\nPlease choose a move instead.",
-                        color=discord.Color.orange()
-                    ),
-                    ephemeral=True
-                )
-                # Clear choice and reset event to allow new choice
-                p1_choice = None
-                ev1.clear()
-                # Show move selection UI again (hide team button since switch was blocked)
-                v1 = MoveView(st.p1_id, st, done1, hide_team_button=True)
-                render_result = await _render_gif_for_panel(st, st.p1_id)
-                await _send_player_panel(p1_itx, st, st.p1_id, v1, render_result)
-                # Wait for new choice
-                start_time = asyncio.get_event_loop().time()
-                while not ev1.is_set():
-                    elapsed = asyncio.get_event_loop().time() - start_time
-                    if elapsed >= TURN_TIMER:
-                        p1_timed_out = True
-                        p1_choice = {"kind": "forfeit"}
-                        break
-                    try:
-                        await asyncio.wait_for(ev1.wait(), timeout=min(0.5, TURN_TIMER - elapsed))
-                    except asyncio.TimeoutError:
-                        continue
+                if st.p1_is_bot:
+                    p1_choice = _choose_quick_fallback_move(st, st.p1_id, st.field)
+                    ev1.set()
+                else:
+                    await safe_send_message(
+                        p1_itx,
+                        embed=discord.Embed(
+                            title="🚫 Switch Blocked!",
+                            description=f"You tried to switch out **{p1_mon_display}**!\n{switch_reason}\n\nPlease choose a move instead.",
+                            color=discord.Color.orange()
+                        ),
+                        ephemeral=True
+                    )
+                    # Clear choice and reset event to allow new choice
+                    p1_choice = None
+                    ev1.clear()
+                    # Show move selection UI again (hide team button since switch was blocked)
+                    v1 = MoveView(st.p1_id, st, done1, hide_team_button=True)
+                    render_result = await _render_gif_for_panel(st, st.p1_id)
+                    await _send_player_panel(p1_itx, st, st.p1_id, v1, render_result)
+                    # Wait for new choice
+                    start_time = asyncio.get_event_loop().time()
+                    while not ev1.is_set():
+                        elapsed = asyncio.get_event_loop().time() - start_time
+                        if elapsed >= TURN_TIMER:
+                            p1_timed_out = True
+                            p1_choice = {"kind": "forfeit"}
+                            break
+                        try:
+                            await asyncio.wait_for(ev1.wait(), timeout=min(0.5, TURN_TIMER - elapsed))
+                        except asyncio.TimeoutError:
+                            continue
     
     if p2_choice and p2_choice.get("kind") == "switch":
         p1_mon = st._active(st.p1_id)
@@ -8275,37 +8453,41 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                 can_switch, switch_reason = can_switch_out(p2_mon, p1_mon, force_switch=False, field_effects=st.field, is_pivot_move=False)
             
             if not can_switch:
-                # Switch is blocked - unlock player, notify them, and let them choose a move
+                # Switch is blocked. Bots should auto-pick a move; humans get re-prompted UI.
                 st.unlock(st.p2_id)
                 p2_mon_display = _format_pokemon_name(p2_mon)
-                await safe_send_message(
-                    p2_itx,
-                    embed=discord.Embed(
-                        title="🚫 Switch Blocked!",
-                        description=f"You tried to switch out **{p2_mon_display}**!\n{switch_reason}\n\nPlease choose a move instead.",
-                        color=discord.Color.orange()
-                    ),
-                    ephemeral=True
-                )
-                # Clear choice and reset event to allow new choice
-                p2_choice = None
-                ev2.clear()
-                # Show move selection UI again (hide team button since switch was blocked)
-                v2 = MoveView(st.p2_id, st, done2, hide_team_button=True)
-                render_result = await _render_gif_for_panel(st, st.p2_id)
-                await _send_player_panel(p2_itx, st, st.p2_id, v2, render_result)
-                # Wait for new choice
-                start_time = asyncio.get_event_loop().time()
-                while not ev2.is_set():
-                    elapsed = asyncio.get_event_loop().time() - start_time
-                    if elapsed >= TURN_TIMER:
-                        p2_timed_out = True
-                        p2_choice = {"kind": "forfeit"}
-                        break
-                    try:
-                        await asyncio.wait_for(ev2.wait(), timeout=min(0.5, TURN_TIMER - elapsed))
-                    except asyncio.TimeoutError:
-                        continue
+                if st.p2_is_bot:
+                    p2_choice = _choose_quick_fallback_move(st, st.p2_id, st.field)
+                    ev2.set()
+                else:
+                    await safe_send_message(
+                        p2_itx,
+                        embed=discord.Embed(
+                            title="🚫 Switch Blocked!",
+                            description=f"You tried to switch out **{p2_mon_display}**!\n{switch_reason}\n\nPlease choose a move instead.",
+                            color=discord.Color.orange()
+                        ),
+                        ephemeral=True
+                    )
+                    # Clear choice and reset event to allow new choice
+                    p2_choice = None
+                    ev2.clear()
+                    # Show move selection UI again (hide team button since switch was blocked)
+                    v2 = MoveView(st.p2_id, st, done2, hide_team_button=True)
+                    render_result = await _render_gif_for_panel(st, st.p2_id)
+                    await _send_player_panel(p2_itx, st, st.p2_id, v2, render_result)
+                    # Wait for new choice
+                    start_time = asyncio.get_event_loop().time()
+                    while not ev2.is_set():
+                        elapsed = asyncio.get_event_loop().time() - start_time
+                        if elapsed >= TURN_TIMER:
+                            p2_timed_out = True
+                            p2_choice = {"kind": "forfeit"}
+                            break
+                        try:
+                            await asyncio.wait_for(ev2.wait(), timeout=min(0.5, TURN_TIMER - elapsed))
+                        except asyncio.TimeoutError:
+                            continue
     
     # Check for forfeits after handling blocked switches (before resolve)
     if p1_choice and p1_choice.get("kind") == "forfeit":

@@ -2575,16 +2575,19 @@ def choose_ai_action(
 
             if best_switch_idx is not None:
                 # Discourage consecutive hard-switching unless heavily justified.
-                margin = 5.5
+                margin = 3.75
                 if analysis.get(last_action_key) == "switch":
-                    margin += 2.5
+                    margin += 1.5
 
                 meaningful_damage = any(dmg_cache >= target_hp * 0.25 for dmg_cache in damage_cache.values())
-                if under_lethal_pressure and not can_fast_ko and best_switch_score >= best_score + margin:
+                # Under lethal pressure, allow more proactive defensive switching.
+                if under_lethal_pressure and not can_fast_ko and best_switch_score >= best_score - 1.0:
                     do_switch = True
                 elif (not meaningful_damage or best_dmg_pct < 22.0) and best_switch_score >= best_score + (margin - 1.5):
                     do_switch = True
                 elif ai_hp_pct < 0.33 and best_dmg_pct < 45.0 and best_switch_score >= best_score + (margin - 2.0):
+                    do_switch = True
+                elif ai_hp_pct < 0.45 and max_incoming_pct >= 60.0 and best_switch_score >= best_score + (margin - 2.25):
                     do_switch = True
 
                 # If we just switched in and are not in immediate danger, avoid pivot loops.
