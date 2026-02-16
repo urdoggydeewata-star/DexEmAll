@@ -6189,6 +6189,17 @@ class StarterView(discord.ui.View):
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ASSETS_CITIES = ASSETS_DIR / "cities"
 ASSETS_ROUTES = ASSETS_DIR / "routes"
+ASSETS_DAYCARE = ASSETS_DIR / "Daycare (1).png"
+ASSETS_DAYCARE_EGG = ASSETS_DIR / "item_icons" / "mystery_egg.png"
+
+DAYCARE_CITY_ID = "pallet-town"
+DAYCARE_AREA_ID = "pallet-daycare"
+DAYCARE_EGG_CAP = 3
+DAYCARE_INCUBATE_MAX = 6
+DAYCARE_BREED_THRESHOLD = 22.0
+DAYCARE_HATCH_MIN = 45.0
+DAYCARE_HATCH_MAX = 80.0
+DAYCARE_HATCH_BOOST_ABILITIES = {"flame-body", "magma-armor"}
 
 ADVENTURE_CITIES = {
     "pallet-town": {
@@ -6198,6 +6209,15 @@ ADVENTURE_CITIES = {
         "next": "route-1",
         "rival_battle": "rival-1",
         "heal": True,
+        "daycare_area": DAYCARE_AREA_ID,
+        "daycare_label": "Daycare",
+    },
+    DAYCARE_AREA_ID: {
+        "name": "Pallet Daycare",
+        "image_uncleared": ASSETS_DAYCARE,
+        "image_cleared": ASSETS_DAYCARE,
+        "is_daycare": True,
+        "heal": False,
     },
     "viridian-city": {
         "name": "Viridian City",
@@ -6973,6 +6993,7 @@ def _adv_default_state() -> dict:
         "rival_defeated": [],     # list of rival battle ids
         "repeat_seen": [],        # species seen/caught for Repeat Ball
         "dex_seen": 0,            # rough dex count for crit capture odds
+        "daycare": {},            # per-city daycare data
     }
 
 async def _get_adventure_state(user_id: str) -> dict:
@@ -7043,6 +7064,716 @@ async def _save_adventure_state(user_id: str, state: dict) -> None:
             db_cache.set_cached_adventure_state(uid, state)
         except Exception:
             pass
+
+
+def _daycare_default_record() -> dict:
+    return {
+        "parents": [None, None],   # Pokémon ids
+        "eggs": [],                # eggs waiting at daycare (max DAYCARE_EGG_CAP)
+        "incubating": [],          # eggs currently in team incubator
+        "breed_progress": 0.0,
+        "last_tick": float(time.time()),
+    }
+
+
+def _daycare_get_record(state: dict, city_id: str = DAYCARE_CITY_ID) -> dict:
+    all_dc = state.setdefault("daycare", {})
+    rec = all_dc.get(city_id)
+    if not isinstance(rec, dict):
+        rec = _daycare_default_record()
+        all_dc[city_id] = rec
+    parents = rec.get("parents")
+    if not isinstance(parents, list):
+        parents = [None, None]
+    parents = (parents + [None, None])[:2]
+    rec["parents"] = [int(p) if str(p).isdigit() else None for p in parents]
+    if not isinstance(rec.get("eggs"), list):
+        rec["eggs"] = []
+    if not isinstance(rec.get("incubating"), list):
+        rec["incubating"] = []
+    try:
+        rec["breed_progress"] = float(rec.get("breed_progress", 0.0) or 0.0)
+    except Exception:
+        rec["breed_progress"] = 0.0
+    try:
+        rec["last_tick"] = float(rec.get("last_tick", time.time()) or time.time())
+    except Exception:
+        rec["last_tick"] = float(time.time())
+    return rec
+
+
+def _daycare_norm_species(species: str) -> str:
+    return str(species or "").strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def _daycare_norm_item(item_id: str | None) -> str:
+    return str(item_id or "").strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def _daycare_ability_key(name: str | None) -> str:
+    return str(name or "").strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def _daycare_short_to_long_stats(short: dict) -> dict:
+    return {
+        "hp": int(short.get("hp", 0)),
+        "attack": int(short.get("atk", 0)),
+        "defense": int(short.get("defn", 0)),
+        "special_attack": int(short.get("spa", 0)),
+        "special_defense": int(short.get("spd", 0)),
+        "speed": int(short.get("spe", 0)),
+    }
+
+
+def _daycare_parse_egg_groups(entry: dict | None) -> set[str]:
+    if not isinstance(entry, dict):
+        return set()
+    raw = entry.get("egg_groups")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = [raw]
+    out: set[str] = set()
+    if isinstance(raw, (list, tuple)):
+        for g in raw:
+            if isinstance(g, dict):
+                name = g.get("name")
+            else:
+                name = g
+            norm = _daycare_norm_species(name)
+            if norm:
+                out.add(norm)
+    return out
+
+
+async def _daycare_species_entry(species: str) -> Optional[dict]:
+    key = _daycare_norm_species(species)
+    if not key:
+        return None
+    try:
+        if db_cache is not None:
+            cached = db_cache.get_cached_pokedex(key) or db_cache.get_cached_pokedex(key.replace("-", " "))
+            if cached is not None:
+                return cached
+    except Exception:
+        pass
+    try:
+        row = await db.get_pokedex_by_name(key)
+        if row:
+            return row
+    except Exception:
+        pass
+    try:
+        return await ensure_species_and_learnsets(key)
+    except Exception:
+        return None
+
+
+def _daycare_pair_info(
+    parent_a: dict,
+    parent_b: dict,
+    entry_a: dict | None,
+    entry_b: dict | None,
+) -> dict:
+    fail = {
+        "can_breed": False,
+        "reason": "These Pokémon can't breed.",
+        "child_species": None,
+        "rate": 0.0,
+    }
+    if not parent_a or not parent_b:
+        fail["reason"] = "Place two Pokémon in daycare."
+        return fail
+    if not entry_a or not entry_b:
+        fail["reason"] = "Missing Pokédex data for one parent."
+        return fail
+
+    s1 = _daycare_norm_species(parent_a.get("species"))
+    s2 = _daycare_norm_species(parent_b.get("species"))
+    g1 = str(parent_a.get("gender") or "genderless").strip().lower()
+    g2 = str(parent_b.get("gender") or "genderless").strip().lower()
+    ditto1 = s1 == "ditto"
+    ditto2 = s2 == "ditto"
+
+    if ditto1 and ditto2:
+        fail["reason"] = "Two Ditto cannot breed together."
+        return fail
+
+    egg1 = _daycare_parse_egg_groups(entry_a)
+    egg2 = _daycare_parse_egg_groups(entry_b)
+    blocked_groups = {"undiscovered", "no-eggs"}
+    if egg1 & blocked_groups or egg2 & blocked_groups:
+        fail["reason"] = "One parent belongs to the Undiscovered egg group."
+        return fail
+
+    if not (ditto1 or ditto2):
+        if g1 == g2:
+            fail["reason"] = "Parents must be opposite gender."
+            return fail
+        if g1 == "genderless" or g2 == "genderless":
+            fail["reason"] = "Genderless parents require Ditto."
+            return fail
+        if not ((egg1 & egg2) - {"ditto"}):
+            fail["reason"] = "Parents are not in a compatible egg group."
+            return fail
+
+    if ditto1:
+        child_species = s2
+    elif ditto2:
+        child_species = s1
+    else:
+        child_species = s1 if g1 == "female" else (s2 if g2 == "female" else s1)
+
+    rate = 1.15 if (s1 == s2 and not (ditto1 or ditto2)) else (0.85 if (ditto1 or ditto2) else 0.95)
+    return {
+        "can_breed": True,
+        "reason": "Compatible pair.",
+        "child_species": child_species,
+        "rate": rate,
+        "ditto_pair": bool(ditto1 or ditto2),
+    }
+
+
+def _daycare_pick_nature(parent_a: dict, parent_b: dict) -> str:
+    item_a = _daycare_norm_item(parent_a.get("held_item"))
+    item_b = _daycare_norm_item(parent_b.get("held_item"))
+    ever_items = {"everstone", "ever-stone"}
+    candidates = []
+    if item_a in ever_items and parent_a.get("nature"):
+        candidates.append(str(parent_a.get("nature")).strip().lower())
+    if item_b in ever_items and parent_b.get("nature"):
+        candidates.append(str(parent_b.get("nature")).strip().lower())
+    if candidates:
+        return random.choice(candidates) or "hardy"
+    na = str(parent_a.get("nature") or "").strip().lower()
+    nb = str(parent_b.get("nature") or "").strip().lower()
+    pool = [n for n in (na, nb) if n]
+    return random.choice(pool) if pool else "hardy"
+
+
+def _daycare_pick_ivs(parent_a: dict, parent_b: dict) -> dict:
+    stats = ["hp", "atk", "defn", "spa", "spd", "spe"]
+    iv_a = _normalize_ivs_evs(parent_a.get("ivs"), 0)
+    iv_b = _normalize_ivs_evs(parent_b.get("ivs"), 0)
+    child = {k: random.randint(0, 31) for k in stats}
+
+    power_map = {
+        "power-weight": "hp",
+        "power-bracer": "atk",
+        "power-belt": "defn",
+        "power-lens": "spa",
+        "power-band": "spd",
+        "power-anklet": "spe",
+    }
+    forced: dict[str, str] = {}
+    ia = _daycare_norm_item(parent_a.get("held_item"))
+    ib = _daycare_norm_item(parent_b.get("held_item"))
+    if ia in power_map:
+        forced[power_map[ia]] = "a"
+    if ib in power_map:
+        # If both parents force the same stat, pick the second holder half the time.
+        stat_key = power_map[ib]
+        if stat_key not in forced or random.random() < 0.5:
+            forced[stat_key] = "b"
+
+    selected = set()
+    for stat_key, src in forced.items():
+        child[stat_key] = int(iv_a.get(stat_key, 0)) if src == "a" else int(iv_b.get(stat_key, 0))
+        selected.add(stat_key)
+
+    inherit_count = 5 if ("destiny-knot" in {ia, ib}) else 3
+    remaining = [k for k in stats if k not in selected]
+    random.shuffle(remaining)
+    for stat_key in remaining:
+        if len(selected) >= inherit_count:
+            break
+        src = random.choice(("a", "b"))
+        child[stat_key] = int(iv_a.get(stat_key, 0)) if src == "a" else int(iv_b.get(stat_key, 0))
+        selected.add(stat_key)
+
+    return child
+
+
+def _daycare_pick_ball(parent_a: dict, parent_b: dict, pair_info: dict) -> str:
+    s1 = _daycare_norm_species(parent_a.get("species"))
+    s2 = _daycare_norm_species(parent_b.get("species"))
+    ditto1 = s1 == "ditto"
+    ditto2 = s2 == "ditto"
+    if ditto1 and not ditto2:
+        source = parent_b
+    elif ditto2 and not ditto1:
+        source = parent_a
+    else:
+        g1 = str(parent_a.get("gender") or "").strip().lower()
+        g2 = str(parent_b.get("gender") or "").strip().lower()
+        source = parent_a if g1 == "female" else (parent_b if g2 == "female" else random.choice([parent_a, parent_b]))
+    ball = str(source.get("pokeball") or "poke-ball").strip().lower()
+    return ball or "poke-ball"
+
+
+def _daycare_pick_ability(parent_a: dict, parent_b: dict, child_entry: dict, pair_info: dict) -> tuple[str, bool]:
+    regs, hides = parse_abilities(child_entry.get("abilities"))
+    regs_norm = [_daycare_ability_key(a) for a in regs if a]
+    hides_norm = [_daycare_ability_key(a) for a in hides if a]
+
+    s1 = _daycare_norm_species(parent_a.get("species"))
+    s2 = _daycare_norm_species(parent_b.get("species"))
+    ditto1 = s1 == "ditto"
+    ditto2 = s2 == "ditto"
+    if ditto1 and not ditto2:
+        source = parent_b
+    elif ditto2 and not ditto1:
+        source = parent_a
+    else:
+        g1 = str(parent_a.get("gender") or "").strip().lower()
+        g2 = str(parent_b.get("gender") or "").strip().lower()
+        source = parent_a if g1 == "female" else (parent_b if g2 == "female" else parent_a)
+
+    parent_ability = _daycare_ability_key(source.get("ability"))
+    parent_hidden = bool(source.get("is_hidden_ability"))
+
+    if parent_hidden and parent_ability in hides_norm and random.random() < 0.60:
+        return parent_ability, True
+    if parent_ability in regs_norm and random.random() < 0.80:
+        return parent_ability, False
+
+    ability_name, is_hidden = roll_hidden_ability(child_entry.get("abilities"), ha_denominator=20)
+    ability_name = _daycare_ability_key(ability_name)
+    if ability_name:
+        return ability_name, bool(is_hidden)
+    if regs_norm:
+        return random.choice(regs_norm), False
+    if hides_norm:
+        return random.choice(hides_norm), True
+    return "run-away", False
+
+
+async def _daycare_create_egg(parent_a: dict, parent_b: dict, pair_info: dict) -> Optional[dict]:
+    child_species = _daycare_norm_species(pair_info.get("child_species"))
+    if not child_species:
+        return None
+    child_entry = await _daycare_species_entry(child_species)
+    if not child_entry:
+        return None
+
+    now = float(time.time())
+    hatch_steps = random.uniform(DAYCARE_HATCH_MIN, DAYCARE_HATCH_MAX)
+    child_ivs = _daycare_pick_ivs(parent_a, parent_b)
+    child_nature = _daycare_pick_nature(parent_a, parent_b)
+    child_ability, child_hidden = _daycare_pick_ability(parent_a, parent_b, child_entry, pair_info)
+    child_ball = _daycare_pick_ball(parent_a, parent_b, pair_info)
+
+    return {
+        "id": f"egg-{int(now * 1000)}-{random.randint(1000, 9999)}",
+        "species": child_species,
+        "created_at": now,
+        "hatch_steps": float(hatch_steps),
+        "progress": 0.0,
+        "nature": child_nature,
+        "ivs": child_ivs,
+        "ability": child_ability,
+        "is_hidden_ability": bool(child_hidden),
+        "pokeball": child_ball,
+    }
+
+
+async def _daycare_team_count(owner_id: str) -> int:
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT COUNT(*) AS c FROM pokemons WHERE owner_id=? AND team_slot BETWEEN 1 AND 6",
+                (owner_id,),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            if not row:
+                return 0
+            return int((row.get("c") if hasattr(row, "keys") else row[0]) or 0)
+    except Exception:
+        return 0
+
+
+async def _daycare_has_hatch_boost(owner_id: str) -> bool:
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT ability FROM pokemons WHERE owner_id=? AND team_slot BETWEEN 1 AND 6",
+                (owner_id,),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+        for row in rows:
+            raw = row.get("ability") if hasattr(row, "keys") else row[0]
+            if _daycare_ability_key(raw) in DAYCARE_HATCH_BOOST_ABILITIES:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def _daycare_hatch_to_team(owner_id: str, egg: dict) -> Optional[dict]:
+    species = _daycare_norm_species(egg.get("species"))
+    if not species:
+        return None
+    entry = await _daycare_species_entry(species)
+    if not entry:
+        return None
+
+    raw_stats = entry.get("stats")
+    if isinstance(raw_stats, str):
+        try:
+            raw_stats = json.loads(raw_stats)
+        except Exception:
+            raw_stats = {}
+    base_long = _normalize_stats_for_generator(raw_stats or {})
+    ivs_short = _normalize_ivs_evs(egg.get("ivs"), 0)
+    ivs_long = _daycare_short_to_long_stats(ivs_short)
+    evs_long = _daycare_short_to_long_stats({"hp": 0, "atk": 0, "defn": 0, "spa": 0, "spd": 0, "spe": 0})
+    nature = str(egg.get("nature") or "hardy").strip().lower() or "hardy"
+    level = 1
+    try:
+        final_stats = calc_all_stats(base_long, ivs_long, evs_long, level, nature)
+    except Exception:
+        return None
+
+    abilities_raw = entry.get("abilities") or []
+    regs, hides = parse_abilities(abilities_raw)
+    regs_norm = [_daycare_ability_key(a) for a in regs if a]
+    hides_norm = [_daycare_ability_key(a) for a in hides if a]
+
+    ability = _daycare_ability_key(egg.get("ability"))
+    is_hidden = bool(egg.get("is_hidden_ability"))
+    if is_hidden and ability not in hides_norm:
+        is_hidden = False
+    if not ability or (is_hidden and ability not in hides_norm) or (not is_hidden and ability not in regs_norm):
+        if regs_norm:
+            ability = random.choice(regs_norm)
+            is_hidden = False
+        elif hides_norm:
+            ability = random.choice(hides_norm)
+            is_hidden = True
+        else:
+            ability = "run-away"
+            is_hidden = False
+
+    gender = _roll_gender_from_ratio(_gender_ratio_from_entry(entry))
+    tera_type = _roll_default_tera_type(_extract_species_types(entry))
+    shiny = await shiny_roll(_wild_shiny_denominator())
+
+    try:
+        mon_id = await db.add_pokemon_with_stats(
+            owner_id=owner_id,
+            species=species,
+            level=level,
+            final_stats=final_stats,
+            ivs=ivs_long,
+            evs=evs_long,
+            nature=nature,
+            ability=ability,
+            gender=gender,
+            form=None,
+            can_gigantamax=False,
+            tera_type=tera_type,
+        )
+    except Exception:
+        return None
+
+    try:
+        async with db.session() as conn:
+            exp_group = await _get_exp_group_for_species(conn, species)
+            initial_exp = await _get_exp_total_for_level(conn, exp_group, level)
+            await conn.execute(
+                "UPDATE pokemons SET exp=?, exp_group=?, hp_now=? WHERE owner_id=? AND id=?",
+                (initial_exp, exp_group, int(final_stats.get("hp", 1)), owner_id, mon_id),
+            )
+            if shiny:
+                await conn.execute("UPDATE pokemons SET shiny=1 WHERE owner_id=? AND id=?", (owner_id, mon_id))
+            if is_hidden:
+                try:
+                    await conn.execute("UPDATE pokemons SET is_hidden_ability=1 WHERE owner_id=? AND id=?", (owner_id, mon_id))
+                except Exception:
+                    pass
+            await conn.commit()
+    except Exception:
+        pass
+
+    try:
+        species_id = int(entry.get("id")) if entry.get("id") is not None else None
+    except Exception:
+        species_id = None
+    try:
+        moves = await _default_levelup_moves(species_id, level, 1) if species_id else ["Tackle"]
+    except Exception:
+        moves = ["Tackle"]
+    try:
+        await db.set_pokemon_moves(owner_id, mon_id, moves[:4] if moves else ["Tackle"])
+    except Exception:
+        pass
+
+    try:
+        ball = str(egg.get("pokeball") or "poke-ball").strip().lower()
+        await _set_pokeball(owner_id, mon_id, ball)
+    except Exception:
+        pass
+
+    slot = await db.next_free_team_slot(owner_id)
+    if slot is not None:
+        try:
+            await db.set_team_slot(owner_id, mon_id, slot)
+        except Exception:
+            pass
+
+    db.invalidate_pokemons_cache(owner_id)
+    return {"id": int(mon_id), "species": species, "level": level}
+
+
+async def _daycare_parent_rows(owner_id: str, parent_ids: list[Optional[int]]) -> tuple[list[Optional[dict]], bool]:
+    id_map: dict[int, dict] = {}
+    ids = [int(i) for i in parent_ids if i is not None]
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        try:
+            async with db.session() as conn:
+                cur = await conn.execute(
+                    f"SELECT id, species, level, gender, nature, ability, held_item, ivs, is_hidden_ability, pokeball "
+                    f"FROM pokemons WHERE owner_id=? AND id IN ({placeholders})",
+                    (owner_id, *ids),
+                )
+                rows = await cur.fetchall()
+                await cur.close()
+            for row in rows:
+                d = dict(row) if hasattr(row, "keys") else {
+                    "id": row[0], "species": row[1], "level": row[2], "gender": row[3],
+                    "nature": row[4], "ability": row[5], "held_item": row[6], "ivs": row[7],
+                    "is_hidden_ability": row[8], "pokeball": row[9],
+                }
+                id_map[int(d["id"])] = d
+        except Exception:
+            pass
+    out: list[Optional[dict]] = []
+    changed = False
+    for pid in parent_ids:
+        if pid is None:
+            out.append(None)
+            continue
+        row = id_map.get(int(pid))
+        if row is None:
+            out.append(None)
+            changed = True
+        else:
+            out.append(row)
+    return out, changed
+
+
+async def _daycare_pair_context(owner_id: str, state: dict) -> tuple[dict, list[Optional[dict]], dict, bool]:
+    rec = _daycare_get_record(state, DAYCARE_CITY_ID)
+    parent_ids = rec.get("parents", [None, None])
+    if not isinstance(parent_ids, list):
+        parent_ids = [None, None]
+    parent_ids = (parent_ids + [None, None])[:2]
+    parent_ids = [int(p) if str(p).isdigit() else None for p in parent_ids]
+    rows, changed = await _daycare_parent_rows(owner_id, parent_ids)
+    if changed:
+        rec["parents"] = [r.get("id") if r else None for r in rows]
+
+    pair_info = {
+        "can_breed": False,
+        "reason": "Place two compatible Pokémon in daycare.",
+        "child_species": None,
+        "rate": 0.0,
+    }
+    if rows[0] and rows[1]:
+        e1 = await _daycare_species_entry(str(rows[0].get("species") or ""))
+        e2 = await _daycare_species_entry(str(rows[1].get("species") or ""))
+        pair_info = _daycare_pair_info(rows[0], rows[1], e1, e2)
+    return rec, rows, pair_info, changed
+
+
+async def _daycare_tick(owner_id: str, state: dict, *, command_credit: float = 0.0) -> tuple[bool, list[str]]:
+    rec, parents, pair_info, changed = await _daycare_pair_context(owner_id, state)
+    now = float(time.time())
+    try:
+        last_tick = float(rec.get("last_tick", now) or now)
+    except Exception:
+        last_tick = now
+    elapsed = max(0.0, now - last_tick)
+    rec["last_tick"] = now
+
+    try:
+        eggs = rec.get("eggs")
+        if not isinstance(eggs, list):
+            eggs = []
+            rec["eggs"] = eggs
+            changed = True
+        incubating = rec.get("incubating")
+        if not isinstance(incubating, list):
+            incubating = []
+            rec["incubating"] = incubating
+            changed = True
+    except Exception:
+        rec["eggs"] = []
+        rec["incubating"] = []
+        eggs = rec["eggs"]
+        incubating = rec["incubating"]
+        changed = True
+
+    # Egg production at daycare (caps at DAYCARE_EGG_CAP)
+    if pair_info.get("can_breed"):
+        try:
+            rec["breed_progress"] = float(rec.get("breed_progress", 0.0) or 0.0)
+        except Exception:
+            rec["breed_progress"] = 0.0
+        if len(eggs) < DAYCARE_EGG_CAP:
+            gain = max(0.0, float(command_credit)) + (elapsed / 45.0)
+            gain *= float(pair_info.get("rate", 1.0) or 1.0)
+            rec["breed_progress"] += gain
+            while rec["breed_progress"] >= DAYCARE_BREED_THRESHOLD and len(eggs) < DAYCARE_EGG_CAP:
+                if parents[0] is None or parents[1] is None:
+                    break
+                egg = await _daycare_create_egg(parents[0], parents[1], pair_info)
+                if not egg:
+                    break
+                eggs.append(egg)
+                rec["breed_progress"] -= DAYCARE_BREED_THRESHOLD
+                changed = True
+            if len(eggs) >= DAYCARE_EGG_CAP:
+                rec["breed_progress"] = min(rec["breed_progress"], DAYCARE_BREED_THRESHOLD - 0.01)
+    else:
+        if float(rec.get("breed_progress", 0.0) or 0.0) != 0.0:
+            rec["breed_progress"] = 0.0
+            changed = True
+
+    # Egg hatching while in team incubator
+    hatch_messages: list[str] = []
+    if incubating:
+        has_boost = await _daycare_has_hatch_boost(owner_id)
+        hatch_gain = max(0.0, float(command_credit)) + (elapsed / 55.0)
+        if has_boost:
+            hatch_gain *= 2.0
+        survivors: list[dict] = []
+        for egg in incubating:
+            if not isinstance(egg, dict):
+                changed = True
+                continue
+            try:
+                egg["progress"] = float(egg.get("progress", 0.0) or 0.0) + hatch_gain
+                hatch_steps = max(1.0, float(egg.get("hatch_steps", DAYCARE_HATCH_MIN) or DAYCARE_HATCH_MIN))
+            except Exception:
+                egg["progress"] = 0.0
+                hatch_steps = DAYCARE_HATCH_MIN
+            if egg["progress"] >= hatch_steps:
+                hatched = await _daycare_hatch_to_team(owner_id, egg)
+                if hatched:
+                    hatch_messages.append(f"🥚➡️ **{str(hatched['species']).replace('-', ' ').title()}** hatched and joined your team!")
+                    changed = True
+                    continue
+                # Hatch failed; keep the egg and try again next tick.
+                egg["progress"] = hatch_steps - 0.25
+            survivors.append(egg)
+        if len(survivors) != len(incubating):
+            changed = True
+        rec["incubating"] = survivors
+
+    # Keep incubation cap sane.
+    if len(rec.get("incubating", [])) > DAYCARE_INCUBATE_MAX:
+        rec["incubating"] = list(rec.get("incubating", []))[:DAYCARE_INCUBATE_MAX]
+        changed = True
+
+    return changed, hatch_messages
+
+
+def _daycare_icon_path_for_species(species: str) -> Optional[Path]:
+    sp = _daycare_norm_species(species)
+    if not sp:
+        return None
+    roots = [
+        Path(__file__).resolve().parent / "pvp" / "_common" / "sprites",
+        Path(__file__).resolve().parent / "sprites",
+    ]
+    for root in roots:
+        p = root / sp / "icon.png"
+        try:
+            if p.exists() and p.stat().st_size > 0:
+                return p
+        except Exception:
+            pass
+    return None
+
+
+def _daycare_random_positions(count: int) -> list[tuple[int, int]]:
+    # Random movement zones around the grassy daycare lawn.
+    zones = [
+        (26, 102, 154, 236),   # left lawn
+        (236, 104, 368, 238),  # right lawn
+        (162, 110, 226, 176),  # center top patch
+    ]
+    out: list[tuple[int, int]] = []
+    min_dist = 38
+    tries = 0
+    while len(out) < max(0, int(count)) and tries < 240:
+        tries += 1
+        x0, y0, x1, y1 = random.choice(zones)
+        x = random.randint(x0, x1)
+        y = random.randint(y0, y1)
+        if all(((x - ox) ** 2 + (y - oy) ** 2) >= (min_dist ** 2) for ox, oy in out):
+            out.append((x, y))
+    while len(out) < count:
+        out.append((40 + 42 * len(out), 165))
+    return out
+
+
+def _embed_with_daycare_panel(
+    title: str,
+    description: str,
+    parent_species: list[str],
+    egg_count: int,
+) -> tuple[discord.Embed, list[discord.File]]:
+    if Image is None:
+        return _embed_with_image(title, description, ASSETS_DAYCARE)
+    try:
+        if not ASSETS_DAYCARE.exists():
+            return _embed_with_image(title, description, ASSETS_DAYCARE)
+        base = Image.open(str(ASSETS_DAYCARE)).convert("RGBA")
+        positions = _daycare_random_positions(len(parent_species))
+        try:
+            resample = Image.Resampling.NEAREST  # Pillow >= 9
+        except Exception:
+            resample = Image.NEAREST
+
+        for species, (x, y) in zip(parent_species, positions):
+            icon_path = _daycare_icon_path_for_species(species)
+            if not icon_path:
+                continue
+            try:
+                icon = Image.open(str(icon_path)).convert("RGBA")
+                icon.thumbnail((34, 34), resample=resample)
+                base.alpha_composite(icon, dest=(int(x), int(y)))
+            except Exception:
+                continue
+
+        egg_count = max(0, min(int(egg_count or 0), DAYCARE_EGG_CAP))
+        if egg_count > 0 and ASSETS_DAYCARE_EGG.exists():
+            try:
+                egg_icon = Image.open(str(ASSETS_DAYCARE_EGG)).convert("RGBA")
+                egg_icon.thumbnail((30, 30), resample=resample)
+                egg_spots = [(255, 194), (284, 184), (313, 194)]
+                for i in range(egg_count):
+                    ex, ey = egg_spots[i]
+                    base.alpha_composite(egg_icon, dest=(ex, ey))
+            except Exception:
+                pass
+
+        buf = BytesIO()
+        base.save(buf, format="PNG")
+        buf.seek(0)
+        filename = "daycare_panel.png"
+        f = discord.File(fp=buf, filename=filename)
+        emb = discord.Embed(title=title, description=description)
+        emb.set_image(url=f"attachment://{filename}")
+        return emb, [f]
+    except Exception:
+        return _embed_with_image(title, description, ASSETS_DAYCARE)
 
 # ---------------- POKEDEX (per-user) ----------------
 async def _ensure_pokedex_tables() -> None:
@@ -8721,6 +9452,15 @@ class AdventureCityView(discord.ui.View):
             heal_btn = discord.ui.Button(label="Heal", style=discord.ButtonStyle.success, custom_id="adv:heal")
             heal_btn.callback = self._on_heal
             self.add_item(heal_btn)
+        daycare_area = city.get("daycare_area")
+        if daycare_area:
+            daycare_btn = discord.ui.Button(
+                label=city.get("daycare_label", "Daycare"),
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"adv:daycare:{daycare_area}",
+            )
+            daycare_btn.callback = self._on_daycare
+            self.add_item(daycare_btn)
         cleared = _city_is_cleared(self.state, self.area_id)
         routes = city.get("routes")
         if routes and isinstance(routes, (list, tuple)):
@@ -8767,6 +9507,26 @@ class AdventureCityView(discord.ui.View):
         await itx.response.defer(ephemeral=True, thinking=False)
         healed = await _heal_party(str(itx.user.id))
         await itx.followup.send(f"✅ Healed your team ({healed} Pokémon).", ephemeral=True)
+
+    async def _on_daycare(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.5:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        await itx.response.defer(ephemeral=True, thinking=False)
+        state = await _get_adventure_state(str(itx.user.id))
+        _, next_id = itx.data["custom_id"].split("adv:daycare:", 1)
+        hist = state.get("area_history", [])
+        hist.append(state.get("area_id"))
+        state["area_history"] = hist[-15:]
+        state["area_id"] = next_id
+        await _save_adventure_state(str(itx.user.id), state)
+        await _send_adventure_panel(itx, state, edit_original=True)
 
     async def _on_next(self, itx: discord.Interaction):
         if not self._guard(itx):
@@ -8885,6 +9645,300 @@ class AdventureCityView(discord.ui.View):
             await _send_adventure_panel(itx, state, edit_original=True)
         finally:
             self._handled = False
+
+
+async def _daycare_candidate_mons(owner_id: str, *, exclude_ids: set[int], limit: int = 250) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT id, species, level, team_slot, shiny FROM pokemons WHERE owner_id=? ORDER BY CASE WHEN team_slot BETWEEN 1 AND 6 THEN 0 ELSE 1 END, team_slot, id DESC LIMIT ?",
+                (owner_id, int(limit)),
+            )
+            fetched = await cur.fetchall()
+            await cur.close()
+        for row in fetched:
+            d = dict(row) if hasattr(row, "keys") else {
+                "id": row[0], "species": row[1], "level": row[2], "team_slot": row[3], "shiny": row[4],
+            }
+            mid = int(d.get("id") or 0)
+            if mid <= 0 or mid in exclude_ids:
+                continue
+            if _daycare_norm_species(d.get("species")) == "egg":
+                continue
+            rows.append(d)
+    except Exception:
+        return []
+    return rows
+
+
+class DaycareParentSelectView(discord.ui.View):
+    def __init__(self, author_id: int, area_id: str, slot_index: int, candidates: list[dict]):
+        super().__init__(timeout=180)
+        self.author_id = author_id
+        self.area_id = area_id
+        self.slot_index = int(slot_index)
+        self.candidates = candidates[:25]
+        self._build()
+
+    def _build(self):
+        options: list[discord.SelectOption] = []
+        for row in self.candidates:
+            species = str(row.get("species") or "Unknown").replace("-", " ").title()
+            level = int(row.get("level") or 1)
+            team_slot = row.get("team_slot")
+            loc = f"Team {team_slot}" if team_slot and 1 <= int(team_slot) <= 6 else "PC"
+            shiny = "✨ " if row.get("shiny") else ""
+            options.append(
+                discord.SelectOption(
+                    label=f"{shiny}{species} Lv{level}",
+                    value=str(int(row.get("id"))),
+                    description=loc,
+                )
+            )
+        if options:
+            sel = discord.ui.Select(
+                placeholder=f"Choose parent slot #{self.slot_index + 1}",
+                options=options,
+                custom_id=f"adv:dc:pick:{self.slot_index}",
+            )
+            sel.callback = self._on_pick
+            self.add_item(sel)
+
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary, custom_id="adv:dc:pick:cancel")
+        cancel_btn.callback = self._on_cancel
+        self.add_item(cancel_btn)
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return itx.user.id == self.author_id
+
+    async def _on_pick(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        values = getattr(itx.data, "values", None) or []
+        if not values:
+            return await itx.response.send_message("Choose a Pokémon first.", ephemeral=True)
+        try:
+            selected_id = int(values[0])
+        except Exception:
+            return await itx.response.send_message("Invalid selection.", ephemeral=True)
+        await itx.response.defer(ephemeral=True, thinking=False)
+        uid = str(itx.user.id)
+        state = await _get_adventure_state(uid)
+        rec = _daycare_get_record(state, DAYCARE_CITY_ID)
+        parents = list((rec.get("parents") or [None, None])[:2])
+        while len(parents) < 2:
+            parents.append(None)
+        other = 1 - self.slot_index
+        if parents[other] is not None and int(parents[other]) == selected_id:
+            await itx.followup.send("That Pokémon is already in the other daycare slot.", ephemeral=True)
+            return
+        parents[self.slot_index] = selected_id
+        rec["parents"] = parents
+        rec["breed_progress"] = 0.0
+        await _save_adventure_state(uid, state)
+        await _send_adventure_panel(itx, state, edit_original=True)
+
+    async def _on_cancel(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        await itx.response.defer(ephemeral=True, thinking=False)
+        state = await _get_adventure_state(str(itx.user.id))
+        await _send_adventure_panel(itx, state, edit_original=True)
+
+
+class AdventureDaycareView(discord.ui.View):
+    def __init__(self, author_id: int, area_id: str, state: dict, rec: dict, parent_rows: list[Optional[dict]], pair_info: dict):
+        super().__init__(timeout=180)
+        self.author_id = author_id
+        self.area_id = area_id
+        self.state = state
+        self.rec = rec
+        self.parent_rows = parent_rows
+        self.pair_info = pair_info
+        self._handled = False
+        self._last_handled_id: str | None = None
+        self._last_handled_ts: float = 0.0
+        self._build_buttons()
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return itx.user.id == self.author_id
+
+    def _build_buttons(self):
+        p0 = self.parent_rows[0] if len(self.parent_rows) > 0 else None
+        p1 = self.parent_rows[1] if len(self.parent_rows) > 1 else None
+
+        if p0:
+            b0 = discord.ui.Button(label="Swap Out Parent #1", style=discord.ButtonStyle.danger, custom_id="adv:dc:out:0")
+            b0.callback = self._on_swap_out
+        else:
+            b0 = discord.ui.Button(label="Swap In Parent #1", style=discord.ButtonStyle.primary, custom_id="adv:dc:in:0")
+            b0.callback = self._on_swap_in
+        self.add_item(b0)
+
+        if p1:
+            b1 = discord.ui.Button(label="Swap Out Parent #2", style=discord.ButtonStyle.danger, custom_id="adv:dc:out:1")
+            b1.callback = self._on_swap_out
+        else:
+            b1 = discord.ui.Button(label="Swap In Parent #2", style=discord.ButtonStyle.primary, custom_id="adv:dc:in:1")
+            b1.callback = self._on_swap_in
+        self.add_item(b1)
+
+        take_btn = discord.ui.Button(
+            label=f"Take Eggs ({len(self.rec.get('eggs') or [])})",
+            style=discord.ButtonStyle.success,
+            custom_id="adv:dc:take",
+        )
+        take_btn.callback = self._on_take_eggs
+        self.add_item(take_btn)
+
+        back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, custom_id="adv:dc:back")
+        back_btn.callback = self._on_back
+        self.add_item(back_btn)
+
+    async def _on_swap_in(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id", "")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.5:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+
+        try:
+            slot_index = int(cid.rsplit(":", 1)[-1])
+        except Exception:
+            return await itx.response.send_message("Invalid daycare slot.", ephemeral=True)
+
+        uid = str(itx.user.id)
+        state = await _get_adventure_state(uid)
+        rec = _daycare_get_record(state, DAYCARE_CITY_ID)
+        parents = list((rec.get("parents") or [None, None])[:2])
+        while len(parents) < 2:
+            parents.append(None)
+        other_id = parents[1 - slot_index]
+        exclude = {int(other_id)} if other_id is not None and str(other_id).isdigit() else set()
+        candidates = await _daycare_candidate_mons(uid, exclude_ids=exclude)
+        if not candidates:
+            self._handled = False
+            return await itx.response.send_message("You have no available Pokémon to place in daycare.", ephemeral=True)
+
+        emb = discord.Embed(
+            title="Daycare — Choose Parent",
+            description=f"Select a Pokémon for parent slot **#{slot_index + 1}**.\nShowing up to 25 options.",
+            color=0x5865F2,
+        )
+        view = DaycareParentSelectView(self.author_id, self.area_id, slot_index, candidates)
+        await itx.response.edit_message(embed=emb, view=view, attachments=[])
+
+    async def _on_swap_out(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id", "")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.5:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        try:
+            slot_index = int(cid.rsplit(":", 1)[-1])
+        except Exception:
+            return await itx.response.send_message("Invalid daycare slot.", ephemeral=True)
+
+        await itx.response.defer(ephemeral=True, thinking=False)
+        uid = str(itx.user.id)
+        state = await _get_adventure_state(uid)
+        rec = _daycare_get_record(state, DAYCARE_CITY_ID)
+        parents = list((rec.get("parents") or [None, None])[:2])
+        while len(parents) < 2:
+            parents.append(None)
+        removed = parents[slot_index]
+        parents[slot_index] = None
+        rec["parents"] = parents
+        rec["breed_progress"] = 0.0
+        await _save_adventure_state(uid, state)
+        await itx.followup.send(
+            "Parent removed from daycare." if removed is not None else "That daycare slot is already empty.",
+            ephemeral=True,
+        )
+        await _send_adventure_panel(itx, state, edit_original=True)
+
+    async def _on_take_eggs(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id", "")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.5:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        await itx.response.defer(ephemeral=True, thinking=False)
+
+        uid = str(itx.user.id)
+        state = await _get_adventure_state(uid)
+        rec = _daycare_get_record(state, DAYCARE_CITY_ID)
+        eggs = list(rec.get("eggs") or [])
+        if not eggs:
+            await itx.followup.send("No eggs are ready right now.", ephemeral=True)
+            await _send_adventure_panel(itx, state, edit_original=True)
+            return
+
+        incubating = list(rec.get("incubating") or [])
+        team_count = await _daycare_team_count(uid)
+        free_slots = max(0, DAYCARE_INCUBATE_MAX - team_count - len(incubating))
+        if free_slots <= 0:
+            await itx.followup.send(
+                "Your team/incubator is full. Free a team slot before taking eggs.",
+                ephemeral=True,
+            )
+            await _send_adventure_panel(itx, state, edit_original=True)
+            return
+
+        take_n = min(free_slots, len(eggs))
+        moved = eggs[:take_n]
+        remaining = eggs[take_n:]
+        for egg in moved:
+            if isinstance(egg, dict):
+                egg["progress"] = float(egg.get("progress", 0.0) or 0.0)
+                egg["hatch_steps"] = float(egg.get("hatch_steps", random.uniform(DAYCARE_HATCH_MIN, DAYCARE_HATCH_MAX)))
+        incubating.extend(moved)
+        rec["incubating"] = incubating[:DAYCARE_INCUBATE_MAX]
+        rec["eggs"] = remaining
+        await _save_adventure_state(uid, state)
+
+        has_boost = await _daycare_has_hatch_boost(uid)
+        boost_msg = " Hatch speed is currently **boosted** (Flame Body / Magma Armor)." if has_boost else ""
+        await itx.followup.send(
+            f"🥚 Took **{take_n}** egg(s) into your team incubator.{boost_msg}",
+            ephemeral=True,
+        )
+        await _send_adventure_panel(itx, state, edit_original=True)
+
+    async def _on_back(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id", "")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.0:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        await itx.response.defer(ephemeral=True, thinking=False)
+        state = await _get_adventure_state(str(itx.user.id))
+        hist = state.get("area_history") or []
+        if hist:
+            prev = hist.pop()
+            state["area_history"] = hist
+            state["area_id"] = prev or DAYCARE_CITY_ID
+        else:
+            state["area_id"] = DAYCARE_CITY_ID
+        await _save_adventure_state(str(itx.user.id), state)
+        await _send_adventure_panel(itx, state, edit_original=True)
 
 def _adventure_help_embed(title: str, description: str) -> discord.Embed:
     emb = discord.Embed(title=title, description=description)
@@ -9615,24 +10669,62 @@ async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_o
             return await edit_fn(embed=emb, files=files, view=view)
 
     uid = str(itx.user.id)
+    hatch_messages: list[str] = []
+    try:
+        changed, hatch_messages = await _daycare_tick(uid, state, command_credit=1.0)
+        if changed:
+            await _save_adventure_state(uid, state)
+    except Exception:
+        hatch_messages = []
     if not edit_original and not is_component:
         await _cancel_previous_panel_for_user(itx.client, uid)
     LAST_PANEL_BY_USER[uid] = {"type": "adventure", "state": copy.deepcopy(state)}
     area_id = state.get("area_id") or "pallet-town"
     if _is_city(area_id):
         city = ADVENTURE_CITIES.get(area_id, {})
-        cleared = _city_is_cleared(state, area_id)
-        img = city.get("image_cleared") if cleared else city.get("image_uncleared")
-        desc = "You are in the city. Choose your next action."
-        if not cleared and city.get("rival_battle"):
-            desc = "Your rival is waiting for a battle."
-        # Track last visited city for blackout fallback
-        if state.get("last_city") != area_id:
-            state["last_city"] = area_id
-            await _save_adventure_state(str(itx.user.id), state)
-        emb, files = _embed_with_image(city.get("name", area_id), desc, img)
-        has_surf = await _team_has_surf(str(itx.user.id))
-        view = AdventureCityView(itx.user.id, area_id, state, has_surf=has_surf)
+        if city.get("is_daycare"):
+            rec, parent_rows, pair_info, changed = await _daycare_pair_context(uid, state)
+            if changed:
+                await _save_adventure_state(uid, state)
+            p1 = parent_rows[0] if len(parent_rows) > 0 else None
+            p2 = parent_rows[1] if len(parent_rows) > 1 else None
+            p1_txt = f"{str(p1.get('species') or '').replace('-', ' ').title()} Lv{int(p1.get('level') or 1)}" if p1 else "—"
+            p2_txt = f"{str(p2.get('species') or '').replace('-', ' ').title()} Lv{int(p2.get('level') or 1)}" if p2 else "—"
+            eggs_waiting = len(rec.get("eggs") or [])
+            eggs_team = len(rec.get("incubating") or [])
+            compat_icon = "✅" if pair_info.get("can_breed") else "❌"
+            desc = (
+                f"**Parent #1:** {p1_txt}\n"
+                f"**Parent #2:** {p2_txt}\n"
+                f"**Compatibility:** {compat_icon} {pair_info.get('reason')}\n"
+                f"**Eggs at daycare:** {eggs_waiting}/{DAYCARE_EGG_CAP}\n"
+                f"**Eggs in team incubator:** {eggs_team}/{DAYCARE_INCUBATE_MAX}"
+            )
+            parent_species = [
+                str(r.get("species") or "")
+                for r in parent_rows
+                if isinstance(r, dict) and r.get("species")
+            ]
+            emb, files = _embed_with_daycare_panel(
+                city.get("name", "Daycare"),
+                desc,
+                parent_species=parent_species,
+                egg_count=eggs_waiting,
+            )
+            view = AdventureDaycareView(itx.user.id, area_id, state, rec, parent_rows, pair_info)
+        else:
+            cleared = _city_is_cleared(state, area_id)
+            img = city.get("image_cleared") if cleared else city.get("image_uncleared")
+            desc = "You are in the city. Choose your next action."
+            if not cleared and city.get("rival_battle"):
+                desc = "Your rival is waiting for a battle."
+            # Track last visited city for blackout fallback
+            if state.get("last_city") != area_id:
+                state["last_city"] = area_id
+                await _save_adventure_state(str(itx.user.id), state)
+            emb, files = _embed_with_image(city.get("name", area_id), desc, img)
+            has_surf = await _team_has_surf(str(itx.user.id))
+            view = AdventureCityView(itx.user.id, area_id, state, has_surf=has_surf)
     else:
         route = ADVENTURE_ROUTES.get(area_id, {})
         # route-22 is only added to cleared_routes when the path-1 blocker is defeated in _on_path, not here
@@ -9716,6 +10808,12 @@ async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_o
         LAST_PANEL_BY_USER[uid]["message_id"] = msg.id
         LAST_PANEL_BY_USER[uid]["channel_id"] = msg.channel.id
         LAST_PANEL_BY_USER[uid]["view"] = view
+    if hatch_messages:
+        for line in hatch_messages[:3]:
+            try:
+                await itx.followup.send(line, ephemeral=True)
+            except Exception:
+                pass
 
 @bot.tree.command(name="adventure", description="Open your adventure panel.")
 async def adventure_cmd(interaction: discord.Interaction):
