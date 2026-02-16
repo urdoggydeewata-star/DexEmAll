@@ -18,6 +18,7 @@ import copy
 import time
 import re
 import difflib
+import urllib.request
 import datetime as dt
 from datetime import datetime, timedelta, timezone
 from collections.abc import Mapping
@@ -12179,6 +12180,9 @@ TEAM_TRAINER_FOOTER_RECT = (42, 430, 212, 491)
 TEAM_TRAINER_NAME_CENTER_X = 127
 TEAM_TRAINER_LABEL_Y = 38
 TEAM_TRAINER_NAME_Y = 62
+TEAM_SHOWDOWN_CACHE_DIR = ASSETS_DIR / "ui" / "team-anim-cache"
+TEAM_SHOWDOWN_UA = "Mozilla/5.0 (DexEmAll Team Renderer)"
+_TEAM_SHOWDOWN_MISS_KEYS: set[str] = set()
 TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
     {"box_xy": (236, 93), "box_wh": (177, 197), "sprite_c": (324, 173), "label_xy": (246, 256), "level_right": (402, 256)},
     {"box_xy": (415, 93), "box_wh": (177, 197), "sprite_c": (503, 173), "label_xy": (425, 256), "level_right": (581, 256)},
@@ -12239,6 +12243,98 @@ def _team_egg_progress_pct(row: dict) -> int:
         return 0
 
 
+def _team_showdown_key_variants(token: str) -> list[str]:
+    t = str(token or "").strip().lower()
+    if not t:
+        return []
+    t = t.replace("♀", "-f").replace("♂", "-m")
+    t = t.replace("’", "").replace("'", "")
+    t = t.replace(".", "").replace(":", "").replace("%", "")
+    t = t.replace(" ", "-").replace("_", "-")
+    while "--" in t:
+        t = t.replace("--", "-")
+    t = t.strip("-")
+    raw = re.sub(r"[^a-z0-9-]", "", t)
+    raw = raw.strip("-")
+    if not raw:
+        return []
+
+    out: list[str] = []
+    for k in (
+        raw,
+        raw.replace("-jr", "jr"),
+        raw.replace("mr-", "mr"),
+        raw.replace("type-null", "typenull"),
+        raw.replace("porygon-z", "porygonz"),
+        raw.replace("ho-oh", "hooh"),
+        raw.replace("-f", "f").replace("-m", "m"),
+        raw.replace("-", ""),
+    ):
+        k2 = str(k or "").strip("-")
+        if k2 and k2 not in out:
+            out.append(k2)
+    return out
+
+
+def _team_row_showdown_keys(row: dict) -> list[str]:
+    species = _species_folder_name(str(row.get("species") or ""))
+    form = _species_folder_name(str(row.get("form") or ""))
+    keys_seed: list[str] = []
+    if species and form and form not in ("base", "default", "normal"):
+        if form.startswith(f"{species}-"):
+            keys_seed.append(form)
+        else:
+            keys_seed.append(f"{species}-{form}")
+    if species:
+        keys_seed.append(species)
+    out: list[str] = []
+    for seed in keys_seed:
+        for k in _team_showdown_key_variants(seed):
+            if k not in out:
+                out.append(k)
+    return out
+
+
+def _team_showdown_cache_path(key: str, shiny: bool) -> Path:
+    sub = "shiny" if shiny else "normal"
+    return TEAM_SHOWDOWN_CACHE_DIR / sub / f"{key}.gif"
+
+
+def _team_download_showdown_gif(key: str, shiny: bool) -> Optional[Path]:
+    key = str(key or "").strip().lower()
+    if not key:
+        return None
+    path = _team_showdown_cache_path(key, shiny)
+    try:
+        if path.exists() and path.is_file() and path.stat().st_size > 0:
+            return path
+    except Exception:
+        pass
+
+    subdir = "xyani-shiny" if shiny else "xyani"
+    miss_key = f"{subdir}:{key}"
+    if miss_key in _TEAM_SHOWDOWN_MISS_KEYS:
+        return None
+
+    url = f"https://play.pokemonshowdown.com/sprites/{subdir}/{key}.gif"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": TEAM_SHOWDOWN_UA})
+        with urllib.request.urlopen(req, timeout=3.5) as resp:
+            data = resp.read()
+        if not data or len(data) < 24:
+            _TEAM_SHOWDOWN_MISS_KEYS.add(miss_key)
+            return None
+        if not data.startswith((b"GIF87a", b"GIF89a")):
+            _TEAM_SHOWDOWN_MISS_KEYS.add(miss_key)
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+    except Exception:
+        _TEAM_SHOWDOWN_MISS_KEYS.add(miss_key)
+        return None
+
+
 def _team_template_path() -> Optional[Path]:
     # Explicit file names first (most reliable).
     for p in TEAM_TEMPLATE_PATHS:
@@ -12288,14 +12384,15 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
     if species:
         folders.append(SPRITES_DIR / species)
 
-    candidates: list[str] = []
+    # 1) Try local animated files first.
+    animated_candidates: list[str] = []
     if is_female:
         if shiny:
-            candidates += ["female-animated-shiny-front.gif", "female-shiny-front.png"]
-        candidates += ["female-animated-front.gif", "female-front.png"]
+            animated_candidates += ["female-animated-shiny-front.gif"]
+        animated_candidates += ["female-animated-front.gif"]
     if shiny:
-        candidates += ["animated-shiny-front.gif", "shiny-front.png"]
-    candidates += ["animated-front.gif", "front.png", "icon.png"]
+        animated_candidates += ["animated-shiny-front.gif"]
+    animated_candidates += ["animated-front.gif"]
 
     for folder in folders:
         try:
@@ -12303,7 +12400,37 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
                 continue
         except Exception:
             continue
-        for name in candidates:
+        for name in animated_candidates:
+            p = folder / name
+            try:
+                if p.exists() and p.is_file() and p.stat().st_size > 0:
+                    return p
+            except Exception:
+                continue
+
+    # 2) Animated remote fallback from Pokemon Showdown (cached locally).
+    for key in _team_row_showdown_keys(row):
+        p = _team_download_showdown_gif(key, shiny=shiny)
+        if p is not None:
+            return p
+
+    # 3) Fallback to static local sprites.
+    static_candidates: list[str] = []
+    if is_female:
+        if shiny:
+            static_candidates += ["female-shiny-front.png"]
+        static_candidates += ["female-front.png"]
+    if shiny:
+        static_candidates += ["shiny-front.png"]
+    static_candidates += ["front.png", "icon.png"]
+
+    for folder in folders:
+        try:
+            if not folder.is_dir():
+                continue
+        except Exception:
+            continue
+        for name in static_candidates:
             p = folder / name
             try:
                 if p.exists() and p.is_file() and p.stat().st_size > 0:
@@ -12662,43 +12789,8 @@ class TeamPanelView(discord.ui.View):
         return itx.user.id == self.author_id
 
     def _overview_payload(self) -> tuple[discord.Embed, list[discord.File]]:
-        count = sum(1 for i in range(1, 7) if self.slots.get(i))
-        emb = discord.Embed(
-            title=f"{self.target_name}'s Team",
-            description=f"**{count}/6** occupied. Click slot buttons for detailed cards.",
-            color=0x5865F2,
-        )
-        for i in range(1, 7):
-            row = self.slots.get(i)
-            if not row:
-                emb.add_field(name=f"Slot {i}", value="— Empty", inline=True)
-                continue
-            if _team_is_egg_row(row):
-                stage = _team_egg_stage(row)
-                pct = _team_egg_progress_pct(row)
-                value = (
-                    f"**🥚 Egg**\n"
-                    f"`{_team_hp_bar(pct)}` {pct}% · {TEAM_EGG_STAGE_LABELS[stage]}\n"
-                    "Incubating"
-                )
-                emb.add_field(name=f"Slot {i}", value=value, inline=True)
-                continue
-            name = _team_species_label(row)
-            gicon = _gender_icon(row.get("gender")) or "•"
-            star = " ✨" if bool(int(row.get("shiny") or 0)) else ""
-            hp_now, hp_max, pct = _team_hp_values(row)
-            item_emoji = (row.get("item_emoji") or "").strip()
-            if not _is_displayable_item_emoji(item_emoji):
-                item_emoji = ""
-            item_id = str(row.get("held_item") or "").strip()
-            held_txt = f"{item_emoji} {pretty_item_name(item_id)}".strip() if item_id else "No held item"
-            value = (
-                f"**{gicon} {name}{star}**\n"
-                f"Lv {int(row.get('level') or 1)} · `{_team_hp_bar(pct)}` {pct}%\n"
-                f"{held_txt}\n"
-                f"ID #{int(row.get('id') or 0)}"
-            )
-            emb.add_field(name=f"Slot {i}", value=value, inline=True)
+        # Keep overview clean: image-only panel + slot buttons.
+        emb = discord.Embed(color=0x5865F2)
         files: list[discord.File] = []
         panel = _team_overview_panel_file(self.target_name, self.slots)
         if panel:
