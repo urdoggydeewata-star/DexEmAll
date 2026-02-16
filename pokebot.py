@@ -7600,6 +7600,48 @@ async def _daycare_team_count(owner_id: str) -> int:
         return 0
 
 
+async def _compact_team_slots(owner_id: str, *, max_slots: int = 6) -> int:
+    """
+    Repack team slots to fill from slot 1 upward while preserving order.
+    Returns number of Pokémon rows that were moved.
+    """
+    moved = 0
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                """
+                SELECT id, team_slot
+                FROM pokemons
+                WHERE owner_id=? AND team_slot BETWEEN 1 AND ?
+                ORDER BY team_slot, id
+                """,
+                (owner_id, int(max_slots)),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            target_slot = 1
+            for row in rows:
+                mon_id = int(row["id"] if hasattr(row, "keys") else row[0])
+                current_slot = int(row["team_slot"] if hasattr(row, "keys") else row[1])
+                if current_slot != target_slot:
+                    await conn.execute(
+                        "UPDATE pokemons SET team_slot=? WHERE owner_id=? AND id=?",
+                        (int(target_slot), owner_id, mon_id),
+                    )
+                    moved += 1
+                target_slot += 1
+            if moved > 0:
+                await conn.commit()
+    except Exception:
+        return 0
+    if moved > 0:
+        try:
+            db.invalidate_pokemons_cache(owner_id)
+        except Exception:
+            pass
+    return moved
+
+
 async def _daycare_has_hatch_boost(owner_id: str) -> bool:
     try:
         async with db.session() as conn:
@@ -9420,6 +9462,7 @@ async def _start_pve_battle(
         else:
             st._money_lost = 0
 
+    turn_loop_error: Optional[Exception] = None
     try:
         # Store battle state on room so /refresh can re-send battle panel
         room.battle_state = st
@@ -9434,6 +9477,14 @@ async def _start_pve_battle(
         if "cancel_previous_panel" in inspect.signature(_turn_loop).parameters:
             kwargs["cancel_previous_panel"] = lambda uid: _cancel_previous_panel_for_user(itx.client, uid)
         await _turn_loop(st, itx, p2_itx, **kwargs)
+    except Exception as e:
+        turn_loop_error = e
+        try:
+            import traceback as _tb
+            print(f"[PvP] _turn_loop error in adventure battle: {type(e).__name__}: {e}")
+            _tb.print_exc()
+        except Exception:
+            pass
     finally:
         await _save_party_state_from_battle(st, itx.user.id)
         level_ups: List[Tuple[int, "Mon", int]] = []
@@ -9454,6 +9505,33 @@ async def _start_pve_battle(
         is_adventure = fmt_label.lower().startswith("adventure") or fmt_label.lower() == "rival"
         is_adventure_wild = is_adventure and (st.p2_name or "").lower().startswith("wild ")
         p1_ran_away = getattr(st, "_p1_ran_away", False)
+        # Fallback: if turn loop failed after a throw was chosen, retry one capture roll
+        # so wild catches do not silently collapse into a draw due an internal exception.
+        if turn_loop_error is not None and is_adventure_wild and st.winner is None and not p1_ran_away:
+            fallback_ball = getattr(st, "_last_throw_ball", None)
+            if fallback_ball:
+                try:
+                    from pvp.panel import _attempt_capture as _panel_attempt_capture
+                    wild_active = st._active(st.p2_id)
+                    if wild_active is not None and int(getattr(wild_active, "hp", 0) or 0) > 0:
+                        caught_fb, shakes_fb = _panel_attempt_capture(wild_active, str(fallback_ball), st)
+                        try:
+                            shakes_i = int(shakes_fb or 0)
+                            if shakes_i > 0:
+                                st._throw_shakes = max(int(getattr(st, "_throw_shakes", 0) or 0), shakes_i)
+                        except Exception:
+                            pass
+                        if caught_fb:
+                            st.winner = st.p1_id
+                            st._caught_wild_mon = wild_active
+                            display = str(getattr(wild_active, "species", "Pokémon") or "Pokémon").replace("-", " ").title()
+                            msg = f"**{st.p1_name}** threw a {str(fallback_ball).replace('_', ' ').title()}! It shook {int(shakes_fb or 1)} time(s) and **caught {display}!**"
+                            fb_log = list(getattr(st, "_last_turn_log", []) or [])
+                            if not any("caught" in str(line).lower() for line in fb_log):
+                                fb_log.append(msg)
+                                st._last_turn_log = fb_log
+                except Exception:
+                    pass
         if is_adventure and not p1_ran_away:
             opp_name = (st.p2_name or "").replace("Wild ", "").strip() or ("Wild Pokémon" if is_adventure_wild else "Trainer")
             opp_level = 0
@@ -9499,7 +9577,10 @@ async def _start_pve_battle(
             elif st.winner == st.p2_id:
                 outcome_desc = f"You've lost the wild battle against a Lv. {opp_level} {opp_name} :)" if is_adventure_wild else f"You've lost the battle against {st.p2_name}."
             else:
-                outcome_desc = "The battle ended in a draw."
+                if turn_loop_error is not None:
+                    outcome_desc = "The battle ended unexpectedly."
+                else:
+                    outcome_desc = "The battle ended in a draw."
             title = "Wild battle has ended!" if is_adventure_wild else f"{st.p2_name} battle ended!"
             emb = discord.Embed(title=title, description="", color=0x5865F2)
             emb.set_footer(text=f"{user_tag} | {route_name} | {ts}")
@@ -10119,6 +10200,7 @@ class DaycareParentSelectView(discord.ui.View):
                     )
                     await conn.commit()
                 db.invalidate_pokemons_cache(uid)
+                await _compact_team_slots(uid)
             except Exception:
                 await itx.followup.send("Couldn't move that Pokémon into daycare right now.", ephemeral=True)
                 return
@@ -17285,6 +17367,7 @@ async def release_pokemon(interaction: discord.Interaction, slot: app_commands.R
             )
             await conn.commit()
             db.invalidate_pokemons_cache(uid)
+            await _compact_team_slots(uid)
 
             await interaction.followup.send(
                 f"✅ Successfully released **{mon['species']}** from slot **{slot}**.{item_msg}",

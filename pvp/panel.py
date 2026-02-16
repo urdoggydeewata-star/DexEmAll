@@ -4160,27 +4160,33 @@ class BattleState:
                     if not mon_target:
                         continue
                     ball_name = act.get("value", {}).get("ball", "poké ball")
-                    caught, shakes = _attempt_capture(mon_target, ball_name, self)
-                    target_display = _format_pokemon_name(mon_target)
-                    if caught:
-                        log.append(f"**{self.p1_name}** threw a {ball_name.title()}! It shook {shakes} time(s) and **caught {target_display}!**")
-                        self.winner = self.p1_id
-                        self._caught_wild_mon = mon_target  # so pokebot can add to team
-                        self._throw_shakes = shakes  # for shake-by-shake embeds
-                        # Capture ends the battle; no further actions
-                        return log, {}, None
-                    else:
-                        # Different messages by shake count (battle continues)
-                        if shakes == 0:
-                            msg = f"**{self.p1_name}** threw a {ball_name.title()}! Oh no! The Pokémon broke free!"
-                        elif shakes == 1:
-                            msg = f"**{self.p1_name}** threw a {ball_name.title()}! Aargh! Almost had it!"
-                        elif shakes == 2:
-                            msg = f"**{self.p1_name}** threw a {ball_name.title()}! So close!"
-                        else:  # 3 shakes
-                            msg = f"**{self.p1_name}** threw a {ball_name.title()}! Aww! It almost appeared to be caught!"
-                        log.append(msg)
-                        self._throw_shakes = shakes  # for shake-by-shake embeds
+                    try:
+                        caught, shakes = _attempt_capture(mon_target, ball_name, self)
+                        target_display = _format_pokemon_name(mon_target)
+                        if caught:
+                            log.append(f"**{self.p1_name}** threw a {ball_name.title()}! It shook {shakes} time(s) and **caught {target_display}!**")
+                            self.winner = self.p1_id
+                            self._caught_wild_mon = mon_target  # so pokebot can add to team
+                            self._throw_shakes = shakes  # for shake-by-shake embeds
+                            # Capture ends the battle; no further actions
+                            return log, {}, None
+                        else:
+                            # Different messages by shake count (battle continues)
+                            if shakes == 0:
+                                msg = f"**{self.p1_name}** threw a {ball_name.title()}! Oh no! The Pokémon broke free!"
+                            elif shakes == 1:
+                                msg = f"**{self.p1_name}** threw a {ball_name.title()}! Aargh! Almost had it!"
+                            elif shakes == 2:
+                                msg = f"**{self.p1_name}** threw a {ball_name.title()}! So close!"
+                            else:  # 3 shakes
+                                msg = f"**{self.p1_name}** threw a {ball_name.title()}! Aww! It almost appeared to be caught!"
+                            log.append(msg)
+                            self._throw_shakes = shakes  # for shake-by-shake embeds
+                    except Exception as capture_err:
+                        # Do not abort the whole battle when a throw-specific error occurs.
+                        print(f"[PvP] Capture resolution error: {capture_err}")
+                        self._throw_shakes = 0
+                        log.append(f"**{self.p1_name}** threw a {ball_name.title()}! But the Poké Ball failed to lock in. Try again.")
                     continue
                 continue
             if act.get("_processed"):
@@ -6463,6 +6469,8 @@ class _BagAllItemsView(discord.ui.View):
         ball_key = (itx.data or {}).get("values", [None])[0]  # type: ignore
         if not ball_key:
             return await itx.response.send_message("Invalid selection.", ephemeral=True)
+        st._last_throw_ball = ball_key
+        st._last_throw_uid = itx.user.id
         await itx.response.defer(ephemeral=True, thinking=False)
         st.lock(itx.user.id)
         await _consume_item(itx.user.id, ball_key, 1)
@@ -6551,6 +6559,8 @@ class _BallSelectView(discord.ui.View):
                 return
             if not st.p2_name.lower().startswith("wild "):
                 return await itx.response.send_message("You can't throw Poké Balls at a trainer’s Pokémon.", ephemeral=True)
+            st._last_throw_ball = ball_key
+            st._last_throw_uid = itx.user.id
             await itx.response.defer(ephemeral=True, thinking=False)
             st.lock(itx.user.id)
             await _consume_item(itx.user.id, ball_key, 1)
