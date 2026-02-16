@@ -10015,6 +10015,52 @@ class DaycareParentSelectView(discord.ui.View):
         if parents[other] is not None and int(parents[other]) == selected_id:
             await itx.followup.send("That Pokémon is already in the other daycare slot.", ephemeral=True)
             return
+        # Validate selection and, when chosen from team, remove it from team slots.
+        selected_team_slot: Optional[int] = None
+        try:
+            async with db.session() as conn:
+                cur = await conn.execute(
+                    "SELECT team_slot FROM pokemons WHERE owner_id=? AND id=? LIMIT 1",
+                    (uid, int(selected_id)),
+                )
+                row = await cur.fetchone()
+                await cur.close()
+            if not row:
+                await itx.followup.send("That Pokémon no longer exists.", ephemeral=True)
+                return
+            raw_slot = row["team_slot"] if hasattr(row, "keys") else row[0]
+            if raw_slot is not None:
+                try:
+                    slot_i = int(raw_slot)
+                    if 1 <= slot_i <= 6:
+                        selected_team_slot = slot_i
+                except Exception:
+                    selected_team_slot = None
+        except Exception:
+            await itx.followup.send("Couldn't validate the selected Pokémon.", ephemeral=True)
+            return
+
+        if selected_team_slot is not None:
+            # Never allow daycare deposit to leave player with no team mons.
+            team_count = await _daycare_team_count(uid)
+            if team_count <= 1:
+                await itx.followup.send(
+                    "You must keep at least **1 Pokémon** in your team.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                async with db.session() as conn:
+                    await conn.execute(
+                        "UPDATE pokemons SET team_slot=NULL WHERE owner_id=? AND id=?",
+                        (uid, int(selected_id)),
+                    )
+                    await conn.commit()
+                db.invalidate_pokemons_cache(uid)
+            except Exception:
+                await itx.followup.send("Couldn't move that Pokémon into daycare right now.", ephemeral=True)
+                return
+
         parents[self.slot_index] = selected_id
         rec["parents"] = parents
         rec["breed_progress"] = 0.0
@@ -10141,11 +10187,50 @@ class AdventureDaycareView(discord.ui.View):
         parents[slot_index] = None
         rec["parents"] = parents
         rec["breed_progress"] = 0.0
+        placed_slot: Optional[int] = None
+        kept_in_pc = False
+        if removed is not None and str(removed).isdigit():
+            removed_id = int(removed)
+            try:
+                async with db.session() as conn:
+                    cur = await conn.execute(
+                        "SELECT team_slot FROM pokemons WHERE owner_id=? AND id=? LIMIT 1",
+                        (uid, removed_id),
+                    )
+                    row = await cur.fetchone()
+                    await cur.close()
+                if row:
+                    raw_slot = row["team_slot"] if hasattr(row, "keys") else row[0]
+                    cur_slot: Optional[int] = None
+                    if raw_slot is not None:
+                        try:
+                            v = int(raw_slot)
+                            if 1 <= v <= 6:
+                                cur_slot = v
+                        except Exception:
+                            cur_slot = None
+                    if cur_slot is not None:
+                        placed_slot = cur_slot
+                    else:
+                        free_slot = await db.next_free_team_slot(uid)
+                        if free_slot is not None:
+                            await db.set_team_slot(uid, removed_id, int(free_slot))
+                            placed_slot = int(free_slot)
+                            db.invalidate_pokemons_cache(uid)
+                        else:
+                            kept_in_pc = True
+            except Exception:
+                kept_in_pc = True
         await _save_adventure_state(uid, state)
-        await itx.followup.send(
-            "Parent removed from daycare." if removed is not None else "That daycare slot is already empty.",
-            ephemeral=True,
-        )
+        if removed is None:
+            msg = "That daycare slot is already empty."
+        elif placed_slot is not None:
+            msg = f"Parent removed from daycare and returned to your team (Slot {placed_slot})."
+        elif kept_in_pc:
+            msg = "Parent removed from daycare and sent to your PC (team is full)."
+        else:
+            msg = "Parent removed from daycare."
+        await itx.followup.send(msg, ephemeral=True)
         await _send_adventure_panel(itx, state, edit_original=True)
 
     async def _on_take_eggs(self, itx: discord.Interaction):
