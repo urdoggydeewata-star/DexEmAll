@@ -12436,18 +12436,44 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                 "level_right": _pt(rx, ry),
             }
 
+        def _sample_rgba(x: int, y: int, fallback: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+            try:
+                sxp = max(0, min(int(x), bw - 1))
+                syp = max(0, min(int(y), bh - 1))
+                px = base.getpixel((sxp, syp))
+                if isinstance(px, tuple):
+                    if len(px) == 4:
+                        return (int(px[0]), int(px[1]), int(px[2]), int(px[3]))
+                    if len(px) == 3:
+                        return (int(px[0]), int(px[1]), int(px[2]), 255)
+                p = int(px)
+                return (p, p, p, 255)
+            except Exception:
+                return fallback
+
         slot_layout = tuple(_layout_scaled(g) for g in TEAM_SLOT_LAYOUT)
 
         draw = ImageDraw.Draw(base)
 
         # Clear trainer card area, then re-draw a generic "Trainer" header + scaled player name.
-        draw.rectangle(_rc(TEAM_TRAINER_HEADER_RECT), fill=(20, 18, 27, 255))
-        draw.rectangle(_rc(TEAM_TRAINER_ART_RECT), fill=(47, 34, 59, 255))
-        draw.rectangle(_rc(TEAM_TRAINER_FOOTER_RECT), fill=(20, 18, 27, 255))
+        hdr_rect = _rc(TEAM_TRAINER_HEADER_RECT)
+        art_rect = _rc(TEAM_TRAINER_ART_RECT)
+        ftr_rect = _rc(TEAM_TRAINER_FOOTER_RECT)
+        header_fill = _sample_rgba(hdr_rect[0] + 6, hdr_rect[1] + 6, (20, 18, 27, 255))
+        footer_fill = _sample_rgba(ftr_rect[0] + 6, ftr_rect[1] + 6, (20, 18, 27, 255))
+        art_fill = _sample_rgba(art_rect[0] + 8, art_rect[1] + 56, (47, 34, 59, 255))
+        draw.rectangle(hdr_rect, fill=header_fill)
+        draw.rectangle(art_rect, fill=art_fill)
+        draw.rectangle(ftr_rect, fill=footer_fill)
 
         # Subtle hatch pattern in trainer card so it doesn't look flat/unfinished.
-        tx0, ty0, tx1, ty1 = _rc(TEAM_TRAINER_ART_RECT)
-        line_color = (71, 52, 87, 210)
+        tx0, ty0, tx1, ty1 = art_rect
+        line_color = (
+            max(0, int(art_fill[0]) - 14),
+            max(0, int(art_fill[1]) - 12),
+            max(0, int(art_fill[2]) - 10),
+            min(255, int(art_fill[3])),
+        )
         step = max(8, int(round(12 * s)))
         for x in range(tx0 - (ty1 - ty0), tx1 + step, step):
             draw.line((x, ty1, x + (ty1 - ty0), ty0), fill=line_color, width=max(1, int(round(1 * s))))
@@ -12475,24 +12501,24 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
             bx, by = geom["box_xy"]
             bw, bh = geom["box_wh"]
             inset = max(2, int(round(4 * s)))
-            radius = max(6, int(round(12 * s)))
-            frame_fill = (88, 60, 106, 255)
-            label_fill = (24, 18, 32, 255)
-            try:
-                draw.rounded_rectangle((bx + inset, by + inset, bx + bw - inset, by + bh - inset), radius=radius, fill=frame_fill)
-            except Exception:
-                draw.rectangle((bx + inset, by + inset, bx + bw - inset, by + bh - inset), fill=frame_fill)
+
+            # Keep the original template card visuals; only clean sprite center + name strip.
+            label_bg = _sample_rgba(bx + inset + 6, by + bh - max(10, int(round(8 * s))), (24, 18, 32, 255))
+            label_h = max(22, int(round(45 * s)))
+            draw.rectangle((bx + inset, by + bh - label_h, bx + bw - inset, by + bh - inset), fill=label_bg)
+
             cx, cy = geom["sprite_c"]
-            r = max(18, int(round(58 * s)))
-            draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(119, 93, 143, 255), outline=(63, 44, 83, 255), width=max(1, int(round(3 * s))))
+            r = max(16, int(round(52 * s)))
+            center_bg = _sample_rgba(cx, cy - r + max(2, int(round(8 * s))), (118, 90, 142, 255))
+            line_col = _sample_rgba(cx - r + max(4, int(round(9 * s))), cy, (64, 47, 82, 255))
+            dot_col = _sample_rgba(cx, cy, (95, 74, 120, 255))
+            edge_col = _sample_rgba(cx + r - max(4, int(round(7 * s))), cy - r + max(4, int(round(8 * s))), (63, 44, 83, 255))
+            draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=center_bg, outline=edge_col, width=max(1, int(round(2 * s))))
             line_h = max(1, int(round(2 * s)))
             margin = max(4, int(round(6 * s)))
-            draw.rectangle((cx - r + margin, cy - line_h, cx + r - margin, cy + line_h), fill=(64, 47, 82, 255))
+            draw.rectangle((cx - r + margin, cy - line_h, cx + r - margin, cy + line_h), fill=line_col)
             cr = max(6, int(round(13 * s)))
-            draw.ellipse((cx - cr, cy - cr, cx + cr, cy + cr), fill=(98, 74, 120, 255), outline=(64, 47, 82, 255), width=max(1, int(round(2 * s))))
-
-            label_h = max(22, int(round(45 * s)))
-            draw.rectangle((bx + inset, by + bh - label_h, bx + bw - inset, by + bh - inset), fill=label_fill)
+            draw.ellipse((cx - cr, cy - cr, cx + cr, cy + cr), fill=dot_col, outline=line_col, width=max(1, int(round(2 * s))))
 
         # Preload sprite frames (animated front preferred).
         sprite_data: dict[int, dict[str, Any]] = {}
@@ -12528,7 +12554,12 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                 )
                 text_prep[slot] = {"label": "Empty", "font": empty_font, "lvl": "", "lvl_x": geom["level_right"][0], "label_x": geom["label_xy"][0]}
                 continue
-            label = _team_species_label(row)
+            if _team_is_egg_row(row):
+                label = "Egg"
+                lvl = f"{_team_egg_progress_pct(row)}%"
+            else:
+                label = _team_species_label(row)
+                lvl = f"lvl {int(row.get('level') or 1)}"
             label_font = _team_fit_font(
                 probe_draw,
                 label,
@@ -12537,7 +12568,6 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                 min_size=max(7, int(round(10 * s))),
                 bold=True,
             )
-            lvl = f"lvl {int(row.get('level') or 1)}"
             lvl_x = geom["level_right"][0]
             if lvl_font_slot:
                 lw = _team_text_width(probe_draw, lvl, lvl_font_slot)
