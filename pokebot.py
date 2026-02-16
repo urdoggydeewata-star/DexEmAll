@@ -7693,17 +7693,35 @@ def _daycare_icon_path_for_species(species: str) -> Optional[Path]:
     sp = _daycare_norm_species(species)
     if not sp:
         return None
+
+    # Prefer the same higher-quality Showdown source used by /team.
+    try:
+        key_variants_fn = globals().get("_team_showdown_key_variants")
+        download_fn = globals().get("_team_download_showdown_gif")
+        if callable(key_variants_fn) and callable(download_fn):
+            for key in key_variants_fn(sp):
+                try:
+                    p = download_fn(key, False)
+                    if p is not None:
+                        return p
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
     roots = [
         Path(__file__).resolve().parent / "pvp" / "_common" / "sprites",
         Path(__file__).resolve().parent / "sprites",
     ]
     for root in roots:
-        p = root / sp / "icon.png"
-        try:
-            if p.exists() and p.stat().st_size > 0:
-                return p
-        except Exception:
-            pass
+        # Prefer animated/static front sprite files before icon fallback.
+        for fname in ("animated-front.gif", "front.png", "icon.png"):
+            p = root / sp / fname
+            try:
+                if p.exists() and p.stat().st_size > 0:
+                    return p
+            except Exception:
+                pass
     return None
 
 
@@ -7743,9 +7761,9 @@ def _embed_with_daycare_panel(
         base = Image.open(str(ASSETS_DAYCARE)).convert("RGBA")
         positions = _daycare_random_positions(len(parent_species))
         try:
-            resample = Image.Resampling.NEAREST  # Pillow >= 9
+            resample = Image.Resampling.LANCZOS  # smoother downscaling for box sprites
         except Exception:
-            resample = Image.NEAREST
+            resample = Image.BICUBIC
 
         for species, (x, y) in zip(parent_species, positions):
             icon_path = _daycare_icon_path_for_species(species)
@@ -7753,8 +7771,10 @@ def _embed_with_daycare_panel(
                 continue
             try:
                 icon = Image.open(str(icon_path)).convert("RGBA")
-                icon.thumbnail((34, 34), resample=resample)
-                base.alpha_composite(icon, dest=(int(x), int(y)))
+                icon.thumbnail((42, 42), resample=resample)
+                dx = max(0, min(int(x), max(0, base.width - icon.width)))
+                dy = max(0, min(int(y), max(0, base.height - icon.height)))
+                base.alpha_composite(icon, dest=(dx, dy))
             except Exception:
                 continue
 
