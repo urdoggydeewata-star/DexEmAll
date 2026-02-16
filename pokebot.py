@@ -8603,11 +8603,11 @@ class AdventureCityView(discord.ui.View):
         hist = state.get("area_history", [])
         hist.append(state.get("area_id"))
         state["area_history"] = hist[-15:]
-                # Reset Route 1 navigation whenever entering it so it always starts at Panel 1/start.
+        # Reset Route 1 navigation whenever entering it so it always starts at Panel 1/start.
         if next_id == "route-1":
-            rn = state.get("route_nav") or {}
-            rn["route-1"] = {"panel": 1, "pos": "start"}
-            state["route_nav"] = rn
+            rp = state.get("route_panels") or {}
+            rp["route-1"] = {"panel": 1, "pos": "start"}
+            state["route_panels"] = rp
         state["area_id"] = next_id
         await _save_adventure_state(str(itx.user.id), state)
         await _send_adventure_panel(itx, state, edit_original=True)
@@ -9083,19 +9083,26 @@ class AdventureRouteView(discord.ui.View):
         state = await _get_adventure_state(str(itx.user.id))
         rp = self._r1_get(state)
         panel = int(rp["panel"])
+        moved_within_route = False
 
         route = ADVENTURE_ROUTES.get(self.area_id, {})
         prev_area = route.get("prev") or "pallet-town"
 
         if panel > 1:
             self._r1_set(state, panel - 1)
-            await self._r1_try_wild_encounter(itx, state, force=False)
+            moved_within_route = True
         else:
             # leaving route backwards -> previous city
             state["area_id"] = prev_area
             state.get("route_panels", {}).pop(self.area_id, None)
 
+        # Persist panel/city movement first so any battle-triggered refresh
+        # reads the latest panel instead of stale DB state.
         await _save_adventure_state(str(itx.user.id), state)
+        if moved_within_route:
+            await self._r1_try_wild_encounter(itx, state, force=False)
+            # Persist encounter side-effects (dex seen/discovered updates).
+            await _save_adventure_state(str(itx.user.id), state)
         await _send_adventure_panel(itx, state, edit_original=False)
 
 
@@ -9109,14 +9116,14 @@ class AdventureRouteView(discord.ui.View):
         state = await _get_adventure_state(str(itx.user.id))
         rp = self._r1_get(state)
         panel = int(rp["panel"])
+        moved_within_route = False
 
         route = ADVENTURE_ROUTES.get(self.area_id, {})
         next_area = route.get("next")
 
         if panel < 3:
             self._r1_set(state, panel + 1)
-            # movement can trigger encounter
-            await self._r1_try_wild_encounter(itx, state, force=False)
+            moved_within_route = True
         else:
             # leaving route -> next city
             if next_area:
@@ -9124,6 +9131,11 @@ class AdventureRouteView(discord.ui.View):
             state.get("route_panels", {}).pop(self.area_id, None)
 
         await _save_adventure_state(str(itx.user.id), state)
+        if moved_within_route:
+            # movement can trigger encounter
+            await self._r1_try_wild_encounter(itx, state, force=False)
+            # Persist encounter side-effects (dex seen/discovered updates).
+            await _save_adventure_state(str(itx.user.id), state)
         # Update the message the user clicked (component interaction)
         await _send_adventure_panel(itx, state, edit_original=False)
 
@@ -9412,6 +9424,14 @@ async def _cancel_previous_panel_for_user(bot: discord.Client, uid: str) -> None
 async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_original: bool) -> None:
     # If this is a button-press (component interaction), edit the clicked message.
     is_component = getattr(itx, 'type', None) == discord.InteractionType.component and getattr(itx, 'message', None) is not None
+    msg = None
+
+    async def _edit_with_files(edit_fn):
+        try:
+            return await edit_fn(embed=emb, attachments=files, view=view)
+        except TypeError:
+            # Compatibility fallback for discord forks that expect files= on edit.
+            return await edit_fn(embed=emb, files=files, view=view)
 
     uid = str(itx.user.id)
     if not edit_original and not is_component:
@@ -9492,9 +9512,22 @@ async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_o
         view = AdventureRouteView(itx.user.id, area_id, state)
 
     if is_component:
-        msg = await itx.message.edit(embed=emb, attachments=files, view=view)
+        if not itx.response.is_done():
+            try:
+                await _edit_with_files(itx.response.edit_message)
+                try:
+                    msg = await itx.original_response()
+                except Exception:
+                    msg = getattr(itx, "message", None)
+            except Exception:
+                msg = await _edit_with_files(itx.message.edit)
+        else:
+            try:
+                msg = await _edit_with_files(itx.edit_original_response)
+            except Exception:
+                msg = await _edit_with_files(itx.message.edit)
     elif edit_original:
-        msg = await itx.edit_original_response(embed=emb, attachments=files, view=view)
+        msg = await _edit_with_files(itx.edit_original_response)
     else:
         # Fresh slash command without editing original; send a normal (non-ephemeral) message
         msg = await itx.followup.send(embed=emb, files=files, view=view, ephemeral=False)
