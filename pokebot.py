@@ -6189,7 +6189,7 @@ class StarterView(discord.ui.View):
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ASSETS_CITIES = ASSETS_DIR / "cities"
 ASSETS_ROUTES = ASSETS_DIR / "routes"
-ASSETS_DAYCARE = ASSETS_DIR / "Daycare (1).png"
+ASSETS_DAYCARE = ASSETS_DIR / "ui" / "daycare.png"
 ASSETS_EGG_STAGES_DIR = ASSETS_DIR / "ui" / "egg-stages"
 ASSETS_EGG_STAGE_UNDAMAGED = ASSETS_EGG_STAGES_DIR / "egg-undamaged.png"
 ASSETS_EGG_STAGE_SLIGHT = ASSETS_EGG_STAGES_DIR / "egg-slightly-cracked.png"
