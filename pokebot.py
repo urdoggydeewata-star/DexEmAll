@@ -20,6 +20,7 @@ import re
 import difflib
 import urllib.request
 import datetime as dt
+import zipfile
 from datetime import datetime, timedelta, timezone
 from collections.abc import Mapping
 from pathlib import Path
@@ -6357,6 +6358,8 @@ DAYCARE_BOX_MAX_SIZE: tuple[int, int] = (26, 20)
 DAYCARE_STATIC_MAX_SIZE: tuple[int, int] = (26, 26)
 BOX_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "box_sprites"
 LEGACY_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "sprites"
+POKESPRITE_MASTER_ZIP = Path(__file__).resolve().parent / "pokesprite-master.zip"
+DAYCARE_ZIP_CACHE_DIR = BOX_SPRITES_DIR / "_pokesprite_zip_cache"
 
 ADVENTURE_CITIES = {
     "pallet-town": {
@@ -7312,6 +7315,75 @@ def _daycare_sprite_folder_candidates(species: str) -> list[str]:
     return out
 
 
+_DAYCARE_POKESPRITE_ZIP_ARCS: Optional[set[str]] = None
+
+
+def _daycare_pokesprite_zip_arcs() -> set[str]:
+    """Cached list of usable regular sprite paths from pokesprite-master.zip."""
+    global _DAYCARE_POKESPRITE_ZIP_ARCS
+    if _DAYCARE_POKESPRITE_ZIP_ARCS is not None:
+        return _DAYCARE_POKESPRITE_ZIP_ARCS
+    arcs: set[str] = set()
+    if not POKESPRITE_MASTER_ZIP.exists():
+        _DAYCARE_POKESPRITE_ZIP_ARCS = arcs
+        return arcs
+    try:
+        with zipfile.ZipFile(str(POKESPRITE_MASTER_ZIP), "r") as zf:
+            for raw in zf.namelist():
+                arc = str(raw or "").strip().replace("\\", "/")
+                low = arc.lower()
+                if "/pokemon-gen8/regular/" in low and low.endswith(".png"):
+                    arcs.add(arc)
+    except Exception:
+        arcs = set()
+    _DAYCARE_POKESPRITE_ZIP_ARCS = arcs
+    return arcs
+
+
+def _daycare_extract_pokesprite_box(species: str) -> Optional[Path]:
+    """
+    Extract a species icon from pokesprite-master.zip into daycare cache and return path.
+    Uses form-first, then base-form fallback candidates.
+    """
+    sp = _daycare_norm_species(species)
+    if not sp or not POKESPRITE_MASTER_ZIP.exists():
+        return None
+    arcs = _daycare_pokesprite_zip_arcs()
+    if not arcs:
+        return None
+    candidates = _daycare_sprite_folder_candidates(sp)
+    prefixes = ("pokesprite-master/pokemon-gen8/regular", "pokemon-gen8/regular")
+    for folder in candidates:
+        try:
+            out_dir = DAYCARE_ZIP_CACHE_DIR / folder
+            out_path = out_dir / "box.png"
+            if out_path.exists() and out_path.stat().st_size > 0:
+                return out_path
+        except Exception:
+            out_path = None  # type: ignore[assignment]
+
+        arc_match: Optional[str] = None
+        for pref in prefixes:
+            arc = f"{pref}/{folder}.png"
+            if arc in arcs:
+                arc_match = arc
+                break
+        if not arc_match:
+            continue
+        try:
+            with zipfile.ZipFile(str(POKESPRITE_MASTER_ZIP), "r") as zf:
+                data = zf.read(arc_match)
+            out_dir = DAYCARE_ZIP_CACHE_DIR / folder
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / "box.png"
+            out_path.write_bytes(data)
+            if out_path.exists() and out_path.stat().st_size > 0:
+                return out_path
+        except Exception:
+            continue
+    return None
+
+
 def _daycare_norm_item(item_id: str | None) -> str:
     return str(item_id or "").strip().lower().replace("_", "-").replace(" ", "-")
 
@@ -7936,7 +8008,27 @@ def _daycare_icon_path_for_species(species: str) -> Optional[Path]:
     if not sp:
         return None
 
-    # Primary source: Pokemon Showdown Gen 5 animated sprites (cached locally).
+    # Primary source for daycare: uploaded box/menu sprite zip.
+    # 1) Uploaded pokesprite zip, extracted on-demand to a local cache.
+    zip_icon = _daycare_extract_pokesprite_box(sp)
+    if zip_icon is not None:
+        try:
+            if zip_icon.exists() and zip_icon.stat().st_size > 0:
+                return zip_icon
+        except Exception:
+            pass
+
+    # 2) Existing extracted box sprite folders.
+    folder_candidates = _daycare_sprite_folder_candidates(sp)
+    for folder in folder_candidates:
+        p = BOX_SPRITES_DIR / folder / "box.png"
+        try:
+            if p.exists() and p.stat().st_size > 0:
+                return p
+        except Exception:
+            pass
+
+    # 3) Fallback to animated Showdown cache if no box/menu sprite exists.
     download_fn = globals().get("_team_download_showdown_gif")
     if callable(download_fn):
         for key in _daycare_showdown_keys(sp):
@@ -7953,11 +8045,10 @@ def _daycare_icon_path_for_species(species: str) -> Optional[Path]:
             except Exception:
                 continue
 
-    # Local fallback: animated/static sprites if already present on disk.
-    folder_candidates = _daycare_sprite_folder_candidates(sp)
+    # 4) Last-resort local fallback.
     for root in (LEGACY_SPRITES_DIR, Path(__file__).resolve().parent / "sprites", BOX_SPRITES_DIR):
         for folder in folder_candidates:
-            for fname in ("animated-front.gif", "front.png", "icon.png", "box.png"):
+            for fname in ("box.png", "icon.png", "animated-front.gif", "front.png"):
                 p = root / folder / fname
                 try:
                     if p.exists() and p.stat().st_size > 0:

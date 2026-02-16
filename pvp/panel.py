@@ -6310,7 +6310,7 @@ _BALLS_BASIC = {
     "ultra ball": 2.0,
     "master ball": 9999.0,
     "safari ball": 1.5,
-    "repeat ball": 3.0,
+    "repeat ball": None,  # gen dependent
     "timer ball": None,  # turn based
     "quick ball": None,  # turn based
     "dusk ball": None,   # env based
@@ -6321,16 +6321,62 @@ _BALLS_BASIC = {
     "level ball": None,  # level compare
     "lure ball": None,
     "moon ball": None,
+    "fast ball": None,
     "friend ball": 1.0,
     "heal ball": 1.0,
     "luxury ball": 1.0,
     "premier ball": 1.0,
     "beast ball": None,
     "dive ball": None,
+    "cherish ball": 1.0,
+    "sport ball": 1.0,
+    "dream ball": None,
+    "park ball": 1.0,
 }
 
 def _normalize_item(name: str) -> str:
     return name.lower().replace("é", "e").replace("-", " ").replace("_", " ").strip()
+
+
+_BALL_NAME_ALIASES = {
+    "pokeball": "poke ball",
+    "greatball": "great ball",
+    "ultraball": "ultra ball",
+    "masterball": "master ball",
+    "safariball": "safari ball",
+    "repeatball": "repeat ball",
+    "timerball": "timer ball",
+    "quickball": "quick ball",
+    "duskball": "dusk ball",
+    "netball": "net ball",
+    "nestball": "nest ball",
+    "heavyball": "heavy ball",
+    "loveball": "love ball",
+    "levelball": "level ball",
+    "lureball": "lure ball",
+    "moonball": "moon ball",
+    "fastball": "fast ball",
+    "friendball": "friend ball",
+    "healball": "heal ball",
+    "luxuryball": "luxury ball",
+    "premierball": "premier ball",
+    "beastball": "beast ball",
+    "diveball": "dive ball",
+    "cherishball": "cherish ball",
+    "sportball": "sport ball",
+    "dreamball": "dream ball",
+    "parkball": "park ball",
+}
+
+
+def _normalize_ball_name(name: str) -> str:
+    n = _normalize_item(name)
+    compact = n.replace(" ", "")
+    if n in _BALLS_BASIC:
+        return n
+    if compact in _BALL_NAME_ALIASES:
+        return _BALL_NAME_ALIASES[compact]
+    return n
 
 
 class _BagLikeView(discord.ui.View):
@@ -6479,7 +6525,11 @@ class _BagAllItemsView(discord.ui.View):
 
 
 async def _fetch_user_items(user_id: int, wanted: list[str]) -> dict:
-    wanted_norm = {_normalize_item(w): w for w in wanted}
+    wanted_norm: dict[str, str] = {}
+    for w in wanted:
+        n = _normalize_item(w)
+        wanted_norm[n] = w
+        wanted_norm[n.replace(" ", "")] = w
     out: dict[str, int] = {}
     try:
         import lib.db as db
@@ -6494,7 +6544,7 @@ async def _fetch_user_items(user_id: int, wanted: list[str]) -> dict:
         await cur.close()
         for row in rows:
             name = _normalize_item(row["item_id"])
-            if name in wanted_norm:
+            if name in wanted_norm or name.replace(" ", "") in wanted_norm:
                 # Use actual item_id so _consume_item can match DB
                 out[row["item_id"]] = int(row["qty"] or 0)
     return out
@@ -6596,44 +6646,57 @@ def _status_bonus(modern_status: Optional[str]) -> float:
     return 1.0
 
 def _ball_multiplier(ball_name: str, mon: Mon, battle_state: BattleState) -> float:
-    b = _normalize_item(ball_name)
-    turn = getattr(battle_state, "turn", 1)
+    b = _normalize_ball_name(ball_name)
+    try:
+        gen = int(getattr(battle_state, "gen", 9) or 9)
+    except Exception:
+        gen = 9
+    try:
+        turn = max(1, int(getattr(battle_state, "turn", 1) or 1))
+    except Exception:
+        turn = 1
     types = [t.lower() for t in getattr(mon, "types", []) or []]
-    weight = getattr(mon, "weight", None)
-    level = getattr(mon, "level", 1)
+    try:
+        level = float(getattr(mon, "level", 1) or 1)
+    except Exception:
+        level = 1.0
     fmt = (battle_state.fmt_label or "").lower()
     in_cave = "cave" in fmt
     at_night = "night" in fmt or "evening" in fmt
     in_water = "water" in fmt or "sea" in fmt or "ocean" in fmt
     in_dark_grass = "dark grass" in fmt
-    in_raid = "raid" in fmt
     # Defaults
     base = _BALLS_BASIC.get(b, 1.0) or 1.0
     if b in ("timer ball",):
-        # Gen III-IV: min 1, max 4, 1 + 0.3*(turn-1); Gen V+: 1 + turns*1229/4096
-        if battle_state.gen and battle_state.gen >= 5:
-            base = min(1.0 + (turn * 1229 / 4096), 4.0)
+        # Gen III-IV: min 1, max 4, 1 + 0.3*(turn-1)
+        # Gen V+: 1 + ((turn-1) * 1229 / 4096), capped at 4.
+        if gen >= 5:
+            base = min(1.0 + ((turn - 1) * 1229 / 4096), 4.0)
         else:
             base = min(1.0 + 0.3 * (turn - 1), 4.0)
     elif b in ("quick ball",):
-        base = 4.0 if turn <= 1 else 1.0
+        base = (5.0 if gen >= 5 else 4.0) if turn <= 1 else 1.0
     elif b in ("dusk ball",):
-        base = 3.5 if (at_night or in_cave or in_dark_grass) else 1.0
-    elif b in ("net ball",):
-        base = 3.0 if ("water" in types or "bug" in types) else 1.0
-    elif b in ("nest ball",):
-        if level < 30:
-            base = max(1.0, (40 - level) / 10)
-        elif battle_state.gen and battle_state.gen >= 7:
-            # SM/SS: 1x or 4x if level <=29 (already handled); else 1x
+        if at_night or in_cave or in_dark_grass:
+            base = 3.5 if gen >= 5 else 4.0
+        else:
             base = 1.0
+    elif b in ("net ball",):
+        if "water" in types or "bug" in types:
+            base = 3.5 if gen >= 5 else 3.0
+        else:
+            base = 1.0
+    elif b in ("nest ball",):
+        if level <= 29:
+            # Modern formula equivalent: (41 - level) / 10, clamped [1, 4].
+            base = max(1.0, min(4.0, (41.0 - level) / 10.0))
         else:
             base = 1.0
     elif b in ("repeat ball",):
         seen = getattr(battle_state, "repeat_seen", set()) or set()
-        base = 3.0 if mon.species.lower() in {s.lower() for s in seen} else 1.0
+        base = (3.5 if gen >= 7 else 3.0) if mon.species.lower() in {str(s).lower() for s in seen} else 1.0
     elif b in ("dive ball",):
-        base = 3.5 if in_water else 1.0
+        base = (3.5 if gen >= 5 else 3.0) if in_water else 1.0
     elif b in ("heavy ball",):
         # Heavy Ball adjusts catch rate additively; handled in _attempt_capture (delta)
         base = 1.0
@@ -6641,30 +6704,48 @@ def _ball_multiplier(ball_name: str, mon: Mon, battle_state: BattleState) -> flo
         # If player's active level higher than target
         lead = battle_state._active(battle_state.p1_id)
         if lead:
-            if lead.level >= mon.level * 4:
+            lead_level = float(getattr(lead, "level", 1) or 1)
+            if lead_level >= level * 4:
                 base = 8.0
-            elif lead.level >= mon.level * 2:
+            elif lead_level >= level * 2:
                 base = 4.0
-            elif lead.level > mon.level:
+            elif lead_level > level:
                 base = 2.0
             else:
                 base = 1.0
     elif b in ("love ball",):
         lead = battle_state._active(battle_state.p1_id)
-        if lead and lead.species.lower() == mon.species.lower():
+        lead_gender = str(getattr(lead, "gender", "") or "").upper() if lead else ""
+        mon_gender = str(getattr(mon, "gender", "") or "").upper()
+        opposite_gender = lead_gender in {"M", "F"} and mon_gender in {"M", "F"} and lead_gender != mon_gender
+        if lead and lead.species.lower() == mon.species.lower() and opposite_gender:
             base = 8.0
         else:
             base = 1.0
     elif b in ("lure ball",):
-        base = 3.0 if "water" in (battle_state.fmt_label or "").lower() else 1.0
+        # Fishing encounters aren't explicitly tracked; use water-route context proxy.
+        if in_water:
+            base = 5.0 if gen >= 7 else 3.0
+        else:
+            base = 1.0
     elif b in ("moon ball",):
-        base = 4.0 if any("nidor" in mon.species.lower() or mon.species.lower() in ("clefairy","jigglypuff") for _ in [0]) else 1.0
+        moon_stone_targets = {"nidorina", "nidorino", "clefairy", "jigglypuff", "skitty", "munna"}
+        base = 4.0 if mon.species.lower() in moon_stone_targets else 1.0
     elif b in ("fast ball",):
-        if getattr(mon, "base_speed", 0) >= 100 or getattr(mon, "speed", 0) >= 100:
+        try:
+            mon_base_speed = float(getattr(mon, "base_speed", 0) or 0)
+        except Exception:
+            mon_base_speed = 0.0
+        if mon_base_speed >= 100:
             base = 4.0
+        else:
+            base = 1.0
     elif b in ("beast ball",):
         is_ub = "ultra beast" in (getattr(mon, "category", "") or "").lower() or getattr(mon, "is_ultra_beast", False)
         base = 5.0 if is_ub else 0.1
+    elif b in ("dream ball",):
+        st = str(getattr(mon, "status", "") or "").lower()
+        base = 4.0 if st in {"slp", "sleep"} else 1.0
     elif b in ("safari ball",):
         base = 1.5
     elif b in ("great ball",):
@@ -6680,12 +6761,19 @@ def _attempt_capture(mon: Mon, ball_name: str, battle_state: BattleState) -> Tup
     ball_mod = _ball_multiplier(ball_name, mon, battle_state)
     if ball_mod >= 9999:
         return True, 1
-    base_rate = getattr(mon, "capture_rate", None) or 45
+    try:
+        base_rate = int(float(getattr(mon, "capture_rate", 45) or 45))
+    except Exception:
+        base_rate = 45
+    base_rate = max(1, min(255, base_rate))
     # Heavy Ball additive delta (Gen II+ approximation)
-    b_norm = _normalize_item(ball_name)
+    b_norm = _normalize_ball_name(ball_name)
     if b_norm == "heavy ball":
-        w = getattr(mon, "weight", None)
-        if w:
+        try:
+            w = float(getattr(mon, "weight", 0) or 0)
+        except Exception:
+            w = 0.0
+        if w > 0:
             if w < 102.0:       # <225.8 lb
                 base_rate = max(1, base_rate - 20)
             elif w < 204.8:     # <451.5 lb
@@ -6697,13 +6785,25 @@ def _attempt_capture(mon: Mon, ball_name: str, battle_state: BattleState) -> Tup
             else:
                 base_rate = min(255, base_rate + 40)
     status_mod = _status_bonus(getattr(mon, "status", None))
-    max_hp = max(1, mon.max_hp)
-    hp = max(1, mon.hp)
-    gen = getattr(battle_state, "gen", 8)
+    try:
+        max_hp = max(1, int(getattr(mon, "max_hp", 1) or 1))
+    except Exception:
+        max_hp = 1
+    try:
+        hp = max(1, int(getattr(mon, "hp", 1) or 1))
+    except Exception:
+        hp = 1
+    try:
+        gen = int(getattr(battle_state, "gen", 8) or 8)
+    except Exception:
+        gen = 8
     # Critical capture (Gen V+ simplified): odds scale with catch rate and seen dex
     crit_capture = False
     if gen >= 5:
-        seen = getattr(battle_state, "dex_seen", 0) or getattr(battle_state, "seen_dex_count", 0)
+        try:
+            seen = int(getattr(battle_state, "dex_seen", 0) or getattr(battle_state, "seen_dex_count", 0) or 0)
+        except Exception:
+            seen = 0
         crit_threshold = min(0.5, (base_rate * ball_mod / 255.0) * 0.2 + (seen / 6000.0))
         if random.random() < crit_threshold:
             crit_capture = True
@@ -6725,7 +6825,11 @@ def _attempt_capture(mon: Mon, ball_name: str, battle_state: BattleState) -> Tup
     # Gen VIII/IX level/difficulty bonuses (simplified)
     bonus_level = 1.0
     if gen >= 8:
-        bonus_level = max((30 - mon.level) / 10, 1) if gen == 8 else max((36 - 2 * mon.level) / 10, 1)
+        try:
+            mon_level = float(getattr(mon, "level", 1) or 1)
+        except Exception:
+            mon_level = 1.0
+        bonus_level = max((30 - mon_level) / 10, 1) if gen == 8 else max((36 - 2 * mon_level) / 10, 1)
     bonus_misc = 1.0
     if gen >= 8:
         if "raid" in (battle_state.fmt_label or "").lower():
