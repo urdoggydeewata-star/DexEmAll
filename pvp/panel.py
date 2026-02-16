@@ -7368,9 +7368,12 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
         f"Turn {st.turn} • {st.fmt_label} (Gen {st.gen})"
     ]
     
-    # Add turn summary if provided
+    # Add turn summary if provided (trim to keep embed under limits).
     if turn_summary:
-        desc_parts.append(f"\n**Turn Summary:**\n{turn_summary}")
+        summary_text = str(turn_summary).strip()
+        if len(summary_text) > 3000:
+            summary_text = "...\n" + summary_text[-2800:]
+        desc_parts.append(f"\n**Turn Summary:**\n{summary_text}")
     
     # Add field conditions if any
     field_text = _field_conditions_text(st.field)
@@ -7433,35 +7436,12 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
     if not embed.title and not embed.description and not embed.fields and not embed.image and not file:
         embed.description = "Battle in progress..."
     
-    # Prefer editing the existing stream message to keep one clean live stream panel.
-    last_msg = getattr(st, "_last_stream_message", None)
     msg = None
     try:
-        if last_msg is not None:
-            try:
-                same_channel = int(getattr(last_msg.channel, "id", 0)) == int(getattr(channel, "id", 0))
-            except Exception:
-                same_channel = False
-            if same_channel:
-                if file is not None:
-                    try:
-                        await last_msg.edit(embed=embed, attachments=[file])
-                    except TypeError:
-                        # Compatibility fallback for discord.py variants that use `files=`.
-                        await last_msg.edit(embed=embed, files=[file])
-                else:
-                    await last_msg.edit(embed=embed, attachments=[])
-                return last_msg
+        # Keep per-turn stream history: send one message each turn with
+        # both image and turn-by-turn summary text (legacy behavior).
         msg = await channel.send(embed=embed, file=file)
         return msg
-    except discord.NotFound:
-        # Message deleted or inaccessible; send a fresh one.
-        try:
-            msg = await channel.send(embed=embed, file=file)
-            return msg
-        except Exception as e:
-            print(f"[Stream] Error sending replacement stream panel: {e}")
-            return None
     except Exception as e:
         print(f"[Stream] Error sending stream: {e}")
         return None

@@ -14326,6 +14326,15 @@ def _box_panel_file(
         except Exception:
             continue
 
+    # Game-like grid guides: top column numbers + left row letters.
+    row_labels = ["a", "b", "c", "d", "e"]
+    for c in range(cols):
+        cx = grid_x + c * (cell_w + gap_x) + (cell_w // 2)
+        draw.text((cx - 4, grid_y - 16), str(c + 1), fill=(18, 42, 66, 240), font=font)
+    for r in range(min(rows, len(row_labels))):
+        ry = grid_y + r * (cell_h + gap_y) + (cell_h // 2)
+        draw.text((grid_x - 16, ry - 4), row_labels[r], fill=(18, 42, 66, 240), font=font)
+
     for pos in range(1, int(box_capacity) + 1):
         idx = pos - 1
         r = idx // cols
@@ -14334,9 +14343,10 @@ def _box_panel_file(
         y0 = grid_y + r * (cell_h + gap_y)
         x1 = x0 + cell_w
         y1 = y0 + cell_h
-        slot_fill = (248, 252, 255, 168) if pos % 2 else (238, 248, 255, 156)
-        draw.rounded_rectangle((x0, y0, x1, y1), radius=9, fill=slot_fill, outline=(116, 156, 188, 255), width=2)
-        draw.text((x0 + 6, y0 + 5), f"{pos:02d}", fill=(44, 80, 110, 255), font=font)
+        # Keep the background art visible: only subtle slot outlines/markers.
+        slot_fill = (255, 255, 255, 30) if pos % 2 else (255, 255, 255, 22)
+        draw.rounded_rectangle((x0, y0, x1, y1), radius=9, fill=slot_fill, outline=(86, 120, 146, 188), width=1)
+        draw.text((x0 + 6, y0 + 5), f"{pos:02d}", fill=(32, 66, 95, 220), font=font)
 
         mon = by_pos.get(pos)
         if not mon:
@@ -14359,23 +14369,27 @@ def _box_panel_file(
                     res = Image.Resampling.NEAREST
                 except Exception:
                     res = Image.NEAREST
-                ico.thumbnail((46, 46), resample=res)
+                ico.thumbnail((50, 50), resample=res)
                 px = x0 + 6
-                py = y0 + 20
+                py = y0 + 16
                 base.alpha_composite(ico, (px, py))
             except Exception:
                 pass
         name = species.replace("-", " ").title()
         if len(name) > 11:
             name = name[:10] + "…"
-        draw.text((x0 + 54, y0 + 21), f"{'★ ' if shiny else ''}{name}", fill=(27, 51, 74, 255), font=font)
-        draw.text((x0 + 54, y0 + 38), f"Lv {level}", fill=(58, 90, 120, 255), font=font)
+        # Soft text shadow for readability over detailed backgrounds.
+        draw.text((x0 + 55, y0 + 24), f"{'★ ' if shiny else ''}{name}", fill=(10, 22, 33, 180), font=font)
+        draw.text((x0 + 54, y0 + 23), f"{'★ ' if shiny else ''}{name}", fill=(230, 241, 250, 255), font=font)
+        draw.text((x0 + 55, y0 + 41), f"Lv {level}", fill=(10, 22, 33, 170), font=font)
+        draw.text((x0 + 54, y0 + 40), f"Lv {level}", fill=(206, 224, 240, 255), font=font)
         held = str(mon.get("held_item") or "").strip()
         if held:
             held_txt = pretty_item_name(held)
             if len(held_txt) > 10:
                 held_txt = held_txt[:9] + "…"
-            draw.text((x0 + 54, y0 + 54), held_txt, fill=(42, 116, 80, 255), font=font)
+            draw.text((x0 + 55, y0 + 57), held_txt, fill=(10, 22, 33, 160), font=font)
+            draw.text((x0 + 54, y0 + 56), held_txt, fill=(176, 233, 194, 255), font=font)
 
     # Right-side team strip (Myuu-style utility panel).
     team_rows = team_rows or []
