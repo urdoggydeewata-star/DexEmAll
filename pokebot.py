@@ -7779,9 +7779,9 @@ def _daycare_icon_path_for_species(species: str) -> Optional[Path]:
     if not sp:
         return None
 
-    # Daycare uses dedicated box sprites (static) by design.
+    # Daycare should prioritize menu/box-style icons.
     for root in (BOX_SPRITES_DIR, LEGACY_SPRITES_DIR, Path(__file__).resolve().parent / "sprites"):
-        for fname in ("box.png", "animated-front.gif", "front.png", "icon.png"):
+        for fname in ("box.png", "icon.png", "front.png"):
             p = root / sp / fname
             try:
                 if p.exists() and p.stat().st_size > 0:
