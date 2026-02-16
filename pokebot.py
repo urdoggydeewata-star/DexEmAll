@@ -6190,7 +6190,12 @@ ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ASSETS_CITIES = ASSETS_DIR / "cities"
 ASSETS_ROUTES = ASSETS_DIR / "routes"
 ASSETS_DAYCARE = ASSETS_DIR / "Daycare (1).png"
-ASSETS_DAYCARE_EGG = ASSETS_DIR / "item_icons" / "mystery_egg.png"
+ASSETS_EGG_STAGES_DIR = ASSETS_DIR / "ui" / "egg-stages"
+ASSETS_EGG_STAGE_UNDAMAGED = ASSETS_EGG_STAGES_DIR / "egg-undamaged.png"
+ASSETS_EGG_STAGE_SLIGHT = ASSETS_EGG_STAGES_DIR / "egg-slightly-cracked.png"
+ASSETS_EGG_STAGE_CRACKED = ASSETS_EGG_STAGES_DIR / "egg-cracked.png"
+ASSETS_EGG_STAGE_EXTREME = ASSETS_EGG_STAGES_DIR / "egg-extremely-cracked.png"
+ASSETS_DAYCARE_EGG = ASSETS_EGG_STAGE_UNDAMAGED
 
 DAYCARE_CITY_ID = "pallet-town"
 DAYCARE_AREA_ID = "pallet-daycare"
@@ -12182,6 +12187,56 @@ TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
     {"box_xy": (415, 294), "box_wh": (177, 197), "sprite_c": (503, 374), "label_xy": (425, 457), "level_right": (581, 457)},
     {"box_xy": (593, 294), "box_wh": (177, 197), "sprite_c": (681, 374), "label_xy": (603, 457), "level_right": (759, 457)},
 )
+TEAM_EGG_STAGE_PATHS: tuple[Path, ...] = (
+    ASSETS_EGG_STAGE_UNDAMAGED,
+    ASSETS_EGG_STAGE_SLIGHT,
+    ASSETS_EGG_STAGE_CRACKED,
+    ASSETS_EGG_STAGE_EXTREME,
+)
+TEAM_EGG_STAGE_LABELS: tuple[str, ...] = (
+    "Undamaged",
+    "Slightly cracked",
+    "Cracked",
+    "Extremely cracked",
+)
+
+
+def _team_is_egg_row(row: dict) -> bool:
+    return _daycare_norm_species(row.get("species")) == "egg"
+
+
+def _team_egg_stage(row: dict) -> int:
+    if not _team_is_egg_row(row):
+        return 0
+    try:
+        stage = int(row.get("_egg_stage"))
+        return max(0, min(3, stage))
+    except Exception:
+        pass
+    try:
+        progress = float(row.get("_egg_progress") or 0.0)
+        hatch_steps = max(1.0, float(row.get("_egg_hatch_steps") or 0.0))
+        ratio = max(0.0, min(1.0, progress / hatch_steps))
+    except Exception:
+        ratio = 0.0
+    if ratio < 0.25:
+        return 0
+    if ratio < 0.50:
+        return 1
+    if ratio < 0.80:
+        return 2
+    return 3
+
+
+def _team_egg_progress_pct(row: dict) -> int:
+    if not _team_is_egg_row(row):
+        return 0
+    try:
+        progress = float(row.get("_egg_progress") or 0.0)
+        hatch_steps = max(1.0, float(row.get("_egg_hatch_steps") or 0.0))
+        return max(0, min(100, int(round((progress / hatch_steps) * 100.0))))
+    except Exception:
+        return 0
 
 
 def _team_template_path() -> Optional[Path]:
@@ -12210,6 +12265,17 @@ def _team_template_path() -> Optional[Path]:
 
 
 def _team_pick_sprite_path(row: dict) -> Optional[Path]:
+    if _team_is_egg_row(row):
+        stage = _team_egg_stage(row)
+        stage = max(0, min(3, int(stage)))
+        for p in (TEAM_EGG_STAGE_PATHS[stage], ASSETS_DIR / "item_icons" / "mystery_egg.png"):
+            try:
+                if p.exists() and p.is_file() and p.stat().st_size > 0:
+                    return p
+            except Exception:
+                continue
+        return None
+
     species = _species_folder_name(str(row.get("species") or ""))
     form = _species_folder_name(str(row.get("form") or ""))
     shiny = bool(int(row.get("shiny") or 0))
@@ -12577,6 +12643,16 @@ class TeamPanelView(discord.ui.View):
             if not row:
                 emb.add_field(name=f"Slot {i}", value="— Empty", inline=True)
                 continue
+            if _team_is_egg_row(row):
+                stage = _team_egg_stage(row)
+                pct = _team_egg_progress_pct(row)
+                value = (
+                    f"**🥚 Egg**\n"
+                    f"`{_team_hp_bar(pct)}` {pct}% · {TEAM_EGG_STAGE_LABELS[stage]}\n"
+                    "Incubating"
+                )
+                emb.add_field(name=f"Slot {i}", value=value, inline=True)
+                continue
             name = _team_species_label(row)
             gicon = _gender_icon(row.get("gender")) or "•"
             star = " ✨" if bool(int(row.get("shiny") or 0)) else ""
@@ -12605,6 +12681,29 @@ class TeamPanelView(discord.ui.View):
         if not row:
             emb = discord.Embed(title=f"{self.target_name} — Slot {slot}", description="This slot is empty.", color=0x2F3136)
             return emb, []
+        if _team_is_egg_row(row):
+            stage = _team_egg_stage(row)
+            pct = _team_egg_progress_pct(row)
+            emb = discord.Embed(
+                title=f"{self.target_name} — Slot {slot}",
+                description=f"**Egg**\n`{_team_hp_bar(pct, width=14)}` **{pct}%** to hatch",
+                color=0xBDA7FF,
+            )
+            emb.add_field(name="Hatch Stage", value=TEAM_EGG_STAGE_LABELS[stage], inline=True)
+            emb.add_field(name="Progress", value=f"{pct}%", inline=True)
+            emb.add_field(name="Level", value=str(int(row.get("level") or 0)), inline=True)
+            emb.add_field(name="Status", value="In team incubator", inline=True)
+            emb.set_footer(text="Eggs crack more as they near hatching.")
+            files: list[discord.File] = []
+            sprite_path = _team_pick_sprite_path(row)
+            if sprite_path is not None:
+                try:
+                    f = discord.File(sprite_path, filename=sprite_path.name)
+                    emb.set_thumbnail(url=f"attachment://{sprite_path.name}")
+                    files.append(f)
+                except Exception:
+                    pass
+            return emb, files
         name = _team_species_label(row)
         shiny = bool(int(row.get("shiny") or 0))
         gicon = _gender_icon(row.get("gender")) or "—"
@@ -12756,9 +12855,76 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
         except Exception:
             continue
 
+    hatch_messages: list[str] = []
+    state: Optional[dict] = None
+    try:
+        state = await _get_adventure_state(uid)
+    except Exception:
+        state = None
+    if state is not None:
+        if uid == str(interaction.user.id):
+            try:
+                changed, hatch_messages = await _daycare_tick(uid, state, command_credit=0.75)
+                if changed:
+                    await _save_adventure_state(uid, state)
+            except Exception:
+                hatch_messages = []
+        try:
+            rec = _daycare_get_record(state, DAYCARE_CITY_ID)
+            incubating = list(rec.get("incubating") or [])
+        except Exception:
+            incubating = []
+        if incubating:
+            empty_slots = [i for i in range(1, 7) if slots.get(i) is None]
+            egg_serial = 0
+            for slot_i in empty_slots:
+                if egg_serial >= len(incubating):
+                    break
+                egg = incubating[egg_serial]
+                egg_serial += 1
+                if not isinstance(egg, dict):
+                    continue
+                try:
+                    progress = float(egg.get("progress", 0.0) or 0.0)
+                    hatch_steps = max(1.0, float(egg.get("hatch_steps", DAYCARE_HATCH_MIN) or DAYCARE_HATCH_MIN))
+                except Exception:
+                    progress = 0.0
+                    hatch_steps = DAYCARE_HATCH_MIN
+                stage = _team_egg_stage({
+                    "species": "egg",
+                    "_egg_progress": progress,
+                    "_egg_hatch_steps": hatch_steps,
+                })
+                slots[slot_i] = {
+                    "id": -1000 - slot_i - egg_serial,
+                    "species": "egg",
+                    "level": 0,
+                    "gender": "genderless",
+                    "shiny": 0,
+                    "team_slot": slot_i,
+                    "held_item": None,
+                    "item_emoji": None,
+                    "hp": 1,
+                    "hp_now": 1,
+                    "moves": [],
+                    "nature": None,
+                    "ability": None,
+                    "friendship": 0,
+                    "form": None,
+                    "_egg_progress": progress,
+                    "_egg_hatch_steps": hatch_steps,
+                    "_egg_stage": stage,
+                }
+
     view = TeamPanelView(interaction.user.id, target.display_name, slots)
     emb, files = view._overview_payload()
     await interaction.followup.send(embed=emb, files=files, view=view, ephemeral=True)
+    if hatch_messages and uid == str(interaction.user.id):
+        for line in hatch_messages[:3]:
+            try:
+                await interaction.followup.send(line, ephemeral=True)
+            except Exception:
+                pass
 
 
 async def _create_pokemon_from_parsed(
