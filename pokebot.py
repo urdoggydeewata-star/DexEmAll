@@ -12379,8 +12379,12 @@ TEAM_SHOWDOWN_CACHE_DIR = ASSETS_DIR / "ui" / "team-anim-cache"
 TEAM_SHOWDOWN_STYLE_DIR = "gen5ani"
 TEAM_SHOWDOWN_UA = "Mozilla/5.0 (DexEmAll Team Renderer)"
 _TEAM_SHOWDOWN_MISS_KEYS: set[str] = set()
-TEAM_MAX_SPRITE_FRAMES = 120
-TEAM_MAX_COMPOSITE_FRAMES = 120
+TEAM_DEFAULT_FRAME_DURATION_MS = 100
+TEAM_MIN_FRAME_DURATION_MS = 90
+TEAM_MAX_FRAME_DURATION_MS = 180
+TEAM_MAX_SPRITE_FRAMES = 48
+TEAM_MAX_COMPOSITE_FRAMES = 24
+TEAM_FETCH_SHOWDOWN_FOR_TEAM = False
 TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
     {"box_xy": (236, 93), "box_wh": (177, 197), "sprite_c": (324, 173), "label_xy": (246, 256), "level_right": (402, 256)},
     {"box_xy": (415, 93), "box_wh": (177, 197), "sprite_c": (503, 173), "label_xy": (425, 256), "level_right": (581, 256)},
@@ -12498,7 +12502,7 @@ def _team_showdown_cache_path(key: str, shiny: bool) -> Path:
     return TEAM_SHOWDOWN_CACHE_DIR / TEAM_SHOWDOWN_STYLE_DIR / sub / f"{key}.gif"
 
 
-def _team_download_showdown_gif(key: str, shiny: bool) -> Optional[Path]:
+def _team_download_showdown_gif(key: str, shiny: bool, *, allow_network: bool = True) -> Optional[Path]:
     key = str(key or "").strip().lower()
     if not key:
         return None
@@ -12508,6 +12512,8 @@ def _team_download_showdown_gif(key: str, shiny: bool) -> Optional[Path]:
             return path
     except Exception:
         pass
+    if not allow_network:
+        return None
 
     subdir = "gen5ani-shiny" if shiny else "gen5ani"
     miss_key = f"{subdir}:{key}"
@@ -12606,13 +12612,20 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
             except Exception:
                 continue
 
-    # 2) Animated remote fallback from Pokemon Showdown (cached locally).
+    # 2) Prefer already-cached Showdown animation files.
     for key in _team_row_showdown_keys(row):
-        p = _team_download_showdown_gif(key, shiny=shiny)
+        p = _team_download_showdown_gif(key, shiny=shiny, allow_network=False)
         if p is not None:
             return p
 
-    # 3) Fallback to static local sprites.
+    # 3) Optional remote fetch fallback (disabled by default for snappier /team).
+    if TEAM_FETCH_SHOWDOWN_FOR_TEAM:
+        for key in _team_row_showdown_keys(row):
+            p = _team_download_showdown_gif(key, shiny=shiny, allow_network=True)
+            if p is not None:
+                return p
+
+    # 4) Fallback to static local sprites.
     static_candidates: list[str] = []
     if is_female:
         if shiny:
@@ -12692,7 +12705,7 @@ def _team_load_sprite_frames(path: Optional[Path], *, max_size: tuple[int, int],
         img = Image.open(str(path))
     except Exception:
         return [], 100
-    duration = int(img.info.get("duration") or 100)
+    duration = int(img.info.get("duration") or TEAM_DEFAULT_FRAME_DURATION_MS)
     frames: list[Any] = []
     if ImageSequence is not None and bool(getattr(img, "is_animated", False)):
         try:
@@ -12711,7 +12724,7 @@ def _team_load_sprite_frames(path: Optional[Path], *, max_size: tuple[int, int],
             frames = [sprite]
         except Exception:
             frames = []
-    return frames, max(40, min(180, duration))
+    return frames, max(TEAM_MIN_FRAME_DURATION_MS, min(TEAM_MAX_FRAME_DURATION_MS, duration))
 
 
 def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -> Optional[discord.File]:
@@ -12848,7 +12861,8 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
         # Preload sprite frames (animated front preferred).
         sprite_data: dict[int, dict[str, Any]] = {}
         cycle_lengths: list[int] = []
-        base_duration = 100
+        duration_samples: list[int] = []
+        base_duration = TEAM_DEFAULT_FRAME_DURATION_MS
         for slot in range(1, 7):
             row = slots.get(slot)
             if not row:
@@ -12860,7 +12874,7 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
             sprite_data[slot] = {"frames": frames, "duration": duration}
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
-                base_duration = min(base_duration, duration)
+                duration_samples.append(int(duration))
 
         lvl_font_slot = _team_font(max(9, int(round(18 * s))), bold=False)
         text_prep: dict[int, dict[str, Any]] = {}
@@ -12909,15 +12923,14 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
         frame_count = 1
         if cycle_lengths:
             try:
-                for n in cycle_lengths:
-                    n = max(1, int(n))
-                    frame_count = (frame_count * n) // math.gcd(frame_count, n)
-                    if frame_count >= TEAM_MAX_COMPOSITE_FRAMES:
-                        frame_count = TEAM_MAX_COMPOSITE_FRAMES
-                        break
+                frame_count = min(TEAM_MAX_COMPOSITE_FRAMES, max(max(1, int(n)) for n in cycle_lengths))
             except Exception:
                 frame_count = min(TEAM_MAX_COMPOSITE_FRAMES, max(cycle_lengths))
         frame_count = max(1, int(frame_count))
+        if duration_samples:
+            duration_samples.sort()
+            base_duration = int(duration_samples[len(duration_samples) // 2])
+        base_duration = max(TEAM_MIN_FRAME_DURATION_MS, min(TEAM_MAX_FRAME_DURATION_MS, int(base_duration)))
         for fi in range(frame_count):
             frame = base.copy()
             frame_draw = ImageDraw.Draw(frame)
@@ -12933,7 +12946,11 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                 data = sprite_data.get(slot) or {}
                 frames = data.get("frames") or []
                 if frames:
-                    sprite = frames[fi % len(frames)]
+                    if frame_count > 1 and len(frames) > 1:
+                        src_i = int((fi * len(frames)) / frame_count) % len(frames)
+                    else:
+                        src_i = 0
+                    sprite = frames[src_i]
                     sx = int(geom["sprite_c"][0] - (sprite.width // 2))
                     sy = int(geom["sprite_c"][1] - (sprite.height // 2))
                     try:
@@ -12955,7 +12972,7 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                 format="GIF",
                 save_all=True,
                 append_images=out_frames[1:],
-                duration=max(50, int(base_duration)),
+                duration=int(base_duration),
                 loop=0,
                 disposal=2,
             )
