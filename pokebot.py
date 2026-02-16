@@ -12211,8 +12211,11 @@ TEAM_TRAINER_NAME_CENTER_X = 127
 TEAM_TRAINER_LABEL_Y = 38
 TEAM_TRAINER_NAME_Y = 62
 TEAM_SHOWDOWN_CACHE_DIR = ASSETS_DIR / "ui" / "team-anim-cache"
+TEAM_SHOWDOWN_STYLE_DIR = "gen5ani"
 TEAM_SHOWDOWN_UA = "Mozilla/5.0 (DexEmAll Team Renderer)"
 _TEAM_SHOWDOWN_MISS_KEYS: set[str] = set()
+TEAM_MAX_SPRITE_FRAMES = 120
+TEAM_MAX_COMPOSITE_FRAMES = 120
 TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
     {"box_xy": (236, 93), "box_wh": (177, 197), "sprite_c": (324, 173), "label_xy": (246, 256), "level_right": (402, 256)},
     {"box_xy": (415, 93), "box_wh": (177, 197), "sprite_c": (503, 173), "label_xy": (425, 256), "level_right": (581, 256)},
@@ -12327,7 +12330,7 @@ def _team_row_showdown_keys(row: dict) -> list[str]:
 
 def _team_showdown_cache_path(key: str, shiny: bool) -> Path:
     sub = "shiny" if shiny else "normal"
-    return TEAM_SHOWDOWN_CACHE_DIR / sub / f"{key}.gif"
+    return TEAM_SHOWDOWN_CACHE_DIR / TEAM_SHOWDOWN_STYLE_DIR / sub / f"{key}.gif"
 
 
 def _team_download_showdown_gif(key: str, shiny: bool) -> Optional[Path]:
@@ -12341,7 +12344,7 @@ def _team_download_showdown_gif(key: str, shiny: bool) -> Optional[Path]:
     except Exception:
         pass
 
-    subdir = "xyani-shiny" if shiny else "xyani"
+    subdir = "gen5ani-shiny" if shiny else "gen5ani"
     miss_key = f"{subdir}:{key}"
     if miss_key in _TEAM_SHOWDOWN_MISS_KEYS:
         return None
@@ -12529,7 +12532,7 @@ def _team_load_sprite_frames(path: Optional[Path], *, max_size: tuple[int, int],
     if ImageSequence is not None and bool(getattr(img, "is_animated", False)):
         try:
             for i, fr in enumerate(ImageSequence.Iterator(img)):
-                if i >= 24:
+                if i >= TEAM_MAX_SPRITE_FRAMES:
                     break
                 sprite = fr.convert("RGBA")
                 sprite.thumbnail(max_size, resample=resample)
@@ -12679,7 +12682,7 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
 
         # Preload sprite frames (animated front preferred).
         sprite_data: dict[int, dict[str, Any]] = {}
-        max_anim_frames = 1
+        cycle_lengths: list[int] = []
         base_duration = 100
         for slot in range(1, 7):
             row = slots.get(slot)
@@ -12691,7 +12694,7 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
             frames, duration = _team_load_sprite_frames(path, max_size=sprite_max, resample=resample)
             sprite_data[slot] = {"frames": frames, "duration": duration}
             if len(frames) > 1:
-                max_anim_frames = max(max_anim_frames, min(len(frames), 24))
+                cycle_lengths.append(len(frames))
                 base_duration = min(base_duration, duration)
 
         lvl_font_slot = _team_font(max(9, int(round(18 * s))), bold=False)
@@ -12738,7 +12741,18 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
             }
 
         out_frames: list[Any] = []
-        frame_count = max(1, int(max_anim_frames))
+        frame_count = 1
+        if cycle_lengths:
+            try:
+                for n in cycle_lengths:
+                    n = max(1, int(n))
+                    frame_count = (frame_count * n) // math.gcd(frame_count, n)
+                    if frame_count >= TEAM_MAX_COMPOSITE_FRAMES:
+                        frame_count = TEAM_MAX_COMPOSITE_FRAMES
+                        break
+            except Exception:
+                frame_count = min(TEAM_MAX_COMPOSITE_FRAMES, max(cycle_lengths))
+        frame_count = max(1, int(frame_count))
         for fi in range(frame_count):
             frame = base.copy()
             frame_draw = ImageDraw.Draw(frame)
