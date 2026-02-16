@@ -5478,7 +5478,16 @@ class TeamSwitchView(discord.ui.View):
             self.add_item(discord.ui.Button(label="No switchable Pokémon", disabled=True, style=discord.ButtonStyle.secondary, row=0))
 
     async def interaction_check(self, itx: discord.Interaction) -> bool:
-        return itx.user.id == self.user_id
+        if itx.user.id != self.user_id:
+            try:
+                if itx.response.is_done():
+                    await itx.followup.send("this isn't for you", ephemeral=True)
+                else:
+                    await itx.response.send_message("this isn't for you", ephemeral=True)
+            except Exception:
+                pass
+            return False
+        return True
     
     async def on_timeout(self):
         """Called when the view times out."""
@@ -5722,7 +5731,16 @@ class MoveView(discord.ui.View):
             pass  # Interaction already expired, nothing we can do
 
     async def interaction_check(self, itx: discord.Interaction) -> bool:
-        return itx.user.id == self.who_id
+        if itx.user.id != self.who_id:
+            try:
+                if itx.response.is_done():
+                    await itx.followup.send("this isn't for you", ephemeral=True)
+                else:
+                    await itx.response.send_message("this isn't for you", ephemeral=True)
+            except Exception:
+                pass
+            return False
+        return True
 
 class _MoveButton(discord.ui.Button):
     def __init__(

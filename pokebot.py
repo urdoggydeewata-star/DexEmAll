@@ -6353,9 +6353,9 @@ DAYCARE_HATCH_MIN = 45.0
 DAYCARE_HATCH_MAX = 80.0
 DAYCARE_HATCH_BOOST_ABILITIES = {"flame-body", "magma-armor"}
 DAYCARE_MAX_ANIM_FRAMES = 16
-DAYCARE_GIF_MAX_SIZE: tuple[int, int] = (30, 30)
-DAYCARE_BOX_MAX_SIZE: tuple[int, int] = (26, 20)
-DAYCARE_STATIC_MAX_SIZE: tuple[int, int] = (26, 26)
+DAYCARE_GIF_MAX_SIZE: tuple[int, int] = (56, 56)
+DAYCARE_BOX_MAX_SIZE: tuple[int, int] = (52, 52)
+DAYCARE_STATIC_MAX_SIZE: tuple[int, int] = (52, 52)
 BOX_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "box_sprites"
 LEGACY_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "sprites"
 POKESPRITE_MASTER_ZIP = Path(__file__).resolve().parent / "pokesprite-master.zip"
@@ -7262,6 +7262,62 @@ def _daycare_get_record(state: dict, city_id: str = DAYCARE_CITY_ID) -> dict:
     return rec
 
 
+def _daycare_parent_ids_from_state_data(state: Any) -> set[int]:
+    """
+    Collect all daycare parent pokemon ids from adventure state payload.
+    This is used to keep daycare parents out of PC box indexing/rendering.
+    """
+    out: set[int] = set()
+    if not isinstance(state, dict):
+        return out
+    all_dc = state.get("daycare")
+    if not isinstance(all_dc, dict):
+        return out
+    for rec in all_dc.values():
+        if not isinstance(rec, dict):
+            continue
+        parents = rec.get("parents")
+        if not isinstance(parents, (list, tuple)):
+            continue
+        for p in list(parents)[:2]:
+            try:
+                pid = int(p)
+            except Exception:
+                continue
+            if pid > 0:
+                out.add(pid)
+    return out
+
+
+async def _daycare_parent_ids_for_owner(owner_id: str) -> set[int]:
+    """Load owner adventure state and return daycare parent ids across all daycare entries."""
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT data FROM adventure_state WHERE owner_id=? LIMIT 1",
+                (owner_id,),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+    except Exception:
+        return set()
+    if not row:
+        return set()
+    raw = row["data"] if hasattr(row, "keys") else row[0]
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except Exception:
+            raw = ""
+    state_obj: Any = raw
+    if isinstance(raw, str):
+        try:
+            state_obj = json.loads(raw)
+        except Exception:
+            state_obj = {}
+    return _daycare_parent_ids_from_state_data(state_obj)
+
+
 def _daycare_norm_species(species: str) -> str:
     return str(species or "").strip().lower().replace("_", "-").replace(" ", "-")
 
@@ -7316,6 +7372,7 @@ def _daycare_sprite_folder_candidates(species: str) -> list[str]:
 
 
 _DAYCARE_POKESPRITE_ZIP_ARCS: Optional[set[str]] = None
+_DAYCARE_POKESPRITE_EGG_ICON: Optional[Path] = None
 
 
 def _daycare_pokesprite_zip_arcs() -> set[str]:
@@ -7381,6 +7438,50 @@ def _daycare_extract_pokesprite_box(species: str) -> Optional[Path]:
                 return out_path
         except Exception:
             continue
+    return None
+
+
+def _daycare_extract_pokesprite_egg_icon() -> Optional[Path]:
+    """
+    Extract the daycare egg icon from pokesprite zip (menu/box sprite style).
+    Cached on disk and in-memory after first successful extraction.
+    """
+    global _DAYCARE_POKESPRITE_EGG_ICON
+    if _DAYCARE_POKESPRITE_EGG_ICON is not None:
+        try:
+            if _DAYCARE_POKESPRITE_EGG_ICON.exists() and _DAYCARE_POKESPRITE_EGG_ICON.stat().st_size > 0:
+                return _DAYCARE_POKESPRITE_EGG_ICON
+        except Exception:
+            _DAYCARE_POKESPRITE_EGG_ICON = None
+    if not POKESPRITE_MASTER_ZIP.exists():
+        return None
+    out_path = DAYCARE_ZIP_CACHE_DIR / "_egg" / "egg.png"
+    try:
+        if out_path.exists() and out_path.stat().st_size > 0:
+            _DAYCARE_POKESPRITE_EGG_ICON = out_path
+            return out_path
+    except Exception:
+        pass
+    candidates = (
+        "pokesprite-master/icons/pokemon/egg.png",
+        "icons/pokemon/egg.png",
+        "pokesprite-master/pokemon-gen8/egg.png",
+        "pokemon-gen8/egg.png",
+    )
+    try:
+        with zipfile.ZipFile(str(POKESPRITE_MASTER_ZIP), "r") as zf:
+            names = set(str(n or "").replace("\\", "/") for n in zf.namelist())
+            picked = next((arc for arc in candidates if arc in names), None)
+            if not picked:
+                return None
+            data = zf.read(picked)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(data)
+        if out_path.exists() and out_path.stat().st_size > 0:
+            _DAYCARE_POKESPRITE_EGG_ICON = out_path
+            return out_path
+    except Exception:
+        return None
     return None
 
 
@@ -8062,12 +8163,12 @@ def _daycare_random_positions(count: int) -> list[tuple[int, int]]:
     # Random movement zones constrained to the inside grass only.
     # Coordinates are top-left anchors for daycare sprites.
     zones = [
-        (60, 132, 140, 214),   # left grass patch
-        (244, 136, 334, 218),  # right grass patch
-        (172, 116, 226, 166),  # center-top grass near house
+        (56, 128, 122, 186),   # left grass patch
+        (248, 132, 314, 190),  # right grass patch
+        (170, 112, 218, 150),  # center-top grass near house
     ]
     out: list[tuple[int, int]] = []
-    min_dist = 30
+    min_dist = 44
     tries = 0
     while len(out) < max(0, int(count)) and tries < 240:
         tries += 1
@@ -8106,6 +8207,26 @@ def _embed_with_daycare_panel(
         except Exception:
             ImageSequence = None  # type: ignore
 
+        def _fit_daycare_sprite(src_img: Any, max_size: tuple[int, int], resample_mode: Any) -> Any:
+            """Scale sprite to target bounds; upscale small menu icons for visibility."""
+            img = src_img.convert("RGBA")
+            w, h = img.size
+            if w <= 0 or h <= 0:
+                return img
+            max_w = max(1, int(max_size[0]))
+            max_h = max(1, int(max_size[1]))
+            scale = min(max_w / float(w), max_h / float(h))
+            # Keep tiny icons readable in daycare by upscaling toward target bounds.
+            if scale >= 1.0:
+                new_w = max(1, int(round(w * scale)))
+                new_h = max(1, int(round(h * scale)))
+                if new_w != w or new_h != h:
+                    return img.resize((new_w, new_h), resample=resample_mode)
+                return img
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            return img.resize((new_w, new_h), resample=resample_mode)
+
         sprite_layers: list[dict[str, Any]] = []
         for species, (x, y) in zip(parent_species, positions):
             icon_path = _daycare_icon_path_for_species(species)
@@ -8132,14 +8253,12 @@ def _embed_with_daycare_panel(
                         for i, fr in enumerate(ImageSequence.Iterator(src)):
                             if i >= DAYCARE_MAX_ANIM_FRAMES:
                                 break
-                            sprite = fr.convert("RGBA")
-                            sprite.thumbnail(max_size, resample=sprite_resample)
+                            sprite = _fit_daycare_sprite(fr, max_size, sprite_resample)
                             frames.append(sprite)
                     except Exception:
                         frames = []
                 if not frames:
-                    sprite = src.convert("RGBA")
-                    sprite.thumbnail(max_size, resample=sprite_resample)
+                    sprite = _fit_daycare_sprite(src, max_size, sprite_resample)
                     frames = [sprite]
                 if not frames:
                     continue
@@ -8152,10 +8271,13 @@ def _embed_with_daycare_panel(
 
         egg_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
         egg_count = max(0, min(int(egg_count or 0), DAYCARE_EGG_CAP))
-        if egg_count > 0 and ASSETS_DAYCARE_EGG.exists():
+        egg_icon_path = _daycare_extract_pokesprite_egg_icon()
+        if egg_icon_path is None and ASSETS_DAYCARE_EGG.exists():
+            egg_icon_path = ASSETS_DAYCARE_EGG
+        if egg_count > 0 and egg_icon_path is not None:
             try:
-                egg_icon = Image.open(str(ASSETS_DAYCARE_EGG)).convert("RGBA")
-                egg_icon.thumbnail((30, 30), resample=resample_smooth)
+                egg_icon = Image.open(str(egg_icon_path)).convert("RGBA")
+                egg_icon.thumbnail((34, 34), resample=resample_pixel)
                 egg_spots = [(255, 194), (284, 184), (313, 194)]
                 for i in range(egg_count):
                     ex, ey = egg_spots[i]
@@ -9061,8 +9183,12 @@ def _mon_to_long_stats(short: dict) -> dict:
     }
 
 
-async def _add_caught_wild_to_team(owner_id: str, mon: "Mon") -> Optional[int]:
-    """Create a pokemon row from a caught wild Mon and assign next free team slot. Returns mon_id or None."""
+async def _add_caught_wild_to_team(owner_id: str, mon: "Mon") -> Optional[dict[str, Any]]:
+    """
+    Create a Pokemon row from a caught wild Mon.
+    If team has room it is placed in team; otherwise it is routed to PC box storage.
+    Returns a placement payload or None on failure.
+    """
     try:
         base_long = _mon_to_long_stats(getattr(mon, "base", {}) or {})
         ivs_long = _mon_to_long_stats(getattr(mon, "ivs", {}) or {})
@@ -9106,7 +9232,34 @@ async def _add_caught_wild_to_team(owner_id: str, mon: "Mon") -> Optional[int]:
         slot = await db.next_free_team_slot(owner_id)
         if slot is not None:
             await db.set_team_slot(owner_id, mon_id, slot)
-        return mon_id
+            return {
+                "mon_id": int(mon_id),
+                "destination": "team",
+                "team_slot": int(slot),
+            }
+        # Team is full: assign into PC box storage and return exact destination.
+        try:
+            await _box_prepare_storage(owner_id)
+            async with db.session() as conn:
+                cur = await conn.execute(
+                    "SELECT box_no, box_pos FROM pokemons WHERE owner_id=? AND id=? LIMIT 1",
+                    (owner_id, int(mon_id)),
+                )
+                row = await cur.fetchone()
+                await cur.close()
+            if row:
+                box_no = int((row["box_no"] if hasattr(row, "keys") else row[0]) or 0)
+                box_pos = int((row["box_pos"] if hasattr(row, "keys") else row[1]) or 0)
+                if box_no > 0 and box_pos > 0:
+                    return {
+                        "mon_id": int(mon_id),
+                        "destination": "box",
+                        "box_no": box_no,
+                        "box_pos": box_pos,
+                    }
+        except Exception:
+            pass
+        return {"mon_id": int(mon_id), "destination": "box"}
     except Exception as e:
         print(f"[PvP] Error adding caught wild to team: {e}")
         return None
@@ -9717,6 +9870,23 @@ async def _start_pve_battle(
                     ev_lines.append(f"**{name}** gained EVs: {', '.join(parts)}.")
                 if ev_lines:
                     emb.add_field(name="", value="\n".join(ev_lines), inline=False)
+            # Add caught wild Pokémon to team/box (wild only), and show where it went if team was full.
+            if is_adventure_wild and st.winner == itx.user.id:
+                caught_mon = getattr(st, "_caught_wild_mon", None)
+                if caught_mon is not None:
+                    try:
+                        placement = await _add_caught_wild_to_team(str(itx.user.id), caught_mon)
+                        if placement and str(placement.get("destination")) == "box":
+                            display = str(getattr(caught_mon, "species", "Pokémon") or "Pokémon").replace("-", " ").title()
+                            bno = placement.get("box_no")
+                            bpos = placement.get("box_pos")
+                            if bno and bpos:
+                                msg = f"**{display}** was sent to **Box {bno}, Slot {bpos}** because your team is full."
+                            else:
+                                msg = f"**{display}** was sent to your **PC Box** because your team is full."
+                            emb.add_field(name="", value=msg, inline=False)
+                    except Exception as e:
+                        print(f"[PvP] Error adding caught wild to storage: {e}")
             # Rare drop: TM Fragment (rolled for every adventure wild win: grass path + /route)
             if is_adventure_wild and st.winner == itx.user.id and random.random() < TM_FRAGMENT_DROP_CHANCE:
                 try:
@@ -9729,14 +9899,6 @@ async def _start_pve_battle(
                 await itx.followup.send(embed=emb, ephemeral=False)
             except Exception:
                 pass
-            # Add caught wild Pokémon to the player's team (wild only)
-            if is_adventure_wild:
-                caught_mon = getattr(st, "_caught_wild_mon", None)
-                if caught_mon is not None and st.winner == itx.user.id:
-                    try:
-                        await _add_caught_wild_to_team(str(itx.user.id), caught_mon)
-                    except Exception as e:
-                        print(f"[PvP] Error adding caught wild to team: {e}")
         # Evolution prompts: only if player won; Everstone blocks level-up evolution
         if st.winner == itx.user.id and level_ups:
             pending_evos: List[Tuple[int, "Mon", str, int]] = []
@@ -10283,18 +10445,20 @@ class DaycareParentSelectView(discord.ui.View):
                     ephemeral=True,
                 )
                 return
-            try:
-                async with db.session() as conn:
-                    await conn.execute(
-                        "UPDATE pokemons SET team_slot=NULL WHERE owner_id=? AND id=?",
-                        (uid, int(selected_id)),
-                    )
-                    await conn.commit()
-                db.invalidate_pokemons_cache(uid)
+        try:
+            # Daycare parents should not remain in team slots or box slots.
+            async with db.session() as conn:
+                await conn.execute(
+                    "UPDATE pokemons SET team_slot=NULL, box_no=NULL, box_pos=NULL WHERE owner_id=? AND id=?",
+                    (uid, int(selected_id)),
+                )
+                await conn.commit()
+            db.invalidate_pokemons_cache(uid)
+            if selected_team_slot is not None:
                 await _compact_team_slots(uid)
-            except Exception:
-                await itx.followup.send("Couldn't move that Pokémon into daycare right now.", ephemeral=True)
-                return
+        except Exception:
+            await itx.followup.send("Couldn't move that Pokémon into daycare right now.", ephemeral=True)
+            return
 
         parents[self.slot_index] = selected_id
         rec["parents"] = parents
@@ -13905,16 +14069,37 @@ async def _box_prepare_storage(owner_id: str) -> None:
     Any mon with team_slot NULL and missing/invalid box placement is auto-assigned.
     """
     box_count, capacity = await _box_get_box_count_and_capacity(owner_id)
+    daycare_parent_ids = await _daycare_parent_ids_for_owner(owner_id)
+    skip_ids = sorted(int(x) for x in daycare_parent_ids if int(x) > 0)
     async with db.session() as conn:
-        cur = await conn.execute(
-            """
+        changed = False
+        if skip_ids:
+            ph = ",".join("?" for _ in skip_ids)
+            cur = await conn.execute(
+                f"SELECT COUNT(1) FROM pokemons WHERE owner_id=? AND id IN ({ph}) AND (box_no IS NOT NULL OR box_pos IS NOT NULL)",
+                tuple([owner_id] + skip_ids),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            dirty = int((row[0] if row else 0) or 0) > 0
+            if dirty:
+                await conn.execute(
+                    f"UPDATE pokemons SET box_no=NULL, box_pos=NULL WHERE owner_id=? AND id IN ({ph})",
+                    tuple([owner_id] + skip_ids),
+                )
+                changed = True
+
+        q = """
             SELECT id, box_no, box_pos
             FROM pokemons
             WHERE owner_id=? AND team_slot IS NULL
-            ORDER BY id
-            """,
-            (owner_id,),
-        )
+        """
+        q_params: list[Any] = [owner_id]
+        if skip_ids:
+            q += f" AND id NOT IN ({','.join('?' for _ in skip_ids)})"
+            q_params.extend(skip_ids)
+        q += " ORDER BY id"
+        cur = await conn.execute(q, tuple(q_params))
         rows = await cur.fetchall()
         await cur.close()
 
@@ -13929,7 +14114,6 @@ async def _box_prepare_storage(owner_id: str) -> None:
             else:
                 unplaced.append(mon_id)
 
-        changed = False
         for mon_id in unplaced:
             placed = False
             for b in range(1, box_count + 1):
@@ -13989,7 +14173,14 @@ def _box_icon_path_for_species(species: str) -> Optional[Path]:
     return None
 
 
-def _box_panel_file(owner_id: str, box_no: int, box_count: int, box_capacity: int, mons: list[dict]) -> Optional[discord.File]:
+def _box_panel_file(
+    owner_id: str,
+    box_no: int,
+    box_count: int,
+    box_capacity: int,
+    mons: list[dict],
+    team_rows: Optional[list[dict]] = None,
+) -> Optional[discord.File]:
     if Image is None:
         return None
     try:
@@ -13999,23 +14190,40 @@ def _box_panel_file(owner_id: str, box_no: int, box_count: int, box_capacity: in
 
     cols = 6
     rows = max(1, math.ceil(max(1, int(box_capacity)) / cols))
-    cell_w, cell_h = 130, 88
-    grid_x, grid_y = 26, 92
-    W = grid_x * 2 + cols * cell_w
-    H = grid_y + rows * cell_h + 34
-    base = Image.new("RGBA", (W, H), (20, 24, 34, 255))
+    cell_w, cell_h = 112, 76
+    gap_x, gap_y = 10, 10
+    margin = 18
+    header_h = 86
+    side_w = 214
+    grid_w = cols * cell_w + (cols - 1) * gap_x
+    grid_h = rows * cell_h + (rows - 1) * gap_y
+    W = margin * 3 + grid_w + side_w
+    H = header_h + margin * 2 + grid_h + margin
+
+    base = Image.new("RGBA", (W, H), (20, 44, 73, 255))
     draw = ImageDraw.Draw(base)
     try:
         font = ImageFont.load_default()
     except Exception:
         font = None
 
-    # Header bar
-    draw.rounded_rectangle((14, 14, W - 14, 74), radius=14, fill=(34, 42, 62, 255), outline=(88, 106, 148, 255), width=2)
-    title = f"PC BOX {box_no}/{box_count}"
-    subtitle = f"Owner: {owner_id} • Capacity: {box_capacity}"
-    draw.text((30, 30), title, fill=(235, 240, 255, 255), font=font)
-    draw.text((30, 52), subtitle, fill=(166, 180, 210, 255), font=font)
+    # Outer/game-like shell
+    draw.rounded_rectangle((9, 9, W - 9, H - 9), radius=18, fill=(32, 74, 118, 255), outline=(165, 211, 246, 255), width=3)
+    draw.rounded_rectangle((margin, 18, W - margin, header_h), radius=14, fill=(239, 247, 255, 255), outline=(73, 130, 183, 255), width=3)
+    draw.text((margin + 14, 34), "POKEMON STORAGE SYSTEM", fill=(39, 84, 132, 255), font=font)
+    owner_tail = owner_id[-6:] if len(owner_id) > 6 else owner_id
+    subtitle = f"Box {box_no}/{box_count}  |  Capacity {box_capacity}  |  Trainer {owner_tail}"
+    draw.text((margin + 14, 56), subtitle, fill=(72, 114, 161, 255), font=font)
+
+    grid_x = margin
+    grid_y = header_h + margin
+    draw.rounded_rectangle(
+        (grid_x - 10, grid_y - 10, grid_x + grid_w + 10, grid_y + grid_h + 10),
+        radius=12,
+        fill=(214, 234, 252, 255),
+        outline=(115, 164, 210, 255),
+        width=2,
+    )
 
     by_pos: dict[int, dict] = {}
     for row in mons:
@@ -14030,12 +14238,13 @@ def _box_panel_file(owner_id: str, box_no: int, box_count: int, box_capacity: in
         idx = pos - 1
         r = idx // cols
         c = idx % cols
-        x0 = grid_x + c * cell_w
-        y0 = grid_y + r * cell_h
-        x1 = x0 + cell_w - 8
-        y1 = y0 + cell_h - 8
-        draw.rounded_rectangle((x0, y0, x1, y1), radius=10, fill=(28, 34, 49, 255), outline=(64, 79, 112, 255), width=2)
-        draw.text((x0 + 8, y0 + 6), f"{pos:02d}", fill=(150, 166, 195, 255), font=font)
+        x0 = grid_x + c * (cell_w + gap_x)
+        y0 = grid_y + r * (cell_h + gap_y)
+        x1 = x0 + cell_w
+        y1 = y0 + cell_h
+        slot_fill = (245, 251, 255, 255) if pos % 2 else (236, 246, 255, 255)
+        draw.rounded_rectangle((x0, y0, x1, y1), radius=9, fill=slot_fill, outline=(120, 172, 217, 255), width=2)
+        draw.text((x0 + 6, y0 + 5), f"{pos:02d}", fill=(46, 99, 149, 255), font=font)
 
         mon = by_pos.get(pos)
         if not mon:
@@ -14058,23 +14267,87 @@ def _box_panel_file(owner_id: str, box_no: int, box_count: int, box_capacity: in
                     res = Image.Resampling.NEAREST
                 except Exception:
                     res = Image.NEAREST
-                ico.thumbnail((52, 52), resample=res)
-                px = x0 + 8
-                py = y0 + 22
+                ico.thumbnail((46, 46), resample=res)
+                px = x0 + 6
+                py = y0 + 20
                 base.alpha_composite(ico, (px, py))
             except Exception:
                 pass
         name = species.replace("-", " ").title()
-        if len(name) > 12:
-            name = name[:11] + "…"
-        draw.text((x0 + 64, y0 + 24), f"{'★ ' if shiny else ''}{name}", fill=(226, 233, 248, 255), font=font)
-        draw.text((x0 + 64, y0 + 46), f"Lv {level}", fill=(174, 190, 219, 255), font=font)
+        if len(name) > 11:
+            name = name[:10] + "…"
+        draw.text((x0 + 54, y0 + 21), f"{'★ ' if shiny else ''}{name}", fill=(37, 63, 97, 255), font=font)
+        draw.text((x0 + 54, y0 + 38), f"Lv {level}", fill=(69, 108, 150, 255), font=font)
         held = str(mon.get("held_item") or "").strip()
         if held:
             held_txt = pretty_item_name(held)
-            if len(held_txt) > 12:
-                held_txt = held_txt[:11] + "…"
-            draw.text((x0 + 64, y0 + 64), held_txt, fill=(132, 214, 170, 255), font=font)
+            if len(held_txt) > 10:
+                held_txt = held_txt[:9] + "…"
+            draw.text((x0 + 54, y0 + 54), held_txt, fill=(46, 134, 90, 255), font=font)
+
+    # Right-side team strip (Myuu-style utility panel).
+    team_rows = team_rows or []
+    team_by_slot: dict[int, dict] = {}
+    for row in team_rows:
+        try:
+            s = int(row.get("team_slot") or 0)
+            if 1 <= s <= 6 and s not in team_by_slot:
+                team_by_slot[s] = row
+        except Exception:
+            continue
+    side_x = grid_x + grid_w + margin
+    side_y = grid_y
+    side_h = grid_h
+    draw.rounded_rectangle(
+        (side_x, side_y, side_x + side_w, side_y + side_h),
+        radius=12,
+        fill=(237, 247, 255, 255),
+        outline=(116, 167, 210, 255),
+        width=2,
+    )
+    draw.text((side_x + 66, side_y + 10), "TEAM", fill=(40, 86, 134, 255), font=font)
+
+    slot_h = max(50, int((side_h - 52 - (5 * 8)) / 6))
+    for slot in range(1, 7):
+        y0 = side_y + 32 + (slot - 1) * (slot_h + 8)
+        y1 = y0 + slot_h
+        draw.rounded_rectangle(
+            (side_x + 10, y0, side_x + side_w - 10, y1),
+            radius=8,
+            fill=(247, 252, 255, 255),
+            outline=(152, 191, 226, 255),
+            width=2,
+        )
+        draw.text((side_x + 16, y0 + 5), f"{slot}", fill=(59, 104, 151, 255), font=font)
+        trow = team_by_slot.get(slot)
+        if not trow:
+            draw.text((side_x + 34, y0 + 18), "Empty", fill=(121, 154, 188, 255), font=font)
+            continue
+        sp = str(trow.get("species") or "Unknown")
+        lv = int(trow.get("level") or 1)
+        icon_path = _box_icon_path_for_species(sp)
+        if icon_path:
+            try:
+                ico = Image.open(str(icon_path))
+                if str(icon_path.suffix).lower() == ".gif":
+                    try:
+                        ico.seek(0)
+                    except Exception:
+                        pass
+                ico = ico.convert("RGBA")
+                try:
+                    res = Image.Resampling.NEAREST
+                except Exception:
+                    res = Image.NEAREST
+                ico.thumbnail((34, 34), resample=res)
+                base.alpha_composite(ico, (side_x + 34, y0 + 9))
+            except Exception:
+                pass
+        nm = sp.replace("-", " ").title()
+        if len(nm) > 10:
+            nm = nm[:9] + "…"
+        draw.text((side_x + 74, y0 + 12), nm, fill=(43, 78, 117, 255), font=font)
+        draw.text((side_x + 74, y0 + 27), f"Lv {lv}", fill=(73, 111, 149, 255), font=font)
 
     buf = BytesIO()
     base.save(buf, format="PNG", optimize=True)
@@ -14098,6 +14371,28 @@ async def _box_render_payload(owner_id: str, box_no: int) -> tuple[discord.Embed
         )
         mons = [dict(r) for r in await cur.fetchall()]
         await cur.close()
+        cur = await conn.execute(
+            """
+            SELECT id, species, level, shiny, team_slot
+            FROM pokemons
+            WHERE owner_id=? AND team_slot BETWEEN 1 AND 6
+            ORDER BY team_slot, id
+            """,
+            (owner_id,),
+        )
+        team_rows = [dict(r) for r in await cur.fetchall()]
+        await cur.close()
+        cur = await conn.execute(
+            """
+            SELECT COUNT(1)
+            FROM pokemons
+            WHERE owner_id=? AND team_slot IS NULL AND box_no BETWEEN 1 AND ?
+            """,
+            (owner_id, int(box_count)),
+        )
+        count_row = await cur.fetchone()
+        await cur.close()
+        total_pc = int((count_row[0] if count_row else 0) or 0)
 
     emb = discord.Embed(
         title=f"PC Box {box_no}/{box_count}",
@@ -14108,9 +14403,9 @@ async def _box_render_payload(owner_id: str, box_no: int) -> tuple[discord.Embed
         color=0x5865F2,
     )
     emb.add_field(name="Filled Slots", value=f"{len(mons)}/{box_capacity}", inline=True)
-    emb.add_field(name="Total PC Mons", value=str(len(mons)), inline=True)
+    emb.add_field(name="Total PC Mons", value=str(total_pc), inline=True)
     emb.add_field(name="Sort Keys", value="gender • total_ivs • level • shiny • legendary", inline=False)
-    f = _box_panel_file(owner_id, box_no, box_count, box_capacity, mons)
+    f = _box_panel_file(owner_id, box_no, box_count, box_capacity, mons, team_rows)
     files: list[discord.File] = []
     if f is not None:
         emb.set_image(url=f"attachment://box-panel.png")
@@ -14322,7 +14617,7 @@ class BoxSwapModal(ui.Modal, title="Box Swap"):
 
     async def on_submit(self, interaction: Interaction):
         if str(interaction.user.id) != self.owner_id:
-            return await interaction.response.send_message("This isn't your box.", ephemeral=True)
+            return await interaction.response.send_message("this isn't for you", ephemeral=True)
         a = _parse_box_int(str(self.pos_a.value))
         b = _parse_box_int(str(self.pos_b.value))
         if not a or not b:
@@ -14341,7 +14636,7 @@ class BoxReleaseModal(ui.Modal, title="Box Release"):
 
     async def on_submit(self, interaction: Interaction):
         if str(interaction.user.id) != self.owner_id:
-            return await interaction.response.send_message("This isn't your box.", ephemeral=True)
+            return await interaction.response.send_message("this isn't for you", ephemeral=True)
         p = _parse_box_int(str(self.pos.value))
         if not p:
             return await interaction.response.send_message("Please enter a valid slot number.", ephemeral=True)
@@ -14361,7 +14656,7 @@ class BoxMoveModal(ui.Modal, title="Box Move"):
 
     async def on_submit(self, interaction: Interaction):
         if str(interaction.user.id) != self.owner_id:
-            return await interaction.response.send_message("This isn't your box.", ephemeral=True)
+            return await interaction.response.send_message("this isn't for you", ephemeral=True)
         s = _parse_box_int(str(self.src_pos.value))
         b = _parse_box_int(str(self.dst_box.value))
         p = _parse_box_int(str(self.dst_pos.value)) if str(self.dst_pos.value or "").strip() else None
@@ -14386,7 +14681,7 @@ class BoxSortModal(ui.Modal, title="Box Sort"):
 
     async def on_submit(self, interaction: Interaction):
         if str(interaction.user.id) != self.owner_id:
-            return await interaction.response.send_message("This isn't your box.", ephemeral=True)
+            return await interaction.response.send_message("this isn't for you", ephemeral=True)
         ok, msg = await _box_sort(self.owner_id, self.box_no, str(self.methods.value))
         await interaction.response.send_message(("✅ " if ok else "❌ ") + msg + "\nUse **Refresh** on your box panel to update.", ephemeral=True)
 
@@ -14401,7 +14696,7 @@ class BoxTakeModal(ui.Modal, title="Box Take Item"):
 
     async def on_submit(self, interaction: Interaction):
         if str(interaction.user.id) != self.owner_id:
-            return await interaction.response.send_message("This isn't your box.", ephemeral=True)
+            return await interaction.response.send_message("this isn't for you", ephemeral=True)
         p = _parse_box_int(str(self.pos.value))
         if not p:
             return await interaction.response.send_message("Please enter a valid slot number.", ephemeral=True)
@@ -14421,7 +14716,7 @@ class BoxMainView(discord.ui.View):
 
     async def interaction_check(self, itx: Interaction) -> bool:
         if int(itx.user.id) != self.owner_discord_id:
-            await itx.response.send_message("This isn't your box panel.", ephemeral=True)
+            await itx.response.send_message("this isn't for you", ephemeral=True)
             return False
         return True
 
@@ -14471,12 +14766,12 @@ class BoxMainView(discord.ui.View):
 @bot.tree.command(name="box", description="Open your PC boxes and manage stored Pokémon.")
 @app_commands.describe(box_no="Box number to open (default 1)")
 async def box_command(interaction: discord.Interaction, box_no: app_commands.Range[int, 1, 64] = 1):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     uid = str(interaction.user.id)
     emb, files, box_no, box_count = await _box_render_payload(uid, int(box_no))
     view = BoxMainView(interaction.user.id, uid, box_no, box_count)
     try:
-        await interaction.followup.send(embed=emb, files=files, view=view, ephemeral=True)
+        await interaction.followup.send(embed=emb, files=files, view=view, ephemeral=False)
     finally:
         _close_files(files)
 
