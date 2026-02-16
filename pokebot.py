@@ -12107,6 +12107,293 @@ async def walk_cmd(inter: discord.Interaction, name: str, slot: int | None = Non
         f"👟 You walked with **{mon['species'].title()}**{auto}. Friendship set to **0**.",
         ephemeral=True
     )
+
+
+def _team_species_label(row: dict) -> str:
+    species = str(row.get("species") or "Unknown").replace("-", " ").replace("_", " ").title()
+    form = str(row.get("form") or "").strip()
+    if form:
+        form_title = form.replace("-", " ").replace("_", " ").title()
+        if form_title.lower() not in species.lower():
+            species = f"{species} ({form_title})"
+    return species
+
+
+def _team_parse_moves(raw: Any) -> list[str]:
+    moves = raw
+    if isinstance(moves, str):
+        try:
+            moves = json.loads(moves)
+        except Exception:
+            moves = [moves]
+    if not isinstance(moves, (list, tuple)):
+        return []
+    out: list[str] = []
+    for m in moves[:4]:
+        if isinstance(m, str):
+            name = m.strip()
+        elif isinstance(m, dict):
+            name = str(m.get("name") or "").strip()
+        else:
+            name = str(m).strip()
+        if name:
+            out.append(name.replace("-", " ").title())
+    return out
+
+
+def _team_hp_values(row: dict) -> tuple[int, int, int]:
+    try:
+        hp_max = int(row.get("hp") or 1)
+    except Exception:
+        hp_max = 1
+    hp_max = max(1, hp_max)
+    try:
+        hp_now = int(row.get("hp_now") if row.get("hp_now") is not None else hp_max)
+    except Exception:
+        hp_now = hp_max
+    hp_now = max(0, min(hp_now, hp_max))
+    pct = int(round((hp_now / max(1, hp_max)) * 100))
+    return hp_now, hp_max, pct
+
+
+def _team_hp_bar(pct: int, width: int = 10) -> str:
+    pct = max(0, min(100, int(pct)))
+    filled = int(round((pct / 100.0) * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _team_overview_icon_path(row: dict) -> Optional[Path]:
+    species = _daycare_norm_species(row.get("species"))
+    form = _daycare_norm_species(row.get("form"))
+    candidates: list[str] = []
+    if species and form:
+        if form.startswith(f"{species}-"):
+            candidates.append(form)
+        else:
+            candidates.append(f"{species}-{form}")
+    if species:
+        candidates.append(species)
+    for key in candidates:
+        p = _daycare_icon_path_for_species(key)
+        if p is not None:
+            return p
+    return None
+
+
+def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -> Optional[discord.File]:
+    if Image is None:
+        return None
+    try:
+        from PIL import ImageDraw  # type: ignore
+    except Exception:
+        return None
+    try:
+        try:
+            resample = Image.Resampling.NEAREST
+        except Exception:
+            resample = Image.NEAREST
+
+        width, height = 840, 360
+        canvas = Image.new("RGBA", (width, height), (17, 20, 27, 255))
+        draw = ImageDraw.Draw(canvas)
+        draw.rectangle((0, 0, width, 56), fill=(35, 41, 54, 255))
+        draw.text((18, 18), f"{target_name} - Team Panel", fill=(240, 244, 255, 255))
+
+        cols, rows = 3, 2
+        card_w, card_h = 252, 132
+        x_gap, y_gap = 18, 16
+        x0, y0 = 18, 72
+
+        for slot in range(1, 7):
+            row_idx = (slot - 1) // cols
+            col_idx = (slot - 1) % cols
+            cx = x0 + col_idx * (card_w + x_gap)
+            cy = y0 + row_idx * (card_h + y_gap)
+            card = slots.get(slot)
+            fill = (30, 36, 48, 255) if card else (23, 27, 36, 255)
+            edge = (84, 98, 125, 255) if card else (64, 74, 95, 255)
+            try:
+                draw.rounded_rectangle((cx, cy, cx + card_w, cy + card_h), radius=12, fill=fill, outline=edge, width=2)
+            except Exception:
+                draw.rectangle((cx, cy, cx + card_w, cy + card_h), fill=fill, outline=edge, width=2)
+
+            draw.text((cx + 12, cy + 10), f"Slot {slot}", fill=(196, 206, 230, 255))
+            if not card:
+                draw.text((cx + 12, cy + 50), "Empty", fill=(150, 162, 190, 255))
+                continue
+
+            name = _team_species_label(card)
+            if len(name) > 20:
+                name = name[:19] + "…"
+            lvl = int(card.get("level") or 1)
+            shiny = bool(int(card.get("shiny") or 0))
+            star = " *" if shiny else ""
+            draw.text((cx + 12, cy + 32), name, fill=(238, 244, 255, 255))
+            draw.text((cx + 12, cy + 52), f"Lv {lvl}{star}", fill=(208, 222, 255, 255))
+
+            hp_now, hp_max, pct = _team_hp_values(card)
+            bar_x, bar_y, bar_w, bar_h = cx + 12, cy + 80, 140, 12
+            draw.rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + bar_h), fill=(52, 58, 74, 255), outline=(92, 102, 128, 255))
+            if pct > 0:
+                fill_w = max(2, int((bar_w - 2) * (pct / 100.0)))
+                hp_color = (97, 220, 121, 255) if pct >= 50 else ((243, 194, 68, 255) if pct >= 20 else (239, 102, 102, 255))
+                draw.rectangle((bar_x + 1, bar_y + 1, bar_x + fill_w, bar_y + bar_h - 1), fill=hp_color)
+            draw.text((bar_x, bar_y + 16), f"HP {hp_now}/{hp_max}", fill=(189, 205, 235, 255))
+
+            icon_path = _team_overview_icon_path(card)
+            if icon_path is not None:
+                try:
+                    icon = Image.open(str(icon_path)).convert("RGBA")
+                    icon.thumbnail((64, 64), resample=resample)
+                    canvas.alpha_composite(icon, dest=(cx + card_w - 78, cy + 14))
+                except Exception:
+                    pass
+
+        buf = BytesIO()
+        canvas.save(buf, format="PNG")
+        buf.seek(0)
+        fname = f"team_panel_{int(time.time())}_{random.randint(1000, 9999)}.png"
+        return discord.File(fp=buf, filename=fname)
+    except Exception:
+        return None
+
+
+class TeamPanelView(discord.ui.View):
+    def __init__(self, author_id: int, target_name: str, slots: dict[int, dict | None]):
+        super().__init__(timeout=240)
+        self.author_id = int(author_id)
+        self.target_name = target_name
+        self.slots = dict(slots)
+        self._build_buttons()
+
+    def _build_buttons(self):
+        overview_btn = discord.ui.Button(label="Overview", style=discord.ButtonStyle.primary, custom_id="team:view:overview", row=0)
+        overview_btn.callback = self._on_overview
+        self.add_item(overview_btn)
+        for i in range(1, 7):
+            has_mon = bool(self.slots.get(i))
+            b = discord.ui.Button(
+                label=f"Slot {i}",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"team:view:slot:{i}",
+                row=1 if i <= 3 else 2,
+                disabled=not has_mon,
+            )
+            b.callback = self._on_slot
+            self.add_item(b)
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return itx.user.id == self.author_id
+
+    def _overview_payload(self) -> tuple[discord.Embed, list[discord.File]]:
+        count = sum(1 for i in range(1, 7) if self.slots.get(i))
+        emb = discord.Embed(
+            title=f"{self.target_name}'s Team",
+            description=f"**{count}/6** occupied. Click slot buttons for detailed cards.",
+            color=0x5865F2,
+        )
+        for i in range(1, 7):
+            row = self.slots.get(i)
+            if not row:
+                emb.add_field(name=f"Slot {i}", value="— Empty", inline=True)
+                continue
+            name = _team_species_label(row)
+            gicon = _gender_icon(row.get("gender")) or "•"
+            star = " ✨" if bool(int(row.get("shiny") or 0)) else ""
+            hp_now, hp_max, pct = _team_hp_values(row)
+            item_emoji = (row.get("item_emoji") or "").strip()
+            if not _is_displayable_item_emoji(item_emoji):
+                item_emoji = ""
+            item_id = str(row.get("held_item") or "").strip()
+            held_txt = f"{item_emoji} {pretty_item_name(item_id)}".strip() if item_id else "No held item"
+            value = (
+                f"**{gicon} {name}{star}**\n"
+                f"Lv {int(row.get('level') or 1)} · `{_team_hp_bar(pct)}` {pct}%\n"
+                f"{held_txt}\n"
+                f"ID #{int(row.get('id') or 0)}"
+            )
+            emb.add_field(name=f"Slot {i}", value=value, inline=True)
+        files: list[discord.File] = []
+        panel = _team_overview_panel_file(self.target_name, self.slots)
+        if panel:
+            emb.set_image(url=f"attachment://{panel.filename}")
+            files.append(panel)
+        return emb, files
+
+    def _slot_payload(self, slot: int) -> tuple[discord.Embed, list[discord.File]]:
+        row = self.slots.get(int(slot))
+        if not row:
+            emb = discord.Embed(title=f"{self.target_name} — Slot {slot}", description="This slot is empty.", color=0x2F3136)
+            return emb, []
+        name = _team_species_label(row)
+        shiny = bool(int(row.get("shiny") or 0))
+        gicon = _gender_icon(row.get("gender")) or "—"
+        hp_now, hp_max, pct = _team_hp_values(row)
+        emb = discord.Embed(
+            title=f"{self.target_name} — Slot {slot}",
+            description=f"**{name}**{' ✨' if shiny else ''}\n`{_team_hp_bar(pct, width=14)}` **{hp_now}/{hp_max}** ({pct}%)",
+            color=0xF1C40F if shiny else 0x5865F2,
+        )
+        emb.add_field(name="Level", value=str(int(row.get("level") or 1)), inline=True)
+        emb.add_field(name="Gender", value=gicon, inline=True)
+        emb.add_field(name="Nature", value=str(row.get("nature") or "Unknown").replace("-", " ").title(), inline=True)
+        ability = str(row.get("ability") or "Unknown").replace("-", " ").title()
+        emb.add_field(name="Ability", value=ability, inline=True)
+        emb.add_field(name="Friendship", value=str(int(row.get("friendship") or 0)), inline=True)
+        held_item = str(row.get("held_item") or "").strip()
+        item_emoji = (row.get("item_emoji") or "").strip()
+        if held_item:
+            held_disp = pretty_item_name(held_item)
+            if _is_displayable_item_emoji(item_emoji):
+                held_disp = f"{item_emoji} {held_disp}"
+        else:
+            held_disp = "None"
+        emb.add_field(name="Held Item", value=held_disp, inline=True)
+        moves = _team_parse_moves(row.get("moves"))
+        emb.add_field(
+            name="Moves",
+            value="\n".join(f"**{i+1}.** {m}" for i, m in enumerate(moves)) if moves else "—",
+            inline=False,
+        )
+        emb.set_footer(text=f"Pokémon ID #{int(row.get('id') or 0)}")
+        files = attach_sprite_to_embed(
+            emb,
+            species=str(row.get("species") or ""),
+            shiny=shiny,
+            gender=row.get("gender"),
+            form_key=row.get("form"),
+        )
+        return emb, files
+
+    async def _edit_payload(self, itx: discord.Interaction, emb: discord.Embed, files: list[discord.File]):
+        try:
+            await itx.response.edit_message(embed=emb, attachments=files, view=self)
+        except TypeError:
+            await itx.response.edit_message(embed=emb, files=files, view=self)
+        except Exception:
+            try:
+                await itx.edit_original_response(embed=emb, attachments=files, view=self)
+            except TypeError:
+                await itx.edit_original_response(embed=emb, files=files, view=self)
+
+    async def _on_overview(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        emb, files = self._overview_payload()
+        await self._edit_payload(itx, emb, files)
+
+    async def _on_slot(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = str((itx.data or {}).get("custom_id") or "")
+        try:
+            slot = int(cid.rsplit(":", 1)[-1])
+        except Exception:
+            return await itx.response.send_message("Invalid slot.", ephemeral=True)
+        emb, files = self._slot_payload(slot)
+        await self._edit_payload(itx, emb, files)
+
+
 @bot.tree.command(name="team", description="Show your current team (6 slots).")
 @app_commands.describe(user="View another user's team (optional)")
 async def team(interaction: discord.Interaction, user: discord.User | None = None):
@@ -12143,13 +12430,17 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
                             "id": p.get("id"), "species": p.get("species"), "level": p.get("level"),
                             "gender": p.get("gender"), "shiny": p.get("shiny"), "team_slot": p.get("team_slot"),
                             "held_item": p.get("held_item"), "item_emoji": item_emoji,
+                            "hp": p.get("hp"), "hp_now": p.get("hp_now"), "moves": p.get("moves"),
+                            "nature": p.get("nature"), "ability": p.get("ability"), "friendship": p.get("friendship"),
+                            "form": p.get("form"),
                         })
         except Exception:
             pass
     if rows is None:
         async with db.session() as conn:
             cur = await conn.execute("""
-            SELECT p.id, p.species, p.level, p.gender, p.shiny, p.team_slot, p.held_item, i.emoji AS item_emoji
+            SELECT p.id, p.species, p.level, p.gender, p.shiny, p.team_slot, p.held_item, i.emoji AS item_emoji,
+                   p.hp, p.hp_now, p.moves, p.nature, p.ability, p.friendship, p.form
             FROM pokemons p
             LEFT JOIN items i ON i.id = p.held_item
             WHERE p.owner_id = ? AND p.team_slot BETWEEN 1 AND 6
@@ -12170,39 +12461,24 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
             "id": r[0], "species": r[1], "level": r[2], "gender": r[3],
             "shiny": r[4], "team_slot": r[5], "held_item": r[6],
             "item_emoji": r[7] if len(r) > 7 else None,
+            "hp": r[8] if len(r) > 8 else None,
+            "hp_now": r[9] if len(r) > 9 else None,
+            "moves": r[10] if len(r) > 10 else None,
+            "nature": r[11] if len(r) > 11 else None,
+            "ability": r[12] if len(r) > 12 else None,
+            "friendship": r[13] if len(r) > 13 else None,
+            "form": r[14] if len(r) > 14 else None,
         }
-        slots[int(row["team_slot"])] = row
+        try:
+            slot_i = int(row["team_slot"])
+            if 1 <= slot_i <= 6:
+                slots[slot_i] = row
+        except Exception:
+            continue
 
-    emb = discord.Embed(title=f"{target.display_name}'s Team (6 slots)")
-    EM_SPACE = "\u2003"  # wide spacing
-
-    for i in range(1, 7):
-        row = slots[i]
-        if not row:
-            value = "No pokemon \n\u200b"  # spacer line to add height
-        else:
-            star  = " ⭐" if bool(int(row.get("shiny") or 0)) else ""
-            gicon = _gender_icon(row.get("gender"))
-            item_emoji = (row.get("item_emoji") or "").strip()
-            # Fallback: held_item stored as name — use cache only (no DB)
-            if not item_emoji and row.get("held_item") and db_cache:
-                cached = db_cache.get_cached_item(str(row["held_item"]))
-                if cached:
-                    item_emoji = (cached.get("emoji") or "").strip()
-            # Only show when displayable (unicode or <:name:id>). Skip bare :shortcode:.
-            if not _is_displayable_item_emoji(item_emoji):
-                item_emoji = ""
-
-            # More spacious two-line layout + a blank spacer line
-            line1 = f"**{gicon} {str(row['species']).title()}{star}**"
-            item_pad = f"{item_emoji} {EM_SPACE}" if item_emoji else ""
-            line2 = f"{item_pad}Lv {row['level']}  ·  ID #{row['id']}"
-            value = f"{line1}\n{line2}\n\u200b"
-
-        # inline=False => each slot gets full width = less condensed
-        emb.add_field(name=f"Slot {i}", value=value, inline=True)
-
-    await interaction.followup.send(embed=emb, ephemeral=True)
+    view = TeamPanelView(interaction.user.id, target.display_name, slots)
+    emb, files = view._overview_payload()
+    await interaction.followup.send(embed=emb, files=files, view=view, ephemeral=True)
 
 
 async def _create_pokemon_from_parsed(
