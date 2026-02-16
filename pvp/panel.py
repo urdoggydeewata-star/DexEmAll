@@ -7433,11 +7433,35 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
     if not embed.title and not embed.description and not embed.fields and not embed.image and not file:
         embed.description = "Battle in progress..."
     
-    # Send new stream message (don't delete old ones - create a new message each turn)
+    # Prefer editing the existing stream message to keep one clean live stream panel.
+    last_msg = getattr(st, "_last_stream_message", None)
     msg = None
     try:
+        if last_msg is not None:
+            try:
+                same_channel = int(getattr(last_msg.channel, "id", 0)) == int(getattr(channel, "id", 0))
+            except Exception:
+                same_channel = False
+            if same_channel:
+                if file is not None:
+                    try:
+                        await last_msg.edit(embed=embed, attachments=[file])
+                    except TypeError:
+                        # Compatibility fallback for discord.py variants that use `files=`.
+                        await last_msg.edit(embed=embed, files=[file])
+                else:
+                    await last_msg.edit(embed=embed, attachments=[])
+                return last_msg
         msg = await channel.send(embed=embed, file=file)
         return msg
+    except discord.NotFound:
+        # Message deleted or inaccessible; send a fresh one.
+        try:
+            msg = await channel.send(embed=embed, file=file)
+            return msg
+        except Exception as e:
+            print(f"[Stream] Error sending replacement stream panel: {e}")
+            return None
     except Exception as e:
         print(f"[Stream] Error sending stream: {e}")
         return None
@@ -8869,13 +8893,19 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
         """Send stream panel update in background (non-blocking for players)"""
         if not st.streaming_enabled or not p1_itx.channel:
             return
+        # Serialize stream rendering/edits so updates stay in order per battle.
+        stream_lock = getattr(st, "_stream_update_lock", None)
+        if stream_lock is None:
+            stream_lock = asyncio.Lock()
+            st._stream_update_lock = stream_lock
         try:
-            turn_summary_text = "\n".join(formatted_turn_log)
-            # Render GIF for stream (shows current battle state with HP hidden)
-            render_result = await _render_gif_for_panel(st, st.p1_id, hide_hp_text=True)
-            msg = await _send_stream_panel(p1_itx.channel, st, turn_summary_text, render_result)
-            if msg is not None:
-                st._last_stream_message = msg
+            async with stream_lock:
+                turn_summary_text = "\n".join(formatted_turn_log)
+                # Render GIF for stream (shows current battle state with HP hidden)
+                render_result = await _render_gif_for_panel(st, st.p1_id, hide_hp_text=True)
+                msg = await _send_stream_panel(p1_itx.channel, st, turn_summary_text, render_result)
+                if msg is not None:
+                    st._last_stream_message = msg
         except Exception as e:
             print(f"[Stream] Error updating stream: {e}")
     
