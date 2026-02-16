@@ -8417,13 +8417,24 @@ async def _start_pve_battle(
             if is_adventure_wild:
                 throw_shakes = getattr(st, "_throw_shakes", 0) or 0
                 if throw_shakes > 0 and last_log and any("threw a" in line and "shook" in line for line in last_log):
+                    shake_msg = None
                     for i in range(1, throw_shakes + 1):
+                        shake_emb = discord.Embed(description=f"Shake {i}!", color=0x5865F2)
                         try:
-                            shake_emb = discord.Embed(description=f"Shake {i}!", color=0x5865F2)
-                            await itx.followup.send(embed=shake_emb, ephemeral=False)
+                            if shake_msg is None:
+                                # Use one ephemeral message and update it each shake.
+                                shake_msg = await itx.followup.send(embed=shake_emb, ephemeral=True, wait=True)
+                            else:
+                                await shake_msg.edit(embed=shake_emb)
                         except Exception:
-                            pass
-                        await asyncio.sleep(1.5)
+                            # Fallback: still keep it private even if editable message fetch fails.
+                            if shake_msg is None:
+                                try:
+                                    await itx.followup.send(embed=shake_emb, ephemeral=True)
+                                except Exception:
+                                    pass
+                        if i < throw_shakes:
+                            await asyncio.sleep(1.5)
             # Outcome
             caught_this_turn = any("and **caught" in line for line in last_log) if is_adventure_wild else False
             if st.winner == itx.user.id:
