@@ -6289,6 +6289,7 @@ DAYCARE_BREED_THRESHOLD = 22.0
 DAYCARE_HATCH_MIN = 45.0
 DAYCARE_HATCH_MAX = 80.0
 DAYCARE_HATCH_BOOST_ABILITIES = {"flame-body", "magma-armor"}
+DAYCARE_MAX_ANIM_FRAMES = 16
 BOX_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "box_sprites"
 LEGACY_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "sprites"
 
@@ -7900,29 +7901,55 @@ def _embed_with_daycare_panel(
         except Exception:
             resample_smooth = Image.BICUBIC
             resample_pixel = Image.NEAREST
+        try:
+            from PIL import ImageSequence  # type: ignore
+        except Exception:
+            ImageSequence = None  # type: ignore
 
+        sprite_layers: list[dict[str, Any]] = []
         for species, (x, y) in zip(parent_species, positions):
             icon_path = _daycare_icon_path_for_species(species)
             if not icon_path:
                 continue
             try:
-                icon = Image.open(str(icon_path)).convert("RGBA")
-                # Keep pixel-art sprites crisp when scaling on the daycare panel.
                 is_box_icon = str(getattr(icon_path, "name", "")).lower() == "box.png"
                 is_gif = str(getattr(icon_path, "suffix", "")).lower() == ".gif"
                 if is_gif:
-                    # Gen5 animated sprites are pixel art; scale with nearest-neighbor.
-                    icon.thumbnail((54, 54), resample=resample_pixel)
+                    max_size = (54, 54)
+                    sprite_resample = resample_pixel
                 elif is_box_icon:
-                    icon.thumbnail((44, 34), resample=resample_pixel)
+                    max_size = (44, 34)
+                    sprite_resample = resample_pixel
                 else:
-                    icon.thumbnail((42, 42), resample=resample_smooth)
-                dx = max(0, min(int(x), max(0, base.width - icon.width)))
-                dy = max(0, min(int(y), max(0, base.height - icon.height)))
-                base.alpha_composite(icon, dest=(dx, dy))
+                    max_size = (42, 42)
+                    sprite_resample = resample_smooth
+
+                src = Image.open(str(icon_path))
+                frames: list[Any] = []
+                if is_gif and ImageSequence is not None and bool(getattr(src, "is_animated", False)):
+                    try:
+                        for i, fr in enumerate(ImageSequence.Iterator(src)):
+                            if i >= DAYCARE_MAX_ANIM_FRAMES:
+                                break
+                            sprite = fr.convert("RGBA")
+                            sprite.thumbnail(max_size, resample=sprite_resample)
+                            frames.append(sprite)
+                    except Exception:
+                        frames = []
+                if not frames:
+                    sprite = src.convert("RGBA")
+                    sprite.thumbnail(max_size, resample=sprite_resample)
+                    frames = [sprite]
+                if not frames:
+                    continue
+
+                dx = max(0, min(int(x), max(0, base.width - frames[0].width)))
+                dy = max(0, min(int(y), max(0, base.height - frames[0].height)))
+                sprite_layers.append({"frames": frames, "dest": (dx, dy)})
             except Exception:
                 continue
 
+        egg_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
         egg_count = max(0, min(int(egg_count or 0), DAYCARE_EGG_CAP))
         if egg_count > 0 and ASSETS_DAYCARE_EGG.exists():
             try:
@@ -7931,14 +7958,62 @@ def _embed_with_daycare_panel(
                 egg_spots = [(255, 194), (284, 184), (313, 194)]
                 for i in range(egg_count):
                     ex, ey = egg_spots[i]
-                    base.alpha_composite(egg_icon, dest=(ex, ey))
+                    egg_layer.alpha_composite(egg_icon, dest=(ex, ey))
             except Exception:
                 pass
 
+        frame_count = 1
+        for layer in sprite_layers:
+            try:
+                frame_count = max(frame_count, len(layer.get("frames") or []))
+            except Exception:
+                continue
+        frame_count = max(1, min(DAYCARE_MAX_ANIM_FRAMES, int(frame_count)))
+
         buf = BytesIO()
-        base.save(buf, format="PNG")
+        if frame_count > 1:
+            out_frames: list[Any] = []
+            for fi in range(frame_count):
+                frame = base.copy()
+                for layer in sprite_layers:
+                    frames = layer.get("frames") or []
+                    if not frames:
+                        continue
+                    if len(frames) > 1:
+                        src_i = int((fi * len(frames)) / frame_count) % len(frames)
+                    else:
+                        src_i = 0
+                    try:
+                        frame.alpha_composite(frames[src_i], dest=layer["dest"])
+                    except Exception:
+                        continue
+                frame.alpha_composite(egg_layer)
+                out_frames.append(frame)
+            out_frames[0].save(
+                buf,
+                format="GIF",
+                save_all=True,
+                append_images=out_frames[1:],
+                duration=int(TEAM_BATTLE_SYNC_DURATION_MS),
+                loop=0,
+                disposal=2,
+            )
+            filename = "daycare_panel.gif"
+        else:
+            frame = base.copy()
+            for layer in sprite_layers:
+                frames = layer.get("frames") or []
+                if not frames:
+                    continue
+                try:
+                    frame.alpha_composite(frames[0], dest=layer["dest"])
+                except Exception:
+                    continue
+            frame.alpha_composite(egg_layer)
+            frame.save(buf, format="PNG")
+            filename = "daycare_panel.png"
+
         buf.seek(0)
-        filename = "daycare_panel.png"
         f = discord.File(fp=buf, filename=filename)
         emb = discord.Embed(title=title, description=description)
         emb.set_image(url=f"attachment://{filename}")
@@ -12379,11 +12454,28 @@ TEAM_SHOWDOWN_CACHE_DIR = ASSETS_DIR / "ui" / "team-anim-cache"
 TEAM_SHOWDOWN_STYLE_DIR = "gen5ani"
 TEAM_SHOWDOWN_UA = "Mozilla/5.0 (DexEmAll Team Renderer)"
 _TEAM_SHOWDOWN_MISS_KEYS: set[str] = set()
-TEAM_DEFAULT_FRAME_DURATION_MS = 100
-TEAM_MIN_FRAME_DURATION_MS = 90
-TEAM_MAX_FRAME_DURATION_MS = 180
-TEAM_MAX_SPRITE_FRAMES = 48
-TEAM_MAX_COMPOSITE_FRAMES = 24
+
+
+def _battle_sync_frame_duration_ms() -> int:
+    """Match team/daycare animation cadence to battle renderer default."""
+    try:
+        fn = globals().get("render_turn_gif")
+        if callable(fn):
+            sig = inspect.signature(fn)
+            p = sig.parameters.get("duration_ms")
+            if p is not None and p.default is not inspect._empty:
+                return max(40, min(220, int(p.default)))
+    except Exception:
+        pass
+    return 100
+
+
+TEAM_BATTLE_SYNC_DURATION_MS = _battle_sync_frame_duration_ms()
+TEAM_DEFAULT_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
+TEAM_MIN_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
+TEAM_MAX_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
+TEAM_MAX_SPRITE_FRAMES = 32
+TEAM_MAX_COMPOSITE_FRAMES = 16
 TEAM_FETCH_SHOWDOWN_FOR_TEAM = False
 TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
     {"box_xy": (236, 93), "box_wh": (177, 197), "sprite_c": (324, 173), "label_xy": (246, 256), "level_right": (402, 256)},
@@ -12696,7 +12788,7 @@ def _team_fit_font(draw, text: str, *, max_width: int, start_size: int, min_size
 
 def _team_load_sprite_frames(path: Optional[Path], *, max_size: tuple[int, int], resample) -> tuple[list[Any], int]:
     if path is None or Image is None:
-        return [], 100
+        return [], TEAM_BATTLE_SYNC_DURATION_MS
     try:
         from PIL import ImageSequence  # type: ignore
     except Exception:
@@ -12704,8 +12796,8 @@ def _team_load_sprite_frames(path: Optional[Path], *, max_size: tuple[int, int],
     try:
         img = Image.open(str(path))
     except Exception:
-        return [], 100
-    duration = int(img.info.get("duration") or TEAM_DEFAULT_FRAME_DURATION_MS)
+        return [], TEAM_BATTLE_SYNC_DURATION_MS
+    duration = TEAM_BATTLE_SYNC_DURATION_MS
     frames: list[Any] = []
     if ImageSequence is not None and bool(getattr(img, "is_animated", False)):
         try:
@@ -12724,7 +12816,7 @@ def _team_load_sprite_frames(path: Optional[Path], *, max_size: tuple[int, int],
             frames = [sprite]
         except Exception:
             frames = []
-    return frames, max(TEAM_MIN_FRAME_DURATION_MS, min(TEAM_MAX_FRAME_DURATION_MS, duration))
+    return frames, duration
 
 
 def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -> Optional[discord.File]:
@@ -12861,20 +12953,18 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
         # Preload sprite frames (animated front preferred).
         sprite_data: dict[int, dict[str, Any]] = {}
         cycle_lengths: list[int] = []
-        duration_samples: list[int] = []
-        base_duration = TEAM_DEFAULT_FRAME_DURATION_MS
+        base_duration = TEAM_BATTLE_SYNC_DURATION_MS
         for slot in range(1, 7):
             row = slots.get(slot)
             if not row:
-                sprite_data[slot] = {"frames": [], "duration": 100}
+                sprite_data[slot] = {"frames": []}
                 continue
             path = _team_pick_sprite_path(row)
             sprite_max = (max(32, int(round(88 * sx))), max(32, int(round(88 * sy))))
-            frames, duration = _team_load_sprite_frames(path, max_size=sprite_max, resample=resample)
-            sprite_data[slot] = {"frames": frames, "duration": duration}
+            frames, _ = _team_load_sprite_frames(path, max_size=sprite_max, resample=resample)
+            sprite_data[slot] = {"frames": frames}
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
-                duration_samples.append(int(duration))
 
         lvl_font_slot = _team_font(max(9, int(round(18 * s))), bold=False)
         text_prep: dict[int, dict[str, Any]] = {}
@@ -12919,6 +13009,38 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                 "label_x": geom["label_xy"][0],
             }
 
+        # Draw static text once and composite it over each animation frame.
+        text_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        text_draw = ImageDraw.Draw(text_layer)
+        for slot in range(1, 7):
+            geom = slot_layout[slot - 1]
+            row = slots.get(slot)
+            slot_text = text_prep.get(slot) or {}
+            if not row:
+                if slot_text.get("font"):
+                    text_draw.text(
+                        geom["label_xy"],
+                        str(slot_text.get("label") or "Empty"),
+                        font=slot_text["font"],
+                        fill=(195, 194, 210, 255),
+                    )
+                continue
+            if slot_text.get("font"):
+                text_draw.text(
+                    (int(slot_text.get("label_x") or geom["label_xy"][0]), geom["label_xy"][1]),
+                    str(slot_text.get("label") or ""),
+                    font=slot_text["font"],
+                    fill=(238, 240, 252, 255),
+                )
+            lvl = str(slot_text.get("lvl") or "")
+            if lvl and lvl_font_slot:
+                text_draw.text(
+                    (int(slot_text.get("lvl_x") or geom["level_right"][0]), geom["level_right"][1]),
+                    lvl,
+                    font=lvl_font_slot,
+                    fill=(230, 230, 240, 255),
+                )
+
         out_frames: list[Any] = []
         frame_count = 1
         if cycle_lengths:
@@ -12927,20 +13049,12 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
             except Exception:
                 frame_count = min(TEAM_MAX_COMPOSITE_FRAMES, max(cycle_lengths))
         frame_count = max(1, int(frame_count))
-        if duration_samples:
-            duration_samples.sort()
-            base_duration = int(duration_samples[len(duration_samples) // 2])
-        base_duration = max(TEAM_MIN_FRAME_DURATION_MS, min(TEAM_MAX_FRAME_DURATION_MS, int(base_duration)))
         for fi in range(frame_count):
             frame = base.copy()
-            frame_draw = ImageDraw.Draw(frame)
             for slot in range(1, 7):
                 geom = slot_layout[slot - 1]
                 row = slots.get(slot)
-                slot_text = text_prep.get(slot) or {}
                 if not row:
-                    if slot_text.get("font"):
-                        frame_draw.text(geom["label_xy"], str(slot_text.get("label") or "Empty"), font=slot_text["font"], fill=(195, 194, 210, 255))
                     continue
 
                 data = sprite_data.get(slot) or {}
@@ -12957,12 +13071,7 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                         frame.alpha_composite(sprite, dest=(sx, sy))
                     except Exception:
                         pass
-
-                if slot_text.get("font"):
-                    frame_draw.text((int(slot_text.get("label_x") or geom["label_xy"][0]), geom["label_xy"][1]), str(slot_text.get("label") or ""), font=slot_text["font"], fill=(238, 240, 252, 255))
-                lvl = str(slot_text.get("lvl") or "")
-                if lvl and lvl_font_slot:
-                    frame_draw.text((int(slot_text.get("lvl_x") or geom["level_right"][0]), geom["level_right"][1]), lvl, font=lvl_font_slot, fill=(230, 230, 240, 255))
+            frame.alpha_composite(text_layer)
             out_frames.append(frame)
 
         buf = BytesIO()
@@ -13138,10 +13247,6 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
     if db_cache is not None:
         try:
             cached = db_cache.get_cached_pokemons(uid)
-            if cached is None:
-                # Populate cache on miss (for /team, mpokeinfo, etc.)
-                await db.list_pokemons(uid, limit=2000, offset=0)
-                cached = db_cache.get_cached_pokemons(uid)
             if cached is not None:
                 team_mons = [p for p in cached if p.get("team_slot") and 1 <= int(p.get("team_slot") or 0) <= 6]
                 team_mons.sort(key=lambda p: (int(p.get("team_slot") or 0), int(p.get("id") or 0)))
@@ -13175,9 +13280,14 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
             """, (uid,))
             rows = [dict(r) for r in await cur.fetchall()]
             await cur.close()
-        # Populate cache for future /team, mpokeinfo calls (db.list_pokemons fetches and caches)
+        # Warm cache asynchronously (don't block /team response).
         try:
-            await db.list_pokemons(uid, limit=2000, offset=0)
+            async def _warm_team_cache() -> None:
+                try:
+                    await db.list_pokemons(uid, limit=2000, offset=0)
+                except Exception:
+                    pass
+            asyncio.create_task(_warm_team_cache())
         except Exception:
             pass
 
