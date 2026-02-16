@@ -7744,9 +7744,11 @@ def _embed_with_daycare_panel(
         base = Image.open(str(ASSETS_DAYCARE)).convert("RGBA")
         positions = _daycare_random_positions(len(parent_species))
         try:
-            resample = Image.Resampling.LANCZOS  # smoother downscaling for box sprites
+            resample_smooth = Image.Resampling.LANCZOS
+            resample_pixel = Image.Resampling.NEAREST
         except Exception:
-            resample = Image.BICUBIC
+            resample_smooth = Image.BICUBIC
+            resample_pixel = Image.NEAREST
 
         for species, (x, y) in zip(parent_species, positions):
             icon_path = _daycare_icon_path_for_species(species)
@@ -7754,7 +7756,12 @@ def _embed_with_daycare_panel(
                 continue
             try:
                 icon = Image.open(str(icon_path)).convert("RGBA")
-                icon.thumbnail((42, 42), resample=resample)
+                # Dedicated box sprites are menu icons (40x30); keep them crisp.
+                is_box_icon = str(getattr(icon_path, "name", "")).lower() == "box.png"
+                if is_box_icon:
+                    icon.thumbnail((44, 34), resample=resample_pixel)
+                else:
+                    icon.thumbnail((42, 42), resample=resample_smooth)
                 dx = max(0, min(int(x), max(0, base.width - icon.width)))
                 dy = max(0, min(int(y), max(0, base.height - icon.height)))
                 base.alpha_composite(icon, dest=(dx, dy))
@@ -7765,7 +7772,7 @@ def _embed_with_daycare_panel(
         if egg_count > 0 and ASSETS_DAYCARE_EGG.exists():
             try:
                 egg_icon = Image.open(str(ASSETS_DAYCARE_EGG)).convert("RGBA")
-                egg_icon.thumbnail((30, 30), resample=resample)
+                egg_icon.thumbnail((30, 30), resample=resample_smooth)
                 egg_spots = [(255, 194), (284, 184), (313, 194)]
                 for i in range(egg_count):
                     ex, ey = egg_spots[i]
