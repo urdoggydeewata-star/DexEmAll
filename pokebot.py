@@ -12167,6 +12167,13 @@ TEAM_TEMPLATE_PATHS: tuple[Path, ...] = (
     ASSETS_DIR / "ui" / "team_panel_template.png",
     ASSETS_DIR / "team-template.png",
 )
+TEAM_TEMPLATE_BASE_SIZE: tuple[int, int] = (808, 537)
+TEAM_TRAINER_HEADER_RECT = (42, 34, 212, 84)
+TEAM_TRAINER_ART_RECT = (42, 85, 212, 410)
+TEAM_TRAINER_FOOTER_RECT = (42, 430, 212, 491)
+TEAM_TRAINER_NAME_CENTER_X = 127
+TEAM_TRAINER_LABEL_Y = 38
+TEAM_TRAINER_NAME_Y = 62
 TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
     {"box_xy": (236, 93), "box_wh": (177, 197), "sprite_c": (324, 173), "label_xy": (246, 256), "level_right": (402, 256)},
     {"box_xy": (415, 93), "box_wh": (177, 197), "sprite_c": (503, 173), "label_xy": (425, 256), "level_right": (581, 256)},
@@ -12178,10 +12185,25 @@ TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
 
 
 def _team_template_path() -> Optional[Path]:
+    # Explicit file names first (most reliable).
     for p in TEAM_TEMPLATE_PATHS:
         try:
             if p.exists() and p.is_file() and p.stat().st_size > 0:
                 return p
+        except Exception:
+            continue
+    # Fallback: auto-pick any PNG in assets/ui or assets containing "team" in filename.
+    for base in (ASSETS_DIR / "ui", ASSETS_DIR):
+        try:
+            if not base.exists() or not base.is_dir():
+                continue
+        except Exception:
+            continue
+        try:
+            for p in sorted(base.glob("*.png")):
+                stem = p.stem.lower()
+                if "team" in stem and "tm" not in stem and p.stat().st_size > 0:
+                    return p
         except Exception:
             continue
     return None
@@ -12320,29 +12342,91 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
             # Fallback: generate a simple empty template if custom one isn't provided yet.
             base = Image.new("RGBA", (808, 537), (92, 56, 106, 255))
 
+        bw, bh = base.size
+        bw0, bh0 = TEAM_TEMPLATE_BASE_SIZE
+        sx = bw / float(max(1, bw0))
+        sy = bh / float(max(1, bh0))
+        s = min(sx, sy)
+
+        def _pt(x: int, y: int) -> tuple[int, int]:
+            return (int(round(x * sx)), int(round(y * sy)))
+
+        def _rc(rect: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+            x0, y0 = _pt(rect[0], rect[1])
+            x1, y1 = _pt(rect[2], rect[3])
+            return x0, y0, x1, y1
+
+        def _layout_scaled(src: dict[str, tuple[int, int]]) -> dict[str, tuple[int, int]]:
+            x, y = src["box_xy"]
+            w, h = src["box_wh"]
+            cx, cy = src["sprite_c"]
+            lx, ly = src["label_xy"]
+            rx, ry = src["level_right"]
+            return {
+                "box_xy": _pt(x, y),
+                "box_wh": (max(1, int(round(w * sx))), max(1, int(round(h * sy)))),
+                "sprite_c": _pt(cx, cy),
+                "label_xy": _pt(lx, ly),
+                "level_right": _pt(rx, ry),
+            }
+
+        slot_layout = tuple(_layout_scaled(g) for g in TEAM_SLOT_LAYOUT)
+
         draw = ImageDraw.Draw(base)
 
         # Clear trainer card area, then re-draw a generic "Trainer" header + scaled player name.
-        draw.rectangle((42, 34, 212, 84), fill=(20, 18, 27, 245))
-        draw.rectangle((42, 85, 212, 410), fill=(28, 22, 35, 240))
-        draw.rectangle((42, 430, 212, 491), fill=(20, 18, 27, 245))
-        trainer_font = _team_font(26, bold=True)
-        name_font = _team_fit_font(draw, target_name, max_width=158, start_size=24, min_size=12, bold=True)
+        draw.rectangle(_rc(TEAM_TRAINER_HEADER_RECT), fill=(20, 18, 27, 255))
+        draw.rectangle(_rc(TEAM_TRAINER_ART_RECT), fill=(47, 34, 59, 255))
+        draw.rectangle(_rc(TEAM_TRAINER_FOOTER_RECT), fill=(20, 18, 27, 255))
+
+        # Subtle hatch pattern in trainer card so it doesn't look flat/unfinished.
+        tx0, ty0, tx1, ty1 = _rc(TEAM_TRAINER_ART_RECT)
+        line_color = (71, 52, 87, 210)
+        step = max(8, int(round(12 * s)))
+        for x in range(tx0 - (ty1 - ty0), tx1 + step, step):
+            draw.line((x, ty1, x + (ty1 - ty0), ty0), fill=line_color, width=max(1, int(round(1 * s))))
+
+        trainer_font = _team_font(max(12, int(round(26 * s))), bold=True)
+        name_font = _team_fit_font(
+            draw,
+            target_name,
+            max_width=max(72, int(round(158 * sx))),
+            start_size=max(12, int(round(24 * s))),
+            min_size=max(9, int(round(11 * s))),
+            bold=True,
+        )
         if trainer_font:
             tw = _team_text_width(draw, "Trainer", trainer_font)
-            draw.text((127 - tw // 2, 38), "Trainer", font=trainer_font, fill=(240, 240, 248, 255))
+            cx, ty = _pt(TEAM_TRAINER_NAME_CENTER_X, TEAM_TRAINER_LABEL_Y)
+            draw.text((cx - tw // 2, ty), "Trainer", font=trainer_font, fill=(240, 240, 248, 255))
         if name_font:
             nw = _team_text_width(draw, target_name, name_font)
-            draw.text((127 - nw // 2, 62), target_name, font=name_font, fill=(220, 228, 250, 255))
+            cx, ny = _pt(TEAM_TRAINER_NAME_CENTER_X, TEAM_TRAINER_NAME_Y)
+            draw.text((cx - nw // 2, ny), target_name, font=name_font, fill=(220, 228, 250, 255))
 
         # Clear each slot's pokemon/text regions so user template can be reused safely.
-        for geom in TEAM_SLOT_LAYOUT:
+        for geom in slot_layout:
             bx, by = geom["box_xy"]
             bw, bh = geom["box_wh"]
-            draw.rectangle((bx + 4, by + 4, bx + bw - 4, by + bh - 4), fill=(96, 65, 117, 220))
+            inset = max(2, int(round(4 * s)))
+            radius = max(6, int(round(12 * s)))
+            frame_fill = (88, 60, 106, 255)
+            label_fill = (24, 18, 32, 255)
+            try:
+                draw.rounded_rectangle((bx + inset, by + inset, bx + bw - inset, by + bh - inset), radius=radius, fill=frame_fill)
+            except Exception:
+                draw.rectangle((bx + inset, by + inset, bx + bw - inset, by + bh - inset), fill=frame_fill)
             cx, cy = geom["sprite_c"]
-            draw.ellipse((cx - 60, cy - 60, cx + 60, cy + 60), fill=(120, 92, 145, 230))
-            draw.rectangle((bx + 4, by + bh - 45, bx + bw - 4, by + bh - 4), fill=(28, 22, 35, 245))
+            r = max(18, int(round(58 * s)))
+            draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(119, 93, 143, 255), outline=(63, 44, 83, 255), width=max(1, int(round(3 * s))))
+            line_h = max(1, int(round(2 * s)))
+            margin = max(4, int(round(6 * s)))
+            draw.rectangle((cx - r + margin, cy - line_h, cx + r - margin, cy + line_h), fill=(64, 47, 82, 255))
+            cr = max(6, int(round(13 * s)))
+            draw.ellipse((cx - cr, cy - cr, cx + cr, cy + cr), fill=(98, 74, 120, 255), outline=(64, 47, 82, 255), width=max(1, int(round(2 * s))))
+
+            label_h = max(22, int(round(45 * s)))
+            draw.rectangle((bx + inset, by + bh - label_h, bx + bw - inset, by + bh - inset), fill=label_fill)
 
         # Preload sprite frames (animated front preferred).
         sprite_data: dict[int, dict[str, Any]] = {}
@@ -12354,25 +12438,64 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                 sprite_data[slot] = {"frames": [], "duration": 100}
                 continue
             path = _team_pick_sprite_path(row)
-            frames, duration = _team_load_sprite_frames(path, max_size=(88, 88), resample=resample)
+            sprite_max = (max(32, int(round(88 * sx))), max(32, int(round(88 * sy))))
+            frames, duration = _team_load_sprite_frames(path, max_size=sprite_max, resample=resample)
             sprite_data[slot] = {"frames": frames, "duration": duration}
             if len(frames) > 1:
                 max_anim_frames = max(max_anim_frames, min(len(frames), 24))
                 base_duration = min(base_duration, duration)
 
-        name_font_slot = _team_font(19, bold=True)
-        lvl_font_slot = _team_font(18, bold=False)
+        lvl_font_slot = _team_font(max(9, int(round(18 * s))), bold=False)
+        text_prep: dict[int, dict[str, Any]] = {}
+        probe_draw = ImageDraw.Draw(base)
+        for slot in range(1, 7):
+            row = slots.get(slot)
+            geom = slot_layout[slot - 1]
+            if not row:
+                empty_font = _team_fit_font(
+                    probe_draw,
+                    "Empty",
+                    max_width=max(28, int(round(110 * sx))),
+                    start_size=max(9, int(round(18 * s))),
+                    min_size=max(7, int(round(12 * s))),
+                    bold=True,
+                )
+                text_prep[slot] = {"label": "Empty", "font": empty_font, "lvl": "", "lvl_x": geom["level_right"][0], "label_x": geom["label_xy"][0]}
+                continue
+            label = _team_species_label(row)
+            label_font = _team_fit_font(
+                probe_draw,
+                label,
+                max_width=max(28, int(round(112 * sx))),
+                start_size=max(9, int(round(19 * s))),
+                min_size=max(7, int(round(10 * s))),
+                bold=True,
+            )
+            lvl = f"lvl {int(row.get('level') or 1)}"
+            lvl_x = geom["level_right"][0]
+            if lvl_font_slot:
+                lw = _team_text_width(probe_draw, lvl, lvl_font_slot)
+                lvl_x = int(geom["level_right"][0] - lw)
+            text_prep[slot] = {
+                "label": label,
+                "font": label_font,
+                "lvl": lvl,
+                "lvl_x": lvl_x,
+                "label_x": geom["label_xy"][0],
+            }
+
         out_frames: list[Any] = []
         frame_count = max(1, int(max_anim_frames))
         for fi in range(frame_count):
             frame = base.copy()
             frame_draw = ImageDraw.Draw(frame)
             for slot in range(1, 7):
-                geom = TEAM_SLOT_LAYOUT[slot - 1]
+                geom = slot_layout[slot - 1]
                 row = slots.get(slot)
+                slot_text = text_prep.get(slot) or {}
                 if not row:
-                    if name_font_slot:
-                        frame_draw.text(geom["label_xy"], "Empty", font=name_font_slot, fill=(195, 194, 210, 255))
+                    if slot_text.get("font"):
+                        frame_draw.text(geom["label_xy"], str(slot_text.get("label") or "Empty"), font=slot_text["font"], fill=(195, 194, 210, 255))
                     continue
 
                 data = sprite_data.get(slot) or {}
@@ -12386,16 +12509,11 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                     except Exception:
                         pass
 
-                label = _team_species_label(row)
-                if len(label) > 11:
-                    label = label[:10] + "..."
-                if name_font_slot:
-                    frame_draw.text(geom["label_xy"], label, font=name_font_slot, fill=(238, 240, 252, 255))
-                lvl = f"Lv {int(row.get('level') or 1)}"
-                if lvl_font_slot:
-                    lw = _team_text_width(frame_draw, lvl, lvl_font_slot)
-                    lx = int(geom["level_right"][0] - lw)
-                    frame_draw.text((lx, geom["level_right"][1]), lvl, font=lvl_font_slot, fill=(230, 230, 240, 255))
+                if slot_text.get("font"):
+                    frame_draw.text((int(slot_text.get("label_x") or geom["label_xy"][0]), geom["label_xy"][1]), str(slot_text.get("label") or ""), font=slot_text["font"], fill=(238, 240, 252, 255))
+                lvl = str(slot_text.get("lvl") or "")
+                if lvl and lvl_font_slot:
+                    frame_draw.text((int(slot_text.get("lvl_x") or geom["level_right"][0]), geom["level_right"][1]), lvl, font=lvl_font_slot, fill=(230, 230, 240, 255))
             out_frames.append(frame)
 
         buf = BytesIO()
