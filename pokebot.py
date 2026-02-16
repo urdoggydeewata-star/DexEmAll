@@ -18,7 +18,6 @@ import copy
 import time
 import re
 import difflib
-from io import BytesIO
 import datetime as dt
 from datetime import datetime, timedelta, timezone
 from collections.abc import Mapping
@@ -51,7 +50,6 @@ try:
 except ImportError:
     db_cache = None
 from lib.poke_ingest import ensure_species_and_learnsets
-from pvp.panel import _base_pp, _max_pp
 from lib.stats import generate_mon, calc_all_stats
 from lib.team_import import parse_showdown_team, get_preset_team_names, get_preset_team, ParsedPokemon
 from lib.legality import legal_moves, species_allowed
@@ -6088,7 +6086,6 @@ class StarterView(discord.ui.View):
                 try:
                     await db.upsert_item_master(starter_ball_item_id, name="Poké Ball")
                     await db.give_item(uid, starter_ball_item_id, 6)
-                    db.invalidate_bag_cache(uid)
                     starter_balls_granted = True
                 except Exception:
                     starter_balls_granted = False
@@ -6110,13 +6107,11 @@ class StarterView(discord.ui.View):
             )
 
             # Initialize adventure state and send rival challenge
-            state_err = None
             try:
                 state = await _get_adventure_state(uid)
                 state["area_id"] = "pallet-town"
                 await _save_adventure_state(uid, state)
             except Exception as e:
-                state_err = e
                 try:
                     print(f"[Adventure] state init failed: {e}")
                 except Exception:
@@ -8140,11 +8135,14 @@ async def _heal_party(user_id: str) -> int:
         rows = await cur.fetchall()
         await cur.close()
         cached_base_stats: Dict[str, dict] = {}
+        species_keys: set[str] = {
+            str(r.get("species") or "").strip().lower().replace(" ", "-")
+            for r in rows
+            if str(r.get("species") or "").strip()
+        }
+        missing_species: list[str] = []
 
-        async def _base_stats_for_species(species_key: str) -> dict:
-            if species_key in cached_base_stats:
-                return cached_base_stats[species_key]
-
+        for species_key in species_keys:
             raw_stats: Any = None
             if db_cache is not None:
                 try:
@@ -8159,28 +8157,39 @@ async def _heal_party(user_id: str) -> int:
                     raw_stats = None
 
             if raw_stats is None:
-                try:
-                    cur_stats = await conn.execute(
-                        "SELECT stats FROM pokedex WHERE LOWER(name)=LOWER(?) OR LOWER(REPLACE(name,' ','-'))=LOWER(?) LIMIT 1",
-                        (species_key, species_key),
-                    )
-                    srow = await cur_stats.fetchone()
-                    await cur_stats.close()
-                    if srow:
-                        raw_stats = srow.get("stats")
-                except Exception:
-                    raw_stats = None
+                missing_species.append(species_key)
+                continue
 
             if isinstance(raw_stats, str):
                 try:
                     raw_stats = json.loads(raw_stats)
                 except Exception:
                     raw_stats = {}
-            if not isinstance(raw_stats, dict):
-                raw_stats = {}
+            cached_base_stats[species_key] = raw_stats if isinstance(raw_stats, dict) else {}
 
-            cached_base_stats[species_key] = raw_stats
-            return raw_stats
+        if missing_species:
+            placeholders = ", ".join(["?"] * len(missing_species))
+            try:
+                cur_stats = await conn.execute(
+                    f"SELECT LOWER(REPLACE(name,' ','-')) AS species_key, stats FROM pokedex WHERE LOWER(REPLACE(name,' ','-')) IN ({placeholders})",
+                    tuple(missing_species),
+                )
+                stat_rows = await cur_stats.fetchall()
+                await cur_stats.close()
+                for srow in stat_rows:
+                    s_key = str(srow.get("species_key") or "").strip().lower()
+                    raw_stats = srow.get("stats")
+                    if isinstance(raw_stats, str):
+                        try:
+                            raw_stats = json.loads(raw_stats)
+                        except Exception:
+                            raw_stats = {}
+                    cached_base_stats[s_key] = raw_stats if isinstance(raw_stats, dict) else {}
+            except Exception:
+                pass
+
+            for species_key in missing_species:
+                cached_base_stats.setdefault(species_key, {})
 
         for row in rows:
             hp_max = max(1, int(row.get("hp") or 1))
@@ -8205,7 +8214,7 @@ async def _heal_party(user_id: str) -> int:
                 evs = _normalize_ivs_evs(evs_raw, default_val=0)
 
                 if species_key:
-                    raw_stats = await _base_stats_for_species(species_key)
+                    raw_stats = cached_base_stats.get(species_key, {})
                     base_long = _normalize_stats_for_generator(raw_stats or {})
                     ivs_long = {
                         "hp": ivs["hp"], "attack": ivs["atk"], "defense": ivs["defn"],
