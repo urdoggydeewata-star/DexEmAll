@@ -12,7 +12,7 @@ import random
 import math
 import json
 
-from .engine import Mon, get_move, damage, type_multiplier, stab, get_generation
+from .engine import Mon, get_move, damage, type_multiplier, stab, get_generation, speed_value, can_switch_out
 # PP helper for PvP bot scoring; keep scoped import to avoid cycles
 try:
     from .panel import _max_pp
@@ -2257,20 +2257,154 @@ def _score_toxic(
     return score
 
 
+def _get_sides_for_user(ai_user_id: int, battle_state: Any) -> Tuple[Any, Any]:
+    """Return (user_side, target_side) for the acting AI user."""
+    if ai_user_id == getattr(battle_state, "p1_id", None):
+        return getattr(battle_state, "p1_side", None), getattr(battle_state, "p2_side", None)
+    return getattr(battle_state, "p2_side", None), getattr(battle_state, "p1_side", None)
+
+
+def _safe_damage_estimate(
+    attacker: Mon,
+    defender: Mon,
+    move_name: str,
+    field_effects: Any,
+    defender_side: Any = None,
+    attacker_side: Any = None,
+) -> int:
+    """Best-effort damage estimate; never raises."""
+    try:
+        dmg, _, _ = damage(
+            attacker,
+            defender,
+            move_name,
+            field_effects,
+            defender_side,
+            attacker_side,
+            is_moving_last=False,
+        )
+        return max(0, int(dmg or 0))
+    except Exception:
+        return 0
+
+
+def _is_grounded_for_hazards(mon: Mon) -> bool:
+    """Simple grounded check for hazard entry scoring."""
+    try:
+        types = [str(t).lower() for t in (getattr(mon, "types", None) or []) if t]
+        if "flying" in types:
+            return False
+        ability = normalize_ability_name(getattr(mon, "ability", "") or "")
+        if ability == "levitate":
+            return False
+        if getattr(mon, "magnet_rise_turns", 0) > 0:
+            return False
+        if getattr(mon, "telekinesis_turns", 0) > 0:
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _hazard_entry_penalty_percent(mon: Mon, side: Any, field_effects: Any, opponent: Optional[Mon] = None) -> float:
+    """Approximate HP% penalty/cost when this mon switches in."""
+    if side is None:
+        return 0.0
+
+    total = 0.0
+    # Stealth Rock
+    if getattr(side, "stealth_rock", False):
+        rock_mult = 1.0
+        try:
+            rock_mult, _ = type_multiplier("Rock", mon, field_effects=field_effects, user=opponent or mon)
+            rock_mult = float(rock_mult)
+        except Exception:
+            rock_mult = 1.0
+        total += 12.5 * max(0.0, rock_mult)
+
+    grounded = _is_grounded_for_hazards(mon)
+    if grounded:
+        # Spikes
+        spikes = int(getattr(side, "spikes", 0) or 0)
+        if spikes == 1:
+            total += 12.5
+        elif spikes == 2:
+            total += 16.67
+        elif spikes >= 3:
+            total += 25.0
+
+        # Toxic Spikes / Sticky Web are not direct HP damage, but still hurt position
+        t_spikes = int(getattr(side, "toxic_spikes", 0) or 0)
+        if t_spikes > 0:
+            mon_types = [str(t).lower() for t in (getattr(mon, "types", None) or []) if t]
+            if "poison" in mon_types:
+                # Absorbing Toxic Spikes is actually beneficial tempo
+                total = max(0.0, total - 2.5)
+            elif "steel" not in mon_types:
+                total += 8.0
+        if bool(getattr(side, "sticky_web", False)):
+            total += 4.0
+
+    return max(0.0, total)
+
+
+def _max_damage_percent(
+    attacker: Mon,
+    defender: Mon,
+    moves: List[str],
+    field_effects: Any,
+    defender_side: Any = None,
+    attacker_side: Any = None,
+) -> Tuple[float, Optional[str]]:
+    """Return (max_damage_percent_of_defender_hp, move_name)."""
+    if not moves:
+        return 0.0, None
+    defender_hp = max(1, int(getattr(defender, "hp", 1) or 1))
+    best_pct = 0.0
+    best_move: Optional[str] = None
+    for mv in moves[:4]:
+        if not mv:
+            continue
+        dmg = _safe_damage_estimate(attacker, defender, str(mv), field_effects, defender_side, attacker_side)
+        pct = (dmg / defender_hp) * 100.0
+        if pct > best_pct:
+            best_pct = pct
+            best_move = str(mv)
+    return best_pct, best_move
+
+
+def _defensive_ability_switch_bonus(switch_mon: Mon, target_move_types: set[str]) -> float:
+    """Reward defensive/immunity abilities on switch-in."""
+    ability = normalize_ability_name(getattr(switch_mon, "ability", "") or "")
+    if not ability:
+        return 0.0
+
+    bonus = 0.0
+    # Hard immunities / absorptions
+    if "Fire" in target_move_types and ability in {"flash-fire", "well-baked-body"}:
+        bonus += 6.0
+    if "Water" in target_move_types and ability in {"water-absorb", "storm-drain", "dry-skin"}:
+        bonus += 6.0
+    if "Electric" in target_move_types and ability in {"volt-absorb", "motor-drive", "lightning-rod"}:
+        bonus += 6.0
+    if "Ground" in target_move_types and ability in {"levitate"}:
+        bonus += 5.0
+    if "Grass" in target_move_types and ability in {"sap-sipper"}:
+        bonus += 5.0
+
+    # Generic useful switch abilities
+    if ability in {"intimidate", "regenerator", "natural-cure"}:
+        bonus += 2.0
+    return bonus
+
+
 def choose_ai_action(
     ai_user_id: int,
     battle_state: Any,
     field_effects: Any
 ) -> Dict[str, Any]:
     """
-    Choose an action for the AI player.
-    Heuristic:
-      - If dummy battle (negative id or dummy Magikarp), always Tackle.
-      - If no damaging moves or all moves very ineffective, consider a switch to a better matchup.
-      - Otherwise pick the move with highest expected damage score:
-          score = type multiplier * base power * STAB * accuracy * (1 + (remaining_pp / max_pp)*0.05)
-        and mildly reward priority moves; break ties with higher PP remaining.
-    Returns {"kind": "move", "value": "<Move>"} or {"kind": "switch", "value": idx}
+    Choose an action for the AI player with richer tactical evaluation.
     """
     # Check if this is a dummy opponent (negative ID indicates dummy)
     # Also check if the active Pokémon is a dummy Magikarp
@@ -2286,123 +2420,191 @@ def choose_ai_action(
     # For dummy Magikarp, always use Tackle
     if is_dummy:
         return {"kind": "move", "value": "Tackle"}
-    
-    # Get available moves - exactly like a human player would
-    available_moves_raw = battle_state.moves_for(ai_user_id)
-    
-    # CRITICAL: Ensure we only get move NAME strings, not dicts
-    # moves_for() should return List[str], but double-check
-    available_moves = []
-    for m in (available_moves_raw or []):
-        if isinstance(m, str):
-            available_moves.append(m)
-        elif isinstance(m, dict):
-            # If it's a dict, extract the name
-            move_name = m.get("name") or m.get("value") or str(m)
-            if move_name:
-                available_moves.append(str(move_name))
-        else:
-            # Convert to string
-            available_moves.append(str(m) if m else "Tackle")
-    
-    if not available_moves:
-        available_moves = ["Tackle"]
-    
+
     # If we have no active mon data, default to random move
     ai_mon = battle_state._active(ai_user_id)
     target_mon = battle_state._opp_active(ai_user_id)
     if not ai_mon or not target_mon:
-        return {"kind": "move", "value": str(random.choice(available_moves))}
+        fallback = battle_state.moves_for(ai_user_id) or ["Tackle"]
+        return {"kind": "move", "value": str(random.choice(fallback))}
 
-    # Build scored move list with real damage sim
-    scored_moves: list[tuple[float, str]] = []
-    target_hp = max(1, target_mon.hp)
-    for mv_name in available_moves:
-        mv_data = get_move(mv_name) or {}
-        power = int(mv_data.get("power") or 0)
-        acc = float(mv_data.get("accuracy") or 100)
-        mtype = mv_data.get("type") or "Normal"
-        category = mv_data.get("damage_class", "").lower()
+    user_side, target_side = _get_sides_for_user(ai_user_id, battle_state)
+    ai_speed = int(speed_value(ai_mon, user_side, field_effects))
+    target_speed = int(speed_value(target_mon, target_side, field_effects))
+    ai_hp_pct = ai_mon.hp / ai_mon.max_hp if ai_mon.max_hp > 0 else 1.0
+    target_hp = max(1, int(target_mon.hp or 1))
 
-        # PP gate: if no PP left, skip
-        pp_left = battle_state._pp_left(ai_user_id, mv_name, ai_mon)
-        if pp_left <= 0:
+    # Track previous AI action to avoid repetitive hard-switch loops.
+    analysis = _battle_analysis.setdefault(id(battle_state), {})
+    last_action_key = f"last_action_{ai_user_id}"
+
+    # Normalize available moves (must be strings with PP > 0)
+    available_moves_raw = battle_state.moves_for(ai_user_id) or []
+    available_moves: List[str] = []
+    for m in available_moves_raw:
+        if isinstance(m, str):
+            name = m
+        elif isinstance(m, dict):
+            name = str(m.get("name") or m.get("value") or "")
+        else:
+            name = str(m) if m else ""
+        if not name:
             continue
-
-        # Non-damaging moves handled separately below
-        if power <= 0 and category in ("status", ""):
-            score = _score_status_or_setup(mv_name, ai_mon, target_mon, field_effects, battle_state)
-            scored_moves.append((score, mv_name))
-            continue
-
-        # Estimate actual damage using engine damage() (min roll)
         try:
-            dmg, meta, _ = damage(ai_mon, target_mon, mv_name, field_effects=field_effects)
+            if battle_state._pp_left(ai_user_id, name, ai_mon) <= 0:
+                continue
         except Exception:
-            dmg = 0
-        dmg = max(0, dmg)
-        est_pct = (dmg / target_hp) * 100.0
+            pass
+        available_moves.append(name)
+    if not available_moves:
+        available_moves = ["Tackle"]
 
-        # Type multiplier via damage already, but add STAB/prio tweaks
+    # Precompute rough incoming threat from opponent.
+    target_moves = [str(m) for m in (getattr(target_mon, "moves", None) or []) if m]
+    max_incoming_pct, _ = _max_damage_percent(
+        target_mon, ai_mon, target_moves, field_effects, user_side, target_side
+    )
+    under_lethal_pressure = max_incoming_pct >= 100.0
+
+    # Precompute raw damage for each move, then identify highest-damage move.
+    damage_cache: Dict[str, int] = {}
+    for mv in available_moves:
+        damage_cache[mv] = _safe_damage_estimate(
+            ai_mon, target_mon, mv, field_effects, target_side, user_side
+        )
+    highest_damage = max(damage_cache.values()) if damage_cache else 0
+
+    # Score all candidate moves.
+    scored_moves: List[Tuple[float, str, float, int]] = []  # (score, move, dmg_pct, priority)
+    setup_moves = {"swords-dance", "dragon-dance", "calm-mind", "nasty-plot", "quiver-dance", "bulk-up"}
+    recovery_moves = {"recover", "roost", "slack-off", "soft-boiled", "heal-order", "strength-sap", "rest"}
+    pivot_moves = {"u-turn", "volt-switch", "flip-turn", "parting-shot", "baton-pass"}
+
+    for mv in available_moves:
+        mv_data = get_move(mv) or {}
+        move_lower = mv.lower().replace(" ", "-")
+        category = (mv_data.get("category") or mv_data.get("damage_class") or "status").lower()
+        power = int(mv_data.get("power") or 0)
         priority = int(mv_data.get("priority") or 0)
-        prio_mult = 1.1 + 0.1 * priority if priority > 0 else 1.0
+        accuracy = float(mv_data.get("accuracy") or 100.0)
+        is_damaging = power > 0 and category != "status"
+        dmg = int(damage_cache.get(mv, 0))
+        dmg_pct = (dmg / target_hp) * 100.0
+        is_highest_damage = bool(is_damaging and dmg >= highest_damage and highest_damage > 0)
 
-        # Status on target? If immune (Steel/Poison vs Toxic, etc.) downweight handled in scoring helper
-        score = est_pct
+        # Base tactical score from the advanced scorer.
+        score = calculate_move_score(
+            ai_mon,
+            target_mon,
+            mv,
+            battle_state,
+            field_effects,
+            user_side,
+            target_side,
+            is_double_battle=False,
+            is_highest_damage=is_highest_damage,
+        )
 
-        # 2HKO / OHKO bonuses
-        if est_pct >= 100:
-            score += 250
-        elif est_pct >= 55:
-            score += 80
-        elif est_pct >= 35:
-            score += 25
+        # Reliability/accuracy weighting for all moves.
+        score *= max(0.45, min(1.05, (accuracy / 100.0) + 0.05))
 
-        # Accuracy factor
-        score *= (acc / 100.0)
+        if is_damaging:
+            # Damage pressure and KO conversion.
+            score += min(12.0, dmg_pct * 0.12)
+            if dmg >= target_hp:
+                acts_first = priority > 0 or ai_speed >= target_speed
+                score += 12.0 if acts_first else 5.0
+            elif dmg_pct >= 70.0:
+                score += 4.5
+            elif dmg_pct <= 8.0:
+                score -= 4.0
+            # PP conservation for offensive options.
+            try:
+                pp_left = battle_state._pp_left(ai_user_id, mv, ai_mon)
+                max_pp = max(pp_left, _max_pp(mv, generation=getattr(battle_state, "gen", 9)))
+                if max_pp > 0 and (pp_left / max_pp) < 0.20:
+                    score -= 1.2
+            except Exception:
+                pass
+        else:
+            # Under severe pressure, greedier setup is often punished.
+            if under_lethal_pressure and move_lower in setup_moves:
+                score -= 12.0
+            if move_lower in recovery_moves and ai_hp_pct <= 0.45:
+                score += 6.0
+            if move_lower in pivot_moves and (under_lethal_pressure or highest_damage < max(1, int(target_hp * 0.30))):
+                score += 3.5
+            if move_lower in setup_moves and not under_lethal_pressure and ai_hp_pct > 0.65:
+                score += 2.0
 
-        # PP conservation: slight bump if plenty of PP, slight penalty if low
-        max_pp = max(pp_left, _max_pp(mv_name, generation=battle_state.gen))
-        pp_ratio = pp_left / max_pp
-        score *= (0.9 + 0.2 * pp_ratio)
+        # Tiny jitter prevents perfectly deterministic bots while keeping best plays dominant.
+        score += random.uniform(-0.35, 0.35)
+        scored_moves.append((score, mv, dmg_pct, priority))
 
-        # Priority boost
-        score *= prio_mult
+    if not scored_moves:
+        move = str(random.choice(available_moves))
+        analysis[last_action_key] = "move"
+        analysis[f"last_move_{ai_user_id}"] = move
+        return {"kind": "move", "value": move}
 
-        # Avoid terrible effectiveness (no damage) by penalizing very low pct
-        if est_pct < 5:
-            score *= 0.2
+    scored_moves.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_move, best_dmg_pct, best_prio = scored_moves[0]
+    best_dmg = damage_cache.get(best_move, 0)
+    can_fast_ko = best_dmg >= target_hp and (best_prio > 0 or ai_speed >= target_speed)
 
-        scored_moves.append((score, mv_name))
+    # Switch decision: only if legal and materially better than best move.
+    switch_options = battle_state.switch_options(ai_user_id) or []
+    do_switch = False
+    best_switch_idx: Optional[int] = None
 
-    # Consider switching if all damaging moves are very weak (score < threshold) and a better switch exists
-    damaging_scores = [s for s, n in scored_moves if s > 5 and n.lower() not in ("stealth rock","stealth-rock","spikes","toxic-spikes","toxic spikes")]
-    need_switch = (not damaging_scores) or (max(damaging_scores) < 60)
+    if switch_options:
+        can_sw, _ = can_switch_out(ai_mon, target_mon, force_switch=False, field_effects=field_effects, battle_state=battle_state)
+        if can_sw:
+            last_type = getattr(target_mon, "_last_move_used_type", None)
+            best_switch_idx, best_switch_score = _choose_best_switch_with_score(
+                current_mon=ai_mon,
+                target_mon=target_mon,
+                switch_options=switch_options,
+                battle_state=battle_state,
+                field_effects=field_effects,
+                switching_user_id=ai_user_id,
+                last_move_type=last_type,
+            )
 
-    if need_switch:
-        last_type = getattr(target_mon, "_last_move_used_type", None)
-        switch_idx = _choose_best_switch(ai_mon, target_mon, battle_state.switch_options(ai_user_id), battle_state, field_effects, switching_user_id=ai_user_id, last_move_type=last_type)
-        if switch_idx is not None:
-            return {"kind": "switch", "value": switch_idx}
+            if best_switch_idx is not None:
+                # Discourage consecutive hard-switching unless heavily justified.
+                margin = 5.5
+                if analysis.get(last_action_key) == "switch":
+                    margin += 2.5
 
-    # Pick best scored move; if multiple close, break ties by higher PP left
-    if scored_moves:
-        scored_moves.sort(key=lambda x: x[0], reverse=True)
-        top_score = scored_moves[0][0]
-        top_moves = [mv for mv in scored_moves if mv[0] >= top_score * 0.98]
-        if len(top_moves) == 1:
-            return {"kind": "move", "value": top_moves[0][1]}
-        # tie-break by PP left
-        best = top_moves[0]
-        best_pp = -1
-        for s, mv in top_moves:
-            pp_left = battle_state._pp_left(ai_user_id, mv, ai_mon)
-            if pp_left > best_pp:
-                best_pp = pp_left
-                best = (s, mv)
-        return {"kind": "move", "value": best[1]}
+                meaningful_damage = any(dmg_cache >= target_hp * 0.25 for dmg_cache in damage_cache.values())
+                if under_lethal_pressure and not can_fast_ko and best_switch_score >= best_score + margin:
+                    do_switch = True
+                elif (not meaningful_damage or best_dmg_pct < 22.0) and best_switch_score >= best_score + (margin - 1.5):
+                    do_switch = True
+                elif ai_hp_pct < 0.33 and best_dmg_pct < 45.0 and best_switch_score >= best_score + (margin - 2.0):
+                    do_switch = True
 
-    return {"kind": "move", "value": str(random.choice(available_moves))}
+                # If we just switched in and are not in immediate danger, avoid pivot loops.
+                if getattr(ai_mon, "_just_switched_in", False) and not under_lethal_pressure and best_dmg_pct >= 30.0:
+                    do_switch = False
+
+    if do_switch and best_switch_idx is not None:
+        analysis[last_action_key] = "switch"
+        return {"kind": "switch", "value": int(best_switch_idx)}
+
+    # Move choice: sample among near-top moves, weighted by score (human-like variety).
+    top_band = [m for m in scored_moves if m[0] >= best_score - 1.75]
+    if len(top_band) > 1:
+        max_s = max(m[0] for m in top_band)
+        weights = [math.exp((m[0] - max_s) / 1.8) for m in top_band]
+        chosen = random.choices(top_band, weights=weights, k=1)[0]
+    else:
+        chosen = top_band[0]
+
+    analysis[last_action_key] = "move"
+    analysis[f"last_move_{ai_user_id}"] = chosen[1]
+    return {"kind": "move", "value": chosen[1]}
 
 
 def _status_immune(move_name: str, target: Mon) -> bool:
@@ -2485,7 +2687,7 @@ def _score_status_or_setup(move_name: str, user: Mon, target: Mon, field_effects
     # Default low value
     return 5.0
 
-def _choose_best_switch(
+def _choose_best_switch_with_score(
     current_mon: Mon,
     target_mon: Mon,
     switch_options: List[int],
@@ -2493,17 +2695,11 @@ def _choose_best_switch(
     field_effects: Any,
     switching_user_id: Optional[int] = None,
     last_move_type: Optional[str] = None,
-) -> Optional[int]:
-    """
-    Choose the best Pokemon to switch into based on:
-    - Type matchups against target
-    - Speed advantage
-    - HP status
-    - Ability synergy
-    """
+) -> Tuple[Optional[int], float]:
+    """Return (best_switch_index, switch_score)."""
     if not switch_options:
-        return None
-    
+        return None, -999.0
+
     # Determine which user is switching
     if switching_user_id is None:
         # Try to infer from current_mon
@@ -2514,83 +2710,130 @@ def _choose_best_switch(
         else:
             # Fallback: assume P1
             switching_user_id = battle_state.p1_id
-    
-    best_switch = None
+
+    best_switch: Optional[int] = None
     best_score = -999.0
-    
-    target_types = target_mon.types or []
-    target_moves = target_mon.moves or []
-    
-    # Analyze target's move types to predict what it might use
-    target_move_types = set()
+    user_side, target_side = _get_sides_for_user(int(switching_user_id), battle_state)
+
+    target_moves = [str(m) for m in (getattr(target_mon, "moves", None) or []) if m]
+    target_move_types: set[str] = set()
     for t_move in target_moves[:4]:
-        t_move_data = get_move(t_move)
-        if t_move_data:
-            t_type = t_move_data.get("type", "Normal")
-            target_move_types.add(t_type)
-    
+        t_move_data = get_move(t_move) or {}
+        t_type = t_move_data.get("type")
+        if t_type:
+            target_move_types.add(str(t_type))
+    if not target_move_types:
+        target_move_types = {str(t) for t in (getattr(target_mon, "types", None) or []) if t}
+
     for switch_idx in switch_options:
         switch_mon = battle_state.team_for(switching_user_id)[switch_idx]
         if not switch_mon or switch_mon.hp <= 0:
             continue
-        
+
+        switch_hp_pct = switch_mon.hp / switch_mon.max_hp if switch_mon.max_hp > 0 else 0.0
+        if switch_hp_pct <= 0:
+            continue
+
+        # Damage race estimates
+        max_incoming_pct, _ = _max_damage_percent(
+            target_mon,
+            switch_mon,
+            target_moves,
+            field_effects,
+            user_side,
+            target_side,
+        )
+        max_outgoing_pct, _ = _max_damage_percent(
+            switch_mon,
+            target_mon,
+            [str(m) for m in (getattr(switch_mon, "moves", None) or []) if m],
+            field_effects,
+            target_side,
+            user_side,
+        )
+
+        # Entry risk from hazards
+        hazard_penalty = _hazard_entry_penalty_percent(switch_mon, user_side, field_effects, opponent=target_mon)
+        post_entry_hp_pct = switch_hp_pct - (hazard_penalty / 100.0)
+
         score = 0.0
-        
-        # Type matchup against target
-        switch_types = switch_mon.types or []
-        for s_type in switch_types:
-            for t_type in target_types:
-                try:
-                    type_mult, _ = type_multiplier(s_type, target_mon, field_effects=field_effects, user=switch_mon)
-                    if type_mult >= 2.0:
-                        score += 2.0  # Good matchup
-                    elif type_mult <= 0.5:
-                        score -= 1.0  # Bad matchup
-                except Exception:
-                    pass
-        
-        # Check resistance to target's moves
-        for t_move_type in target_move_types:
-            for s_type in switch_types:
-                try:
-                    type_mult, _ = type_multiplier(t_move_type, switch_mon, field_effects=field_effects, user=target_mon)
-                    if type_mult <= 0.5:
-                        score += 1.5  # Resists target's moves
-                    elif type_mult >= 2.0:
-                        score -= 1.5  # Weak to target's moves
-                except Exception:
-                    pass
-        
-        # Speed advantage
-        switch_speed = getattr(switch_mon, 'stats', {}).get('spe', 0) or 0
-        target_speed = getattr(target_mon, 'stats', {}).get('spe', 0) or 0
+        score += switch_hp_pct * 18.0
+        score += max(0.0, 24.0 - (max_incoming_pct * 0.45))
+        score += max_outgoing_pct * 0.28
+        score -= hazard_penalty * 0.55
+
+        if max_outgoing_pct >= 100.0:
+            score += 16.0
+        elif max_outgoing_pct >= 70.0:
+            score += 7.0
+        elif max_outgoing_pct <= 15.0:
+            score -= 3.0
+
+        if max_incoming_pct >= 100.0:
+            score -= 18.0
+        elif max_incoming_pct >= 70.0:
+            score -= 8.0
+
+        # Speed edge matters for revenge kills and tempo
+        switch_speed = int(speed_value(switch_mon, user_side, field_effects))
+        target_speed = int(speed_value(target_mon, target_side, field_effects))
         if switch_speed > target_speed:
-            score += 1.0
+            score += 2.5
 
         # Predict last move: reward resists/immunities, punish weakness
         if last_move_type:
             try:
                 lm_mult, _ = type_multiplier(last_move_type, switch_mon, field_effects=field_effects, user=target_mon)
-                if lm_mult <= 0.5:
-                    score += 2.5
-                elif lm_mult >= 2.0:
-                    score -= 2.5
+                lm = float(lm_mult)
+                if lm == 0.0:
+                    score += 8.0
+                elif lm <= 0.5:
+                    score += 4.0
+                elif lm >= 2.0:
+                    score -= 6.0
             except Exception:
                 pass
-        
-        # HP status (prefer healthy Pokemon)
-        switch_hp_percent = switch_mon.hp / switch_mon.max_hp if switch_mon.max_hp > 0 else 0
-        score += switch_hp_percent * 2.0  # Up to +2 for full HP
-        
-        # Ability synergy
-        switch_ability = normalize_ability_name(switch_mon.ability or "")
-        if switch_ability in ["intimidate"]:
-            score += 0.5  # Intimidate is useful
-        
+
+        # Defensive ability synergies
+        score += _defensive_ability_switch_bonus(switch_mon, target_move_types)
+
+        # Status / post-entry survivability penalty
+        status = str(getattr(switch_mon, "status", "") or "").lower()
+        if status in {"tox", "psn"}:
+            score -= 4.0
+        elif status == "brn":
+            score -= 1.5
+        elif status == "par":
+            score -= 1.0
+        if post_entry_hp_pct <= 0.2:
+            score -= 8.0
+
         if score > best_score:
             best_score = score
             best_switch = switch_idx
-    
+
+    return best_switch, best_score
+
+
+def _choose_best_switch(
+    current_mon: Mon,
+    target_mon: Mon,
+    switch_options: List[int],
+    battle_state: Any,
+    field_effects: Any,
+    switching_user_id: Optional[int] = None,
+    last_move_type: Optional[str] = None,
+) -> Optional[int]:
+    """Compatibility wrapper: return only the best switch index."""
+    best_switch, _ = _choose_best_switch_with_score(
+        current_mon=current_mon,
+        target_mon=target_mon,
+        switch_options=switch_options,
+        battle_state=battle_state,
+        field_effects=field_effects,
+        switching_user_id=switching_user_id,
+        last_move_type=last_move_type,
+    )
     return best_switch
 
 
