@@ -6206,6 +6206,8 @@ DAYCARE_BREED_THRESHOLD = 22.0
 DAYCARE_HATCH_MIN = 45.0
 DAYCARE_HATCH_MAX = 80.0
 DAYCARE_HATCH_BOOST_ABILITIES = {"flame-body", "magma-armor"}
+BOX_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "box_sprites"
+LEGACY_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "sprites"
 
 ADVENTURE_CITIES = {
     "pallet-town": {
@@ -7694,28 +7696,9 @@ def _daycare_icon_path_for_species(species: str) -> Optional[Path]:
     if not sp:
         return None
 
-    # Prefer the same higher-quality Showdown source used by /team.
-    try:
-        key_variants_fn = globals().get("_team_showdown_key_variants")
-        download_fn = globals().get("_team_download_showdown_gif")
-        if callable(key_variants_fn) and callable(download_fn):
-            for key in key_variants_fn(sp):
-                try:
-                    p = download_fn(key, False)
-                    if p is not None:
-                        return p
-                except Exception:
-                    continue
-    except Exception:
-        pass
-
-    roots = [
-        Path(__file__).resolve().parent / "pvp" / "_common" / "sprites",
-        Path(__file__).resolve().parent / "sprites",
-    ]
-    for root in roots:
-        # Prefer animated/static front sprite files before icon fallback.
-        for fname in ("animated-front.gif", "front.png", "icon.png"):
+    # Daycare uses dedicated box sprites (static) by design.
+    for root in (BOX_SPRITES_DIR, LEGACY_SPRITES_DIR, Path(__file__).resolve().parent / "sprites"):
+        for fname in ("box.png", "front.png", "icon.png"):
             p = root / sp / fname
             try:
                 if p.exists() and p.stat().st_size > 0:
