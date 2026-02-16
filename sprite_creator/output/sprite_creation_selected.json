@@ -1,0 +1,29 @@
+[
+  {
+    "source": "C:\\Users\\adama\\Downloads\\Animated Pokemon Sprites\\Animated Pokemon Sprites\\Graphics\\Pokemon\\Front\\OGERPON_11.png",
+    "folder": "ogerpon",
+    "bucket": "front",
+    "created": [
+      "C:\\Users\\adama\\OneDrive\\Bureau\\myuu clone\\sprite_creator\\output\\ogerpon\\front.png",
+      "C:\\Users\\adama\\OneDrive\\Bureau\\myuu clone\\sprite_creator\\output\\ogerpon\\animated-front.gif"
+    ]
+  },
+  {
+    "source": "C:\\Users\\adama\\Downloads\\Animated Pokemon Sprites\\Animated Pokemon Sprites\\Graphics\\Pokemon\\Back\\OGERPON_11.png",
+    "folder": "ogerpon",
+    "bucket": "back",
+    "created": [
+      "C:\\Users\\adama\\OneDrive\\Bureau\\myuu clone\\sprite_creator\\output\\ogerpon\\back.png",
+      "C:\\Users\\adama\\OneDrive\\Bureau\\myuu clone\\sprite_creator\\output\\ogerpon\\animated-back.gif"
+    ]
+  },
+  {
+    "source": "C:\\Users\\adama\\Downloads\\Animated Pokemon Sprites\\Animated Pokemon Sprites\\Graphics\\Pokemon\\Front shiny\\OGERPON_11.png",
+    "folder": "ogerpon",
+    "bucket": "front_shiny",
+    "created": [
+      "C:\\Users\\adama\\OneDrive\\Bureau\\myuu clone\\sprite_creator\\output\\ogerpon\\shiny-front.png",
+      "C:\\Users\\adama\\OneDrive\\Bureau\\myuu clone\\sprite_creator\\output\\ogerpon\\animated-shiny-front.gif"
+    ]
+  }
+]

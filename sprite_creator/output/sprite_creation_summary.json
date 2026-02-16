@@ -1,0 +1,38 @@
+[
+  {
+    "source": "C:\\Users\\adama\\Downloads\\Animated Pokemon Sprites\\Animated Pokemon Sprites\\Graphics\\Pokemon\\Front\\VENUSAUR_2.png",
+    "target_folder": "venusaur",
+    "kind": "front",
+    "created": [
+      "C:\\Users\\adama\\OneDrive\\Bureau\\myuu clone\\sprite_creator\\output\\venusaur\\front.png",
+      "C:\\Users\\adama\\OneDrive\\Bureau\\myuu clone\\sprite_creator\\output\\venusaur\\animated-front.gif"
+    ]
+  },
+  {
+    "source": "C:\\Users\\adama\\Downloads\\Animated Pokemon Sprites\\Animated Pokemon Sprites\\Graphics\\Pokemon\\Back\\VENUSAUR_2.png",
+    "target_folder": "venusaur",
+    "kind": "back",
+    "created": [
+      "C:\\Users\\adama\\OneDrive\\Bureau\\myuu clone\\sprite_creator\\output\\venusaur\\back.png",
+      "C:\\Users\\adama\\OneDrive\\Bureau\\myuu clone\\sprite_creator\\output\\venusaur\\animated-back.gif"
+    ]
+  },
+  {
+    "source": "C:\\Users\\adama\\Downloads\\Animated Pokemon Sprites\\Animated Pokemon Sprites\\Graphics\\Pokemon\\Front shiny\\VENUSAUR_2.png",
+    "target_folder": "venusaur",
+    "kind": "front_shiny",
+    "created": [
+      "C:\\Users\\adama\\OneDrive\\Bureau\\myuu clone\\sprite_creator\\output\\venusaur\\shiny-front.png",
+      "C:\\Users\\adama\\OneDrive\\Bureau\\myuu clone\\sprite_creator\\output\\venusaur\\animated-shiny-front.gif"
+    ]
+  },
+  {
+    "source": "C:\\Users\\adama\\Downloads\\Animated Pokemon Sprites\\Animated Pokemon Sprites\\Graphics\\Pokemon\\Back shiny\\VENUSAUR_2.png",
+    "target_folder": "venusaur",
+    "kind": "back_shiny",
+    "created": [
+      "C:\\Users\\adama\\OneDrive\\Bureau\\myuu clone\\sprite_creator\\output\\venusaur\\shiny-back.png",
+      "C:\\Users\\adama\\OneDrive\\Bureau\\myuu clone\\sprite_creator\\output\\venusaur\\animated-shiny-back.gif"
+    ]
+  }
+]
