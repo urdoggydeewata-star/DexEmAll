@@ -268,9 +268,20 @@ def _patch_pvp_streaming_reliability() -> None:
                 if stream_channel is None or not hasattr(stream_channel, "send"):
                     return None
 
+                try:
+                    turn_no = int(getattr(st, "turn", 0) or 0)
+                except Exception:
+                    turn_no = 0
+                summary_text = str(turn_summary or "").strip()
+                # Match requested stream UX:
+                # - Turn 1: image only (no summary text)
+                # - Later turns: include summary (moves + damage)
+                if turn_no <= 1:
+                    summary_text = ""
+
                 stream_key = None
                 try:
-                    stream_key = (int(getattr(st, "turn", 0) or 0), str(turn_summary or "").strip())
+                    stream_key = (turn_no, summary_text)
                     if stream_key == getattr(st, "_stream_last_sent_key", None):
                         return getattr(st, "_last_stream_message", None)
                 except Exception:
@@ -283,7 +294,7 @@ def _patch_pvp_streaming_reliability() -> None:
                     pass
 
                 try:
-                    msg = await original_send_stream(stream_channel, st, turn_summary, gif_file)
+                    msg = await original_send_stream(stream_channel, st, summary_text or None, gif_file)
                     if msg is not None:
                         if stream_key is not None:
                             st._stream_last_sent_key = stream_key
@@ -297,12 +308,11 @@ def _patch_pvp_streaming_reliability() -> None:
                     p1 = _pvp_panel._format_pokemon_name(st._active(st.p1_id))
                     p2 = _pvp_panel._format_pokemon_name(st._active(st.p2_id))
                     desc = f"Turn {getattr(st, 'turn', '?')} • {getattr(st, 'fmt_label', 'Battle')} (Gen {getattr(st, 'gen', '?')})"
-                    if turn_summary:
-                        summary_text = str(turn_summary).strip()
-                        if summary_text:
-                            if len(summary_text) > 2500:
-                                summary_text = "...\n" + summary_text[-2300:]
-                            desc += f"\n\n**Turn Summary:**\n{summary_text}"
+                    if summary_text:
+                        _sum = summary_text
+                        if len(_sum) > 2500:
+                            _sum = "...\n" + _sum[-2300:]
+                        desc += f"\n\n**Turn Summary:**\n{_sum}"
                     emb = discord.Embed(
                         title=f"📺 Battle Stream: **{p1}** vs **{p2}**",
                         description=desc,
@@ -317,12 +327,11 @@ def _patch_pvp_streaming_reliability() -> None:
                     print(f"[StreamPatch] stream embed fallback failed: {e}")
                     try:
                         txt = f"📺 Stream update • Turn {getattr(st, 'turn', '?')} • {getattr(st, 'fmt_label', 'Battle')}"
-                        if turn_summary:
-                            summary_text = str(turn_summary).strip()
-                            if summary_text:
-                                if len(summary_text) > 1500:
-                                    summary_text = "...\n" + summary_text[-1300:]
-                                txt += f"\n{summary_text}"
+                        if summary_text:
+                            _sum = summary_text
+                            if len(_sum) > 1500:
+                                _sum = "...\n" + _sum[-1300:]
+                            txt += f"\n{_sum}"
                         msg = await stream_channel.send(txt)
                         if stream_key is not None:
                             st._stream_last_sent_key = stream_key
@@ -352,10 +361,6 @@ def _patch_pvp_streaming_reliability() -> None:
                     if bool(getattr(st, "streaming_enabled", False)) and not bool(getattr(st, "_stream_started", False)):
                         ch = getattr(st, "stream_channel", None)
                         if ch is not None and hasattr(ch, "send"):
-                            try:
-                                await ch.send("📺 Stream connected. Live battle updates will post here.")
-                            except Exception:
-                                pass
                             render_result = None
                             render_fn = getattr(_pvp_panel, "_render_gif_for_panel", None)
                             if callable(render_fn):
@@ -366,7 +371,7 @@ def _patch_pvp_streaming_reliability() -> None:
                             send_fn = getattr(_pvp_panel, "_send_stream_panel", None)
                             if callable(send_fn):
                                 try:
-                                    msg = await send_fn(ch, st, "Battle has begun!", render_result)
+                                    msg = await send_fn(ch, st, None, render_result)
                                     if msg is not None:
                                         st._last_stream_message = msg
                                 except Exception as e:
@@ -391,10 +396,20 @@ def _patch_pvp_streaming_reliability() -> None:
                             st.stream_channel = ch
                             st.stream_channel_id = getattr(ch, "id", None)
                             summary_lines = list(getattr(st, "_last_turn_log", []) or [])
-                            summary_text = "\n".join(summary_lines).strip() if summary_lines else "Battle in progress..."
+                            try:
+                                turn_no = int(getattr(st, "turn", 0) or 0)
+                            except Exception:
+                                turn_no = 0
+                            send_initial = (turn_no <= 1 and not bool(getattr(st, "_stream_initial_sent", False)))
+                            send_summary = (turn_no >= 2 and bool(summary_lines))
+                            if not (send_initial or send_summary):
+                                return result
+                            summary_text = "\n".join(summary_lines).strip() if send_summary else None
                             send_fn = getattr(_pvp_panel, "_send_stream_panel", None)
                             if callable(send_fn):
-                                await send_fn(ch, st, summary_text, None)
+                                await send_fn(ch, st, summary_text, gif_file if send_initial else None)
+                                if send_initial:
+                                    st._stream_initial_sent = True
                 except Exception as e:
                     print(f"[StreamPatch] _send_player_panel stream mirror failed: {e}")
                 return result
@@ -408,17 +423,6 @@ def _patch_pvp_streaming_reliability() -> None:
             if callable(original_start_if_ready) and not getattr(original_start_if_ready, "_dex_stream_patch", False):
 
                 async def _wrapped_start_if_ready(self, itx):
-                    try:
-                        if bool(getattr(self, "streaming_enabled", False)) and not bool(getattr(self, "_stream_notice_sent", False)):
-                            ch = getattr(itx, "channel", None)
-                            if ch is not None and hasattr(ch, "send"):
-                                await ch.send(
-                                    "📺 Stream is enabled: the 'only players can see panels' line refers to private control panels. "
-                                    "Public stream updates are posted in this channel."
-                                )
-                            self._stream_notice_sent = True
-                    except Exception:
-                        pass
                     result = await original_start_if_ready(self, itx)
                     return result
 
