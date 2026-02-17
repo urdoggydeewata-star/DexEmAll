@@ -6766,7 +6766,7 @@ TM_SELLER_PRICE = 500  # Coins per TM (Gen 1)
 TM_SELLER_ITEMS = [GEN1_TMS[i - 1] for i in (1, 3, 5, 6, 7, 9, 11, 12, 15, 17, 20, 21, 22, 23, 24, 31, 34, 35, 37, 40, 42, 44, 45, 49, 50)]
 
 # Route move item drop: when user presses "Next" to move across a route, roll for a random item from this pool.
-ROUTE_MOVE_ITEM_DROP_CHANCE = 0.05  # Probability per move (e.g. 15%)
+ROUTE_MOVE_ITEM_DROP_CHANCE = 0.90  # Probability per move (e.g. 15%)
 ROUTE_MOVE_ITEM_POOL: List[Tuple[str, str]] = [
     ("potion", "Potion"),
     ("antidote", "Antidote"),
