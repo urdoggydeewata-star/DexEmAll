@@ -57,6 +57,7 @@ from lib.team_import import parse_showdown_team, get_preset_team_names, get_pres
 from lib.legality import legal_moves, species_allowed
 from lib.rules import rules_for
 import lib.rules as _rules
+from lib import evolution_mechanics as evo_mech
 import pvp.sprites as _pvp_sprites
 try:
     from tools.cache_everything import warm_cache, STATIC_TABLES
@@ -10096,14 +10097,9 @@ async def _get_level_up_evolution(
     held_item: Optional[str] = None,
     area_id: Optional[str] = None,
 ) -> Optional[str]:
-    """
-    Return the evolved species (lowercase) if level-up conditions are met.
-    Supports level thresholds and condition-based evolutions (time/friendship/gender/moves/location) when present in data.
-    """
-    return await _find_evolution_for_trigger(
+    return await evo_mech.resolve_level_up_evolution(
         conn,
         species_name,
-        expected_trigger="level-up",
         level=level,
         friendship=friendship,
         gender=gender,
@@ -10124,67 +10120,20 @@ async def _get_item_use_evolution(
     held_item: Optional[str] = None,
     area_id: Optional[str] = None,
 ) -> Optional[str]:
-    """
-    Return the evolved species (lowercase) if this species evolves by using the given item.
-    """
-    item_norm = _daycare_norm_item(item_id)
-    if not item_norm:
-        return None
-    target = await _find_evolution_for_trigger(
+    return await evo_mech.resolve_item_evolution(
         conn,
         species_name,
-        expected_trigger="use-item",
+        item_id,
         friendship=friendship,
         gender=gender,
         moves=moves,
         held_item=held_item,
-        item_used=item_norm,
         area_id=area_id,
     )
-    if target:
-        return target
-    # Fallback for older/simplified evolution payloads that omit per-branch details.
-    return _fallback_item_evolution_target(species_name, item_norm)
 
 
 async def _get_any_item_evolution_target(conn, species_name: str) -> Optional[str]:
-    """
-    Return one example item id if the species has an item-use evolution.
-    Used for user-facing hints when no level-up evolution is available.
-    """
-    cur = await conn.execute(
-        "SELECT evolution FROM pokedex WHERE LOWER(name)=LOWER(?) OR LOWER(REPLACE(name,' ','-'))=LOWER(?) LIMIT 1",
-        (species_name.strip(), _evo_norm_text(species_name)),
-    )
-    row = await cur.fetchone()
-    await cur.close()
-    if not row or row.get("evolution") is None:
-        return None
-    evo = _parse_evolution(row["evolution"])
-    if not isinstance(evo, dict):
-        return None
-    raw_next = evo.get("next")
-    if isinstance(raw_next, list):
-        next_list = raw_next
-    elif raw_next is not None:
-        next_list = [raw_next]
-    else:
-        next_list = []
-    for n in next_list:
-        if not isinstance(n, dict):
-            continue
-        detail_blob = n.get("details")
-        if detail_blob in (None, "", []):
-            detail_blob = n.get("evolution_details")
-        detail_candidates = _evo_details_candidates(detail_blob)
-        if not detail_candidates:
-            detail_candidates = [n]
-        for details in detail_candidates:
-            trigger = _evo_norm_text(_evo_unwrap_nameish(details.get("trigger")))
-            item_id = _daycare_norm_item(_evo_unwrap_nameish(details.get("item")))
-            if trigger in {"use-item", "item"} and item_id:
-                return item_id
-    return None
+    return await evo_mech.suggest_item_evolution_item(conn, species_name)
 
 
 async def _apply_evolution(owner_id: str, mon_db_id: int, evolved_species_name: str, level: int) -> bool:
@@ -14092,6 +14041,31 @@ async def walk_cmd(inter: discord.Interaction, name: str, slot: int | None = Non
     )
 
 
+async def _consume_item_for_evolution(owner_id: str, item_id: str) -> bool:
+    """
+    Consume one item for /evolve.
+    Uses db.take_item when available; falls back to the local decrement helper.
+    """
+    item_key = str(item_id or "").strip().lower()
+    if not item_key:
+        return False
+    take_fn = getattr(db, "take_item", None)
+    if callable(take_fn):
+        try:
+            return bool(await take_fn(owner_id, item_key, qty=1))
+        except TypeError:
+            try:
+                return bool(await take_fn(owner_id, item_key, 1))
+            except Exception:
+                pass
+        except Exception:
+            pass
+    try:
+        return bool(await _decrement_user_item(owner_id, item_key, 1))
+    except Exception:
+        return False
+
+
 @bot.tree.command(name="evolve", description="Evolve a team Pokémon using level conditions or an evolution item.")
 @app_commands.describe(
     name="Pokémon name in your team (e.g. eevee)",
@@ -14099,140 +14073,152 @@ async def walk_cmd(inter: discord.Interaction, name: str, slot: int | None = Non
     item="Optional evolution item (e.g. Thunder Stone)",
 )
 async def evolve_cmd(inter: discord.Interaction, name: str, slot: int | None = None, item: str | None = None):
-    mon = await resolve_team_mon(inter, name, slot)
-    if not mon:
-        return
-
-    uid = str(inter.user.id)
-    mon_id = int(mon["id"])
-    auto_mon = f" (autocorrected to **{mon['_autocorrected_to']}**)" if mon.get("_autocorrected_to") else ""
-
-    area_id: Optional[str] = None
     try:
-        state = await _get_adventure_state(uid)
-        if isinstance(state, dict):
-            area_id = str(state.get("area_id") or "").strip() or None
-    except Exception:
-        area_id = None
+        mon = await resolve_team_mon(inter, name, slot)
+        if not mon:
+            return
 
-    async with db.session() as conn:
-        cur = await conn.execute(
-            """
-            SELECT species, level, friendship, gender, held_item, moves
-            FROM pokemons
-            WHERE owner_id=? AND id=?
-            LIMIT 1
-            """,
-            (uid, mon_id),
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        if not row:
-            return await inter.followup.send("❌ Pokémon not found in your team.", ephemeral=True)
+        uid = str(inter.user.id)
+        mon_id = int(mon["id"])
+        auto_mon = f" (autocorrected to **{mon['_autocorrected_to']}**)" if mon.get("_autocorrected_to") else ""
 
-        species_raw = str((row["species"] if hasattr(row, "keys") else row[0]) or "").strip()
-        species = _daycare_norm_species(species_raw)
-        level_raw = row["level"] if hasattr(row, "keys") else row[1]
-        friendship_raw = row["friendship"] if hasattr(row, "keys") else row[2]
-        gender = str((row["gender"] if hasattr(row, "keys") else row[3]) or "").strip().lower() or None
-        held_item = str((row["held_item"] if hasattr(row, "keys") else row[4]) or "").strip().lower() or None
-        moves_raw = row["moves"] if hasattr(row, "keys") else row[5]
+        area_id: Optional[str] = None
         try:
-            level = int(level_raw or 1)
+            state = await _get_adventure_state(uid)
+            if isinstance(state, dict):
+                area_id = str(state.get("area_id") or "").strip() or None
         except Exception:
-            level = 1
-        try:
-            friendship = int(friendship_raw) if friendship_raw is not None else None
-        except Exception:
-            friendship = None
+            area_id = None
 
-        item_id: Optional[str] = None
-        item_disp: Optional[str] = None
-        auto_item_note = ""
-        evo_target: Optional[str] = None
+        async with db.session() as conn:
+            cur = await conn.execute(
+                """
+                SELECT species, level, friendship, gender, held_item, moves
+                FROM pokemons
+                WHERE owner_id=? AND id=?
+                LIMIT 1
+                """,
+                (uid, mon_id),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            if not row:
+                return await inter.followup.send("❌ Pokémon not found in your team.", ephemeral=True)
 
-        if item and str(item).strip():
-            item_row, auto_item, suggestions = await _resolve_item_fuzzy(conn, str(item), threshold=0.80)
-            if not item_row:
-                if suggestions:
+            species_raw = str((row["species"] if hasattr(row, "keys") else row[0]) or "").strip()
+            species = _daycare_norm_species(species_raw)
+            level_raw = row["level"] if hasattr(row, "keys") else row[1]
+            friendship_raw = row["friendship"] if hasattr(row, "keys") else row[2]
+            gender = str((row["gender"] if hasattr(row, "keys") else row[3]) or "").strip().lower() or None
+            held_item = str((row["held_item"] if hasattr(row, "keys") else row[4]) or "").strip().lower() or None
+            moves_raw = row["moves"] if hasattr(row, "keys") else row[5]
+            try:
+                level = int(level_raw or 1)
+            except Exception:
+                level = 1
+            try:
+                friendship = int(friendship_raw) if friendship_raw is not None else None
+            except Exception:
+                friendship = None
+
+            item_id: Optional[str] = None
+            item_disp: Optional[str] = None
+            auto_item_note = ""
+            evo_target: Optional[str] = None
+
+            if item and str(item).strip():
+                item_row, auto_item, suggestions = await _resolve_item_fuzzy(conn, str(item), threshold=0.80)
+                if not item_row:
+                    if suggestions:
+                        return await inter.followup.send(
+                            f"❌ I couldn't find that item. Did you mean: {', '.join(suggestions)}?",
+                            ephemeral=True,
+                        )
+                    return await inter.followup.send("❌ I couldn't find that item.", ephemeral=True)
+                item_id = str(item_row.get("id") or "").strip().lower()
+                if not item_id:
+                    return await inter.followup.send("❌ Invalid evolution item.", ephemeral=True)
+                item_disp = pretty_item_name(item_row.get("name") or item_id)
+                if auto_item:
+                    auto_item_note = f" (autocorrected item to **{auto_item}**)"
+
+                qty = await _get_item_qty(uid, item_id, conn=conn)
+                if qty <= 0:
                     return await inter.followup.send(
-                        f"❌ I couldn't find that item. Did you mean: {', '.join(suggestions)}?",
+                        f"❌ You don’t have **{item_disp}** in your bag.",
                         ephemeral=True,
                     )
-                return await inter.followup.send("❌ I couldn't find that item.", ephemeral=True)
-            item_id = str(item_row.get("id") or "").strip().lower()
-            if not item_id:
-                return await inter.followup.send("❌ Invalid evolution item.", ephemeral=True)
-            item_disp = pretty_item_name(item_row.get("name") or item_id)
-            if auto_item:
-                auto_item_note = f" (autocorrected item to **{auto_item}**)"
-
-            qty = await _get_item_qty(uid, item_id, conn=conn)
-            if qty <= 0:
-                return await inter.followup.send(
-                    f"❌ You don’t have **{item_disp}** in your bag.",
-                    ephemeral=True,
+                evo_target = await _get_item_use_evolution(
+                    conn,
+                    species,
+                    item_id,
+                    friendship=friendship,
+                    gender=gender,
+                    moves=moves_raw,
+                    held_item=held_item,
+                    area_id=area_id,
                 )
-            evo_target = await _get_item_use_evolution(
-                conn,
-                species,
-                item_id,
-                friendship=friendship,
-                gender=gender,
-                moves=moves_raw,
-                held_item=held_item,
-                area_id=area_id,
-            )
-            if not evo_target:
-                pretty_species = species_raw.replace("-", " ").title()
-                return await inter.followup.send(
-                    f"❌ **{pretty_species}** can't evolve with **{item_disp}** right now{auto_item_note}.",
-                    ephemeral=True,
+                if not evo_target:
+                    pretty_species = species_raw.replace("-", " ").title()
+                    return await inter.followup.send(
+                        f"❌ **{pretty_species}** can't evolve with **{item_disp}** right now{auto_item_note}.",
+                        ephemeral=True,
+                    )
+            else:
+                evo_target = await _get_level_up_evolution(
+                    conn,
+                    species,
+                    level,
+                    friendship=friendship,
+                    gender=gender,
+                    moves=moves_raw,
+                    held_item=held_item,
+                    area_id=area_id,
                 )
-        else:
-            evo_target = await _get_level_up_evolution(
-                conn,
-                species,
-                level,
-                friendship=friendship,
-                gender=gender,
-                moves=moves_raw,
-                held_item=held_item,
-                area_id=area_id,
-            )
-            if not evo_target:
-                item_hint = await _get_any_item_evolution_target(conn, species)
-                hint_line = ""
-                if item_hint:
-                    hint_line = f" Try using `/evolve` with item **{pretty_item_name(item_hint)}**."
-                pretty_species = species_raw.replace("-", " ").title()
-                return await inter.followup.send(
-                    f"❌ **{pretty_species}** doesn't meet any evolution conditions right now.{hint_line}",
-                    ephemeral=True,
-                )
+                if not evo_target:
+                    item_hint = await _get_any_item_evolution_target(conn, species)
+                    hint_line = ""
+                    if item_hint:
+                        hint_line = f" Try using `/evolve` with item **{pretty_item_name(item_hint)}**."
+                    pretty_species = species_raw.replace("-", " ").title()
+                    return await inter.followup.send(
+                        f"❌ **{pretty_species}** doesn't meet any evolution conditions right now.{hint_line}",
+                        ephemeral=True,
+                    )
 
-    consumed_item = False
-    if item_id:
-        consumed_item = await db.take_item(uid, item_id, qty=1)
-        if not consumed_item:
-            return await inter.followup.send("❌ You no longer have that item in your bag.", ephemeral=True)
+        consumed_item = False
+        if item_id:
+            consumed_item = await _consume_item_for_evolution(uid, item_id)
+            if not consumed_item:
+                return await inter.followup.send("❌ You no longer have that item in your bag.", ephemeral=True)
 
-    applied = await _apply_evolution(uid, mon_id, evo_target, level)
-    if not applied:
-        if consumed_item and item_id:
-            try:
-                await db.give_item(uid, item_id, 1)
-            except Exception:
-                pass
-        return await inter.followup.send("❌ Evolution failed. Please try again.", ephemeral=True)
+        applied = await _apply_evolution(uid, mon_id, evo_target, level)
+        if not applied:
+            if consumed_item and item_id:
+                try:
+                    await db.give_item(uid, item_id, 1)
+                except Exception:
+                    pass
+            return await inter.followup.send("❌ Evolution failed. Please try again.", ephemeral=True)
 
-    from_name = species_raw.replace("-", " ").title()
-    to_name = str(evo_target).replace("-", " ").title()
-    item_note = f" using **{item_disp}**{auto_item_note}" if item_id else ""
-    await inter.followup.send(
-        f"✨ **{from_name}** evolved into **{to_name}**{item_note}{auto_mon}!",
-        ephemeral=True,
-    )
+        from_name = species_raw.replace("-", " ").title()
+        to_name = str(evo_target).replace("-", " ").title()
+        item_note = f" using **{item_disp}**{auto_item_note}" if item_id else ""
+        await inter.followup.send(
+            f"✨ **{from_name}** evolved into **{to_name}**{item_note}{auto_mon}!",
+            ephemeral=True,
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        msg = f"❌ Evolution command failed: {type(e).__name__}."
+        try:
+            if inter.response.is_done():
+                await inter.followup.send(msg, ephemeral=True)
+            else:
+                await inter.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
 
 
 def _team_species_label(row: dict) -> str:
