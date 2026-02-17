@@ -7503,6 +7503,23 @@ RIVAL_BATTLES = {
     },
 }
 
+
+async def _try_route_move_item_drop(itx: discord.Interaction, user_id: str) -> None:
+    """Roll for a random item from ROUTE_MOVE_ITEM_POOL (same kind of trigger as random encounter on route move)."""
+    if not ROUTE_MOVE_ITEM_POOL or random.random() >= ROUTE_MOVE_ITEM_DROP_CHANCE:
+        return
+    item_id, display_name = random.choice(ROUTE_MOVE_ITEM_POOL)
+    try:
+        await db.upsert_item_master(item_id, name=display_name)
+        await db.give_item(user_id, item_id, 1)
+        try:
+            await itx.followup.send(f"You found a **{display_name}** on the ground!", ephemeral=False)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def _adv_default_state() -> dict:
     return {
         "area_id": "pallet-town",
@@ -10602,18 +10619,6 @@ class AdventureCityView(discord.ui.View):
             state["route_panels"] = rp
         state["area_id"] = next_id
         await _save_adventure_state(str(itx.user.id), state)
-        # Random chance to find an item when moving to a new route
-        if ROUTE_MOVE_ITEM_POOL and random.random() < ROUTE_MOVE_ITEM_DROP_CHANCE:
-            item_id, display_name = random.choice(ROUTE_MOVE_ITEM_POOL)
-            try:
-                await db.upsert_item_master(item_id, name=display_name)
-                await db.give_item(str(itx.user.id), item_id, 1)
-                try:
-                    await itx.followup.send(f"You found a **{display_name}** on the ground!", ephemeral=False)
-                except Exception:
-                    pass
-            except Exception:
-                pass
         await _send_adventure_panel(itx, state, edit_original=True)
 
     async def _on_rival(self, itx: discord.Interaction):
@@ -11486,6 +11491,7 @@ class AdventureRouteView(discord.ui.View):
         # reads the latest panel instead of stale DB state.
         await _save_adventure_state(str(itx.user.id), state)
         if moved_within_route:
+            await _try_route_move_item_drop(itx, str(itx.user.id))
             await self._r1_try_wild_encounter(itx, state, force=False)
             # Persist encounter side-effects (dex seen/discovered updates).
             await _save_adventure_state(str(itx.user.id), state)
@@ -11518,6 +11524,8 @@ class AdventureRouteView(discord.ui.View):
 
         await _save_adventure_state(str(itx.user.id), state)
         if moved_within_route:
+            # movement can trigger item drop (same trigger as encounter chance)
+            await _try_route_move_item_drop(itx, str(itx.user.id))
             # movement can trigger encounter
             await self._r1_try_wild_encounter(itx, state, force=False)
             # Persist encounter side-effects (dex seen/discovered updates).
@@ -11620,6 +11628,8 @@ class AdventureRouteView(discord.ui.View):
             path = (route.get("grass_paths") or {}).get(path_id)
             if not path:
                 return await itx.followup.send("That path doesn't exist.", ephemeral=False)
+            # Random item drop on path move (same kind of trigger as Route 1 encounter chance)
+            await _try_route_move_item_drop(itx, str(itx.user.id))
             blocker = path.get("blocker")
             if blocker and blocker not in state.get("defeated_trainers", {}):
                 trainer = (route.get("trainers") or {}).get(blocker)
