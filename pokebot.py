@@ -59,6 +59,7 @@ from lib.legality import legal_moves, species_allowed
 from lib.rules import rules_for
 import lib.rules as _rules
 from lib import evolution_mechanics as evo_mech
+from lib import breeding_mechanics as breeding_mech
 import pvp.sprites as _pvp_sprites
 try:
     from tools.cache_everything import warm_cache, STATIC_TABLES
@@ -6786,8 +6787,6 @@ BOX_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "box_spr
 LEGACY_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "sprites"
 POKESPRITE_MASTER_ZIP = Path(__file__).resolve().parent / "pokesprite-master.zip"
 DAYCARE_ZIP_CACHE_DIR = BOX_SPRITES_DIR / "_pokesprite_zip_cache"
-_DAYCARE_PRE_EVO_MAP: dict[str, str] = {}
-_DAYCARE_PRE_EVO_READY = False
 ASSETS_BOX_BACKGROUNDS_DIR = ASSETS_DIR / "ui" / "box-backgrounds"
 BOX_SPRITES_BACKGROUNDS_DIR = BOX_SPRITES_DIR / "backgrounds"
 BOX_BACKGROUND_FILENAMES: tuple[str, ...] = (
@@ -7838,171 +7837,51 @@ def _daycare_norm_species(species: str) -> str:
 
 
 def _daycare_parse_evolution_blob(raw: Any) -> Any:
-    if raw is None:
-        return {}
-    if isinstance(raw, (dict, list)):
-        return raw
-    if isinstance(raw, str):
-        try:
-            data = json.loads(raw)
-            return data if isinstance(data, (dict, list)) else {}
-        except Exception:
-            return {}
-    return {}
+    return breeding_mech.parse_evolution_blob(raw)
 
 
 def _daycare_next_evo_entries(parent_species: str, raw_evolution: Any) -> list[tuple[str, str]]:
-    """
-    Return (child_species, parent_species) edges from an evolution payload.
-    Handles nested trees so final forms (e.g., Gengar) still map back through Haunter.
-    """
-    evo = _daycare_parse_evolution_blob(raw_evolution)
-    out: list[tuple[str, str]] = []
-
-    def _node_species(node: Any) -> str:
-        if isinstance(node, str):
-            return _daycare_norm_species(node)
-        if not isinstance(node, dict):
-            return ""
-        raw = node.get("species") or node.get("name") or node.get("pokemon")
-        if isinstance(raw, dict):
-            raw = raw.get("name") or raw.get("species") or raw.get("pokemon")
-        return _daycare_norm_species(raw or "")
-
-    def _node_next(node: Any) -> list[Any]:
-        if isinstance(node, dict):
-            nxt = node.get("next") or node.get("evolves_to") or node.get("children")
-            if isinstance(nxt, list):
-                return list(nxt)
-            if nxt is not None:
-                return [nxt]
-        return []
-
-    def _walk(parent: str, nodes: list[Any]) -> None:
-        for node in nodes:
-            child = _node_species(node)
-            if child:
-                out.append((child, parent))
-                _walk(child, _node_next(node))
-            else:
-                _walk(parent, _node_next(node))
-
-    start_nodes: list[Any] = []
-    raw_next = evo.get("next") if isinstance(evo, dict) else None
-    if isinstance(raw_next, list):
-        start_nodes = list(raw_next)
-    elif raw_next is not None:
-        start_nodes = [raw_next]
-    elif isinstance(evo, list):
-        start_nodes = list(evo)
-    _walk(_daycare_norm_species(parent_species), start_nodes)
-    return out
+    return breeding_mech.next_evo_edges(parent_species, raw_evolution)
 
 
-async def _daycare_pre_evo_map() -> dict[str, str]:
-    global _DAYCARE_PRE_EVO_READY, _DAYCARE_PRE_EVO_MAP
-    if _DAYCARE_PRE_EVO_READY and _DAYCARE_PRE_EVO_MAP:
-        return _DAYCARE_PRE_EVO_MAP
-    pre_map: dict[str, str] = {}
+async def _daycare_pokedex_rows_for_breeding() -> list[tuple[Any, Any]]:
+    rows_out: list[tuple[Any, Any]] = []
     try:
         async with db.session() as conn:
             cur = await conn.execute("SELECT name, evolution FROM pokedex")
             rows = await cur.fetchall()
             await cur.close()
-        for row in rows:
-            parent_name = row["name"] if hasattr(row, "keys") else row[0]
-            evolution_blob = row["evolution"] if hasattr(row, "keys") else row[1]
-            parent = _daycare_norm_species(parent_name)
-            if not parent:
-                continue
-            for child, parent_from_edge in _daycare_next_evo_entries(parent, evolution_blob):
-                if child and child not in pre_map:
-                    pre_map[child] = _daycare_norm_species(parent_from_edge or parent)
     except Exception:
-        return _DAYCARE_PRE_EVO_MAP
-    _DAYCARE_PRE_EVO_MAP = pre_map
-    _DAYCARE_PRE_EVO_READY = True
-    return _DAYCARE_PRE_EVO_MAP
+        return rows_out
+    for row in rows:
+        name_val = row["name"] if hasattr(row, "keys") else row[0]
+        evolution_val = row["evolution"] if hasattr(row, "keys") else row[1]
+        rows_out.append((name_val, evolution_val))
+    return rows_out
+
+
+async def _daycare_pre_evo_map() -> dict[str, str]:
+    return await breeding_mech.pre_evo_map(_daycare_pokedex_rows_for_breeding)
 
 
 async def _daycare_resolve_egg_species(species: str) -> str:
-    """
-    Resolve breeding offspring to the base stage of the chain.
-    Example: Gengar/Haunter -> Gastly egg species.
-    """
-    cur = _daycare_norm_species(species)
-    if not cur:
-        return ""
-    # Canonical special case in core games.
-    if cur == "manaphy":
-        return "phione"
-    pre_map = await _daycare_pre_evo_map()
-    if not pre_map:
-        return cur
-    seen = {cur}
-    while True:
-        parent = _daycare_norm_species(pre_map.get(cur))
-        if not parent or parent in seen:
-            break
-        cur = parent
-        seen.add(cur)
-    return cur
+    return await breeding_mech.resolve_egg_species(
+        species,
+        fetch_pokedex_rows=_daycare_pokedex_rows_for_breeding,
+        allow_pokeapi_fallback=True,
+    )
 
 
 def _daycare_breeding_source_parent(parent_a: dict, parent_b: dict) -> dict:
-    s1 = _daycare_norm_species(parent_a.get("species"))
-    s2 = _daycare_norm_species(parent_b.get("species"))
-    ditto1 = s1 == "ditto"
-    ditto2 = s2 == "ditto"
-    if ditto1 and not ditto2:
-        return parent_b
-    if ditto2 and not ditto1:
-        return parent_a
-    g1 = str(parent_a.get("gender") or "").strip().lower()
-    g2 = str(parent_b.get("gender") or "").strip().lower()
-    if g1 == "female":
-        return parent_a
-    if g2 == "female":
-        return parent_b
-    return parent_a
+    return breeding_mech.breeding_source_parent(parent_a, parent_b)
 
 
 def _daycare_apply_incense_baby_rules(base_child: str, parent_a: dict, parent_b: dict) -> str:
-    source = _daycare_breeding_source_parent(parent_a, parent_b)
-    source_species = _daycare_norm_species(source.get("species"))
-    baby_rule = DAYCARE_INCENSE_BABIES.get(source_species)
-    if not baby_rule:
-        return base_child
-    baby_species, required_incense = baby_rule
-    need_item = _daycare_norm_item(required_incense)
-    held_a = _daycare_norm_item(parent_a.get("held_item"))
-    held_b = _daycare_norm_item(parent_b.get("held_item"))
-    held_source = _daycare_norm_item(source.get("held_item"))
-    # Core behavior: incense is required to produce baby forms.
-    if need_item and (held_source == need_item or held_a == need_item or held_b == need_item):
-        return _daycare_norm_species(baby_species)
-    return base_child
+    return breeding_mech.apply_incense_baby_rules(base_child, parent_a, parent_b, DAYCARE_INCENSE_BABIES)
 
 
 def _daycare_parse_moves(raw_moves: Any) -> list[str]:
-    moves = raw_moves
-    if isinstance(moves, str):
-        try:
-            moves = json.loads(moves)
-        except Exception:
-            moves = [moves]
-    if not isinstance(moves, (list, tuple)):
-        return []
-    out: list[str] = []
-    for mv in moves[:4]:
-        if isinstance(mv, dict):
-            name = mv.get("name")
-        else:
-            name = mv
-        norm = _daycare_norm_species(name)
-        if norm:
-            out.append(norm)
-    return out
+    return breeding_mech.parse_moves(raw_moves)
 
 
 async def _daycare_egg_move_pool(species: str, generation: int = 1) -> set[str]:
@@ -8043,19 +7922,14 @@ async def _daycare_egg_move_pool(species: str, generation: int = 1) -> set[str]:
 
 
 async def _daycare_inherited_egg_moves(parent_a: dict, parent_b: dict, child_species: str) -> list[str]:
-    item_a = _daycare_norm_item(parent_a.get("held_item"))
-    item_b = _daycare_norm_item(parent_b.get("held_item"))
-    if item_a not in DAYCARE_MIRROR_HERB_ITEMS and item_b not in DAYCARE_MIRROR_HERB_ITEMS:
-        return []
-    egg_pool = await _daycare_egg_move_pool(child_species, generation=1)
-    if not egg_pool:
-        return []
-    parent_moves = set(_daycare_parse_moves(parent_a.get("moves"))) | set(_daycare_parse_moves(parent_b.get("moves")))
-    inheritable = [m for m in parent_moves if m in egg_pool]
-    if not inheritable:
-        return []
-    random.shuffle(inheritable)
-    return inheritable[:2]
+    inherited = await breeding_mech.inherited_egg_moves(
+        parent_a,
+        parent_b,
+        child_species,
+        egg_move_pool_fetch=(lambda species: _daycare_egg_move_pool(species, generation=1)),
+        mirror_herb_items=DAYCARE_MIRROR_HERB_ITEMS,
+    )
+    return inherited[:2]
 
 
 def _daycare_showdown_keys(species: str) -> list[str]:
@@ -8241,25 +8115,7 @@ def _daycare_short_to_long_stats(short: dict) -> dict:
 
 
 def _daycare_parse_egg_groups(entry: dict | None) -> set[str]:
-    if not isinstance(entry, dict):
-        return set()
-    raw = entry.get("egg_groups")
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except Exception:
-            raw = [raw]
-    out: set[str] = set()
-    if isinstance(raw, (list, tuple)):
-        for g in raw:
-            if isinstance(g, dict):
-                name = g.get("name")
-            else:
-                name = g
-            norm = _daycare_norm_species(name)
-            if norm:
-                out.add(norm)
-    return out
+    return breeding_mech.parse_egg_groups(entry)
 
 
 async def _daycare_species_entry(species: str) -> Optional[dict]:
@@ -8291,209 +8147,49 @@ def _daycare_pair_info(
     entry_a: dict | None,
     entry_b: dict | None,
 ) -> dict:
-    fail = {
-        "can_breed": False,
-        "reason": "These Pokémon can't breed.",
-        "child_species": None,
-        "rate": 0.0,
-    }
-    if not parent_a or not parent_b:
-        fail["reason"] = "Place two Pokémon in daycare."
-        return fail
-    if not entry_a or not entry_b:
-        fail["reason"] = "Missing Pokédex data for one parent."
-        return fail
-
-    s1 = _daycare_norm_species(parent_a.get("species"))
-    s2 = _daycare_norm_species(parent_b.get("species"))
-    g1 = str(parent_a.get("gender") or "genderless").strip().lower()
-    g2 = str(parent_b.get("gender") or "genderless").strip().lower()
-    ditto1 = s1 == "ditto"
-    ditto2 = s2 == "ditto"
-
-    if ditto1 and ditto2:
-        fail["reason"] = "Two Ditto cannot breed together."
-        return fail
-
-    egg1 = _daycare_parse_egg_groups(entry_a)
-    egg2 = _daycare_parse_egg_groups(entry_b)
-    blocked_groups = {"undiscovered", "no-eggs"}
-    if egg1 & blocked_groups or egg2 & blocked_groups:
-        fail["reason"] = "One parent belongs to the Undiscovered egg group."
-        return fail
-
-    if not (ditto1 or ditto2):
-        if g1 == g2:
-            fail["reason"] = "Parents must be opposite gender."
-            return fail
-        if g1 == "genderless" or g2 == "genderless":
-            fail["reason"] = "Genderless parents require Ditto."
-            return fail
-        if not ((egg1 & egg2) - {"ditto"}):
-            fail["reason"] = "Parents are not in a compatible egg group."
-            return fail
-
-    if ditto1:
-        child_species = s2
-    elif ditto2:
-        child_species = s1
-    else:
-        child_species = s1 if g1 == "female" else (s2 if g2 == "female" else s1)
-
-    rate = 1.15 if (s1 == s2 and not (ditto1 or ditto2)) else (0.85 if (ditto1 or ditto2) else 0.95)
-    return {
-        "can_breed": True,
-        "reason": "Compatible pair.",
-        "child_species": child_species,
-        "rate": rate,
-        "ditto_pair": bool(ditto1 or ditto2),
-    }
+    return breeding_mech.pair_info(parent_a, parent_b, entry_a, entry_b)
 
 
 def _daycare_pick_nature(parent_a: dict, parent_b: dict) -> str:
-    item_a = _daycare_norm_item(parent_a.get("held_item"))
-    item_b = _daycare_norm_item(parent_b.get("held_item"))
-    ever_items = {"everstone", "ever-stone"}
-    candidates = []
-    if item_a in ever_items and parent_a.get("nature"):
-        candidates.append(str(parent_a.get("nature")).strip().lower())
-    if item_b in ever_items and parent_b.get("nature"):
-        candidates.append(str(parent_b.get("nature")).strip().lower())
-    if candidates:
-        return random.choice(candidates) or "hardy"
-    na = str(parent_a.get("nature") or "").strip().lower()
-    nb = str(parent_b.get("nature") or "").strip().lower()
-    pool = [n for n in (na, nb) if n]
-    return random.choice(pool) if pool else "hardy"
+    return breeding_mech.pick_nature(parent_a, parent_b)
 
 
 def _daycare_pick_ivs(parent_a: dict, parent_b: dict) -> dict:
-    stats = ["hp", "atk", "defn", "spa", "spd", "spe"]
-    iv_a = _normalize_ivs_evs(parent_a.get("ivs"), 0)
-    iv_b = _normalize_ivs_evs(parent_b.get("ivs"), 0)
-    child = {k: random.randint(0, 31) for k in stats}
-
-    power_map = {
-        "power-weight": "hp",
-        "power-bracer": "atk",
-        "power-belt": "defn",
-        "power-lens": "spa",
-        "power-band": "spd",
-        "power-anklet": "spe",
-    }
-    forced: dict[str, str] = {}
-    ia = _daycare_norm_item(parent_a.get("held_item"))
-    ib = _daycare_norm_item(parent_b.get("held_item"))
-    if ia in power_map:
-        forced[power_map[ia]] = "a"
-    if ib in power_map:
-        # If both parents force the same stat, pick the second holder half the time.
-        stat_key = power_map[ib]
-        if stat_key not in forced or random.random() < 0.5:
-            forced[stat_key] = "b"
-
-    selected = set()
-    for stat_key, src in forced.items():
-        child[stat_key] = int(iv_a.get(stat_key, 0)) if src == "a" else int(iv_b.get(stat_key, 0))
-        selected.add(stat_key)
-
-    inherit_count = 5 if ("destiny-knot" in {ia, ib}) else 3
-    remaining = [k for k in stats if k not in selected]
-    random.shuffle(remaining)
-    for stat_key in remaining:
-        if len(selected) >= inherit_count:
-            break
-        src = random.choice(("a", "b"))
-        child[stat_key] = int(iv_a.get(stat_key, 0)) if src == "a" else int(iv_b.get(stat_key, 0))
-        selected.add(stat_key)
-
-    return child
+    return breeding_mech.pick_ivs(parent_a, parent_b, normalize_ivs_evs=_normalize_ivs_evs)
 
 
 def _daycare_pick_ball(parent_a: dict, parent_b: dict, pair_info: dict) -> str:
-    s1 = _daycare_norm_species(parent_a.get("species"))
-    s2 = _daycare_norm_species(parent_b.get("species"))
-    ditto1 = s1 == "ditto"
-    ditto2 = s2 == "ditto"
-    if ditto1 and not ditto2:
-        source = parent_b
-    elif ditto2 and not ditto1:
-        source = parent_a
-    else:
-        g1 = str(parent_a.get("gender") or "").strip().lower()
-        g2 = str(parent_b.get("gender") or "").strip().lower()
-        source = parent_a if g1 == "female" else (parent_b if g2 == "female" else random.choice([parent_a, parent_b]))
-    ball = str(source.get("pokeball") or "poke-ball").strip().lower()
-    return ball or "poke-ball"
+    return breeding_mech.pick_ball(parent_a, parent_b, pair_info)
 
 
 def _daycare_pick_ability(parent_a: dict, parent_b: dict, child_entry: dict, pair_info: dict) -> tuple[str, bool]:
-    regs, hides = parse_abilities(child_entry.get("abilities"))
-    regs_norm = [_daycare_ability_key(a) for a in regs if a]
-    hides_norm = [_daycare_ability_key(a) for a in hides if a]
-
-    s1 = _daycare_norm_species(parent_a.get("species"))
-    s2 = _daycare_norm_species(parent_b.get("species"))
-    ditto1 = s1 == "ditto"
-    ditto2 = s2 == "ditto"
-    if ditto1 and not ditto2:
-        source = parent_b
-    elif ditto2 and not ditto1:
-        source = parent_a
-    else:
-        g1 = str(parent_a.get("gender") or "").strip().lower()
-        g2 = str(parent_b.get("gender") or "").strip().lower()
-        source = parent_a if g1 == "female" else (parent_b if g2 == "female" else parent_a)
-
-    parent_ability = _daycare_ability_key(source.get("ability"))
-    parent_hidden = bool(source.get("is_hidden_ability"))
-
-    if parent_hidden and parent_ability in hides_norm and random.random() < 0.60:
-        return parent_ability, True
-    if parent_ability in regs_norm and random.random() < 0.80:
-        return parent_ability, False
-
-    ability_name, is_hidden = roll_hidden_ability(child_entry.get("abilities"), ha_denominator=20)
-    ability_name = _daycare_ability_key(ability_name)
-    if ability_name:
-        return ability_name, bool(is_hidden)
-    if regs_norm:
-        return random.choice(regs_norm), False
-    if hides_norm:
-        return random.choice(hides_norm), True
-    return "run-away", False
+    return breeding_mech.pick_ability(
+        parent_a,
+        parent_b,
+        child_entry,
+        pair_info,
+        parse_abilities_fn=parse_abilities,
+        roll_hidden_ability_fn=(lambda abilities: roll_hidden_ability(abilities, ha_denominator=20)),
+    )
 
 
 async def _daycare_create_egg(parent_a: dict, parent_b: dict, pair_info: dict) -> Optional[dict]:
-    base_child = await _daycare_resolve_egg_species(str(pair_info.get("child_species") or ""))
-    if not base_child:
-        return None
-    child_species = _daycare_apply_incense_baby_rules(base_child, parent_a, parent_b)
-    child_entry = await _daycare_species_entry(child_species)
-    if not child_entry:
-        return None
-
-    now = float(time.time())
-    hatch_steps = random.uniform(DAYCARE_HATCH_MIN, DAYCARE_HATCH_MAX)
-    child_ivs = _daycare_pick_ivs(parent_a, parent_b)
-    child_nature = _daycare_pick_nature(parent_a, parent_b)
-    child_ability, child_hidden = _daycare_pick_ability(parent_a, parent_b, child_entry, pair_info)
-    child_ball = _daycare_pick_ball(parent_a, parent_b, pair_info)
-    inherited_egg_moves = await _daycare_inherited_egg_moves(parent_a, parent_b, child_species)
-
-    return {
-        "id": f"egg-{int(now * 1000)}-{random.randint(1000, 9999)}",
-        "species": child_species,
-        "created_at": now,
-        "hatch_steps": float(hatch_steps),
-        "progress": 0.0,
-        "nature": child_nature,
-        "ivs": child_ivs,
-        "ability": child_ability,
-        "is_hidden_ability": bool(child_hidden),
-        "pokeball": child_ball,
-        "egg_moves": inherited_egg_moves,
-    }
+    return await breeding_mech.create_egg(
+        parent_a,
+        parent_b,
+        pair_info,
+        resolve_egg_species_fn=_daycare_resolve_egg_species,
+        species_entry_fetch=_daycare_species_entry,
+        pick_ivs_fn=_daycare_pick_ivs,
+        pick_nature_fn=_daycare_pick_nature,
+        pick_ability_fn=_daycare_pick_ability,
+        pick_ball_fn=_daycare_pick_ball,
+        inherited_egg_moves_fn=_daycare_inherited_egg_moves,
+        incense_babies=DAYCARE_INCENSE_BABIES,
+        hatch_min=DAYCARE_HATCH_MIN,
+        hatch_max=DAYCARE_HATCH_MAX,
+        pre_evo_map_fetch=_daycare_pre_evo_map,
+    )
 
 
 async def _daycare_team_count(owner_id: str) -> int:
