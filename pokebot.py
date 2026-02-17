@@ -7976,6 +7976,51 @@ def _adv_default_state() -> dict:
         "daycare": {},            # per-city daycare data
     }
 
+
+def _adv_history_entry(state: dict, area_id: str | None) -> Any:
+    aid = str(area_id or "").strip() or "pallet-town"
+    if aid == "route-1":
+        rp = (state.get("route_panels") or {}).get("route-1")
+        panel = 1
+        if isinstance(rp, dict):
+            try:
+                panel = max(1, min(int(rp.get("panel", 1)), 3))
+            except Exception:
+                panel = 1
+        return {"area_id": "route-1", "route_panel": int(panel)}
+    return aid
+
+
+def _adv_history_push(state: dict, area_id: str | None) -> None:
+    hist = state.get("area_history")
+    if not isinstance(hist, list):
+        hist = []
+    hist.append(_adv_history_entry(state, area_id))
+    state["area_history"] = hist[-15:]
+
+
+def _adv_history_pop(state: dict, default_area: str = "pallet-town") -> str:
+    hist = state.get("area_history")
+    if not isinstance(hist, list) or not hist:
+        return str(default_area or "pallet-town")
+    raw = hist.pop()
+    state["area_history"] = hist
+    if isinstance(raw, dict):
+        area = str(raw.get("area_id") or "").strip() or str(default_area or "pallet-town")
+        if area == "route-1":
+            panel = 3
+            try:
+                panel = max(1, min(int(raw.get("route_panel", 3)), 3))
+            except Exception:
+                panel = 3
+            rp = state.setdefault("route_panels", {})
+            rp["route-1"] = {"panel": int(panel), "pos": ("end" if panel >= 3 else "start")}
+            state["route_panels"] = rp
+        return area
+    prev = str(raw or "").strip()
+    return prev or str(default_area or "pallet-town")
+
+
 async def _get_adventure_state(user_id: str) -> dict:
     uid = str(user_id)
     default = _adv_default_state()
@@ -11621,12 +11666,9 @@ class AdventurePokeMartView(discord.ui.View):
         try:
             await itx.response.defer(ephemeral=True, thinking=False)
             state = await _get_adventure_state(str(itx.user.id))
-            hist = state.get("area_history") or []
-            if not hist:
+            if not isinstance(state.get("area_history"), list) or not state.get("area_history"):
                 return await itx.followup.send("No previous area.", ephemeral=False)
-            prev = hist.pop()
-            state["area_history"] = hist
-            state["area_id"] = prev or "pallet-town"
+            state["area_id"] = _adv_history_pop(state, "pallet-town")
             await _save_adventure_state(str(itx.user.id), state)
             await _send_adventure_panel(itx, state, edit_original=True)
         finally:
@@ -11733,9 +11775,7 @@ class AdventureCityView(discord.ui.View):
         await itx.response.defer(ephemeral=True, thinking=False)
         state = await _get_adventure_state(str(itx.user.id))
         _, next_id = itx.data["custom_id"].split("adv:daycare:", 1)
-        hist = state.get("area_history", [])
-        hist.append(state.get("area_id"))
-        state["area_history"] = hist[-15:]
+        _adv_history_push(state, state.get("area_id"))
         state["area_id"] = next_id
         await _save_adventure_state(str(itx.user.id), state)
         await _send_adventure_panel(itx, state, edit_original=True)
@@ -11753,9 +11793,7 @@ class AdventureCityView(discord.ui.View):
         await itx.response.defer(ephemeral=True, thinking=False)
         state = await _get_adventure_state(str(itx.user.id))
         _, next_id = itx.data["custom_id"].split("adv:area:", 1)
-        hist = state.get("area_history", [])
-        hist.append(state.get("area_id"))
-        state["area_history"] = hist[-15:]
+        _adv_history_push(state, state.get("area_id"))
         state["area_id"] = next_id
         await _save_adventure_state(str(itx.user.id), state)
         await _send_adventure_panel(itx, state, edit_original=True)
@@ -11773,9 +11811,7 @@ class AdventureCityView(discord.ui.View):
         await itx.response.defer(ephemeral=True, thinking=False)
         state = await _get_adventure_state(str(itx.user.id))
         _, next_id = itx.data["custom_id"].split("adv:next:", 1)
-        hist = state.get("area_history", [])
-        hist.append(state.get("area_id"))
-        state["area_history"] = hist[-15:]
+        _adv_history_push(state, state.get("area_id"))
         # Reset Route 1 navigation whenever entering it so it always starts at Panel 1/start.
         if next_id == "route-1":
             rp = state.get("route_panels") or {}
@@ -11867,12 +11903,9 @@ class AdventureCityView(discord.ui.View):
         try:
             await itx.response.defer(ephemeral=True, thinking=False)
             state = await _get_adventure_state(str(itx.user.id))
-            hist = state.get("area_history") or []
-            if not hist:
+            if not isinstance(state.get("area_history"), list) or not state.get("area_history"):
                 return await itx.followup.send("No previous area.", ephemeral=False)
-            prev = hist.pop()
-            state["area_history"] = hist
-            state["area_id"] = prev or "pallet-town"
+            state["area_id"] = _adv_history_pop(state, "pallet-town")
             await _save_adventure_state(str(itx.user.id), state)
             await _send_adventure_panel(itx, state, edit_original=True)
         finally:
@@ -12285,13 +12318,10 @@ class AdventureDaycareView(discord.ui.View):
         self._last_handled_ts = now
         await itx.response.defer(ephemeral=True, thinking=False)
         state = await _get_adventure_state(str(itx.user.id))
-        hist = state.get("area_history") or []
-        if hist:
-            prev = hist.pop()
-            state["area_history"] = hist
-            state["area_id"] = prev or DAYCARE_CITY_ID
-        else:
+        if not isinstance(state.get("area_history"), list) or not state.get("area_history"):
             state["area_id"] = DAYCARE_CITY_ID
+        else:
+            state["area_id"] = _adv_history_pop(state, DAYCARE_CITY_ID)
         await _save_adventure_state(str(itx.user.id), state)
         await _send_adventure_panel(itx, state, edit_original=True)
 
@@ -12540,9 +12570,7 @@ class AdventureRouteView(discord.ui.View):
                     # Stay on current area and re-send panel so user can click Next again to advance
                     await _send_adventure_panel(itx, state, edit_original=True)
                     return
-            hist = state.get("area_history", [])
-            hist.append(state.get("area_id"))
-            state["area_history"] = hist[-15:]
+            _adv_history_push(state, state.get("area_id"))
             state["area_id"] = next_id
             await _save_adventure_state(str(itx.user.id), state)
             await _send_adventure_panel(itx, state, edit_original=True)
@@ -12562,12 +12590,9 @@ class AdventureRouteView(discord.ui.View):
         try:
             await itx.response.defer(ephemeral=True, thinking=False)
             state = await _get_adventure_state(str(itx.user.id))
-            hist = state.get("area_history") or []
-            if not hist:
+            if not isinstance(state.get("area_history"), list) or not state.get("area_history"):
                 return await itx.followup.send("No previous area.", ephemeral=False)
-            prev = hist.pop()
-            state["area_history"] = hist
-            state["area_id"] = prev or "pallet-town"
+            state["area_id"] = _adv_history_pop(state, "pallet-town")
             await _save_adventure_state(str(itx.user.id), state)
             await _send_adventure_panel(itx, state, edit_original=True)
         finally:
@@ -12715,6 +12740,7 @@ class AdventureRoute1PersistentView(discord.ui.View):
             else:
                 next_area = route.get("next")
                 if next_area:
+                    _adv_history_push(state, "route-1")
                     state["area_id"] = next_area
                 state.get("route_panels", {}).pop("route-1", None)
         else:
@@ -12785,6 +12811,7 @@ class _AdventureRouteViewRoute1Methods:
         else:
             # leaving route -> next city
             if next_area:
+                _adv_history_push(state, self.area_id)
                 state["area_id"] = next_area
             state.get("route_panels", {}).pop(self.area_id, None)
 
