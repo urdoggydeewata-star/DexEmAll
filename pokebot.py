@@ -6803,6 +6803,9 @@ ADVENTURE_CITIES = {
         "next": "route-1",
         "rival_battle": "rival-1",
         "heal": False,
+        "sub_areas": [
+            ("pallet-pokemart", "Poké Mart"),
+        ],
     },
     DAYCARE_AREA_ID: {
         "name": "Viridian Daycare",
@@ -6839,6 +6842,13 @@ ADVENTURE_CITIES = {
         "name": "Poké Mart",
         "parent_city": "viridian-city",
         "image": ASSETS_CITIES / "viridian-pokemart.png",
+        "is_pokemart": True,
+    },
+    "pallet-pokemart": {
+        "name": "Poké Mart",
+        "parent_city": "pallet-town",
+        "image": ASSETS_CITIES / "pallet-town-start.png",
+        "is_pokemart": True,
     },
 }
 
@@ -6900,6 +6910,99 @@ ROUTE_MOVE_ITEMS_BY_TIER: Dict[str, List[Tuple[str, str]]] = {
         ("full-restore", "Full Restore"),
         ("tm-fragment", "TM Fragment"),
     ],
+}
+
+# Poké Mart economy table (from shared "Sellable Items in Pokémon" spec).
+# Values are used directly for both buy and sell in market flow.
+MARKET_PRICE_CATALOG: Dict[str, List[Tuple[str, str, int]]] = {
+    "Treasure Items": [
+        ("nugget", "Nugget", 5000),
+        ("big_nugget", "Big Nugget", 10000),
+        ("pearl", "Pearl", 700),
+        ("big_pearl", "Big Pearl", 3750),
+        ("stardust", "Stardust", 1000),
+        ("star_piece", "Star Piece", 4900),
+        ("tiny_mushroom", "Tiny Mushroom", 250),
+        ("big_mushroom", "Big Mushroom", 2500),
+        ("shoal_salt", "Shoal Salt", 10),
+        ("shoal_shell", "Shoal Shell", 10),
+    ],
+    "Healing Items": [
+        ("potion", "Potion", 800),
+        ("super_potion", "Super Potion", 1800),
+        ("hyper_potion", "Hyper Potion", 3500),
+        ("full_restore", "Full Restore", 7500),
+        ("revive", "Revive", 4000),
+        ("fresh_water", "Fresh Water", 600),
+        ("soda_pop", "Soda Pop", 900),
+        ("lemonade", "Lemonade", 1200),
+        ("moomoo_milk", "Moomoo Milk", 1500),
+        ("antidote", "Antidote", 400),
+        ("burn_heal", "Burn Heal", 500),
+        ("ice_heal", "Ice Heal", 500),
+        ("awakening", "Awakening", 500),
+        ("paralyze_heal", "Parlyz Heal", 450),
+        ("full_heal", "Full Heal", 1200),
+    ],
+    "PP Recovery": [
+        ("ether", "Ether", 1500),
+        ("elixir", "Elixir", 3500),
+    ],
+    "Evolution Stones": [
+        ("fire_stone", "Fire Stone", 2100),
+        ("water_stone", "Water Stone", 2100),
+        ("thunder_stone", "Thunder Stone", 2100),
+        ("leaf_stone", "Leaf Stone", 2100),
+        ("moon_stone", "Moon Stone", 2100),
+        ("sun_stone", "Sun Stone", 2100),
+    ],
+    "Poké Balls": [
+        ("poke_ball", "Poké Ball", 100),
+        ("great_ball", "Great Ball", 300),
+        ("ultra_ball", "Ultra Ball", 600),
+        ("repeat_ball", "Repeat Ball", 500),
+        ("timer_ball", "Timer Ball", 500),
+        ("net_ball", "Net Ball", 500),
+        ("dive_ball", "Dive Ball", 500),
+        ("nest_ball", "Nest Ball", 500),
+        ("luxury_ball", "Luxury Ball", 500),
+    ],
+    "Other Battle / Escape Items": [
+        ("poke_doll", "Poké Doll", 500),
+        ("fluffy_tail", "Fluffy Tail", 500),
+    ],
+    "Held Items": [
+        ("leftovers", "Leftovers", 2000),
+        ("quick_claw", "Quick Claw", 50),
+        ("kings_rock", "King's Rock", 100),
+        ("scope_lens", "Scope Lens", 100),
+        ("focus_band", "Focus Band", 100),
+        ("choice_band", "Choice Band", 100),
+        ("exp_share", "Exp. Share", 1500),
+        ("amulet_coin", "Amulet Coin", 100),
+        ("everstone", "Everstone", 100),
+        ("lucky_egg", "Lucky Egg", 5000),
+        ("macho_brace", "Macho Brace", 1500),
+        ("soothe_bell", "Soothe Bell", 100),
+    ],
+}
+MARKET_ITEM_ALIASES: Dict[str, str] = {
+    "pokeball": "poke_ball",
+    "poke_ball": "poke_ball",
+    "great_ball": "great_ball",
+    "ultra_ball": "ultra_ball",
+    "parlyz_heal": "paralyze_heal",
+    "kingsrock": "kings_rock",
+}
+MARKET_SELL_PRICES: Dict[str, int] = {
+    item_id: int(price)
+    for rows in MARKET_PRICE_CATALOG.values()
+    for item_id, _disp, price in rows
+}
+MARKET_DISPLAY_NAMES: Dict[str, str] = {
+    item_id: disp
+    for rows in MARKET_PRICE_CATALOG.values()
+    for item_id, disp, _price in rows
 }
 
 ADVENTURE_ROUTES = {
@@ -7664,6 +7767,197 @@ async def _roll_and_give_route_move_item_async(user_id: str) -> Optional[str]:
         import traceback
         traceback.print_exc()
         return None
+
+
+def _is_pokemart(area_id: str) -> bool:
+    city = ADVENTURE_CITIES.get(str(area_id or ""), {})
+    return bool(city.get("is_pokemart"))
+
+
+def _market_normalize_key(raw: str) -> str:
+    key = item_id_from_user(str(raw or ""))
+    return MARKET_ITEM_ALIASES.get(key, key)
+
+
+def _market_resolve_item_key(raw: str) -> Optional[str]:
+    key = _market_normalize_key(raw)
+    if key in MARKET_SELL_PRICES:
+        return key
+    # Accept display names from the catalog.
+    key2 = item_id_from_user(str(raw or ""))
+    for item_id, display in MARKET_DISPLAY_NAMES.items():
+        if item_id_from_user(display) == key2:
+            return item_id
+    return None
+
+
+def _market_item_variants(item_key: str) -> tuple[str, ...]:
+    base = item_id_from_user(item_key)
+    out = [base, base.replace("_", "-")]
+    if base == "paralyze_heal":
+        out.append("parlyz_heal")
+        out.append("paralyze-heal")
+    dedup: list[str] = []
+    for k in out:
+        if k and k not in dedup:
+            dedup.append(k)
+    return tuple(dedup)
+
+
+def _market_display(item_key: str) -> str:
+    return MARKET_DISPLAY_NAMES.get(item_key, pretty_item_name(item_key))
+
+
+def _market_price_embed() -> discord.Embed:
+    emb = discord.Embed(
+        title="Poké Mart Price List",
+        description=f"These prices are active for market buys/sells in Poké Mart.\nCurrency: **{PKDollar_NAME}**",
+        color=0x4CAF50,
+    )
+    for category, rows in MARKET_PRICE_CATALOG.items():
+        lines = [f"• **{disp}** — {int(price):,}" for _item_id, disp, price in rows]
+        value = "\n".join(lines)[:1024] if lines else "—"
+        emb.add_field(name=category, value=value, inline=False)
+    return emb
+
+
+async def _market_total_qty(owner_id: str, item_key: str, conn: Any | None = None) -> int:
+    variants = _market_item_variants(item_key)
+    if not variants:
+        return 0
+    own_conn = conn is None
+    if own_conn:
+        try:
+            conn = await db.connect()
+        except Exception:
+            return 0
+    try:
+        placeholders = ", ".join("?" for _ in variants)
+        cur = await conn.execute(
+            f"SELECT COALESCE(SUM(qty), 0) AS total_qty FROM user_items WHERE owner_id=? AND item_id IN ({placeholders})",
+            (owner_id, *variants),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return 0
+        return int((row.get("total_qty") if hasattr(row, "keys") else row[0]) or 0)
+    except Exception:
+        return 0
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+
+async def _market_buy(owner_id: str, item_key: str, qty_requested: int) -> tuple[bool, str]:
+    qty_requested = int(qty_requested)
+    if qty_requested <= 0:
+        return False, "Quantity must be a positive number."
+    price = int(MARKET_SELL_PRICES.get(item_key, 0))
+    if price <= 0:
+        return False, "That item is not sold in this Poké Mart."
+    variants = _market_item_variants(item_key)
+    canonical_item_id = item_id_from_user(item_key)
+    display = _market_display(item_key)
+    async with DB_WRITE_LOCK:
+        async with db.session() as conn:
+            await conn.execute(
+                "INSERT INTO users(user_id, coins, currencies) VALUES(?, 0, '{\"coins\": 0}'::jsonb) ON CONFLICT(user_id) DO NOTHING",
+                (owner_id,),
+            )
+            current_total = await _market_total_qty(owner_id, item_key, conn=conn)
+            if current_total >= MAX_STACK:
+                return False, f"You already have **{current_total}/{MAX_STACK}** {display}."
+            qty_allowed = min(int(qty_requested), int(MAX_STACK - current_total))
+            total_cost = int(price * qty_allowed)
+
+            cur = await conn.execute("SELECT * FROM users WHERE user_id=? LIMIT 1", (owner_id,))
+            row = await cur.fetchone()
+            await cur.close()
+            balance = int(db.get_currency_from_row(dict(row) if row else None, "coins"))
+            if balance < total_cost:
+                return False, (
+                    f"Not enough {PKDollar_NAME}. Cost: **{total_cost:,}**, "
+                    f"you have **{balance:,}**."
+                )
+
+            await db.add_currency_conn(conn, owner_id, "coins", -total_cost)
+            await conn.execute(
+                "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,?) "
+                "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = MIN(user_items.qty + excluded.qty, ?);",
+                (owner_id, canonical_item_id, qty_allowed, MAX_STACK),
+            )
+            await conn.commit()
+    await db.upsert_item_master(canonical_item_id, name=display)
+    try:
+        db.invalidate_bag_cache(owner_id)
+    except Exception:
+        pass
+    return True, (
+        f"✅ Bought **{qty_allowed}× {display}** for **{price * qty_allowed:,} {PKDollar_NAME}**."
+        + (f" (capped at {MAX_STACK})" if qty_allowed < qty_requested else "")
+    )
+
+
+async def _market_sell(owner_id: str, item_key: str, qty_requested: int) -> tuple[bool, str]:
+    qty_requested = int(qty_requested)
+    if qty_requested <= 0:
+        return False, "Quantity must be a positive number."
+    price = int(MARKET_SELL_PRICES.get(item_key, 0))
+    if price <= 0:
+        return False, "That item cannot be sold here."
+    variants = _market_item_variants(item_key)
+    display = _market_display(item_key)
+    async with DB_WRITE_LOCK:
+        async with db.session() as conn:
+            placeholders = ", ".join("?" for _ in variants)
+            cur = await conn.execute(
+                f"SELECT item_id, qty FROM user_items WHERE owner_id=? AND item_id IN ({placeholders}) ORDER BY qty DESC, item_id",
+                (owner_id, *variants),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            total_owned = 0
+            parsed_rows: list[tuple[str, int]] = []
+            for row in rows or []:
+                iid = str(row["item_id"] if hasattr(row, "keys") else row[0])
+                have = int((row.get("qty") if hasattr(row, "keys") else row[1]) or 0)
+                if have <= 0:
+                    continue
+                parsed_rows.append((iid, have))
+                total_owned += have
+            if total_owned <= 0:
+                return False, f"You don't have any **{display}** to sell."
+            qty_to_sell = min(qty_requested, total_owned)
+            remain = qty_to_sell
+            for iid, have in parsed_rows:
+                if remain <= 0:
+                    break
+                take = min(remain, have)
+                new_qty = max(0, have - take)
+                await conn.execute(
+                    "UPDATE user_items SET qty=? WHERE owner_id=? AND item_id=?",
+                    (new_qty, owner_id, iid),
+                )
+                remain -= take
+            await conn.execute(
+                "INSERT INTO users(user_id, coins, currencies) VALUES(?, 0, '{\"coins\": 0}'::jsonb) ON CONFLICT(user_id) DO NOTHING",
+                (owner_id,),
+            )
+            payout = int(price * qty_to_sell)
+            await db.add_currency_conn(conn, owner_id, "coins", payout)
+            await conn.commit()
+    try:
+        db.invalidate_bag_cache(owner_id)
+    except Exception:
+        pass
+    return True, (
+        f"✅ Sold **{qty_to_sell}× {display}** for **{price * qty_to_sell:,} {PKDollar_NAME}**."
+        + (f" (only had {total_owned})" if qty_to_sell < qty_requested else "")
+    )
 
 
 def _adv_default_state() -> dict:
@@ -11191,6 +11485,154 @@ class TMSellerView(discord.ui.View):
             ephemeral=True,
         )
 
+
+class MarketTradeModal(discord.ui.Modal):
+    def __init__(self, author_id: int, area_id: str, mode: str):
+        mode_name = "Buy" if str(mode).lower() == "buy" else "Sell"
+        super().__init__(title=f"Poké Mart • {mode_name}")
+        self.author_id = int(author_id)
+        self.area_id = str(area_id)
+        self.mode = "buy" if str(mode).lower() == "buy" else "sell"
+
+        self.item_input = discord.ui.TextInput(
+            label="Item",
+            placeholder="e.g. potion, nugget, ultra ball",
+            max_length=64,
+            required=True,
+        )
+        self.qty_input = discord.ui.TextInput(
+            label="Quantity",
+            placeholder="1",
+            max_length=7,
+            required=True,
+            default="1",
+        )
+        self.add_item(self.item_input)
+        self.add_item(self.qty_input)
+
+    async def on_submit(self, itx: discord.Interaction):
+        if int(itx.user.id) != self.author_id:
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        await itx.response.defer(ephemeral=True, thinking=False)
+        uid = str(itx.user.id)
+        state = await _get_adventure_state(uid)
+        if str(state.get("area_id") or "") != self.area_id or not _is_pokemart(self.area_id):
+            return await itx.followup.send("Market access is only available while you're inside a Poké Mart.", ephemeral=True)
+
+        item_raw = str(self.item_input.value or "").strip()
+        item_key = _market_resolve_item_key(item_raw)
+        if not item_key:
+            q = item_id_from_user(item_raw)
+            suggestions = [
+                disp for k, disp in MARKET_DISPLAY_NAMES.items()
+                if q and (q in k or q in item_id_from_user(disp))
+            ][:5]
+            if suggestions:
+                return await itx.followup.send(
+                    f"Unknown market item. Did you mean: {', '.join(f'**{s}**' for s in suggestions)}?",
+                    ephemeral=True,
+                )
+            return await itx.followup.send("Unknown market item. Use **Price List** to browse valid items.", ephemeral=True)
+
+        try:
+            qty = int(str(self.qty_input.value or "").strip())
+        except Exception:
+            return await itx.followup.send("Quantity must be a valid integer.", ephemeral=True)
+        if qty <= 0:
+            return await itx.followup.send("Quantity must be positive.", ephemeral=True)
+        if qty > MAX_STACK:
+            return await itx.followup.send(f"Quantity too large (max {MAX_STACK}).", ephemeral=True)
+
+        if self.mode == "buy":
+            ok, msg = await _market_buy(uid, item_key, qty)
+        else:
+            ok, msg = await _market_sell(uid, item_key, qty)
+        _ = ok
+        return await itx.followup.send(msg, ephemeral=True)
+
+
+class AdventurePokeMartView(discord.ui.View):
+    def __init__(self, author_id: int, area_id: str, state: dict):
+        super().__init__(timeout=180)
+        self.author_id = int(author_id)
+        self.area_id = str(area_id)
+        self.state = state
+        self._handled = False
+        self._last_handled_id: str | None = None
+        self._last_handled_ts: float = 0.0
+        self._build_buttons()
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return int(itx.user.id) == self.author_id
+
+    def _build_buttons(self):
+        buy_btn = discord.ui.Button(label="Buy Item", style=discord.ButtonStyle.success, custom_id="mart:buy")
+        buy_btn.callback = self._on_buy
+        self.add_item(buy_btn)
+
+        sell_btn = discord.ui.Button(label="Sell Item", style=discord.ButtonStyle.primary, custom_id="mart:sell")
+        sell_btn.callback = self._on_sell
+        self.add_item(sell_btn)
+
+        list_btn = discord.ui.Button(label="Price List", style=discord.ButtonStyle.secondary, custom_id="mart:list")
+        list_btn.callback = self._on_price_list
+        self.add_item(list_btn)
+
+        if self.state.get("area_history"):
+            back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, custom_id="mart:back")
+            back_btn.callback = self._on_back
+            self.add_item(back_btn)
+
+    async def _on_buy(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not _is_pokemart(self.area_id):
+            return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
+        await itx.response.send_modal(MarketTradeModal(self.author_id, self.area_id, "buy"))
+
+    async def _on_sell(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not _is_pokemart(self.area_id):
+            return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
+        await itx.response.send_modal(MarketTradeModal(self.author_id, self.area_id, "sell"))
+
+    async def _on_price_list(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not _is_pokemart(self.area_id):
+            return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
+        uid = str(itx.user.id)
+        coins = await db.get_currency(uid, "coins")
+        emb = _market_price_embed()
+        emb.set_footer(text=f"Your balance: {coins:,} {PKDollar_NAME}")
+        await itx.response.send_message(embed=emb, ephemeral=True)
+
+    async def _on_back(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.0:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        try:
+            await itx.response.defer(ephemeral=True, thinking=False)
+            state = await _get_adventure_state(str(itx.user.id))
+            hist = state.get("area_history") or []
+            if not hist:
+                return await itx.followup.send("No previous area.", ephemeral=False)
+            prev = hist.pop()
+            state["area_history"] = hist
+            state["area_id"] = prev or "pallet-town"
+            await _save_adventure_state(str(itx.user.id), state)
+            await _send_adventure_panel(itx, state, edit_original=True)
+        finally:
+            self._handled = False
+
+
 class AdventureCityView(discord.ui.View):
     def __init__(self, author_id: int, area_id: str, state: dict, *, has_surf: bool = False):
         super().__init__(timeout=180)
@@ -12693,6 +13135,27 @@ async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_o
                 egg_count=eggs_waiting,
             )
             view = AdventureDaycareView(itx.user.id, area_id, state, rec, parent_rows, pair_info)
+        elif city.get("is_pokemart"):
+            direct_image = city.get("image")
+            if direct_image and Path(direct_image).exists():
+                img = direct_image
+            elif city.get("parent_city"):
+                parent_city = ADVENTURE_CITIES.get(str(city.get("parent_city")), {})
+                img = parent_city.get("image_cleared") or parent_city.get("image_uncleared")
+            else:
+                img = city.get("image_uncleared") or city.get("image_cleared")
+            balance = await db.get_currency(uid, "coins")
+            desc = (
+                f"Welcome to the Poké Mart.\n\n"
+                f"Use **Buy Item** or **Sell Item** to trade from the market list.\n"
+                f"Your balance: **{balance:,} {PKDollar_NAME}**"
+            )
+            emb, files = _embed_with_image(city.get("name", area_id), desc, img)
+            effective_city = city.get("parent_city") or area_id
+            if state.get("last_city") != effective_city:
+                state["last_city"] = effective_city
+                await _save_adventure_state(str(itx.user.id), state)
+            view = AdventurePokeMartView(itx.user.id, area_id, state)
         else:
             cleared = _city_is_cleared(state, area_id)
             # Sub-areas use sprite sheet regions; main cities use image_uncleared/image_cleared
