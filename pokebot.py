@@ -322,6 +322,10 @@ def _patch_pvp_streaming_reliability() -> None:
                     if bool(getattr(st, "streaming_enabled", False)) and not bool(getattr(st, "_stream_started", False)):
                         ch = getattr(st, "stream_channel", None)
                         if ch is not None and hasattr(ch, "send"):
+                            try:
+                                await ch.send("📺 Stream connected. Live battle updates will post here.")
+                            except Exception:
+                                pass
                             render_result = None
                             render_fn = getattr(_pvp_panel, "_render_gif_for_panel", None)
                             if callable(render_fn):
@@ -351,7 +355,6 @@ def _patch_pvp_streaming_reliability() -> None:
             if callable(original_start_if_ready) and not getattr(original_start_if_ready, "_dex_stream_patch", False):
 
                 async def _wrapped_start_if_ready(self, itx):
-                    result = await original_start_if_ready(self, itx)
                     try:
                         if bool(getattr(self, "streaming_enabled", False)) and not bool(getattr(self, "_stream_notice_sent", False)):
                             ch = getattr(itx, "channel", None)
@@ -363,6 +366,7 @@ def _patch_pvp_streaming_reliability() -> None:
                             self._stream_notice_sent = True
                     except Exception:
                         pass
+                    result = await original_start_if_ready(self, itx)
                     return result
 
                 _wrapped_start_if_ready._dex_stream_patch = True  # type: ignore[attr-defined]
@@ -372,6 +376,104 @@ def _patch_pvp_streaming_reliability() -> None:
 
 
 _patch_pvp_streaming_reliability()
+
+
+def _patch_pvp_capture_reliability() -> None:
+    """
+    Runtime patch for Poké Ball capture reliability when only pokebot.py is deployable.
+
+    Fixes observed regressions where:
+    - Master Ball could fail due upstream parsing exceptions.
+    - Ball IDs with mixed separators/unicode dashes weren't normalized robustly.
+    """
+    try:
+        basic = getattr(_pvp_panel, "_BALLS_BASIC", {}) or {}
+        aliases = getattr(_pvp_panel, "_BALL_NAME_ALIASES", {}) or {}
+
+        original_normalize_item = getattr(_pvp_panel, "_normalize_item", None)
+        if callable(original_normalize_item) and not getattr(original_normalize_item, "_dex_capture_patch", False):
+            def _wrapped_normalize_item(name: str) -> str:
+                n = str(name or "").strip().lower().replace("é", "e")
+                for ch in ("-", "_", "–", "—", "‑", "‒", "−", "﹣", "－", ":"):
+                    n = n.replace(ch, " ")
+                return " ".join(n.split())
+            _wrapped_normalize_item._dex_capture_patch = True  # type: ignore[attr-defined]
+            _pvp_panel._normalize_item = _wrapped_normalize_item
+
+        original_normalize_ball = getattr(_pvp_panel, "_normalize_ball_name", None)
+        if callable(original_normalize_ball) and not getattr(original_normalize_ball, "_dex_capture_patch", False):
+            def _wrapped_normalize_ball_name(name: str) -> str:
+                try:
+                    n = _pvp_panel._normalize_item(name)  # type: ignore[attr-defined]
+                except Exception:
+                    n = str(name or "").strip().lower().replace("-", " ").replace("_", " ")
+                compact = "".join(ch for ch in n if ch.isalnum())
+                if n in basic:
+                    return n
+                if compact in aliases:
+                    return aliases[compact]
+                return n
+            _wrapped_normalize_ball_name._dex_capture_patch = True  # type: ignore[attr-defined]
+            _pvp_panel._normalize_ball_name = _wrapped_normalize_ball_name
+
+        original_ball_multiplier = getattr(_pvp_panel, "_ball_multiplier", None)
+        if callable(original_ball_multiplier) and not getattr(original_ball_multiplier, "_dex_capture_patch", False):
+            def _wrapped_ball_multiplier(ball_name, mon, battle_state):
+                b = _pvp_panel._normalize_ball_name(ball_name)  # type: ignore[attr-defined]
+                if b == "master ball":
+                    return 9999.0
+                try:
+                    return float(original_ball_multiplier(ball_name, mon, battle_state))
+                except Exception:
+                    base = basic.get(b, 1.0)
+                    return float(base if base not in (None, 0) else 1.0)
+            _wrapped_ball_multiplier._dex_capture_patch = True  # type: ignore[attr-defined]
+            _pvp_panel._ball_multiplier = _wrapped_ball_multiplier
+
+        original_attempt_capture = getattr(_pvp_panel, "_attempt_capture", None)
+        if callable(original_attempt_capture) and not getattr(original_attempt_capture, "_dex_capture_patch", False):
+            def _wrapped_attempt_capture(mon, ball_name, battle_state):
+                b = _pvp_panel._normalize_ball_name(ball_name)  # type: ignore[attr-defined]
+                if b == "master ball":
+                    return True, 1
+                try:
+                    return original_attempt_capture(mon, ball_name, battle_state)
+                except Exception as e:
+                    try:
+                        print(f"[CapturePatch] _attempt_capture fallback: {e}")
+                    except Exception:
+                        pass
+                    try:
+                        ball_mod = float(_pvp_panel._ball_multiplier(ball_name, mon, battle_state))  # type: ignore[attr-defined]
+                        if ball_mod >= 9999:
+                            return True, 1
+                        base_rate = int(float(getattr(mon, "capture_rate", 45) or 45))
+                        base_rate = max(1, min(255, base_rate))
+                        max_hp = max(1, int(getattr(mon, "max_hp", 1) or 1))
+                        hp = max(1, int(getattr(mon, "hp", 1) or 1))
+                        status_fn = getattr(_pvp_panel, "_status_bonus", None)
+                        status_mod = float(status_fn(getattr(mon, "status", None))) if callable(status_fn) else 1.0
+                        a = ((3 * max_hp - 2 * hp) * base_rate * max(0.1, ball_mod) * max(1.0, status_mod)) / (3 * max_hp)
+                        if a >= 255:
+                            return True, 4
+                        import math as _m
+                        bval = int(65536 / _m.pow(16711680 / max(1, int(a)), 0.25))
+                        shakes = 0
+                        for _ in range(4):
+                            if random.randint(0, 65535) < bval:
+                                shakes += 1
+                            else:
+                                break
+                        return shakes == 4, shakes
+                    except Exception:
+                        return False, 0
+            _wrapped_attempt_capture._dex_capture_patch = True  # type: ignore[attr-defined]
+            _pvp_panel._attempt_capture = _wrapped_attempt_capture
+    except Exception:
+        pass
+
+
+_patch_pvp_capture_reliability()
 
 # =========================
 #  Terastallization helpers
