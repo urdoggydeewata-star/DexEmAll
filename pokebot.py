@@ -6691,6 +6691,7 @@ DAYCARE_AREA_ID = "pallet-daycare"
 DAYCARE_EGG_CAP = 3
 DAYCARE_INCUBATE_MAX = 6
 DAYCARE_BREED_THRESHOLD = 22.0
+DAYCARE_EGG_INTERVAL_SECONDS = 3600.0
 DAYCARE_HATCH_MIN = 45.0
 DAYCARE_HATCH_MAX = 80.0
 DAYCARE_HATCH_BOOST_ABILITIES = {"flame-body", "magma-armor"}
@@ -6702,6 +6703,8 @@ BOX_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "box_spr
 LEGACY_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "sprites"
 POKESPRITE_MASTER_ZIP = Path(__file__).resolve().parent / "pokesprite-master.zip"
 DAYCARE_ZIP_CACHE_DIR = BOX_SPRITES_DIR / "_pokesprite_zip_cache"
+_DAYCARE_PRE_EVO_MAP: dict[str, str] = {}
+_DAYCARE_PRE_EVO_READY = False
 ASSETS_BOX_BACKGROUNDS_DIR = ASSETS_DIR / "ui" / "box-backgrounds"
 BOX_SPRITES_BACKGROUNDS_DIR = BOX_SPRITES_DIR / "backgrounds"
 BOX_BACKGROUND_FILENAMES: tuple[str, ...] = (
@@ -7614,7 +7617,8 @@ def _daycare_default_record() -> dict:
         "parents": [None, None],   # Pokémon ids
         "eggs": [],                # eggs waiting at daycare (max DAYCARE_EGG_CAP)
         "incubating": [],          # eggs currently in team incubator
-        "breed_progress": 0.0,
+        "breed_progress": 0.0,     # legacy key (kept for backward compatibility)
+        "last_egg_at": float(time.time()),
         "last_tick": float(time.time()),
     }
 
@@ -7638,6 +7642,10 @@ def _daycare_get_record(state: dict, city_id: str = DAYCARE_CITY_ID) -> dict:
         rec["breed_progress"] = float(rec.get("breed_progress", 0.0) or 0.0)
     except Exception:
         rec["breed_progress"] = 0.0
+    try:
+        rec["last_egg_at"] = float(rec.get("last_egg_at", time.time()) or time.time())
+    except Exception:
+        rec["last_egg_at"] = float(time.time())
     try:
         rec["last_tick"] = float(rec.get("last_tick", time.time()) or time.time())
     except Exception:
@@ -7703,6 +7711,104 @@ async def _daycare_parent_ids_for_owner(owner_id: str) -> set[int]:
 
 def _daycare_norm_species(species: str) -> str:
     return str(species or "").strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def _daycare_parse_evolution_blob(raw: Any) -> dict:
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _daycare_next_evo_entries(raw_evolution: Any) -> list[tuple[str, dict]]:
+    evo = _daycare_parse_evolution_blob(raw_evolution)
+    raw_next = evo.get("next")
+    if isinstance(raw_next, list):
+        next_list = raw_next
+    elif raw_next is not None:
+        next_list = [raw_next]
+    else:
+        next_list = []
+    out: list[tuple[str, dict]] = []
+    for nxt in next_list:
+        if isinstance(nxt, str):
+            sp = _daycare_norm_species(nxt)
+            if sp:
+                out.append((sp, {}))
+            continue
+        if not isinstance(nxt, dict):
+            continue
+        sp = _daycare_norm_species(nxt.get("species") or "")
+        if not sp:
+            continue
+        details = nxt.get("details") or {}
+        if isinstance(details, str):
+            try:
+                parsed = json.loads(details)
+                details = parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                details = {}
+        if not isinstance(details, dict):
+            details = {}
+        out.append((sp, details))
+    return out
+
+
+async def _daycare_pre_evo_map() -> dict[str, str]:
+    global _DAYCARE_PRE_EVO_READY, _DAYCARE_PRE_EVO_MAP
+    if _DAYCARE_PRE_EVO_READY and _DAYCARE_PRE_EVO_MAP:
+        return _DAYCARE_PRE_EVO_MAP
+    pre_map: dict[str, str] = {}
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute("SELECT name, evolution FROM pokedex")
+            rows = await cur.fetchall()
+            await cur.close()
+        for row in rows:
+            parent_name = row["name"] if hasattr(row, "keys") else row[0]
+            evolution_blob = row["evolution"] if hasattr(row, "keys") else row[1]
+            parent = _daycare_norm_species(parent_name)
+            if not parent:
+                continue
+            for child, _details in _daycare_next_evo_entries(evolution_blob):
+                if child and child not in pre_map:
+                    pre_map[child] = parent
+    except Exception:
+        return _DAYCARE_PRE_EVO_MAP
+    _DAYCARE_PRE_EVO_MAP = pre_map
+    _DAYCARE_PRE_EVO_READY = True
+    return _DAYCARE_PRE_EVO_MAP
+
+
+async def _daycare_resolve_egg_species(species: str) -> str:
+    """
+    Resolve breeding offspring to the base stage of the chain.
+    Example: Gengar/Haunter -> Gastly egg species.
+    """
+    cur = _daycare_norm_species(species)
+    if not cur:
+        return ""
+    # Canonical special case in core games.
+    if cur == "manaphy":
+        return "phione"
+    pre_map = await _daycare_pre_evo_map()
+    if not pre_map:
+        return cur
+    seen = {cur}
+    while True:
+        parent = _daycare_norm_species(pre_map.get(cur))
+        if not parent or parent in seen:
+            break
+        cur = parent
+        seen.add(cur)
+    return cur
 
 
 def _daycare_showdown_keys(species: str) -> list[str]:
@@ -8112,7 +8218,7 @@ def _daycare_pick_ability(parent_a: dict, parent_b: dict, child_entry: dict, pai
 
 
 async def _daycare_create_egg(parent_a: dict, parent_b: dict, pair_info: dict) -> Optional[dict]:
-    child_species = _daycare_norm_species(pair_info.get("child_species"))
+    child_species = await _daycare_resolve_egg_species(str(pair_info.get("child_species") or ""))
     if not child_species:
         return None
     child_entry = await _daycare_species_entry(child_species)
@@ -8422,30 +8528,58 @@ async def _daycare_tick(owner_id: str, state: dict, *, command_credit: float = 0
         incubating = rec["incubating"]
         changed = True
 
-    # Egg production at daycare (caps at DAYCARE_EGG_CAP)
+    # Egg production at daycare (strict cadence: at most 1 egg per hour, up to cap)
     if pair_info.get("can_breed"):
+        interval = max(60.0, float(DAYCARE_EGG_INTERVAL_SECONDS))
         try:
-            rec["breed_progress"] = float(rec.get("breed_progress", 0.0) or 0.0)
+            last_egg_at = float(rec.get("last_egg_at", now) or now)
         except Exception:
-            rec["breed_progress"] = 0.0
-        if len(eggs) < DAYCARE_EGG_CAP:
-            gain = max(0.0, float(command_credit)) + (elapsed / 45.0)
-            gain *= float(pair_info.get("rate", 1.0) or 1.0)
-            rec["breed_progress"] += gain
-            while rec["breed_progress"] >= DAYCARE_BREED_THRESHOLD and len(eggs) < DAYCARE_EGG_CAP:
+            last_egg_at = now
+            rec["last_egg_at"] = now
+            changed = True
+        if last_egg_at > now:
+            last_egg_at = now
+            rec["last_egg_at"] = now
+            changed = True
+
+        if len(eggs) >= DAYCARE_EGG_CAP:
+            # Pause timer while egg storage is full so no backlog forms.
+            if abs(last_egg_at - now) > 1.0:
+                rec["last_egg_at"] = now
+                changed = True
+        else:
+            produced = False
+            while (now - last_egg_at) >= interval and len(eggs) < DAYCARE_EGG_CAP:
                 if parents[0] is None or parents[1] is None:
                     break
                 egg = await _daycare_create_egg(parents[0], parents[1], pair_info)
                 if not egg:
                     break
                 eggs.append(egg)
-                rec["breed_progress"] -= DAYCARE_BREED_THRESHOLD
+                last_egg_at += interval
+                produced = True
                 changed = True
-            if len(eggs) >= DAYCARE_EGG_CAP:
-                rec["breed_progress"] = min(rec["breed_progress"], DAYCARE_BREED_THRESHOLD - 0.01)
-    else:
-        if float(rec.get("breed_progress", 0.0) or 0.0) != 0.0:
+            if produced:
+                rec["last_egg_at"] = last_egg_at
+
+        # Keep legacy field clean after migrating to real-time cadence.
+        try:
+            if float(rec.get("breed_progress", 0.0) or 0.0) != 0.0:
+                rec["breed_progress"] = 0.0
+                changed = True
+        except Exception:
             rec["breed_progress"] = 0.0
+            changed = True
+    else:
+        try:
+            if float(rec.get("breed_progress", 0.0) or 0.0) != 0.0:
+                rec["breed_progress"] = 0.0
+                changed = True
+        except Exception:
+            rec["breed_progress"] = 0.0
+            changed = True
+        if rec.get("last_egg_at") is None:
+            rec["last_egg_at"] = now
             changed = True
 
     # Egg hatching while in team incubator
@@ -9414,11 +9548,179 @@ def _parse_evolution(evolution: Any) -> dict:
     return {}
 
 
-async def _get_level_up_evolution(conn, species_name: str, level: int) -> Optional[str]:
-    """
-    Return the evolved species name (lowercase) if this species can evolve by level-up at the given level.
-    Uses pokedex.evolution JSON: next[].details.trigger == 'level-up' and level >= min_level.
-    """
+def _evo_norm_text(v: Any) -> str:
+    return str(v or "").strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def _evo_move_name_set(raw_moves: Any) -> set[str]:
+    moves = raw_moves
+    if isinstance(moves, str):
+        try:
+            parsed = json.loads(moves)
+            moves = parsed
+        except Exception:
+            moves = [moves]
+    if not isinstance(moves, (list, tuple)):
+        return set()
+    out: set[str] = set()
+    for m in moves[:4]:
+        if isinstance(m, dict):
+            name = m.get("name")
+        else:
+            name = m
+        norm = _evo_norm_text(name)
+        if norm:
+            out.add(norm)
+    return out
+
+
+def _evo_day_phase_utc() -> str:
+    hour = datetime.now(timezone.utc).hour
+    return "day" if 6 <= hour < 18 else "night"
+
+
+async def _evo_move_type_match(conn, moves_norm: set[str], required_type: str) -> bool:
+    if not moves_norm:
+        return False
+    move_list = [m for m in moves_norm if m]
+    if not move_list:
+        return False
+    placeholders = ",".join("?" for _ in move_list)
+    try:
+        cur = await conn.execute(
+            f"""
+            SELECT type
+            FROM moves
+            WHERE LOWER(REPLACE(name, ' ', '-')) IN ({placeholders})
+            """,
+            tuple(move_list),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+    except Exception:
+        return False
+    req = _evo_norm_text(required_type)
+    for row in rows:
+        t = _evo_norm_text(row["type"] if hasattr(row, "keys") else row[0])
+        if t == req:
+            return True
+    return False
+
+
+async def _evo_details_match(
+    conn,
+    details: Any,
+    *,
+    expected_trigger: str,
+    level: Optional[int],
+    friendship: Optional[int],
+    gender: Optional[str],
+    moves: Any,
+    held_item: Optional[str],
+    item_used: Optional[str],
+    area_id: Optional[str],
+) -> bool:
+    info = details or {}
+    if isinstance(info, str):
+        try:
+            parsed = json.loads(info)
+            info = parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            info = {}
+    if not isinstance(info, dict):
+        info = {}
+
+    expected = _evo_norm_text(expected_trigger)
+    trigger = _evo_norm_text(info.get("trigger"))
+
+    if expected == "level-up":
+        if trigger and trigger not in {"level-up"}:
+            return False
+    elif expected == "use-item":
+        if trigger and trigger not in {"use-item", "item"}:
+            return False
+    else:
+        if expected and trigger and trigger != expected:
+            return False
+
+    if expected == "level-up":
+        min_level = info.get("min_level")
+        if min_level is not None:
+            try:
+                need = int(min_level)
+            except (TypeError, ValueError):
+                return False
+            if level is None or int(level) < need:
+                return False
+        required_held = _daycare_norm_item(info.get("held_item") or "")
+        if required_held and _daycare_norm_item(held_item or "") != required_held:
+            return False
+    elif expected == "use-item":
+        required_item = _daycare_norm_item(info.get("item") or "")
+        used_item = _daycare_norm_item(item_used or "")
+        if required_item and used_item != required_item:
+            return False
+        if not required_item and trigger not in {"use-item", "item"}:
+            return False
+
+    req_gender = _evo_norm_text(info.get("gender"))
+    if req_gender in {"male", "female"} and _evo_norm_text(gender) != req_gender:
+        return False
+
+    req_time = _evo_norm_text(info.get("time_of_day"))
+    if req_time:
+        phase = _evo_day_phase_utc()
+        if req_time in {"day", "night"} and phase != req_time:
+            return False
+
+    for key in ("min_happiness", "min_friendship", "min_affection"):
+        if info.get(key) is None:
+            continue
+        try:
+            needed = int(info.get(key))
+        except (TypeError, ValueError):
+            return False
+        if friendship is None or int(friendship) < needed:
+            return False
+
+    moves_norm = _evo_move_name_set(moves)
+    req_move = _evo_norm_text(info.get("known_move"))
+    if req_move and req_move not in moves_norm:
+        return False
+    req_move_type = _evo_norm_text(info.get("known_move_type"))
+    if req_move_type:
+        ok_type = await _evo_move_type_match(conn, moves_norm, req_move_type)
+        if not ok_type:
+            return False
+
+    req_location = _evo_norm_text(info.get("location"))
+    if req_location and _evo_norm_text(area_id) != req_location:
+        return False
+
+    # Unsupported special conditions: avoid false positives.
+    if bool(info.get("needs_overworld_rain")) or bool(info.get("turn_upside_down")):
+        return False
+    for unsupported in ("trade_species", "party_species", "party_type", "relative_physical_stats", "min_beauty"):
+        val = info.get(unsupported)
+        if val not in (None, "", 0, False):
+            return False
+
+    return True
+
+
+async def _find_evolution_for_trigger(
+    conn,
+    species_name: str,
+    *,
+    expected_trigger: str,
+    level: Optional[int] = None,
+    friendship: Optional[int] = None,
+    gender: Optional[str] = None,
+    moves: Any = None,
+    held_item: Optional[str] = None,
+    item_used: Optional[str] = None,
+    area_id: Optional[str] = None,
+) -> Optional[str]:
     cur = await conn.execute(
         "SELECT evolution FROM pokedex WHERE LOWER(name) = LOWER(?) LIMIT 1",
         (species_name.strip(),),
@@ -9439,28 +9741,129 @@ async def _get_level_up_evolution(conn, species_name: str, level: int) -> Option
         next_list = []
     for n in next_list:
         if isinstance(n, str):
-            # Bare species name (e.g. simple evolution format): treat as valid at any level
             s = (n or "").strip().lower().replace(" ", "-")
-            if s:
+            if s and _evo_norm_text(expected_trigger) == "level-up":
                 return s
             continue
         if not isinstance(n, dict):
             continue
+        species = (n.get("species") or "").strip().lower().replace(" ", "-")
+        if not species:
+            continue
         details = n.get("details") or {}
-        trigger = (details.get("trigger") or "").lower().replace(" ", "-")
-        if trigger != "level-up":
+        ok = await _evo_details_match(
+            conn,
+            details,
+            expected_trigger=_evo_norm_text(expected_trigger),
+            level=level,
+            friendship=friendship,
+            gender=gender,
+            moves=moves,
+            held_item=held_item,
+            item_used=item_used,
+            area_id=area_id,
+        )
+        if ok:
+            return species
+    return None
+
+
+async def _get_level_up_evolution(
+    conn,
+    species_name: str,
+    level: int,
+    *,
+    friendship: Optional[int] = None,
+    gender: Optional[str] = None,
+    moves: Any = None,
+    held_item: Optional[str] = None,
+    area_id: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Return the evolved species (lowercase) if level-up conditions are met.
+    Supports level thresholds and condition-based evolutions (time/friendship/gender/moves/location) when present in data.
+    """
+    return await _find_evolution_for_trigger(
+        conn,
+        species_name,
+        expected_trigger="level-up",
+        level=level,
+        friendship=friendship,
+        gender=gender,
+        moves=moves,
+        held_item=held_item,
+        area_id=area_id,
+    )
+
+
+async def _get_item_use_evolution(
+    conn,
+    species_name: str,
+    item_id: str,
+    *,
+    friendship: Optional[int] = None,
+    gender: Optional[str] = None,
+    moves: Any = None,
+    held_item: Optional[str] = None,
+    area_id: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Return the evolved species (lowercase) if this species evolves by using the given item.
+    """
+    item_norm = _daycare_norm_item(item_id)
+    if not item_norm:
+        return None
+    return await _find_evolution_for_trigger(
+        conn,
+        species_name,
+        expected_trigger="use-item",
+        friendship=friendship,
+        gender=gender,
+        moves=moves,
+        held_item=held_item,
+        item_used=item_norm,
+        area_id=area_id,
+    )
+
+
+async def _get_any_item_evolution_target(conn, species_name: str) -> Optional[str]:
+    """
+    Return one example item id if the species has an item-use evolution.
+    Used for user-facing hints when no level-up evolution is available.
+    """
+    cur = await conn.execute(
+        "SELECT evolution FROM pokedex WHERE LOWER(name) = LOWER(?) LIMIT 1",
+        (species_name.strip(),),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    if not row or row.get("evolution") is None:
+        return None
+    evo = _parse_evolution(row["evolution"])
+    if not isinstance(evo, dict):
+        return None
+    raw_next = evo.get("next")
+    if isinstance(raw_next, list):
+        next_list = raw_next
+    elif raw_next is not None:
+        next_list = [raw_next]
+    else:
+        next_list = []
+    for n in next_list:
+        if not isinstance(n, dict):
             continue
-        min_level = details.get("min_level")
-        if min_level is None:
+        details = n.get("details") or {}
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except Exception:
+                details = {}
+        if not isinstance(details, dict):
             continue
-        try:
-            min_level = int(min_level)
-        except (TypeError, ValueError):
-            continue
-        if level >= min_level:
-            species = (n.get("species") or "").strip().lower().replace(" ", "-")
-            if species:
-                return species
+        trigger = _evo_norm_text(details.get("trigger"))
+        item_id = _daycare_norm_item(details.get("item"))
+        if trigger in {"use-item", "item"} and item_id:
+            return item_id
     return None
 
 
@@ -10300,7 +10703,16 @@ async def _start_pve_battle(
                     held = (mon.item or "").strip().lower().replace(" ", "-")
                     if held == "everstone":
                         continue
-                    evo_name = await _get_level_up_evolution(conn, mon.species, new_lvl)
+                    evo_name = await _get_level_up_evolution(
+                        conn,
+                        mon.species,
+                        new_lvl,
+                        friendship=getattr(mon, "friendship", None),
+                        gender=getattr(mon, "gender", None),
+                        moves=getattr(mon, "moves", None),
+                        held_item=getattr(mon, "item", None),
+                        area_id=getattr(st, "adventure_area_id", None),
+                    )
                     if evo_name:
                         pending_evos.append((mid, mon, evo_name, new_lvl))
             for mid, mon, evo_name, new_lvl in pending_evos:
@@ -13277,6 +13689,149 @@ async def walk_cmd(inter: discord.Interaction, name: str, slot: int | None = Non
     )
 
 
+@bot.tree.command(name="evolve", description="Evolve a team Pokémon using level conditions or an evolution item.")
+@app_commands.describe(
+    name="Pokémon name in your team (e.g. eevee)",
+    slot="If duplicates, which team slot (1–6)",
+    item="Optional evolution item (e.g. Thunder Stone)",
+)
+async def evolve_cmd(inter: discord.Interaction, name: str, slot: int | None = None, item: str | None = None):
+    mon = await resolve_team_mon(inter, name, slot)
+    if not mon:
+        return
+
+    uid = str(inter.user.id)
+    mon_id = int(mon["id"])
+    auto_mon = f" (autocorrected to **{mon['_autocorrected_to']}**)" if mon.get("_autocorrected_to") else ""
+
+    area_id: Optional[str] = None
+    try:
+        state = await _get_adventure_state(uid)
+        if isinstance(state, dict):
+            area_id = str(state.get("area_id") or "").strip() or None
+    except Exception:
+        area_id = None
+
+    async with db.session() as conn:
+        cur = await conn.execute(
+            """
+            SELECT species, level, friendship, gender, held_item, moves
+            FROM pokemons
+            WHERE owner_id=? AND id=?
+            LIMIT 1
+            """,
+            (uid, mon_id),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return await inter.followup.send("❌ Pokémon not found in your team.", ephemeral=True)
+
+        species_raw = str((row["species"] if hasattr(row, "keys") else row[0]) or "").strip()
+        species = _daycare_norm_species(species_raw)
+        level_raw = row["level"] if hasattr(row, "keys") else row[1]
+        friendship_raw = row["friendship"] if hasattr(row, "keys") else row[2]
+        gender = str((row["gender"] if hasattr(row, "keys") else row[3]) or "").strip().lower() or None
+        held_item = str((row["held_item"] if hasattr(row, "keys") else row[4]) or "").strip().lower() or None
+        moves_raw = row["moves"] if hasattr(row, "keys") else row[5]
+        try:
+            level = int(level_raw or 1)
+        except Exception:
+            level = 1
+        try:
+            friendship = int(friendship_raw) if friendship_raw is not None else None
+        except Exception:
+            friendship = None
+
+        item_id: Optional[str] = None
+        item_disp: Optional[str] = None
+        auto_item_note = ""
+        evo_target: Optional[str] = None
+
+        if item and str(item).strip():
+            item_row, auto_item, suggestions = await _resolve_item_fuzzy(conn, str(item), threshold=0.80)
+            if not item_row:
+                if suggestions:
+                    return await inter.followup.send(
+                        f"❌ I couldn't find that item. Did you mean: {', '.join(suggestions)}?",
+                        ephemeral=True,
+                    )
+                return await inter.followup.send("❌ I couldn't find that item.", ephemeral=True)
+            item_id = str(item_row.get("id") or "").strip().lower()
+            if not item_id:
+                return await inter.followup.send("❌ Invalid evolution item.", ephemeral=True)
+            item_disp = pretty_item_name(item_row.get("name") or item_id)
+            if auto_item:
+                auto_item_note = f" (autocorrected item to **{auto_item}**)"
+
+            qty = await _get_item_qty(uid, item_id, conn=conn)
+            if qty <= 0:
+                return await inter.followup.send(
+                    f"❌ You don’t have **{item_disp}** in your bag.",
+                    ephemeral=True,
+                )
+            evo_target = await _get_item_use_evolution(
+                conn,
+                species,
+                item_id,
+                friendship=friendship,
+                gender=gender,
+                moves=moves_raw,
+                held_item=held_item,
+                area_id=area_id,
+            )
+            if not evo_target:
+                pretty_species = species_raw.replace("-", " ").title()
+                return await inter.followup.send(
+                    f"❌ **{pretty_species}** can't evolve with **{item_disp}** right now{auto_item_note}.",
+                    ephemeral=True,
+                )
+        else:
+            evo_target = await _get_level_up_evolution(
+                conn,
+                species,
+                level,
+                friendship=friendship,
+                gender=gender,
+                moves=moves_raw,
+                held_item=held_item,
+                area_id=area_id,
+            )
+            if not evo_target:
+                item_hint = await _get_any_item_evolution_target(conn, species)
+                hint_line = ""
+                if item_hint:
+                    hint_line = f" Try using `/evolve` with item **{pretty_item_name(item_hint)}**."
+                pretty_species = species_raw.replace("-", " ").title()
+                return await inter.followup.send(
+                    f"❌ **{pretty_species}** doesn't meet any evolution conditions right now.{hint_line}",
+                    ephemeral=True,
+                )
+
+    consumed_item = False
+    if item_id:
+        consumed_item = await db.take_item(uid, item_id, qty=1)
+        if not consumed_item:
+            return await inter.followup.send("❌ You no longer have that item in your bag.", ephemeral=True)
+
+    applied = await _apply_evolution(uid, mon_id, evo_target, level)
+    if not applied:
+        if consumed_item and item_id:
+            try:
+                await db.give_item(uid, item_id, 1)
+            except Exception:
+                pass
+        return await inter.followup.send("❌ Evolution failed. Please try again.", ephemeral=True)
+
+    from_name = species_raw.replace("-", " ").title()
+    to_name = str(evo_target).replace("-", " ").title()
+    item_note = f" using **{item_disp}**{auto_item_note}" if item_id else ""
+    await inter.followup.send(
+        f"✨ **{from_name}** evolved into **{to_name}**{item_note}{auto_mon}!",
+        ephemeral=True,
+    )
+
+
 def _team_species_label(row: dict) -> str:
     species = str(row.get("species") or "Unknown").replace("-", " ").replace("_", " ").title()
     form = str(row.get("form") or "").strip()
@@ -14898,7 +15453,7 @@ async def _box_render_payload(owner_id: str, box_no: int) -> tuple[discord.Embed
         title=f"PC Box {box_no}/{box_count}",
         description=(
             "Manage your boxed Pokémon with the buttons below.\n"
-            "Actions: **Box Swap**, **Box Release**, **Box Move**, **Box Sort**, **Box Take**"
+            "Actions: **Box Swap (Team <-> Box)**, **Box Release**, **Box Move**, **Box Sort**, **Box Take**"
         ),
         color=0x5865F2,
     )
@@ -14929,27 +15484,91 @@ def _parse_box_int(v: str | None) -> Optional[int]:
         return None
 
 
-async def _box_swap_positions(owner_id: str, box_no: int, pos_a: int, pos_b: int) -> tuple[bool, str]:
-    if pos_a == pos_b:
-        return False, "Positions must be different."
+async def _box_swap_positions(owner_id: str, box_no: int, team_slot: int, box_pos: int) -> tuple[bool, str]:
+    """
+    Swap/move between one team slot and one box slot:
+      - both occupied: swap
+      - only team occupied: move team mon into box slot
+      - only box occupied: move box mon into team slot
+    """
+    if not (1 <= int(team_slot) <= 6):
+        return False, "Team slot must be between 1 and 6."
+    box_count, box_capacity = await _box_get_box_count_and_capacity(owner_id)
+    if not (1 <= int(box_no) <= int(box_count)):
+        return False, f"Box number must be between 1 and {box_count}."
+    if not (1 <= int(box_pos) <= int(box_capacity)):
+        return False, f"Box slot must be between 1 and {box_capacity}."
     async with db.session() as conn:
-        q = "SELECT id, species, box_pos FROM pokemons WHERE owner_id=? AND team_slot IS NULL AND box_no=? AND box_pos=? LIMIT 1"
-        cur = await conn.execute(q, (owner_id, int(box_no), int(pos_a)))
-        a = await cur.fetchone()
+        cur = await conn.execute(
+            "SELECT id, species FROM pokemons WHERE owner_id=? AND team_slot=? LIMIT 1",
+            (owner_id, int(team_slot)),
+        )
+        team_row = await cur.fetchone()
         await cur.close()
-        cur = await conn.execute(q, (owner_id, int(box_no), int(pos_b)))
-        b = await cur.fetchone()
+        cur = await conn.execute(
+            "SELECT id, species FROM pokemons WHERE owner_id=? AND team_slot IS NULL AND box_no=? AND box_pos=? LIMIT 1",
+            (owner_id, int(box_no), int(box_pos)),
+        )
+        box_row = await cur.fetchone()
         await cur.close()
-        if not a or not b:
-            return False, "One or both slots are empty in this box."
-        aid = int(a["id"] if hasattr(a, "keys") else a[0])
-        bid = int(b["id"] if hasattr(b, "keys") else b[0])
-        await conn.execute("UPDATE pokemons SET box_pos=0 WHERE owner_id=? AND id=?", (owner_id, aid))
-        await conn.execute("UPDATE pokemons SET box_pos=? WHERE owner_id=? AND id=?", (int(pos_a), owner_id, bid))
-        await conn.execute("UPDATE pokemons SET box_pos=? WHERE owner_id=? AND id=?", (int(pos_b), owner_id, aid))
+
+        if not team_row and not box_row:
+            return False, "Both the selected team slot and box slot are empty."
+
+        if team_row and box_row:
+            team_id = int(team_row["id"] if hasattr(team_row, "keys") else team_row[0])
+            team_species = str(team_row["species"] if hasattr(team_row, "keys") else team_row[1])
+            box_id = int(box_row["id"] if hasattr(box_row, "keys") else box_row[0])
+            box_species = str(box_row["species"] if hasattr(box_row, "keys") else box_row[1])
+            await conn.execute(
+                "UPDATE pokemons SET team_slot=NULL, box_no=?, box_pos=? WHERE owner_id=? AND id=?",
+                (int(box_no), int(box_pos), owner_id, team_id),
+            )
+            await conn.execute(
+                "UPDATE pokemons SET team_slot=?, box_no=NULL, box_pos=NULL WHERE owner_id=? AND id=?",
+                (int(team_slot), owner_id, box_id),
+            )
+            await conn.commit()
+            db.invalidate_pokemons_cache(owner_id)
+            return True, (
+                f"Swapped **{team_species.replace('-', ' ').title()}** (Team {team_slot}) "
+                f"with **{box_species.replace('-', ' ').title()}** (Box {box_no}, Slot {box_pos})."
+            )
+
+        if team_row and not box_row:
+            cur = await conn.execute(
+                "SELECT COUNT(1) AS c FROM pokemons WHERE owner_id=? AND team_slot BETWEEN 1 AND 6",
+                (owner_id,),
+            )
+            count_row = await cur.fetchone()
+            await cur.close()
+            team_count = int((count_row["c"] if hasattr(count_row, "keys") else count_row[0]) or 0) if count_row else 0
+            if team_count <= 1:
+                return False, "You must keep at least one Pokémon in your team."
+
+            team_id = int(team_row["id"] if hasattr(team_row, "keys") else team_row[0])
+            team_species = str(team_row["species"] if hasattr(team_row, "keys") else team_row[1])
+            await conn.execute(
+                "UPDATE pokemons SET team_slot=NULL, box_no=?, box_pos=? WHERE owner_id=? AND id=?",
+                (int(box_no), int(box_pos), owner_id, team_id),
+            )
+            await conn.commit()
+            db.invalidate_pokemons_cache(owner_id)
+            await _compact_team_slots(owner_id)
+            return True, (
+                f"Moved **{team_species.replace('-', ' ').title()}** from Team {team_slot} "
+                f"to Box {box_no}, Slot {box_pos}."
+            )
+
+        box_id = int(box_row["id"] if hasattr(box_row, "keys") else box_row[0])
+        box_species = str(box_row["species"] if hasattr(box_row, "keys") else box_row[1])
+        await conn.execute(
+            "UPDATE pokemons SET team_slot=?, box_no=NULL, box_pos=NULL WHERE owner_id=? AND id=?",
+            (int(team_slot), owner_id, box_id),
+        )
         await conn.commit()
     db.invalidate_pokemons_cache(owner_id)
-    return True, f"Swapped positions **{pos_a}** and **{pos_b}** in Box {box_no}."
+    return True, f"Moved **{box_species.replace('-', ' ').title()}** from Box {box_no}, Slot {box_pos} to Team {team_slot}."
 
 
 async def _box_move_mon(owner_id: str, src_box: int, src_pos: int, dst_box: int, dst_pos: Optional[int]) -> tuple[bool, str]:
@@ -15106,9 +15725,9 @@ async def _box_sort(owner_id: str, box_no: int, raw_methods: str | None) -> tupl
     return True, f"Sorted Box {box_no} by **{', '.join(methods)}**."
 
 
-class BoxSwapModal(ui.Modal, title="Box Swap"):
-    pos_a = ui.TextInput(label="First slot position", placeholder="e.g. 3", required=True, max_length=3)
-    pos_b = ui.TextInput(label="Second slot position", placeholder="e.g. 14", required=True, max_length=3)
+class BoxSwapModal(ui.Modal, title="Box Swap (Team <-> Box)"):
+    team_slot = ui.TextInput(label="Team slot", placeholder="1-6", required=True, max_length=2)
+    box_pos = ui.TextInput(label="Box slot position", placeholder="e.g. 14", required=True, max_length=3)
 
     def __init__(self, owner_id: str, box_no: int):
         super().__init__(timeout=120)
@@ -15118,11 +15737,13 @@ class BoxSwapModal(ui.Modal, title="Box Swap"):
     async def on_submit(self, interaction: Interaction):
         if str(interaction.user.id) != self.owner_id:
             return await interaction.response.send_message("this isn't for you", ephemeral=True)
-        a = _parse_box_int(str(self.pos_a.value))
-        b = _parse_box_int(str(self.pos_b.value))
-        if not a or not b:
-            return await interaction.response.send_message("Please enter valid slot numbers.", ephemeral=True)
-        ok, msg = await _box_swap_positions(self.owner_id, self.box_no, a, b)
+        team_slot = _parse_box_int(str(self.team_slot.value))
+        box_pos = _parse_box_int(str(self.box_pos.value))
+        if not team_slot or not box_pos:
+            return await interaction.response.send_message("Please enter a valid team slot and box slot.", ephemeral=True)
+        if not (1 <= int(team_slot) <= 6):
+            return await interaction.response.send_message("Team slot must be between 1 and 6.", ephemeral=True)
+        ok, msg = await _box_swap_positions(self.owner_id, self.box_no, team_slot, box_pos)
         await interaction.response.send_message(("✅ " if ok else "❌ ") + msg + "\nUse **Refresh** on your box panel to update.", ephemeral=True)
 
 
@@ -15291,23 +15912,20 @@ async def _validate_box_and_slot(
     return True, "", box_count, box_capacity
 
 
-@bot.tree.command(name="boxswap", description="Swap two slot positions inside one box.")
-@app_commands.describe(box_no="Box number", pos_a="First slot position", pos_b="Second slot position")
+@bot.tree.command(name="boxswap", description="Swap/move between one team slot and one box slot.")
+@app_commands.describe(box_no="Box number", team_slot="Team slot (1-6)", box_pos="Box slot position")
 async def boxswap_command(
     interaction: discord.Interaction,
     box_no: app_commands.Range[int, 1, 64],
-    pos_a: app_commands.Range[int, 1, 180],
-    pos_b: app_commands.Range[int, 1, 180],
+    team_slot: app_commands.Range[int, 1, 6],
+    box_pos: app_commands.Range[int, 1, 180],
 ):
     await interaction.response.defer(ephemeral=True)
     owner_id = str(interaction.user.id)
-    ok, msg, _count, _cap = await _validate_box_and_slot(owner_id, int(box_no), slot=int(pos_a))
+    ok, msg, _count, _cap = await _validate_box_and_slot(owner_id, int(box_no), slot=int(box_pos))
     if not ok:
         return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
-    ok, msg, _count, _cap = await _validate_box_and_slot(owner_id, int(box_no), slot=int(pos_b))
-    if not ok:
-        return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
-    changed, out = await _box_swap_positions(owner_id, int(box_no), int(pos_a), int(pos_b))
+    changed, out = await _box_swap_positions(owner_id, int(box_no), int(team_slot), int(box_pos))
     await interaction.followup.send(("✅ " if changed else "❌ ") + out, ephemeral=True)
 
 
