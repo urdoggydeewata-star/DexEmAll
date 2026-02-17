@@ -6766,7 +6766,7 @@ TM_SELLER_PRICE = 500  # Coins per TM (Gen 1)
 TM_SELLER_ITEMS = [GEN1_TMS[i - 1] for i in (1, 3, 5, 6, 7, 9, 11, 12, 15, 17, 20, 21, 22, 23, 24, 31, 34, 35, 37, 40, 42, 44, 45, 49, 50)]
 
 # Route move item drop: when user presses "Next" to move across a route, roll for a random item from this pool.
-ROUTE_MOVE_ITEM_DROP_CHANCE = 0.90  # Probability per move (e.g. 15%)
+ROUTE_MOVE_ITEM_DROP_CHANCE = 1.00  # Probability per move (e.g. 15%)
 ROUTE_MOVE_ITEM_POOL: List[Tuple[str, str]] = [
     ("potion", "Potion"),
     ("antidote", "Antidote"),
@@ -7506,18 +7506,21 @@ RIVAL_BATTLES = {
 
 async def _try_route_move_item_drop(itx: discord.Interaction, user_id: str) -> None:
     """Roll for a random item from ROUTE_MOVE_ITEM_POOL (same kind of trigger as random encounter on route move)."""
-    if not ROUTE_MOVE_ITEM_POOL or random.random() >= ROUTE_MOVE_ITEM_DROP_CHANCE:
+    if not ROUTE_MOVE_ITEM_POOL:
+        return
+    if random.random() >= ROUTE_MOVE_ITEM_DROP_CHANCE:
         return
     item_id, display_name = random.choice(ROUTE_MOVE_ITEM_POOL)
     try:
         await db.upsert_item_master(item_id, name=display_name)
         await db.give_item(user_id, item_id, 1)
-        try:
-            await itx.followup.send(f"You found a **{display_name}** on the ground!", ephemeral=False)
-        except Exception:
-            pass
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Adventure] Route move item drop give_item failed: {e}")
+        return
+    try:
+        await itx.followup.send(f"You found a **{display_name}** on the ground!", ephemeral=False)
+    except Exception as e:
+        print(f"[Adventure] Route move item drop followup.send failed: {e}")
 
 
 def _adv_default_state() -> dict:
@@ -11491,11 +11494,14 @@ class AdventureRouteView(discord.ui.View):
         # reads the latest panel instead of stale DB state.
         await _save_adventure_state(str(itx.user.id), state)
         if moved_within_route:
-            await _try_route_move_item_drop(itx, str(itx.user.id))
             await self._r1_try_wild_encounter(itx, state, force=False)
             # Persist encounter side-effects (dex seen/discovered updates).
             await _save_adventure_state(str(itx.user.id), state)
+        # Update the message the user clicked (component interaction)
         await _send_adventure_panel(itx, state, edit_original=False)
+        # Item drop after panel so it always has a valid followup; same trigger as encounter
+        if moved_within_route:
+            await _try_route_move_item_drop(itx, str(itx.user.id))
 
 
     async def _on_forward_route1(self, itx: discord.Interaction):
@@ -11524,14 +11530,15 @@ class AdventureRouteView(discord.ui.View):
 
         await _save_adventure_state(str(itx.user.id), state)
         if moved_within_route:
-            # movement can trigger item drop (same trigger as encounter chance)
-            await _try_route_move_item_drop(itx, str(itx.user.id))
             # movement can trigger encounter
             await self._r1_try_wild_encounter(itx, state, force=False)
             # Persist encounter side-effects (dex seen/discovered updates).
             await _save_adventure_state(str(itx.user.id), state)
         # Update the message the user clicked (component interaction)
         await _send_adventure_panel(itx, state, edit_original=False)
+        # Item drop after panel so it always has a valid followup; same trigger as encounter
+        if moved_within_route:
+            await _try_route_move_item_drop(itx, str(itx.user.id))
 
 
     async def _on_force_route1(self, itx: discord.Interaction):
