@@ -1,9 +1,47 @@
 from __future__ import annotations
 from pathlib import Path
+import threading
 from typing import Optional
+import zipfile
 
 # Root: pvp/_common/sprites/<species>/
 BASE_SPRITES_DIR = Path(__file__).resolve().parent / "_common" / "sprites"
+SPRITES_ARCHIVE_PATH = BASE_SPRITES_DIR.parent / "sprites-download.zip"
+_ANIMATED_SENTINEL = BASE_SPRITES_DIR / "pikachu" / "animated-front.gif"
+_SPRITES_BOOTSTRAP_DONE = False
+_SPRITES_BOOTSTRAP_LOCK = threading.Lock()
+
+
+def _ensure_animated_sprite_pack() -> None:
+    """
+    Ensure animated showdown-style sprites are available on disk.
+
+    Some deployments can end up with icon-only folders if the large sprite pack
+    wasn't extracted yet. When that happens, extract sprites-download.zip once so
+    battle rendering can use animated front/back assets again.
+    """
+    global _SPRITES_BOOTSTRAP_DONE
+    if _SPRITES_BOOTSTRAP_DONE:
+        return
+    if _ANIMATED_SENTINEL.exists():
+        _SPRITES_BOOTSTRAP_DONE = True
+        return
+    with _SPRITES_BOOTSTRAP_LOCK:
+        if _SPRITES_BOOTSTRAP_DONE:
+            return
+        if _ANIMATED_SENTINEL.exists():
+            _SPRITES_BOOTSTRAP_DONE = True
+            return
+        if not SPRITES_ARCHIVE_PATH.exists():
+            _SPRITES_BOOTSTRAP_DONE = True
+            return
+        try:
+            with zipfile.ZipFile(SPRITES_ARCHIVE_PATH) as sprite_archive:
+                sprite_archive.extractall(BASE_SPRITES_DIR.parent)
+        except Exception:
+            # If extraction fails, keep existing behavior and let icon fallback handle it.
+            pass
+        _SPRITES_BOOTSTRAP_DONE = True
 
 def _norm_species(name: str) -> str:
     s = (name or "").strip().lower()
@@ -63,6 +101,8 @@ def find_sprite(
     
     Handles both short forms ("sky") and full forms ("shaymin-sky").
     """
+    _ensure_animated_sprite_pack()
+
     # Try form-specific folder first if form is provided
     if form:
         norm_species = _norm_species(species)
@@ -136,8 +176,9 @@ def find_sprite(
                     p = form_folder / fn
                     if p.exists():
                         return p
-                # Explicit icon/box fallback when directional assets are absent.
-                for fn in ("icon.png", "box.png"):
+                # Explicit icon fallback when directional assets are absent.
+                # Do not use box/menu sprites for battle rendering.
+                for fn in ("icon.png",):
                     p = form_folder / fn
                     if p.exists():
                         return p
@@ -157,8 +198,9 @@ def find_sprite(
         if p.exists():
             return p
 
-    # Explicit icon/box fallback when directional assets are absent.
-    for fn in ("icon.png", "box.png"):
+    # Explicit icon fallback when directional assets are absent.
+    # Do not use box/menu sprites for battle rendering.
+    for fn in ("icon.png",):
         p = folder / fn
         if p.exists():
             return p
