@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 
 import lib
 from lib import db
+from lib.owner_settings import load_owner_settings
 try:
     from lib import db_cache
 except ImportError:
@@ -657,23 +658,48 @@ intents.members = True            # requires Members intent enabled in Dev Porta
 intents.messages = True
 intents.message_content = True    # keep True if you still use prefix commands elsewhere
 
-# Banned user IDs (blocked from all slash commands and app interactions)
-BANNED_IDS: frozenset[int] = frozenset({
-    891797928396587059
-})
+# Owner-editable runtime settings (IDs/channels/roles live in config/owner_settings.json).
+_OWNER_SETTINGS = load_owner_settings()
+
+# ==== OWNER / ADMIN SETTINGS ====
+OWNER_IDS: set[int] = set(_OWNER_SETTINGS.owner_ids)
+STATIC_ADMIN_IDS: set[int] = set(_OWNER_SETTINGS.admin_ids)
+BANNED_IDS: frozenset[int] = frozenset(_OWNER_SETTINGS.banned_ids)
+CODE_BYPASS_IDS: frozenset[int] = frozenset(_OWNER_SETTINGS.code_bypass_ids)
+
+DEV_GUILD_ID = int(_OWNER_SETTINGS.dev_guild_id)
+DEV_GUILD = discord.Object(id=DEV_GUILD_ID)
+
+# Embed echo settings
+EMBED_ECHO_GUILD_ID: int | None = _OWNER_SETTINGS.embed_echo_guild_id
+EMBED_ECHO_CHANNEL_IDS: set[int] = set(_OWNER_SETTINGS.embed_echo_channel_ids)
+EMBED_ECHO_USER_IDS: set[int] | None = (
+    set(_OWNER_SETTINGS.embed_echo_user_ids)
+    if _OWNER_SETTINGS.embed_echo_user_ids is not None
+    else None
+)
+EMBED_ECHO_DELETE_SOURCE = bool(_OWNER_SETTINGS.embed_echo_delete_source)
+EMBED_ECHO_IGNORE_PREFIX_COMMANDS = bool(_OWNER_SETTINGS.embed_echo_ignore_prefix_commands)
+
+# Verification button settings
+VERIFY_GUILD_ID = int(_OWNER_SETTINGS.verify_guild_id)
+VERIFY_CHANNEL_ID = int(_OWNER_SETTINGS.verify_channel_id)
+VERIFY_ROLE_ID = int(_OWNER_SETTINGS.verify_role_id)
+VERIFY_BUTTON_CUSTOM_ID = str(_OWNER_SETTINGS.verify_button_custom_id)
+
+# Beta claim settings
+BETA_ANNOUNCEMENT_CHANNEL_ID = int(_OWNER_SETTINGS.beta_announcement_channel_id)
+BETA_CLAIM_CUSTOM_ID = str(_OWNER_SETTINGS.beta_claim_custom_id)
 
 # Access code gate: users must run /code <code> before using the bot (set BOT_ACCESS_CODE in .env)
 BOT_ACCESS_CODE: str = (os.getenv("BOT_ACCESS_CODE") or "").strip()
-# IDs that bypass the code gate (owners + comma-separated from env, e.g. CODE_BYPASS_IDS=123,456)
-_CODE_BYPASS_RAW = os.getenv("CODE_BYPASS_IDS", "")
-CODE_BYPASS_IDS: frozenset[int] = frozenset(
-    int(x.strip()) for x in _CODE_BYPASS_RAW.split(",") if x.strip()
-)
 
 _ACCESS_VERIFY_CACHE_TTL_SECONDS = 300.0
 _ACCESS_VERIFY_CACHE: dict[int, tuple[bool, float]] = {}
 _USER_GEN_CACHE_TTL_SECONDS = 300.0
 _USER_GEN_CACHE: dict[str, tuple[int, float]] = {}
+_ADMIN_CHECK_CACHE_TTL_SECONDS = 120.0
+_ADMIN_CHECK_CACHE: dict[str, tuple[bool, float]] = {}
 
 
 def _get_cached_access_verified(user_id: int) -> Optional[bool]:
@@ -708,6 +734,45 @@ def _get_cached_user_gen(user_id: str) -> Optional[int]:
 
 def _set_cached_user_gen(user_id: str, generation: int) -> None:
     _USER_GEN_CACHE[str(user_id)] = (int(generation), float(time.time()))
+
+
+def _get_cached_admin_check(user_id: str) -> Optional[bool]:
+    uid = str(user_id)
+    rec = _ADMIN_CHECK_CACHE.get(uid)
+    if rec is None:
+        return None
+    val, ts = rec
+    if (time.time() - float(ts)) > _ADMIN_CHECK_CACHE_TTL_SECONDS:
+        _ADMIN_CHECK_CACHE.pop(uid, None)
+        return None
+    return bool(val)
+
+
+def _set_cached_admin_check(user_id: str, is_admin: bool) -> None:
+    _ADMIN_CHECK_CACHE[str(user_id)] = (bool(is_admin), float(time.time()))
+
+
+def _is_static_admin(user_id: int | str) -> bool:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    return uid in OWNER_IDS or uid in STATIC_ADMIN_IDS
+
+
+async def _is_admin_user(user_id: int | str) -> bool:
+    if _is_static_admin(user_id):
+        return True
+    uid = str(user_id)
+    cached = _get_cached_admin_check(uid)
+    if cached is not None:
+        return bool(cached)
+    try:
+        val = bool(await db.is_admin(uid))
+    except Exception:
+        val = False
+    _set_cached_admin_check(uid, val)
+    return val
 
 
 class _BannedCheckTree(app_commands.CommandTree):
@@ -754,26 +819,6 @@ class _BannedCheckTree(app_commands.CommandTree):
 
 bot = commands.Bot(command_prefix='.', intents=intents, tree_cls=_BannedCheckTree)
 # ==== OWNER / ADMIN CHECKS ====
-OWNER_IDS: set[int] = { 764310943781617716 }  # <-- your ID
-DEV_GUILD_ID = 889548793912123392
-DEV_GUILD = discord.Object(id=DEV_GUILD_ID)
-
-# Embed echo (set these IDs to enable)
-EMBED_ECHO_GUILD_ID: int | None = 889548793912123392
-EMBED_ECHO_CHANNEL_IDS: set[int] = {
-    907370913002049628,  # rules-and-info
-    1459363727483600990, # future-implementations
-    1465864011223535774, # sneak-peaks
-}
-EMBED_ECHO_USER_IDS: set[int] | None = None  # e.g. {123} to limit to you; None = allow all
-EMBED_ECHO_DELETE_SOURCE = True              # delete original user message after echo
-EMBED_ECHO_IGNORE_PREFIX_COMMANDS = True     # ignore messages starting with the prefix
-
-# Verification button (rules channel)
-VERIFY_GUILD_ID = 889548793912123392
-VERIFY_CHANNEL_ID = 907370913002049628
-BETA_ANNOUNCEMENT_CHANNEL_ID = 1464033412183752808
-BETA_CLAIM_CUSTOM_ID = "beta_claim"
 
 
 class BetaClaimView(discord.ui.View):
@@ -832,11 +877,8 @@ class BetaClaimView(discord.ui.View):
 # Beta claim view is created in on_ready() (needs a running event loop) and stored on bot.beta_claim_view
 
 
-VERIFY_ROLE_ID = 907370845167566929
-VERIFY_BUTTON_CUSTOM_ID = "verify:accept_rules"
-
 def owners_only():
-    """Allow only hardcoded owner IDs."""
+    """Allow only owner IDs from owner settings."""
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.user and interaction.user.id in OWNER_IDS:
             return True
@@ -845,15 +887,15 @@ def owners_only():
     return app_commands.check(predicate)
 
 def admin_only():
-    """Allow ONLY users listed in the DB admins table."""
+    """Allow static admins/owners and DB admins."""
     async def predicate(interaction: discord.Interaction) -> bool:
         try:
-            if await db.is_admin(str(interaction.user.id)):
+            if await _is_admin_user(interaction.user.id):
                 return True
         except Exception:
             pass
         await interaction.response.send_message(
-            "❌ You are not allowed to use this command (DB admin only).",
+            "❌ You are not allowed to use this command (admin only).",
             ephemeral=True
         )
         return False
@@ -892,9 +934,9 @@ async def restartbot(interaction: discord.Interaction):
 @bot.tree.command(name="am_i_admin", description="Tell me if I can run DB-admin commands.")
 async def am_i_admin(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
-    in_db = await db.is_admin(str(interaction.user.id))
+    in_db = await _is_admin_user(interaction.user.id)
     await interaction.followup.send(
-        "DB Admin: " + ("YES ✅" if in_db else "NO ❌"),
+        "Admin: " + ("YES ✅" if in_db else "NO ❌"),
         ephemeral=True
     )
 
@@ -20876,7 +20918,7 @@ async def release_pokemon(interaction: discord.Interaction, slot: app_commands.R
     uid = str(interaction.user.id)
     
     # Check if user is admin (admins bypass safety checks)
-    is_admin = await db.is_admin(uid)
+    is_admin = await _is_admin_user(uid)
     
     # Get the Pokémon in the specified slot
     conn = await db.connect()
@@ -21000,7 +21042,7 @@ async def clear_team(interaction: discord.Interaction):
     uid = str(interaction.user.id)
     
     # Check if user is admin (admins bypass safety checks)
-    is_admin = await db.is_admin(uid)
+    is_admin = await _is_admin_user(uid)
     
     conn = await db.connect()
     try:
