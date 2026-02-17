@@ -211,6 +211,7 @@ class Mon:
     is_fully_evolved: bool = True  # False if can still evolve (for Eviolite)
     weight_kg: float = 0.0  # Weight in kilograms (for Low Kick, Grass Knot, Heavy Slam, Heat Crash)
     friendship: int = 255  # Friendship value (0-255, default max for Return/Frustration)
+    capture_rate: int = 45  # Species catch rate used for wild capture rolls
     # Stat stages: -6 to +6 for each stat (accuracy/evasion too)
     stages: Dict[str,int] = field(default_factory=lambda: {
         "atk": 0, "defn": 0, "spa": 0, "spd": 0, "spe": 0, "accuracy": 0, "evasion": 0
@@ -827,7 +828,8 @@ def build_mon(dto: Dict[str, Any], *, set_level: int = 100, heal: bool = True) -
         moves=(dto.get("moves") or ["Tackle"])[:4] or ["Tackle"],
         is_fully_evolved=bool(dto.get("is_fully_evolved", True)),  # For Eviolite
         weight_kg=float(dto.get("weight_kg", 100.0)),  # Weight for Low Kick/Grass Knot
-        friendship=int(dto.get("friendship", 255))  # Friendship for Return/Frustration
+        friendship=int(dto.get("friendship", 255)),  # Friendship for Return/Frustration
+        capture_rate=max(1, min(255, int(float(dto.get("capture_rate", 45) or 45)))),
     )
     # Store original calculated stats for Beast Boost (before any modifications)
     mon._original_calculated_stats = dict(stats)

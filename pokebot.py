@@ -8725,6 +8725,10 @@ async def _build_mon_from_team_entry(team_entry: dict) -> Optional["Mon"]:
     evs_long = {"hp": evs["hp"], "attack": evs["atk"], "defense": evs["defn"], "special_attack": evs["spa"], "special_defense": evs["spd"], "speed": evs["spe"]}
     final_stats = calc_all_stats(base_long, ivs_long, evs_long, level, nature)
     hp_max = final_stats.get("hp", 1)
+    try:
+        capture_rate = int(float(entry.get("capture_rate") or 45))
+    except Exception:
+        capture_rate = 45
 
     dto = {
         "species": entry.get("name") or species,
@@ -8740,6 +8744,7 @@ async def _build_mon_from_team_entry(team_entry: dict) -> Optional["Mon"]:
         "hp_now": hp_max,
         "weight_kg": float(entry.get("weight_kg") or 100.0),
         "friendship": int(entry.get("base_happiness") or 70),
+        "capture_rate": capture_rate,
         "nature": nature,
     }
     # Optional fixed stats override (e.g. for scripted rival/trainer teams)
@@ -8832,6 +8837,10 @@ async def _build_mon_from_species(species: str, level: int, moves: Optional[list
             for i in range(len(move_list)):
                 if random.random() < 0.001:  # 0.1% per slot
                     move_list[i] = random.choice(special_moves)
+    try:
+        capture_rate = int(float(entry.get("capture_rate") or 45))
+    except Exception:
+        capture_rate = 45
     dto = {
         "species": entry.get("name") or species,
         "types": types_tuple,
@@ -8861,6 +8870,7 @@ async def _build_mon_from_species(species: str, level: int, moves: Optional[list
         "hp_now": int(rolled["stats"]["hp"]),
         "weight_kg": float(entry.get("weight_kg") or 100.0),
         "friendship": int(entry.get("base_happiness") or 70),
+        "capture_rate": capture_rate,
     }
     return build_mon(dto, set_level=level, heal=True)
 
@@ -14879,6 +14889,117 @@ async def box_command(interaction: discord.Interaction, box_no: app_commands.Ran
         await interaction.followup.send(embed=emb, files=files, view=view, ephemeral=False)
     finally:
         _close_files(files)
+
+
+async def _validate_box_and_slot(
+    owner_id: str,
+    box_no: int,
+    *,
+    slot: Optional[int] = None,
+) -> tuple[bool, str, int, int]:
+    await _box_prepare_storage(owner_id)
+    box_count, box_capacity = await _box_get_box_count_and_capacity(owner_id)
+    if not (1 <= int(box_no) <= int(box_count)):
+        return False, f"Box number must be between 1 and {box_count}.", box_count, box_capacity
+    if slot is not None and not (1 <= int(slot) <= int(box_capacity)):
+        return False, f"Slot must be between 1 and {box_capacity}.", box_count, box_capacity
+    return True, "", box_count, box_capacity
+
+
+@bot.tree.command(name="boxswap", description="Swap two slot positions inside one box.")
+@app_commands.describe(box_no="Box number", pos_a="First slot position", pos_b="Second slot position")
+async def boxswap_command(
+    interaction: discord.Interaction,
+    box_no: app_commands.Range[int, 1, 64],
+    pos_a: app_commands.Range[int, 1, 180],
+    pos_b: app_commands.Range[int, 1, 180],
+):
+    await interaction.response.defer(ephemeral=True)
+    owner_id = str(interaction.user.id)
+    ok, msg, _count, _cap = await _validate_box_and_slot(owner_id, int(box_no), slot=int(pos_a))
+    if not ok:
+        return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+    ok, msg, _count, _cap = await _validate_box_and_slot(owner_id, int(box_no), slot=int(pos_b))
+    if not ok:
+        return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+    changed, out = await _box_swap_positions(owner_id, int(box_no), int(pos_a), int(pos_b))
+    await interaction.followup.send(("✅ " if changed else "❌ ") + out, ephemeral=True)
+
+
+@bot.tree.command(name="boxmove", description="Move a boxed Pokémon to a different box.")
+@app_commands.describe(
+    src_box="Source box number",
+    src_pos="Source slot position",
+    dst_box="Destination box number",
+    dst_pos="Destination slot (leave empty for first free)",
+)
+async def boxmove_command(
+    interaction: discord.Interaction,
+    src_box: app_commands.Range[int, 1, 64],
+    src_pos: app_commands.Range[int, 1, 180],
+    dst_box: app_commands.Range[int, 1, 64],
+    dst_pos: Optional[int] = None,
+):
+    await interaction.response.defer(ephemeral=True)
+    owner_id = str(interaction.user.id)
+    ok, msg, _count, _cap = await _validate_box_and_slot(owner_id, int(src_box), slot=int(src_pos))
+    if not ok:
+        return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+    ok, msg, _count, cap = await _validate_box_and_slot(owner_id, int(dst_box))
+    if not ok:
+        return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+    if dst_pos is not None and not (1 <= int(dst_pos) <= int(cap)):
+        return await interaction.followup.send(f"❌ Destination slot must be between 1 and {cap}.", ephemeral=True)
+    changed, out = await _box_move_mon(owner_id, int(src_box), int(src_pos), int(dst_box), int(dst_pos) if dst_pos is not None else None)
+    await interaction.followup.send(("✅ " if changed else "❌ ") + out, ephemeral=True)
+
+
+@bot.tree.command(name="boxrelease", description="Release a Pokémon from one of your box slots.")
+@app_commands.describe(box_no="Box number", pos="Slot position to release")
+async def boxrelease_command(
+    interaction: discord.Interaction,
+    box_no: app_commands.Range[int, 1, 64],
+    pos: app_commands.Range[int, 1, 180],
+):
+    await interaction.response.defer(ephemeral=True)
+    owner_id = str(interaction.user.id)
+    ok, msg, _count, _cap = await _validate_box_and_slot(owner_id, int(box_no), slot=int(pos))
+    if not ok:
+        return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+    changed, out = await _box_release_mon(owner_id, int(box_no), int(pos))
+    await interaction.followup.send(("✅ " if changed else "❌ ") + out, ephemeral=True)
+
+
+@bot.tree.command(name="boxsort", description="Sort one box by your chosen keys.")
+@app_commands.describe(box_no="Box number", methods="Comma-separated keys: gender,total_ivs,level,shiny,legendary")
+async def boxsort_command(
+    interaction: discord.Interaction,
+    box_no: app_commands.Range[int, 1, 64],
+    methods: str,
+):
+    await interaction.response.defer(ephemeral=True)
+    owner_id = str(interaction.user.id)
+    ok, msg, _count, _cap = await _validate_box_and_slot(owner_id, int(box_no))
+    if not ok:
+        return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+    changed, out = await _box_sort(owner_id, int(box_no), methods)
+    await interaction.followup.send(("✅ " if changed else "❌ ") + out, ephemeral=True)
+
+
+@bot.tree.command(name="boxtake", description="Take a held item from a boxed Pokémon.")
+@app_commands.describe(box_no="Box number", pos="Slot position")
+async def boxtake_command(
+    interaction: discord.Interaction,
+    box_no: app_commands.Range[int, 1, 64],
+    pos: app_commands.Range[int, 1, 180],
+):
+    await interaction.response.defer(ephemeral=True)
+    owner_id = str(interaction.user.id)
+    ok, msg, _count, _cap = await _validate_box_and_slot(owner_id, int(box_no), slot=int(pos))
+    if not ok:
+        return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+    changed, out = await _box_take_item(owner_id, int(box_no), int(pos))
+    await interaction.followup.send(("✅ " if changed else "❌ ") + out, ephemeral=True)
 
 
 async def _create_pokemon_from_parsed(

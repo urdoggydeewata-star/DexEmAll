@@ -334,7 +334,7 @@ async def get_party_for_engine(user_id: int, *, save_to_battle_cache: bool = Fal
     with get_connection() as conn:
         can_gmax_expr = "COALESCE(p.can_gigantamax::int, 0)"
         cur = conn.execute(f"""
-            SELECT p.*, pd.id as species_id, pd.name as species_name, pd.introduced_in, pd.types, pd.stats, pd.abilities, pd.is_fully_evolved, pd.weight_kg, pd.form_name,
+            SELECT p.*, pd.id as species_id, pd.name as species_name, pd.introduced_in, pd.types, pd.stats, pd.abilities, pd.is_fully_evolved, pd.weight_kg, pd.capture_rate, pd.form_name,
                    {can_gmax_expr} as can_gigantamax
             FROM pokemons p
             LEFT JOIN pokedex pd ON LOWER(p.species) = LOWER(pd.name)
@@ -512,6 +512,7 @@ async def get_party_for_engine(user_id: int, *, save_to_battle_cache: bool = Fal
                 "is_female": row["gender"] == "female",
                 "is_fully_evolved": bool(row["is_fully_evolved"]) if row["is_fully_evolved"] is not None else True,  # For Eviolite
                 "weight_kg": float(row["weight_kg"]) if row["weight_kg"] is not None else 100.0,  # Weight for Low Kick/Grass Knot
+                "capture_rate": int(row_dict.get("capture_rate")) if row_dict.get("capture_rate") is not None else 45,
                 "form": form,  # Add form to the data
                 "can_gigantamax": bool(row_dict.get("can_gigantamax", 0)) if "can_gigantamax" in row_dict else False,  # Gigantamax capability
                 "tera_type": row_dict.get("tera_type"),
