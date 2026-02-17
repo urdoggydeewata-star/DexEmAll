@@ -8214,7 +8214,7 @@ async def _market_buy(owner_id: str, item_key: str, qty_requested: int) -> tuple
             await db.add_currency_conn(conn, owner_id, "coins", -total_cost)
             await conn.execute(
                 "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,?) "
-                "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = MIN(user_items.qty + excluded.qty, ?);",
+                "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = LEAST(user_items.qty + excluded.qty, ?::int);",
                 (owner_id, canonical_item_id, qty_allowed, MAX_STACK),
             )
             await conn.commit()
