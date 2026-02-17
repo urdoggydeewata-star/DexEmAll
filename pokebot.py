@@ -6747,7 +6747,7 @@ ASSETS_EGG_STAGE_5_HEAVY = ASSETS_EGG_STAGES_DIR / "egg-stage-5-heavily-cracked.
 ASSETS_EGG_STAGE_6_EXTREME = ASSETS_EGG_STAGES_DIR / "egg-stage-6-extremely-cracked.png"
 ASSETS_DAYCARE_EGG = ASSETS_EGG_STAGE_1_INTACT
 
-DAYCARE_CITY_ID = "pallet-town"
+DAYCARE_CITY_ID = "viridian-city"
 DAYCARE_AREA_ID = "pallet-daycare"
 DAYCARE_EGG_CAP = 3
 DAYCARE_INCUBATE_MAX = 6
@@ -6802,16 +6802,14 @@ ADVENTURE_CITIES = {
         "image_cleared": ASSETS_CITIES / "pallet-town-cleared.png",
         "next": "route-1",
         "rival_battle": "rival-1",
-        "heal": True,
-        "daycare_area": DAYCARE_AREA_ID,
-        "daycare_label": "Daycare",
+        "heal": False,
     },
     DAYCARE_AREA_ID: {
-        "name": "Pallet Daycare",
+        "name": "Viridian Daycare",
         "image_uncleared": ASSETS_DAYCARE,
         "image_cleared": ASSETS_DAYCARE,
         "is_daycare": True,
-        "heal": False,
+        "heal": True,
     },
     "viridian-city": {
         "name": "Viridian City",
@@ -6821,7 +6819,7 @@ ADVENTURE_CITIES = {
         "gym_leader": "viridian",
         "gym_badge": "boulder",
         "gym_closed": True,
-        "heal": True,
+        "heal": False,
         # Sub-areas: (area_id, label) - buttons that navigate to buildings with sprite sheet regions
         "sub_areas": [
             ("viridian-pokemon-center", "Pokémon Center"),
@@ -6834,6 +6832,8 @@ ADVENTURE_CITIES = {
         "parent_city": "viridian-city",
         "image": ASSETS_CITIES / "viridian-pokecenter.png",
         "heal": True,
+        "daycare_area": DAYCARE_AREA_ID,
+        "daycare_label": "Daycare",
     },
     "viridian-pokemart": {
         "name": "Poké Mart",
@@ -11604,6 +11604,12 @@ class AdventureDaycareView(discord.ui.View):
         return itx.user.id == self.author_id
 
     def _build_buttons(self):
+        daycare_cfg = ADVENTURE_CITIES.get(self.area_id, {})
+        if daycare_cfg.get("heal"):
+            heal_btn = discord.ui.Button(label="Heal", style=discord.ButtonStyle.success, custom_id="adv:dc:heal")
+            heal_btn.callback = self._on_heal
+            self.add_item(heal_btn)
+
         p0 = self.parent_rows[0] if len(self.parent_rows) > 0 else None
         p1 = self.parent_rows[1] if len(self.parent_rows) > 1 else None
 
@@ -11634,6 +11640,20 @@ class AdventureDaycareView(discord.ui.View):
         back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, custom_id="adv:dc:back")
         back_btn.callback = self._on_back
         self.add_item(back_btn)
+
+    async def _on_heal(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.5:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        await itx.response.defer(ephemeral=True, thinking=False)
+        healed = await _heal_party(str(itx.user.id))
+        await itx.followup.send(f"✅ Healed your team ({healed} Pokémon).", ephemeral=True)
 
     async def _on_swap_in(self, itx: discord.Interaction):
         if not self._guard(itx):
