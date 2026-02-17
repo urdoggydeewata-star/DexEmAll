@@ -6692,9 +6692,27 @@ DAYCARE_EGG_CAP = 3
 DAYCARE_INCUBATE_MAX = 6
 DAYCARE_BREED_THRESHOLD = 22.0
 DAYCARE_EGG_INTERVAL_SECONDS = 3600.0
+DAYCARE_OVAL_CHARM_INTERVAL_MULT = 0.75
+DAYCARE_OVAL_CHARM_BONUS_EGG_CHANCE = 0.15
 DAYCARE_HATCH_MIN = 45.0
 DAYCARE_HATCH_MAX = 80.0
 DAYCARE_HATCH_BOOST_ABILITIES = {"flame-body", "magma-armor"}
+DAYCARE_HATCH_COMMAND_BONUS_CAP = 0.18
+DAYCARE_MIRROR_HERB_ITEMS = {"mirror-herb", "mirror_herb"}
+DAYCARE_INCENSE_BABIES: dict[str, tuple[str, str]] = {
+    "snorlax": ("munchlax", "full-incense"),
+    "mr-mime": ("mime-jr", "odd-incense"),
+    "chansey": ("happiny", "luck-incense"),
+    "blissey": ("happiny", "luck-incense"),
+    "roselia": ("budew", "rose-incense"),
+    "roserade": ("budew", "rose-incense"),
+    "sudowoodo": ("bonsly", "rock-incense"),
+    "wobbuffet": ("wynaut", "lax-incense"),
+    "marill": ("azurill", "sea-incense"),
+    "azumarill": ("azurill", "sea-incense"),
+    "chimecho": ("chingling", "pure-incense"),
+    "mantine": ("mantyke", "wave-incense"),
+}
 DAYCARE_MAX_ANIM_FRAMES = 16
 DAYCARE_GIF_MAX_SIZE: tuple[int, int] = (56, 56)
 DAYCARE_BOX_MAX_SIZE: tuple[int, int] = (52, 52)
@@ -7852,6 +7870,115 @@ async def _daycare_resolve_egg_species(species: str) -> str:
     return cur
 
 
+def _daycare_breeding_source_parent(parent_a: dict, parent_b: dict) -> dict:
+    s1 = _daycare_norm_species(parent_a.get("species"))
+    s2 = _daycare_norm_species(parent_b.get("species"))
+    ditto1 = s1 == "ditto"
+    ditto2 = s2 == "ditto"
+    if ditto1 and not ditto2:
+        return parent_b
+    if ditto2 and not ditto1:
+        return parent_a
+    g1 = str(parent_a.get("gender") or "").strip().lower()
+    g2 = str(parent_b.get("gender") or "").strip().lower()
+    if g1 == "female":
+        return parent_a
+    if g2 == "female":
+        return parent_b
+    return parent_a
+
+
+def _daycare_apply_incense_baby_rules(base_child: str, parent_a: dict, parent_b: dict) -> str:
+    source = _daycare_breeding_source_parent(parent_a, parent_b)
+    source_species = _daycare_norm_species(source.get("species"))
+    baby_rule = DAYCARE_INCENSE_BABIES.get(source_species)
+    if not baby_rule:
+        return base_child
+    baby_species, required_incense = baby_rule
+    need_item = _daycare_norm_item(required_incense)
+    held_a = _daycare_norm_item(parent_a.get("held_item"))
+    held_b = _daycare_norm_item(parent_b.get("held_item"))
+    held_source = _daycare_norm_item(source.get("held_item"))
+    # Core behavior: incense is required to produce baby forms.
+    if need_item and (held_source == need_item or held_a == need_item or held_b == need_item):
+        return _daycare_norm_species(baby_species)
+    return base_child
+
+
+def _daycare_parse_moves(raw_moves: Any) -> list[str]:
+    moves = raw_moves
+    if isinstance(moves, str):
+        try:
+            moves = json.loads(moves)
+        except Exception:
+            moves = [moves]
+    if not isinstance(moves, (list, tuple)):
+        return []
+    out: list[str] = []
+    for mv in moves[:4]:
+        if isinstance(mv, dict):
+            name = mv.get("name")
+        else:
+            name = mv
+        norm = _daycare_norm_species(name)
+        if norm:
+            out.append(norm)
+    return out
+
+
+async def _daycare_egg_move_pool(species: str, generation: int = 1) -> set[str]:
+    sp = _daycare_norm_species(species)
+    if not sp:
+        return set()
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT id FROM pokedex WHERE LOWER(name)=LOWER(?) LIMIT 1",
+                (sp,),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            if not row:
+                return set()
+            species_id = int(row["id"] if hasattr(row, "keys") else row[0])
+            cur = await conn.execute(
+                """
+                SELECT m.name
+                FROM learnsets l
+                JOIN moves m ON m.id = l.move_id
+                WHERE l.species_id=? AND l.generation=? AND LOWER(TRIM(l.method))='egg'
+                """,
+                (species_id, int(generation)),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+    except Exception:
+        return set()
+    out: set[str] = set()
+    for row in rows:
+        name = row["name"] if hasattr(row, "keys") else row[0]
+        norm = _daycare_norm_species(name)
+        if norm:
+            out.add(norm)
+    return out
+
+
+async def _daycare_inherited_egg_moves(parent_a: dict, parent_b: dict, child_species: str) -> list[str]:
+    item_a = _daycare_norm_item(parent_a.get("held_item"))
+    item_b = _daycare_norm_item(parent_b.get("held_item"))
+    if item_a not in DAYCARE_MIRROR_HERB_ITEMS and item_b not in DAYCARE_MIRROR_HERB_ITEMS:
+        return []
+    egg_pool = await _daycare_egg_move_pool(child_species, generation=1)
+    if not egg_pool:
+        return []
+    parent_moves = set(_daycare_parse_moves(parent_a.get("moves"))) | set(_daycare_parse_moves(parent_b.get("moves")))
+    inheritable = [m for m in parent_moves if m in egg_pool]
+    if not inheritable:
+        return []
+    random.shuffle(inheritable)
+    return inheritable[:2]
+
+
 def _daycare_showdown_keys(species: str) -> list[str]:
     """
     Build robust Pokemon Showdown sprite keys for daycare rendering.
@@ -8259,9 +8386,10 @@ def _daycare_pick_ability(parent_a: dict, parent_b: dict, child_entry: dict, pai
 
 
 async def _daycare_create_egg(parent_a: dict, parent_b: dict, pair_info: dict) -> Optional[dict]:
-    child_species = await _daycare_resolve_egg_species(str(pair_info.get("child_species") or ""))
-    if not child_species:
+    base_child = await _daycare_resolve_egg_species(str(pair_info.get("child_species") or ""))
+    if not base_child:
         return None
+    child_species = _daycare_apply_incense_baby_rules(base_child, parent_a, parent_b)
     child_entry = await _daycare_species_entry(child_species)
     if not child_entry:
         return None
@@ -8272,6 +8400,7 @@ async def _daycare_create_egg(parent_a: dict, parent_b: dict, pair_info: dict) -
     child_nature = _daycare_pick_nature(parent_a, parent_b)
     child_ability, child_hidden = _daycare_pick_ability(parent_a, parent_b, child_entry, pair_info)
     child_ball = _daycare_pick_ball(parent_a, parent_b, pair_info)
+    inherited_egg_moves = await _daycare_inherited_egg_moves(parent_a, parent_b, child_species)
 
     return {
         "id": f"egg-{int(now * 1000)}-{random.randint(1000, 9999)}",
@@ -8284,6 +8413,7 @@ async def _daycare_create_egg(parent_a: dict, parent_b: dict, pair_info: dict) -
         "ability": child_ability,
         "is_hidden_ability": bool(child_hidden),
         "pokeball": child_ball,
+        "egg_moves": inherited_egg_moves,
     }
 
 
@@ -8361,6 +8491,29 @@ async def _daycare_has_hatch_boost(owner_id: str) -> bool:
     except Exception:
         pass
     return False
+
+
+async def _daycare_has_oval_charm(owner_id: str) -> bool:
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                """
+                SELECT qty
+                FROM user_items
+                WHERE owner_id=? AND item_id IN ('oval-charm', 'oval_charm')
+                ORDER BY qty DESC
+                LIMIT 1
+                """,
+                (owner_id,),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+        if not row:
+            return False
+        qty = row["qty"] if hasattr(row, "keys") else row[0]
+        return int(qty or 0) > 0
+    except Exception:
+        return False
 
 
 async def _daycare_hatch_to_team(owner_id: str, egg: dict) -> Optional[dict]:
@@ -8457,6 +8610,15 @@ async def _daycare_hatch_to_team(owner_id: str, egg: dict) -> Optional[dict]:
         moves = await _default_levelup_moves(species_id, level, 1) if species_id else ["Tackle"]
     except Exception:
         moves = ["Tackle"]
+    egg_moves = _daycare_parse_moves(egg.get("egg_moves"))
+    if egg_moves:
+        # Mirror Herb support: inherited egg moves are injected first, then defaults.
+        merged: list[str] = []
+        for mv in egg_moves + _daycare_parse_moves(moves):
+            pretty = mv.replace("-", " ").title()
+            if pretty and pretty not in merged:
+                merged.append(pretty)
+        moves = merged[:4] if merged else (moves[:4] if isinstance(moves, list) else ["Tackle"])
     try:
         await db.set_pokemon_moves(owner_id, mon_id, moves[:4] if moves else ["Tackle"])
     except Exception:
@@ -8487,7 +8649,7 @@ async def _daycare_parent_rows(owner_id: str, parent_ids: list[Optional[int]]) -
         try:
             async with db.session() as conn:
                 cur = await conn.execute(
-                    f"SELECT id, species, level, gender, nature, ability, held_item, ivs, is_hidden_ability, pokeball "
+                    f"SELECT id, species, level, gender, nature, ability, held_item, ivs, is_hidden_ability, pokeball, moves "
                     f"FROM pokemons WHERE owner_id=? AND id IN ({placeholders})",
                     (owner_id, *ids),
                 )
@@ -8497,7 +8659,7 @@ async def _daycare_parent_rows(owner_id: str, parent_ids: list[Optional[int]]) -
                 d = dict(row) if hasattr(row, "keys") else {
                     "id": row[0], "species": row[1], "level": row[2], "gender": row[3],
                     "nature": row[4], "ability": row[5], "held_item": row[6], "ivs": row[7],
-                    "is_hidden_ability": row[8], "pokeball": row[9],
+                    "is_hidden_ability": row[8], "pokeball": row[9], "moves": row[10],
                 }
                 id_map[int(d["id"])] = d
         except Exception:
@@ -8573,6 +8735,17 @@ async def _daycare_tick(owner_id: str, state: dict, *, command_credit: float = 0
     if pair_info.get("can_breed"):
         interval = max(60.0, float(DAYCARE_EGG_INTERVAL_SECONDS))
         try:
+            pair_rate = float(pair_info.get("rate", 1.0) or 1.0)
+        except Exception:
+            pair_rate = 1.0
+        pair_rate = max(0.35, pair_rate)
+        interval = max(60.0, interval / pair_rate)
+        if await _daycare_has_oval_charm(owner_id):
+            interval = max(60.0, interval * float(DAYCARE_OVAL_CHARM_INTERVAL_MULT))
+            oval_charm_active = True
+        else:
+            oval_charm_active = False
+        try:
             last_egg_at = float(rec.get("last_egg_at", now) or now)
         except Exception:
             last_egg_at = now
@@ -8600,6 +8773,15 @@ async def _daycare_tick(owner_id: str, state: dict, *, command_credit: float = 0
                 last_egg_at += interval
                 produced = True
                 changed = True
+                if (
+                    oval_charm_active
+                    and len(eggs) < DAYCARE_EGG_CAP
+                    and random.random() < float(DAYCARE_OVAL_CHARM_BONUS_EGG_CHANCE)
+                ):
+                    bonus = await _daycare_create_egg(parents[0], parents[1], pair_info)
+                    if bonus:
+                        eggs.append(bonus)
+                        changed = True
             if produced:
                 rec["last_egg_at"] = last_egg_at
 
@@ -8627,7 +8809,9 @@ async def _daycare_tick(owner_id: str, state: dict, *, command_credit: float = 0
     hatch_messages: list[str] = []
     if incubating:
         has_boost = await _daycare_has_hatch_boost(owner_id)
-        hatch_gain = max(0.0, float(command_credit)) + (elapsed / 55.0)
+        # Commands slightly accelerate hatch progress for the owner only.
+        cmd_bonus = min(max(0.0, float(command_credit)), float(DAYCARE_HATCH_COMMAND_BONUS_CAP))
+        hatch_gain = cmd_bonus + (elapsed / 55.0)
         if has_boost:
             hatch_gain *= 2.0
         survivors: list[dict] = []
