@@ -10,7 +10,7 @@ try:
     from PIL import Image  # type: ignore
 except Exception:  # Pillow not installed
     Image = None  # type: ignore
-import randomB
+import random
 import math
 import asyncio
 import inspect
