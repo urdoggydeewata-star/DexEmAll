@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Callable, Any, Tuple
 from datetime import datetime, timedelta
 import discord
+try:
+    from PIL import Image as _PILImage, ImageDraw as _PILImageDraw  # type: ignore
+except Exception:
+    _PILImage = None  # type: ignore
+    _PILImageDraw = None  # type: ignore
 
 from .manager import get_manager
 from .engine import (
@@ -7165,6 +7170,195 @@ def _normalize_gender_for_display(gender: Optional[str]) -> Optional[str]:
     return None
 
 
+def _resolve_fallback_sprite_path(
+    species: str,
+    *,
+    gen: int,
+    perspective: str,
+    shiny: bool,
+    female: bool,
+    form: Optional[str] = None,
+) -> Optional[Path]:
+    """
+    Resolve a best-effort sprite path for static fallback panel rendering.
+    Prefers normal sprite lookup, then explicit icon.png fallback.
+    """
+    try:
+        from .sprites import find_sprite, BASE_SPRITES_DIR, _norm_species
+    except Exception:
+        return None
+
+    # Try standard lookup first (static preferred to avoid GIF decode cost).
+    try:
+        p = find_sprite(
+            species,
+            gen=gen,
+            perspective=perspective,
+            shiny=shiny,
+            female=female,
+            prefer_animated=False,
+            form=form,
+        )
+        if p is not None:
+            pp = Path(p)
+            if pp.exists() and pp.stat().st_size > 0:
+                return pp
+    except Exception:
+        pass
+    try:
+        p = find_sprite(
+            species,
+            gen=gen,
+            perspective=perspective,
+            shiny=shiny,
+            female=female,
+            prefer_animated=True,
+            form=form,
+        )
+        if p is not None:
+            pp = Path(p)
+            if pp.exists() and pp.stat().st_size > 0:
+                return pp
+    except Exception:
+        pass
+
+    # Hard fallback to icon.png in form/base folder.
+    try:
+        base_species = _norm_species(species)
+        cands: List[Path] = []
+        if form:
+            norm_form = _norm_species(form)
+            if norm_form.startswith(f"{base_species}-"):
+                folder = norm_form
+            else:
+                folder = f"{base_species}-{norm_form}"
+            cands.append(BASE_SPRITES_DIR / folder / "icon.png")
+        cands.append(BASE_SPRITES_DIR / base_species / "icon.png")
+        for c in cands:
+            if c.exists() and c.stat().st_size > 0:
+                return c
+    except Exception:
+        pass
+    return None
+
+
+def _fallback_static_panel_file(
+    st: "BattleState",
+    for_user_id: int,
+    *,
+    hide_hp_text: bool = False,
+    filename_prefix: str = "battle-panel",
+) -> Optional[discord.File]:
+    """
+    Last-resort static image for player/stream panels when GIF rendering fails.
+    Prevents text-only battles when animated/front-back assets are unavailable.
+    """
+    if _PILImage is None or _PILImageDraw is None:
+        return None
+    me = st._active(for_user_id)
+    opp = st._opp_active(for_user_id)
+    if me is None or opp is None:
+        return None
+
+    try:
+        W, H = 512, 384
+        img = _PILImage.new("RGBA", (W, H), (55, 68, 88, 255))
+        draw = _PILImageDraw.Draw(img)
+        # Simple arena fallback background.
+        draw.rectangle((0, 0, W, int(H * 0.56)), fill=(86, 90, 103, 255))
+        draw.rectangle((0, int(H * 0.56), W, H), fill=(196, 171, 134, 255))
+        draw.ellipse((W // 2 - 90, int(H * 0.56) - 30, W // 2 + 90, int(H * 0.56) + 26), fill=(228, 206, 164, 255))
+
+        # Resolve display species/forms similarly to panel render path.
+        my_species = getattr(me, "_illusion_species", me.species) if getattr(me, "_illusion_active", False) else me.species
+        opp_species = getattr(opp, "_illusion_species", opp.species) if getattr(opp, "_illusion_active", False) else opp.species
+        my_form = getattr(me, "_illusion_form", None) if getattr(me, "_illusion_active", False) else getattr(me, "form", None)
+        opp_form = getattr(opp, "_illusion_form", None) if getattr(opp, "_illusion_active", False) else getattr(opp, "form", None)
+
+        my_path = _resolve_fallback_sprite_path(
+            my_species,
+            gen=st.gen,
+            perspective="back",
+            shiny=bool(getattr(me, "shiny", False)),
+            female=(getattr(me, "gender", None) == "F"),
+            form=my_form,
+        )
+        opp_path = _resolve_fallback_sprite_path(
+            opp_species,
+            gen=st.gen,
+            perspective="front",
+            shiny=bool(getattr(opp, "shiny", False)),
+            female=(getattr(opp, "gender", None) == "F"),
+            form=opp_form,
+        )
+
+        def _load_sprite(path: Optional[Path], max_size: tuple[int, int]) -> Optional[Any]:
+            if path is None:
+                return None
+            try:
+                src = _PILImage.open(str(path))
+                if bool(getattr(src, "is_animated", False)):
+                    try:
+                        src.seek(0)
+                    except Exception:
+                        pass
+                spr = src.convert("RGBA")
+                try:
+                    res = _PILImage.Resampling.NEAREST
+                except Exception:
+                    res = _PILImage.NEAREST
+                spr.thumbnail(max_size, resample=res)
+                return spr
+            except Exception:
+                return None
+
+        my_sprite = _load_sprite(my_path, (176, 176))
+        opp_sprite = _load_sprite(opp_path, (156, 156))
+
+        if my_sprite is not None:
+            mx = max(12, int(W * 0.12))
+            my = max(120, int(H * 0.52) - my_sprite.height // 2)
+            img.alpha_composite(my_sprite, dest=(mx, my))
+        if opp_sprite is not None:
+            ox = min(W - opp_sprite.width - 14, int(W * 0.66))
+            oy = max(52, int(H * 0.22) - opp_sprite.height // 2)
+            img.alpha_composite(opp_sprite, dest=(ox, oy))
+
+        def _hp_pct(mon: Any) -> float:
+            try:
+                return max(0.0, min(1.0, float(mon.hp) / max(1.0, float(mon.max_hp))))
+            except Exception:
+                return 0.0
+
+        def _hp_bar(x: int, y: int, pct: float, color: tuple[int, int, int, int]) -> None:
+            draw.rectangle((x, y, x + 150, y + 12), fill=(45, 45, 45, 230))
+            draw.rectangle((x + 1, y + 1, x + 149, y + 11), fill=(190, 190, 190, 210))
+            fill_w = max(0, min(148, int(round(148 * pct))))
+            if fill_w > 0:
+                draw.rectangle((x + 1, y + 1, x + 1 + fill_w, y + 11), fill=color)
+
+        me_name = _format_pokemon_name(me)
+        opp_name = _format_pokemon_name(opp)
+        draw.text((18, H - 58), me_name, fill=(241, 241, 241, 255))
+        draw.text((W - 180, 18), opp_name, fill=(241, 241, 241, 255))
+        _hp_bar(18, H - 40, _hp_pct(me), (95, 198, 94, 255))
+        _hp_bar(W - 180, 36, _hp_pct(opp), (95, 198, 94, 255))
+        if not hide_hp_text:
+            try:
+                draw.text((18, H - 24), f"{int(me.hp)}/{int(me.max_hp)}", fill=(230, 230, 230, 255))
+                draw.text((W - 180, 50), f"{int(opp.hp)}/{int(opp.max_hp)}", fill=(230, 230, 230, 255))
+            except Exception:
+                pass
+
+        buf = BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        buf.seek(0)
+        pov = "p1" if for_user_id == st.p1_id else "p2"
+        return discord.File(buf, filename=f"{filename_prefix}_{int(st.turn)}_{pov}.png")
+    except Exception:
+        return None
+
+
 async def _render_gif_for_panel(st: BattleState, for_user_id: int, hide_hp_text: bool = False) -> Optional[Tuple[discord.File, 'Path']]:
     """Render GIF for a player panel and return (discord.File, Path). Returns None if rendering fails.
     The Path is returned so the caller can delete it after sending to Discord."""
@@ -7424,6 +7618,9 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
         if render_result:
             # render_result is now a tuple: (discord.File, Path)
             file, gif_path_to_cleanup = render_result
+    if not file:
+        # Final fallback: static panel image so stream never becomes text-only.
+        file = _fallback_static_panel_file(st, st.p1_id, hide_hp_text=True, filename_prefix="stream-panel")
     
     if file:
         embed.set_image(url=f"attachment://{file.filename}")
@@ -7643,6 +7840,9 @@ async def _send_player_panel(itx: discord.Interaction, st: BattleState, for_user
                 print(f"[Panel] Info: render_turn_gif is None (import failed or disabled)")
             else:
                 print(f"[Panel] Info: _render_gif_for_panel returned None (rendering failed)")
+    if not file:
+        # Final fallback: static image so PvP panel still shows visual state.
+        file = _fallback_static_panel_file(st, for_user_id, hide_hp_text=False, filename_prefix="battle-panel")
     
     # Set image in embed if we have a file
     if file:

@@ -14343,9 +14343,8 @@ def _box_panel_file(
         y0 = grid_y + r * (cell_h + gap_y)
         x1 = x0 + cell_w
         y1 = y0 + cell_h
-        # Keep the background art visible: only subtle slot outlines/markers.
-        slot_fill = (255, 255, 255, 30) if pos % 2 else (255, 255, 255, 22)
-        draw.rounded_rectangle((x0, y0, x1, y1), radius=9, fill=slot_fill, outline=(86, 120, 146, 188), width=1)
+        # Keep slots unfilled so background art is fully visible.
+        draw.rounded_rectangle((x0, y0, x1, y1), radius=9, fill=None, outline=(86, 120, 146, 188), width=1)
         draw.text((x0 + 6, y0 + 5), f"{pos:02d}", fill=(32, 66, 95, 220), font=font)
 
         mon = by_pos.get(pos)
