@@ -247,6 +247,132 @@ def _patch_adventure_switch_embed_privacy() -> None:
 
 _patch_adventure_switch_embed_privacy()
 
+
+def _patch_pvp_streaming_reliability() -> None:
+    """
+    Runtime patch for PvP streaming when only pokebot.py is deployable.
+
+    - Keeps a stable public stream channel on battle state.
+    - Sends an initial "battle started" stream panel.
+    - Adds robust fallback if stream attachment send fails.
+    - Posts a public clarification that private panels != public stream.
+    """
+    try:
+        original_send_stream = getattr(_pvp_panel, "_send_stream_panel", None)
+        if callable(original_send_stream) and not getattr(original_send_stream, "_dex_stream_patch", False):
+
+            async def _wrapped_send_stream_panel(channel, st, turn_summary: Optional[str] = None, gif_file: Optional[Any] = None):
+                stream_channel = channel
+                if stream_channel is None or not hasattr(stream_channel, "send"):
+                    stream_channel = getattr(st, "stream_channel", None)
+                if stream_channel is None or not hasattr(stream_channel, "send"):
+                    return None
+
+                try:
+                    st.stream_channel = stream_channel
+                    st.stream_channel_id = getattr(stream_channel, "id", None)
+                except Exception:
+                    pass
+
+                try:
+                    msg = await original_send_stream(stream_channel, st, turn_summary, gif_file)
+                    if msg is not None:
+                        return msg
+                except Exception as e:
+                    print(f"[StreamPatch] _send_stream_panel primary send failed: {e}")
+
+                # Fallback: ensure at least one public embed goes out.
+                try:
+                    p1 = _pvp_panel._format_pokemon_name(st._active(st.p1_id))
+                    p2 = _pvp_panel._format_pokemon_name(st._active(st.p2_id))
+                    desc = f"Turn {getattr(st, 'turn', '?')} • {getattr(st, 'fmt_label', 'Battle')} (Gen {getattr(st, 'gen', '?')})"
+                    if turn_summary:
+                        summary_text = str(turn_summary).strip()
+                        if summary_text:
+                            if len(summary_text) > 2500:
+                                summary_text = "...\n" + summary_text[-2300:]
+                            desc += f"\n\n**Turn Summary:**\n{summary_text}"
+                    emb = discord.Embed(
+                        title=f"📺 Battle Stream: **{p1}** vs **{p2}**",
+                        description=desc,
+                        color=discord.Color.purple(),
+                    )
+                    return await stream_channel.send(embed=emb)
+                except Exception as e:
+                    print(f"[StreamPatch] stream fallback send failed: {e}")
+                    return None
+
+            _wrapped_send_stream_panel._dex_stream_patch = True  # type: ignore[attr-defined]
+            _pvp_panel._send_stream_panel = _wrapped_send_stream_panel
+
+        original_turn_loop = getattr(_pvp_panel, "_turn_loop", None)
+        if callable(original_turn_loop) and not getattr(original_turn_loop, "_dex_stream_patch", False):
+
+            async def _wrapped_turn_loop(st, p1_itx, p2_itx, *args, **kwargs):
+                try:
+                    st._p1_itx = p1_itx
+                    st._p2_itx = p2_itx
+                    if getattr(st, "stream_channel", None) is None:
+                        ch = getattr(p1_itx, "channel", None) or getattr(p2_itx, "channel", None)
+                        if ch is not None and hasattr(ch, "send"):
+                            st.stream_channel = ch
+                            st.stream_channel_id = getattr(ch, "id", None)
+
+                    # Kick off a first public stream post as soon as battle starts.
+                    if bool(getattr(st, "streaming_enabled", False)) and not bool(getattr(st, "_stream_started", False)):
+                        ch = getattr(st, "stream_channel", None)
+                        if ch is not None and hasattr(ch, "send"):
+                            render_result = None
+                            render_fn = getattr(_pvp_panel, "_render_gif_for_panel", None)
+                            if callable(render_fn):
+                                try:
+                                    render_result = await render_fn(st, st.p1_id, hide_hp_text=True)
+                                except Exception as e:
+                                    print(f"[StreamPatch] initial render failed: {e}")
+                            send_fn = getattr(_pvp_panel, "_send_stream_panel", None)
+                            if callable(send_fn):
+                                try:
+                                    msg = await send_fn(ch, st, "Battle has begun!", render_result)
+                                    if msg is not None:
+                                        st._last_stream_message = msg
+                                except Exception as e:
+                                    print(f"[StreamPatch] initial stream send failed: {e}")
+                        st._stream_started = True
+                except Exception:
+                    pass
+                return await original_turn_loop(st, p1_itx, p2_itx, *args, **kwargs)
+
+            _wrapped_turn_loop._dex_stream_patch = True  # type: ignore[attr-defined]
+            _pvp_panel._turn_loop = _wrapped_turn_loop
+
+        accept_view_cls = getattr(_pvp_panel, "AcceptView", None)
+        if accept_view_cls is not None:
+            original_start_if_ready = getattr(accept_view_cls, "_start_if_ready", None)
+            if callable(original_start_if_ready) and not getattr(original_start_if_ready, "_dex_stream_patch", False):
+
+                async def _wrapped_start_if_ready(self, itx):
+                    result = await original_start_if_ready(self, itx)
+                    try:
+                        if bool(getattr(self, "streaming_enabled", False)) and not bool(getattr(self, "_stream_notice_sent", False)):
+                            ch = getattr(itx, "channel", None)
+                            if ch is not None and hasattr(ch, "send"):
+                                await ch.send(
+                                    "📺 Stream is enabled: the 'only players can see panels' line refers to private control panels. "
+                                    "Public stream updates are posted in this channel."
+                                )
+                            self._stream_notice_sent = True
+                    except Exception:
+                        pass
+                    return result
+
+                _wrapped_start_if_ready._dex_stream_patch = True  # type: ignore[attr-defined]
+                accept_view_cls._start_if_ready = _wrapped_start_if_ready
+    except Exception:
+        pass
+
+
+_patch_pvp_streaming_reliability()
+
 # =========================
 #  Terastallization helpers
 # =========================
