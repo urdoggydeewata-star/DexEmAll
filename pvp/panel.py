@@ -7580,6 +7580,13 @@ async def _render_gif_for_panel(st: BattleState, for_user_id: int, hide_hp_text:
 
 async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn_summary: Optional[str] = None, gif_file: Optional[Any] = None):
     """Send or update the stream panel (P1 view, no buttons)"""
+    # Turn 1 should be image-only in stream output.
+    try:
+        if int(getattr(st, "turn", 0) or 0) <= 1:
+            turn_summary = None
+    except Exception:
+        pass
+
     # Build description (no HP bars/text - they're visible in the GIF)
     desc_parts = [
         f"Turn {st.turn} • {st.fmt_label} (Gen {st.gen})"
@@ -7672,6 +7679,16 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
         return msg
     except Exception as e:
         print(f"[Stream] Error sending stream: {e}")
+        try:
+            fallback = f"📺 Stream update • Turn {getattr(st, 'turn', '?')} • {getattr(st, 'fmt_label', 'Battle')}"
+            if turn_summary:
+                txt = str(turn_summary).strip()
+                if len(txt) > 1200:
+                    txt = "...\n" + txt[-1000:]
+                fallback += f"\n{txt}"
+            return await channel.send(fallback)
+        except Exception as fallback_err:
+            print(f"[Stream] Text fallback failed: {fallback_err}")
         return None
     finally:
         # Close stream attachment and best-effort cleanup of legacy render path.
@@ -8194,7 +8211,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                 stream_ch = await _resolve_stream_channel(st, p1_itx, p2_itx)
                 if stream_ch is not None:
                     render_result = await _render_gif_for_panel(st, st.p1_id, hide_hp_text=True)
-                    msg = await _send_stream_panel(stream_ch, st, "Battle has begun!", render_result)
+                    msg = await _send_stream_panel(stream_ch, st, None, render_result)
                     if msg is not None:
                         st._last_stream_message = msg
             except Exception as e:
@@ -9187,19 +9204,18 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                 msg = await _send_stream_panel(stream_channel, st, turn_summary_text, render_result)
                 if msg is not None:
                     st._last_stream_message = msg
+                else:
+                    # Last-resort keepalive so stream never appears "dead".
+                    try:
+                        await stream_channel.send(f"📺 Stream update • Turn {getattr(st, 'turn', '?')}")
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"[Stream] Error updating stream: {e}")
-    
-    # Send both player summaries in parallel; don't block on stream update (fire-and-forget)
-    def _on_stream_done(t: asyncio.Task) -> None:
-        try:
-            t.result()
-        except Exception as e:
-            print(f"[Stream] send_stream_update task error: {e}")
 
-    _stream_task = asyncio.create_task(send_stream_update())
-    _stream_task.add_done_callback(_on_stream_done)
+    # Send player summaries first, then await stream send to avoid dropped updates.
     await asyncio.gather(send_p1_summary(), send_p2_summary())
+    await send_stream_update()
 
     if st.winner:
         if award_money_callback:
