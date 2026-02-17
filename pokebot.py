@@ -2861,7 +2861,7 @@ async def take_item(interaction: discord.Interaction, name: str, slot: int | Non
         # Add the item back to the user's bag before removing it from the Pokémon
         await conn.execute(
             "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,1) "
-            "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = qty + 1;",
+            "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = user_items.qty + 1;",
             (uid, str(held))
         )
         await conn.commit()
@@ -2990,7 +2990,7 @@ class QuantityModal(discord.ui.Modal, title="Buy item"):
                     if allowed > 0:
                         await conn.execute(
                             "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,?) "
-                            "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = MIN(qty + excluded.qty, ?);",
+                            "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = MIN(user_items.qty + excluded.qty, ?);",
                             (owner, item_id, allowed, MAX_STACK)
                         )
 
@@ -3739,7 +3739,7 @@ async def _give_item(owner_id: str, item_id: str, qty: int) -> None:
                 INSERT INTO user_items (owner_id, item_id, qty)
                 VALUES (?, ?, ?)
                 ON CONFLICT(owner_id, item_id)
-                DO UPDATE SET qty = qty + excluded.qty
+                DO UPDATE SET qty = user_items.qty + excluded.qty
             """, (owner_id, item_id, qty))
             await conn.commit()
             return
@@ -4806,7 +4806,7 @@ class AdminGivePokemon(commands.Cog):
                     # Add 1 of the item to the user's bag (if not already present)
                     await conn.execute(
                         "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,1) "
-                        "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = qty + 1;",
+                        "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = user_items.qty + 1;",
                         (p["target_id"], p["item_id"])
                     )
                     await conn.commit()
@@ -7804,7 +7804,10 @@ def _daycare_next_evo_entries(raw_evolution: Any) -> list[tuple[str, dict]]:
             continue
         if not isinstance(nxt, dict):
             continue
-        sp = _daycare_norm_species(nxt.get("species") or "")
+        raw_species = nxt.get("species")
+        if isinstance(raw_species, dict):
+            raw_species = raw_species.get("name") or raw_species.get("species")
+        sp = _daycare_norm_species(raw_species or "")
         if not sp:
             continue
         details = nxt.get("details") or {}
@@ -7814,6 +7817,8 @@ def _daycare_next_evo_entries(raw_evolution: Any) -> list[tuple[str, dict]]:
                 details = parsed if isinstance(parsed, dict) else {}
             except Exception:
                 details = {}
+        elif isinstance(details, (list, tuple)) and details:
+            details = details[0] if isinstance(details[0], dict) else {}
         if not isinstance(details, dict):
             details = {}
         out.append((sp, details))
@@ -9777,6 +9782,46 @@ def _evo_norm_text(v: Any) -> str:
     return str(v or "").strip().lower().replace("_", "-").replace(" ", "-")
 
 
+def _evo_unwrap_nameish(v: Any) -> Any:
+    """
+    Unwrap PokeAPI-like nested objects to a comparable scalar.
+    Examples:
+      {"name": "use-item"} -> "use-item"
+      {"item": {"name": "water-stone"}} -> "water-stone"
+    """
+    if isinstance(v, dict):
+        if "name" in v and not isinstance(v.get("name"), (dict, list, tuple)):
+            return v.get("name")
+        for key in ("item", "trigger", "species", "value", "id"):
+            if key in v:
+                return _evo_unwrap_nameish(v.get(key))
+        return None
+    return v
+
+
+def _evo_details_candidates(raw_details: Any) -> list[dict]:
+    details = raw_details
+    if isinstance(details, str):
+        try:
+            details = json.loads(details)
+        except Exception:
+            details = {}
+    if isinstance(details, dict):
+        return [details]
+    if isinstance(details, (list, tuple)):
+        out: list[dict] = []
+        for d in details:
+            if isinstance(d, str):
+                try:
+                    d = json.loads(d)
+                except Exception:
+                    d = {}
+            if isinstance(d, dict):
+                out.append(d)
+        return out
+    return []
+
+
 def _evo_move_name_set(raw_moves: Any) -> set[str]:
     moves = raw_moves
     if isinstance(moves, str):
@@ -9856,7 +9901,7 @@ async def _evo_details_match(
         info = {}
 
     expected = _evo_norm_text(expected_trigger)
-    trigger = _evo_norm_text(info.get("trigger"))
+    trigger = _evo_norm_text(_evo_unwrap_nameish(info.get("trigger")))
 
     if expected == "level-up":
         if trigger and trigger not in {"level-up"}:
@@ -9877,22 +9922,26 @@ async def _evo_details_match(
                 return False
             if level is None or int(level) < need:
                 return False
-        required_held = _daycare_norm_item(info.get("held_item") or "")
+        required_held = _daycare_norm_item(_evo_unwrap_nameish(info.get("held_item")) or "")
         if required_held and _daycare_norm_item(held_item or "") != required_held:
             return False
     elif expected == "use-item":
-        required_item = _daycare_norm_item(info.get("item") or "")
+        required_item = _daycare_norm_item(_evo_unwrap_nameish(info.get("item")) or "")
         used_item = _daycare_norm_item(item_used or "")
         if required_item and used_item != required_item:
             return False
         if not required_item and trigger not in {"use-item", "item"}:
             return False
 
-    req_gender = _evo_norm_text(info.get("gender"))
+    req_gender = _evo_norm_text(_evo_unwrap_nameish(info.get("gender")))
+    if req_gender == "1":
+        req_gender = "female"
+    elif req_gender == "2":
+        req_gender = "male"
     if req_gender in {"male", "female"} and _evo_norm_text(gender) != req_gender:
         return False
 
-    req_time = _evo_norm_text(info.get("time_of_day"))
+    req_time = _evo_norm_text(_evo_unwrap_nameish(info.get("time_of_day")))
     if req_time:
         phase = _evo_day_phase_utc()
         if req_time in {"day", "night"} and phase != req_time:
@@ -9909,16 +9958,16 @@ async def _evo_details_match(
             return False
 
     moves_norm = _evo_move_name_set(moves)
-    req_move = _evo_norm_text(info.get("known_move"))
+    req_move = _evo_norm_text(_evo_unwrap_nameish(info.get("known_move")))
     if req_move and req_move not in moves_norm:
         return False
-    req_move_type = _evo_norm_text(info.get("known_move_type"))
+    req_move_type = _evo_norm_text(_evo_unwrap_nameish(info.get("known_move_type")))
     if req_move_type:
         ok_type = await _evo_move_type_match(conn, moves_norm, req_move_type)
         if not ok_type:
             return False
 
-    req_location = _evo_norm_text(info.get("location"))
+    req_location = _evo_norm_text(_evo_unwrap_nameish(info.get("location")))
     if req_location and _evo_norm_text(area_id) != req_location:
         return False
 
@@ -9947,8 +9996,8 @@ async def _find_evolution_for_trigger(
     area_id: Optional[str] = None,
 ) -> Optional[str]:
     cur = await conn.execute(
-        "SELECT evolution FROM pokedex WHERE LOWER(name) = LOWER(?) LIMIT 1",
-        (species_name.strip(),),
+        "SELECT evolution FROM pokedex WHERE LOWER(name)=LOWER(?) OR LOWER(REPLACE(name,' ','-'))=LOWER(?) LIMIT 1",
+        (species_name.strip(), _evo_norm_text(species_name)),
     )
     row = await cur.fetchone()
     await cur.close()
@@ -9972,24 +10021,31 @@ async def _find_evolution_for_trigger(
             continue
         if not isinstance(n, dict):
             continue
-        species = (n.get("species") or "").strip().lower().replace(" ", "-")
+        species = _daycare_norm_species(_evo_unwrap_nameish(n.get("species")))
         if not species:
             continue
-        details = n.get("details") or {}
-        ok = await _evo_details_match(
-            conn,
-            details,
-            expected_trigger=_evo_norm_text(expected_trigger),
-            level=level,
-            friendship=friendship,
-            gender=gender,
-            moves=moves,
-            held_item=held_item,
-            item_used=item_used,
-            area_id=area_id,
-        )
-        if ok:
-            return species
+        detail_blob = n.get("details")
+        if detail_blob in (None, "", []):
+            detail_blob = n.get("evolution_details")
+        candidates = _evo_details_candidates(detail_blob)
+        if not candidates:
+            # Some datasets flatten details directly on the node.
+            candidates = [n]
+        for details in candidates:
+            ok = await _evo_details_match(
+                conn,
+                details,
+                expected_trigger=_evo_norm_text(expected_trigger),
+                level=level,
+                friendship=friendship,
+                gender=gender,
+                moves=moves,
+                held_item=held_item,
+                item_used=item_used,
+                area_id=area_id,
+            )
+            if ok:
+                return species
     return None
 
 
@@ -10057,8 +10113,8 @@ async def _get_any_item_evolution_target(conn, species_name: str) -> Optional[st
     Used for user-facing hints when no level-up evolution is available.
     """
     cur = await conn.execute(
-        "SELECT evolution FROM pokedex WHERE LOWER(name) = LOWER(?) LIMIT 1",
-        (species_name.strip(),),
+        "SELECT evolution FROM pokedex WHERE LOWER(name)=LOWER(?) OR LOWER(REPLACE(name,' ','-'))=LOWER(?) LIMIT 1",
+        (species_name.strip(), _evo_norm_text(species_name)),
     )
     row = await cur.fetchone()
     await cur.close()
@@ -10077,18 +10133,17 @@ async def _get_any_item_evolution_target(conn, species_name: str) -> Optional[st
     for n in next_list:
         if not isinstance(n, dict):
             continue
-        details = n.get("details") or {}
-        if isinstance(details, str):
-            try:
-                details = json.loads(details)
-            except Exception:
-                details = {}
-        if not isinstance(details, dict):
-            continue
-        trigger = _evo_norm_text(details.get("trigger"))
-        item_id = _daycare_norm_item(details.get("item"))
-        if trigger in {"use-item", "item"} and item_id:
-            return item_id
+        detail_blob = n.get("details")
+        if detail_blob in (None, "", []):
+            detail_blob = n.get("evolution_details")
+        detail_candidates = _evo_details_candidates(detail_blob)
+        if not detail_candidates:
+            detail_candidates = [n]
+        for details in detail_candidates:
+            trigger = _evo_norm_text(_evo_unwrap_nameish(details.get("trigger")))
+            item_id = _daycare_norm_item(_evo_unwrap_nameish(details.get("item")))
+            if trigger in {"use-item", "item"} and item_id:
+                return item_id
     return None
 
 
@@ -10834,6 +10889,7 @@ async def _start_pve_battle(
                             await asyncio.sleep(1.5)
             # Outcome
             caught_this_turn = any("and **caught" in line for line in last_log) if is_adventure_wild else False
+            pending_evos: List[Tuple[int, "Mon", str, int]] = []
             if st.winner == itx.user.id:
                 outcome_desc = "" if (is_adventure_wild and caught_this_turn) else (
                     f"**{st.p1_name}** won the battle! You've won the wild battle against a Lv. {opp_level} {opp_name} :)" if is_adventure_wild
@@ -10891,6 +10947,32 @@ async def _start_pve_battle(
                     ev_lines.append(f"**{name}** gained EVs: {', '.join(parts)}.")
                 if ev_lines:
                     emb.add_field(name="", value="\n".join(ev_lines), inline=False)
+            # Evolution readiness (level-up trigger): include a summary line in battle result,
+            # then send one Yes/No prompt per eligible mon immediately after.
+            if st.winner == itx.user.id and level_ups:
+                async with db.session() as conn:
+                    for mid, mon, new_lvl in level_ups:
+                        held = (mon.item or "").strip().lower().replace(" ", "-")
+                        if held == "everstone":
+                            continue
+                        evo_name = await _get_level_up_evolution(
+                            conn,
+                            mon.species,
+                            new_lvl,
+                            friendship=getattr(mon, "friendship", None),
+                            gender=getattr(mon, "gender", None),
+                            moves=getattr(mon, "moves", None),
+                            held_item=getattr(mon, "item", None),
+                            area_id=getattr(st, "adventure_area_id", None),
+                        )
+                        if evo_name:
+                            pending_evos.append((mid, mon, evo_name, new_lvl))
+            if pending_evos:
+                ready_lines = [
+                    f"⬆️ **{(mon.species or 'Pokémon').replace('-', ' ').title()}** is ready to evolve into **{evo.replace('-', ' ').title()}**."
+                    for _mid, mon, evo, _lvl in pending_evos
+                ]
+                emb.add_field(name="", value="\n".join(ready_lines), inline=False)
             # Add caught wild Pokémon to team/box (wild only), and show where it went if team was full.
             if is_adventure_wild and st.winner == itx.user.id:
                 caught_mon = getattr(st, "_caught_wild_mon", None)
@@ -10920,26 +11002,8 @@ async def _start_pve_battle(
                 await itx.followup.send(embed=emb, ephemeral=False)
             except Exception:
                 pass
-        # Evolution prompts: only if player won; Everstone blocks level-up evolution
-        if st.winner == itx.user.id and level_ups:
-            pending_evos: List[Tuple[int, "Mon", str, int]] = []
-            async with db.session() as conn:
-                for mid, mon, new_lvl in level_ups:
-                    held = (mon.item or "").strip().lower().replace(" ", "-")
-                    if held == "everstone":
-                        continue
-                    evo_name = await _get_level_up_evolution(
-                        conn,
-                        mon.species,
-                        new_lvl,
-                        friendship=getattr(mon, "friendship", None),
-                        gender=getattr(mon, "gender", None),
-                        moves=getattr(mon, "moves", None),
-                        held_item=getattr(mon, "item", None),
-                        area_id=getattr(st, "adventure_area_id", None),
-                    )
-                    if evo_name:
-                        pending_evos.append((mid, mon, evo_name, new_lvl))
+        # Evolution prompts: one Yes/No prompt per eligible Pokémon.
+        if pending_evos:
             for mid, mon, evo_name, new_lvl in pending_evos:
                 cur_name = (mon.species or "").replace("-", " ").title()
                 evo_display = evo_name.replace("-", " ").title()
