@@ -16,6 +16,7 @@ import asyncio
 import inspect
 import copy
 import time
+import hashlib
 import re
 import difflib
 import urllib.request
@@ -668,6 +669,45 @@ CODE_BYPASS_IDS: frozenset[int] = frozenset(
     int(x.strip()) for x in _CODE_BYPASS_RAW.split(",") if x.strip()
 )
 
+_ACCESS_VERIFY_CACHE_TTL_SECONDS = 300.0
+_ACCESS_VERIFY_CACHE: dict[int, tuple[bool, float]] = {}
+_USER_GEN_CACHE_TTL_SECONDS = 300.0
+_USER_GEN_CACHE: dict[str, tuple[int, float]] = {}
+
+
+def _get_cached_access_verified(user_id: int) -> Optional[bool]:
+    rec = _ACCESS_VERIFY_CACHE.get(int(user_id))
+    if rec is None:
+        return None
+    val, ts = rec
+    if (time.time() - float(ts)) > _ACCESS_VERIFY_CACHE_TTL_SECONDS:
+        _ACCESS_VERIFY_CACHE.pop(int(user_id), None)
+        return None
+    return bool(val)
+
+
+def _set_cached_access_verified(user_id: int, verified: bool) -> None:
+    _ACCESS_VERIFY_CACHE[int(user_id)] = (bool(verified), float(time.time()))
+
+
+def _get_cached_user_gen(user_id: str) -> Optional[int]:
+    uid = str(user_id)
+    rec = _USER_GEN_CACHE.get(uid)
+    if rec is None:
+        return None
+    val, ts = rec
+    if (time.time() - float(ts)) > _USER_GEN_CACHE_TTL_SECONDS:
+        _USER_GEN_CACHE.pop(uid, None)
+        return None
+    try:
+        return int(val)
+    except Exception:
+        return None
+
+
+def _set_cached_user_gen(user_id: str, generation: int) -> None:
+    _USER_GEN_CACHE[str(user_id)] = (int(generation), float(time.time()))
+
 
 class _BannedCheckTree(app_commands.CommandTree):
     """CommandTree that blocks banned users and enforces access code gate."""
@@ -693,7 +733,10 @@ class _BannedCheckTree(app_commands.CommandTree):
             bypass = uid in (OWNER_IDS | CODE_BYPASS_IDS)
             cmd_name = (interaction.data or {}).get("name", "")
             if not bypass and cmd_name != "code":
-                verified = await db.is_access_verified(str(uid))
+                verified = _get_cached_access_verified(uid)
+                if verified is None:
+                    verified = await db.is_access_verified(str(uid))
+                    _set_cached_access_verified(uid, bool(verified))
                 if not verified:
                     try:
                         await interaction.response.send_message(
@@ -1039,7 +1082,7 @@ async def mygen(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
     uid = str(interaction.user.id)
     try:
-        g = await db.get_user_gen(uid)   # defaults to 1 if column empty/missing
+        g = await _user_selected_gen(uid)
     except Exception:
         g = 1
     await interaction.followup.send(f"Your current generation is **Gen {g}**.", ephemeral=True)
@@ -1065,6 +1108,7 @@ async def setgen(
     uid = str(user.id)
     
     await db.set_user_gen(uid, gen)
+    _set_cached_user_gen(uid, int(gen))
     
     if also_unlock:
         conn = await db.connect()
@@ -1107,7 +1151,7 @@ async def enforce_item_gimmick_gate(
     if not item_id:
         return True  # nothing to check
     try:
-        user_gen = await db.get_user_gen(owner_id)
+        user_gen = await _user_selected_gen(owner_id)
     except Exception:
         user_gen = 1
 
@@ -5411,11 +5455,13 @@ async def code_cmd(interaction: discord.Interaction, code: str):
         return
     if (code or "").strip() == BOT_ACCESS_CODE:
         await db.set_access_verified(uid)
+        _set_cached_access_verified(int(uid), True)
         await interaction.response.send_message(
             "✅ Access granted! You can now use the bot.",
             ephemeral=True,
         )
     else:
+        _set_cached_access_verified(int(uid), False)
         await interaction.response.send_message(
             "❌ Invalid code. Please check and try again.",
             ephemeral=True,
@@ -5579,13 +5625,17 @@ async def _ensure_starter_mon_row(uid: str, species: str, mon: dict, entry: dict
 
 async def _user_selected_gen(user_id: str) -> int:
     """Return the player's currently selected gen (defaults to 1)."""
+    uid = str(user_id)
+    cached = _get_cached_user_gen(uid)
+    if cached is not None:
+        return cached
     conn = await db.connect()
     try:
-        cur  = await conn.execute("SELECT generation FROM user_rulesets WHERE user_id=?", (user_id,))
+        cur  = await conn.execute("SELECT generation FROM user_rulesets WHERE user_id=?", (uid,))
         row  = await cur.fetchone(); await cur.close()
-        if row:
-            return int(row["generation"])
-        return 1
+        val = int(row["generation"]) if row and row.get("generation") is not None else 1
+        _set_cached_user_gen(uid, val)
+        return val
     except Exception:
         return 1
     finally:
@@ -6709,6 +6759,8 @@ DAYCARE_HATCH_MAX = 80.0
 DAYCARE_HATCH_BOOST_ABILITIES = {"flame-body", "magma-armor"}
 DAYCARE_HATCH_COMMAND_BONUS_CAP = 0.18
 DAYCARE_MIRROR_HERB_ITEMS = {"mirror-herb", "mirror_herb"}
+DAYCARE_HATCH_BOOST_CACHE_TTL_SECONDS = 15.0
+DAYCARE_OVAL_CHARM_CACHE_TTL_SECONDS = 30.0
 DAYCARE_INCENSE_BABIES: dict[str, tuple[str, str]] = {
     "snorlax": ("munchlax", "full-incense"),
     "mr-mime": ("mime-jr", "odd-incense"),
@@ -6723,6 +6775,9 @@ DAYCARE_INCENSE_BABIES: dict[str, tuple[str, str]] = {
     "chimecho": ("chingling", "pure-incense"),
     "mantine": ("mantyke", "wave-incense"),
 }
+
+_DAYCARE_HATCH_BOOST_CACHE: dict[str, tuple[bool, float]] = {}
+_DAYCARE_OVAL_CHARM_CACHE: dict[str, tuple[bool, float]] = {}
 DAYCARE_MAX_ANIM_FRAMES = 16
 DAYCARE_GIF_MAX_SIZE: tuple[int, int] = (56, 56)
 DAYCARE_BOX_MAX_SIZE: tuple[int, int] = (52, 52)
@@ -8576,24 +8631,40 @@ async def _compact_team_slots(owner_id: str, *, max_slots: int = 6) -> int:
 
 
 async def _daycare_has_hatch_boost(owner_id: str) -> bool:
+    oid = str(owner_id)
+    cached = _DAYCARE_HATCH_BOOST_CACHE.get(oid)
+    if cached is not None:
+        val, ts = cached
+        if (time.time() - float(ts)) <= DAYCARE_HATCH_BOOST_CACHE_TTL_SECONDS:
+            return bool(val)
+        _DAYCARE_HATCH_BOOST_CACHE.pop(oid, None)
     try:
         async with db.session() as conn:
             cur = await conn.execute(
                 "SELECT ability FROM pokemons WHERE owner_id=? AND team_slot BETWEEN 1 AND 6",
-                (owner_id,),
+                (oid,),
             )
             rows = await cur.fetchall()
             await cur.close()
         for row in rows:
             raw = row.get("ability") if hasattr(row, "keys") else row[0]
             if _daycare_ability_key(raw) in DAYCARE_HATCH_BOOST_ABILITIES:
+                _DAYCARE_HATCH_BOOST_CACHE[oid] = (True, float(time.time()))
                 return True
     except Exception:
         pass
+    _DAYCARE_HATCH_BOOST_CACHE[oid] = (False, float(time.time()))
     return False
 
 
 async def _daycare_has_oval_charm(owner_id: str) -> bool:
+    oid = str(owner_id)
+    cached = _DAYCARE_OVAL_CHARM_CACHE.get(oid)
+    if cached is not None:
+        val, ts = cached
+        if (time.time() - float(ts)) <= DAYCARE_OVAL_CHARM_CACHE_TTL_SECONDS:
+            return bool(val)
+        _DAYCARE_OVAL_CHARM_CACHE.pop(oid, None)
     try:
         async with db.session() as conn:
             cur = await conn.execute(
@@ -8604,14 +8675,17 @@ async def _daycare_has_oval_charm(owner_id: str) -> bool:
                 ORDER BY qty DESC
                 LIMIT 1
                 """,
-                (owner_id,),
+                (oid,),
             )
             row = await cur.fetchone()
             await cur.close()
         if not row:
+            _DAYCARE_OVAL_CHARM_CACHE[oid] = (False, float(time.time()))
             return False
         qty = row["qty"] if hasattr(row, "keys") else row[0]
-        return int(qty or 0) > 0
+        has_charm = int(qty or 0) > 0
+        _DAYCARE_OVAL_CHARM_CACHE[oid] = (bool(has_charm), float(time.time()))
+        return bool(has_charm)
     except Exception:
         return False
 
@@ -14517,6 +14591,8 @@ TEAM_MAX_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
 TEAM_MAX_SPRITE_FRAMES = 64
 TEAM_MAX_COMPOSITE_FRAMES = 64
 TEAM_FETCH_SHOWDOWN_FOR_TEAM = False
+TEAM_OVERVIEW_CACHE_TTL_SECONDS = 12.0
+TEAM_WARM_CACHE_INTERVAL_SECONDS = 120.0
 TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
     {"box_xy": (236, 93), "box_wh": (177, 197), "sprite_c": (324, 173), "label_xy": (246, 256), "level_right": (402, 256)},
     {"box_xy": (415, 93), "box_wh": (177, 197), "sprite_c": (503, 173), "label_xy": (425, 256), "level_right": (581, 256)},
@@ -14541,6 +14617,9 @@ TEAM_EGG_STAGE_LABELS: tuple[str, ...] = (
     "Heavily cracked",
     "Extremely cracked",
 )
+
+_TEAM_OVERVIEW_RENDER_CACHE: dict[str, tuple[float, bytes, str]] = {}
+_TEAM_WARM_CACHE_TS: dict[str, float] = {}
 
 
 def _team_is_egg_row(row: dict) -> bool:
@@ -14886,6 +14965,41 @@ def _team_load_sprite_frames(path: Optional[Path], *, max_size: tuple[int, int],
     return frames, duration
 
 
+def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None]) -> str:
+    snapshot: list[Any] = []
+    for slot in range(1, 7):
+        row = slots.get(slot)
+        if not row:
+            snapshot.append(None)
+            continue
+        species_norm = _daycare_norm_species(row.get("species"))
+        item = {
+            "species": species_norm,
+            "form": _species_folder_name(str(row.get("form") or "")),
+            "shiny": int(bool(row.get("shiny"))),
+            "gender": str(row.get("gender") or "").strip().lower(),
+            "level": int(row.get("level") or 0),
+            "hp_now": int(row.get("hp_now") or 0),
+            "hp_max": int(row.get("hp") or 0),
+        }
+        if species_norm == "egg":
+            item["egg_progress"] = round(float(row.get("_egg_progress") or 0.0), 3)
+            item["egg_hatch_steps"] = round(float(row.get("_egg_hatch_steps") or 0.0), 3)
+            item["egg_stage"] = int(_team_egg_stage(row))
+        snapshot.append(item)
+    raw = json.dumps(
+        {
+            "target": str(target_name or ""),
+            "slots": snapshot,
+            "sync_ms": int(TEAM_BATTLE_SYNC_DURATION_MS),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
 def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -> Optional[discord.File]:
     if Image is None:
         return None
@@ -14893,6 +15007,14 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
         from PIL import ImageDraw  # type: ignore
     except Exception:
         return None
+    cache_key = _team_overview_cache_key(target_name, slots)
+    now = float(time.time())
+    cached = _TEAM_OVERVIEW_RENDER_CACHE.get(cache_key)
+    if cached is not None:
+        ts, data, ext = cached
+        if (now - float(ts)) <= TEAM_OVERVIEW_CACHE_TTL_SECONDS and data:
+            return discord.File(fp=BytesIO(data), filename=f"team_panel_{cache_key}.{ext}")
+        _TEAM_OVERVIEW_RENDER_CACHE.pop(cache_key, None)
     try:
         try:
             resample = Image.Resampling.NEAREST
@@ -15163,9 +15285,14 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
         else:
             out_frames[0].save(buf, format="PNG")
             ext = "png"
-        buf.seek(0)
-        fname = f"team_panel_{int(time.time())}_{random.randint(1000, 9999)}.{ext}"
-        return discord.File(fp=buf, filename=fname)
+        data = buf.getvalue()
+        _TEAM_OVERVIEW_RENDER_CACHE[cache_key] = (now, data, ext)
+        if len(_TEAM_OVERVIEW_RENDER_CACHE) > 96:
+            # Keep cache bounded; drop oldest half.
+            old_keys = sorted(_TEAM_OVERVIEW_RENDER_CACHE.items(), key=lambda kv: kv[1][0])[:48]
+            for k, _v in old_keys:
+                _TEAM_OVERVIEW_RENDER_CACHE.pop(k, None)
+        return discord.File(fp=BytesIO(data), filename=f"team_panel_{cache_key}.{ext}")
     except Exception:
         return None
 
@@ -15304,6 +15431,21 @@ class TeamPanelView(discord.ui.View):
         await self._edit_payload(itx, emb, files)
 
 
+def _daycare_tick_needed(rec: Optional[dict]) -> bool:
+    if not isinstance(rec, dict):
+        return False
+    parents = rec.get("parents")
+    if isinstance(parents, (list, tuple)):
+        for p in parents[:2]:
+            if p is not None and str(p).isdigit():
+                return True
+    if rec.get("eggs"):
+        return True
+    if rec.get("incubating"):
+        return True
+    return False
+
+
 @bot.tree.command(name="team", description="Show your current team (6 slots).")
 @app_commands.describe(user="View another user's team (optional)")
 async def team(interaction: discord.Interaction, user: discord.User | None = None):
@@ -15356,12 +15498,16 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
             await cur.close()
         # Warm cache asynchronously (don't block /team response).
         try:
-            async def _warm_team_cache() -> None:
-                try:
-                    await db.list_pokemons(uid, limit=2000, offset=0)
-                except Exception:
-                    pass
-            asyncio.create_task(_warm_team_cache())
+            now = float(time.time())
+            last_warm = float(_TEAM_WARM_CACHE_TS.get(uid, 0.0))
+            if (now - last_warm) >= TEAM_WARM_CACHE_INTERVAL_SECONDS:
+                _TEAM_WARM_CACHE_TS[uid] = now
+                async def _warm_team_cache() -> None:
+                    try:
+                        await db.list_pokemons(uid, limit=2000, offset=0)
+                    except Exception:
+                        pass
+                asyncio.create_task(_warm_team_cache())
         except Exception:
             pass
 
@@ -15388,65 +15534,64 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
             continue
 
     hatch_messages: list[str] = []
-    state: Optional[dict] = None
-    try:
-        state = await _get_adventure_state(uid)
-    except Exception:
-        state = None
-    if state is not None:
-        if uid == str(interaction.user.id):
-            try:
-                changed, hatch_messages = await _daycare_tick(uid, state, command_credit=0.75)
-                if changed:
-                    await _save_adventure_state(uid, state)
-            except Exception:
-                hatch_messages = []
+    if uid == str(interaction.user.id):
+        state: Optional[dict] = None
         try:
-            rec = _daycare_get_record(state, DAYCARE_CITY_ID)
-            incubating = list(rec.get("incubating") or [])
+            state = await _get_adventure_state(uid)
         except Exception:
-            incubating = []
-        if incubating:
-            empty_slots = [i for i in range(1, 7) if slots.get(i) is None]
-            egg_serial = 0
-            for slot_i in empty_slots:
-                if egg_serial >= len(incubating):
-                    break
-                egg = incubating[egg_serial]
-                egg_serial += 1
-                if not isinstance(egg, dict):
-                    continue
+            state = None
+        if state is not None:
+            rec = _daycare_get_record(state, DAYCARE_CITY_ID)
+            if _daycare_tick_needed(rec):
                 try:
-                    progress = float(egg.get("progress", 0.0) or 0.0)
-                    hatch_steps = max(1.0, float(egg.get("hatch_steps", DAYCARE_HATCH_MIN) or DAYCARE_HATCH_MIN))
+                    changed, hatch_messages = await _daycare_tick(uid, state, command_credit=0.75)
+                    if changed:
+                        await _save_adventure_state(uid, state)
                 except Exception:
-                    progress = 0.0
-                    hatch_steps = DAYCARE_HATCH_MIN
-                stage = _team_egg_stage({
-                    "species": "egg",
-                    "_egg_progress": progress,
-                    "_egg_hatch_steps": hatch_steps,
-                })
-                slots[slot_i] = {
-                    "id": -1000 - slot_i - egg_serial,
-                    "species": "egg",
-                    "level": 0,
-                    "gender": "genderless",
-                    "shiny": 0,
-                    "team_slot": slot_i,
-                    "held_item": None,
-                    "item_emoji": None,
-                    "hp": 1,
-                    "hp_now": 1,
-                    "moves": [],
-                    "nature": None,
-                    "ability": None,
-                    "friendship": 0,
-                    "form": None,
-                    "_egg_progress": progress,
-                    "_egg_hatch_steps": hatch_steps,
-                    "_egg_stage": stage,
-                }
+                    hatch_messages = []
+                rec = _daycare_get_record(state, DAYCARE_CITY_ID)
+            incubating = list(rec.get("incubating") or [])
+            if incubating:
+                empty_slots = [i for i in range(1, 7) if slots.get(i) is None]
+                egg_serial = 0
+                for slot_i in empty_slots:
+                    if egg_serial >= len(incubating):
+                        break
+                    egg = incubating[egg_serial]
+                    egg_serial += 1
+                    if not isinstance(egg, dict):
+                        continue
+                    try:
+                        progress = float(egg.get("progress", 0.0) or 0.0)
+                        hatch_steps = max(1.0, float(egg.get("hatch_steps", DAYCARE_HATCH_MIN) or DAYCARE_HATCH_MIN))
+                    except Exception:
+                        progress = 0.0
+                        hatch_steps = DAYCARE_HATCH_MIN
+                    stage = _team_egg_stage({
+                        "species": "egg",
+                        "_egg_progress": progress,
+                        "_egg_hatch_steps": hatch_steps,
+                    })
+                    slots[slot_i] = {
+                        "id": -1000 - slot_i - egg_serial,
+                        "species": "egg",
+                        "level": 0,
+                        "gender": "genderless",
+                        "shiny": 0,
+                        "team_slot": slot_i,
+                        "held_item": None,
+                        "item_emoji": None,
+                        "hp": 1,
+                        "hp_now": 1,
+                        "moves": [],
+                        "nature": None,
+                        "ability": None,
+                        "friendship": 0,
+                        "form": None,
+                        "_egg_progress": progress,
+                        "_egg_hatch_steps": hatch_steps,
+                        "_egg_stage": stage,
+                    }
 
     view = TeamPanelView(interaction.user.id, target.display_name, slots)
     emb, files = view._overview_payload()
@@ -17842,7 +17987,7 @@ async def equipgear(interaction: discord.Interaction, item: str):
                 emoji_raw = (row.get("emoji") or "").strip()
                 emoji = emoji_raw if _is_displayable_item_emoji(emoji_raw) else ""
                 disp  = pretty_item_name(row.get("name") or row.get("id") or item_id)
-                user_gen = await db.get_user_gen(uid)
+                user_gen = await _user_selected_gen(uid)
                 emb = discord.Embed(
                     title=f"Trainer Gear for {interaction.user.display_name} (Gen {user_gen})",
                     description=f"ℹ️ You already have {(emoji + ' ') if emoji else ''}**{disp}** equipped. Nothing consumed.",
@@ -17865,7 +18010,7 @@ async def equipgear(interaction: discord.Interaction, item: str):
         await _set_gear(uid, slot, item_id, skip_ensure=True)
 
         # Auto-unlock Megas if equipping bracelet/ring/keystone while in Gen ≥ 6
-        user_gen = await db.get_user_gen(uid)
+        user_gen = await _user_selected_gen(uid)
         if slot == "mega" and user_gen >= 6:
             await _set_mega_unlocked(uid, True, skip_ensure=True)
 
@@ -17901,7 +18046,7 @@ async def mygear(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
     uid = str(interaction.user.id)
     await _ensure_equipment_table()
-    user_gen = await db.get_user_gen(uid)
+    user_gen = await _user_selected_gen(uid)
     gear = await _get_all_gear(uid, skip_ensure=True)
 
     emb = discord.Embed(
