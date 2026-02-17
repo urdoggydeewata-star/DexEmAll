@@ -437,9 +437,9 @@ async def get_currency(user_id: str, key: str = "coins") -> int:
             pass
 
 
-def _currency_path(key: str) -> str:
-    """Postgres text[] literal for one key, e.g. '{coins}'."""
-    return "{" + key + "}"
+def _currency_path(key: str) -> list[str]:
+    """Path array for jsonb_set(..., path::text[], ...), e.g. ['coins']."""
+    return [str(key or "").strip()]
 
 
 async def set_currency(user_id: str, key: str, value: int) -> None:

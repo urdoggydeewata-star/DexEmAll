@@ -14985,6 +14985,24 @@ class MPokeInfo(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(MPokeInfo(bot))
+
+
+@bot.tree.command(name="pkinfo", description="Alias for /mpokeinfo (team Pokémon details).")
+@app_commands.describe(
+    name="Pokémon species (e.g. pikachu)",
+    slot="Team slot (1–6) if you have duplicates",
+)
+async def pkinfo_alias(interaction: Interaction, name: str, slot: Optional[int] = None):
+    cog = bot.get_cog("MPokeInfo")
+    if isinstance(cog, MPokeInfo):
+        return await cog.mpokeinfo(interaction, name, slot)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("❌ PK info system is not loaded yet. Try again in a moment.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ PK info system is not loaded yet. Try again in a moment.", ephemeral=True)
+    except Exception:
+        pass
 ## Friendship :
 def item_id_from_user(s: str) -> str:
     """Normalize user text -> canonical item id (lowercase + underscores)."""
