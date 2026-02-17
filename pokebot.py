@@ -6681,11 +6681,13 @@ ASSETS_CITIES = ASSETS_DIR / "cities"
 ASSETS_ROUTES = ASSETS_DIR / "routes"
 ASSETS_DAYCARE = ASSETS_DIR / "ui" / "daycare.png"
 ASSETS_EGG_STAGES_DIR = ASSETS_DIR / "ui" / "egg-stages"
-ASSETS_EGG_STAGE_UNDAMAGED = ASSETS_EGG_STAGES_DIR / "egg-undamaged.png"
-ASSETS_EGG_STAGE_SLIGHT = ASSETS_EGG_STAGES_DIR / "egg-slightly-cracked.png"
-ASSETS_EGG_STAGE_CRACKED = ASSETS_EGG_STAGES_DIR / "egg-cracked.png"
-ASSETS_EGG_STAGE_EXTREME = ASSETS_EGG_STAGES_DIR / "egg-extremely-cracked.png"
-ASSETS_DAYCARE_EGG = ASSETS_EGG_STAGE_UNDAMAGED
+ASSETS_EGG_STAGE_1_INTACT = ASSETS_EGG_STAGES_DIR / "egg-stage-1-intact.png"
+ASSETS_EGG_STAGE_2_SLIGHT = ASSETS_EGG_STAGES_DIR / "egg-stage-2-slightly-cracked.png"
+ASSETS_EGG_STAGE_3_CRACKED = ASSETS_EGG_STAGES_DIR / "egg-stage-3-cracked.png"
+ASSETS_EGG_STAGE_4_MORE = ASSETS_EGG_STAGES_DIR / "egg-stage-4-more-cracked.png"
+ASSETS_EGG_STAGE_5_HEAVY = ASSETS_EGG_STAGES_DIR / "egg-stage-5-heavily-cracked.png"
+ASSETS_EGG_STAGE_6_EXTREME = ASSETS_EGG_STAGES_DIR / "egg-stage-6-extremely-cracked.png"
+ASSETS_DAYCARE_EGG = ASSETS_EGG_STAGE_1_INTACT
 
 DAYCARE_CITY_ID = "pallet-town"
 DAYCARE_AREA_ID = "pallet-daycare"
@@ -14488,15 +14490,19 @@ TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
     {"box_xy": (593, 294), "box_wh": (177, 197), "sprite_c": (681, 374), "label_xy": (603, 457), "level_right": (759, 457)},
 )
 TEAM_EGG_STAGE_PATHS: tuple[Path, ...] = (
-    ASSETS_EGG_STAGE_UNDAMAGED,
-    ASSETS_EGG_STAGE_SLIGHT,
-    ASSETS_EGG_STAGE_CRACKED,
-    ASSETS_EGG_STAGE_EXTREME,
+    ASSETS_EGG_STAGE_1_INTACT,
+    ASSETS_EGG_STAGE_2_SLIGHT,
+    ASSETS_EGG_STAGE_3_CRACKED,
+    ASSETS_EGG_STAGE_4_MORE,
+    ASSETS_EGG_STAGE_5_HEAVY,
+    ASSETS_EGG_STAGE_6_EXTREME,
 )
 TEAM_EGG_STAGE_LABELS: tuple[str, ...] = (
-    "Undamaged",
+    "Intact",
     "Slightly cracked",
     "Cracked",
+    "More cracked",
+    "Heavily cracked",
     "Extremely cracked",
 )
 
@@ -14508,9 +14514,10 @@ def _team_is_egg_row(row: dict) -> bool:
 def _team_egg_stage(row: dict) -> int:
     if not _team_is_egg_row(row):
         return 0
+    max_stage = max(0, len(TEAM_EGG_STAGE_PATHS) - 1)
     try:
         stage = int(row.get("_egg_stage"))
-        return max(0, min(3, stage))
+        return max(0, min(max_stage, stage))
     except Exception:
         pass
     try:
@@ -14519,13 +14526,17 @@ def _team_egg_stage(row: dict) -> int:
         ratio = max(0.0, min(1.0, progress / hatch_steps))
     except Exception:
         ratio = 0.0
-    if ratio < 0.25:
+    if ratio < 0.20:
         return 0
-    if ratio < 0.50:
+    if ratio < 0.40:
         return 1
-    if ratio < 0.80:
+    if ratio < 0.60:
         return 2
-    return 3
+    if ratio < 0.80:
+        return 3
+    if ratio < 0.99:
+        return 4
+    return 5
 
 
 def _team_egg_progress_pct(row: dict) -> int:
