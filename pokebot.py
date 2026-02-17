@@ -7770,14 +7770,31 @@ def _market_display(item_key: str) -> str:
     return _catalog_market_display_name(str(item_key or ""))
 
 
+MARKET_TREASURE_ITEM_KEYS: frozenset[str] = frozenset(
+    str(item_id)
+    for item_id, _disp, _price in MARKET_PRICE_CATALOG.get("Treasure Items", [])
+)
+
+
+def _market_is_treasure(item_key: str) -> bool:
+    return _market_normalize_key(str(item_key or "")) in MARKET_TREASURE_ITEM_KEYS
+
+
 def _market_price_embed() -> discord.Embed:
     emb = discord.Embed(
         title="Poké Mart Price List",
-        description=f"These prices are active for market buys/sells in Poké Mart.\nCurrency: **{PKDollar_NAME}**",
+        description=(
+            f"These prices are active for Poké Mart trading.\n"
+            f"Currency: **{PKDollar_NAME}**\n"
+            "Treasure Items are **sell-only**."
+        ),
         color=0x4CAF50,
     )
     for category, rows in MARKET_PRICE_CATALOG.items():
-        lines = [f"• **{disp}** — {int(price):,}" for _item_id, disp, price in rows]
+        if category == "Treasure Items":
+            lines = [f"• **{disp}** — Sell for {int(price):,}" for _item_id, disp, price in rows]
+        else:
+            lines = [f"• **{disp}** — {int(price):,}" for _item_id, disp, price in rows]
         value = "\n".join(lines)[:1024] if lines else "—"
         emb.add_field(name=category, value=value, inline=False)
     return emb
@@ -7818,12 +7835,14 @@ async def _market_buy(owner_id: str, item_key: str, qty_requested: int) -> tuple
     qty_requested = int(qty_requested)
     if qty_requested <= 0:
         return False, "Quantity must be a positive number."
-    price = int(MARKET_SELL_PRICES.get(item_key, 0))
+    canonical_item_id = _market_normalize_key(item_key)
+    display = _market_display(canonical_item_id)
+    if _market_is_treasure(canonical_item_id):
+        return False, f"**{display}** is a treasure item and cannot be bought. Treasure items can only be sold."
+    price = int(MARKET_SELL_PRICES.get(canonical_item_id, 0))
     if price <= 0:
         return False, "That item is not sold in this Poké Mart."
-    variants = _market_item_variants(item_key)
-    canonical_item_id = _market_normalize_key(item_key)
-    display = _market_display(item_key)
+    variants = _market_item_variants(canonical_item_id)
     async with DB_WRITE_LOCK:
         async with db.session() as conn:
             await conn.execute(
@@ -7868,11 +7887,12 @@ async def _market_sell(owner_id: str, item_key: str, qty_requested: int) -> tupl
     qty_requested = int(qty_requested)
     if qty_requested <= 0:
         return False, "Quantity must be a positive number."
-    price = int(MARKET_SELL_PRICES.get(item_key, 0))
+    canonical_item_id = _market_normalize_key(item_key)
+    price = int(MARKET_SELL_PRICES.get(canonical_item_id, 0))
     if price <= 0:
         return False, "That item cannot be sold here."
-    variants = _market_item_variants(item_key)
-    display = _market_display(item_key)
+    variants = _market_item_variants(canonical_item_id)
+    display = _market_display(canonical_item_id)
     async with DB_WRITE_LOCK:
         async with db.session() as conn:
             placeholders = ", ".join("?" for _ in variants)
@@ -11462,20 +11482,26 @@ class TMSellerView(discord.ui.View):
         )
 
 
-class MarketTradeModal(discord.ui.Modal):
-    def __init__(self, author_id: int, area_id: str, mode: str):
+def _market_mode_rows(mode: str) -> list[tuple[str, str, int, str]]:
+    want_buy = str(mode).lower() == "buy"
+    out: list[tuple[str, str, int, str]] = []
+    for category, rows in MARKET_PRICE_CATALOG.items():
+        if want_buy and category == "Treasure Items":
+            continue
+        for item_id, disp, price in rows:
+            out.append((str(item_id), str(disp), int(price), str(category)))
+    return out
+
+
+class MarketQuantityModal(discord.ui.Modal):
+    def __init__(self, author_id: int, area_id: str, mode: str, item_key: str):
         mode_name = "Buy" if str(mode).lower() == "buy" else "Sell"
-        super().__init__(title=f"Poké Mart • {mode_name}")
+        display = _market_display(item_key)
+        super().__init__(title=f"Poké Mart • {mode_name} {display}")
         self.author_id = int(author_id)
         self.area_id = str(area_id)
         self.mode = "buy" if str(mode).lower() == "buy" else "sell"
-
-        self.item_input = discord.ui.TextInput(
-            label="Item",
-            placeholder="e.g. potion, nugget, ultra ball",
-            max_length=64,
-            required=True,
-        )
+        self.item_key = _market_normalize_key(item_key)
         self.qty_input = discord.ui.TextInput(
             label="Quantity",
             placeholder="1",
@@ -11483,7 +11509,6 @@ class MarketTradeModal(discord.ui.Modal):
             required=True,
             default="1",
         )
-        self.add_item(self.item_input)
         self.add_item(self.qty_input)
 
     async def on_submit(self, itx: discord.Interaction):
@@ -11494,22 +11519,6 @@ class MarketTradeModal(discord.ui.Modal):
         state = await _get_adventure_state(uid)
         if str(state.get("area_id") or "") != self.area_id or not _is_pokemart(self.area_id):
             return await itx.followup.send("Market access is only available while you're inside a Poké Mart.", ephemeral=True)
-
-        item_raw = str(self.item_input.value or "").strip()
-        item_key = _market_resolve_item_key(item_raw)
-        if not item_key:
-            q = item_id_from_user(item_raw)
-            suggestions = [
-                disp for k, disp in MARKET_DISPLAY_NAMES.items()
-                if q and (q in k or q in item_id_from_user(disp))
-            ][:5]
-            if suggestions:
-                return await itx.followup.send(
-                    f"Unknown market item. Did you mean: {', '.join(f'**{s}**' for s in suggestions)}?",
-                    ephemeral=True,
-                )
-            return await itx.followup.send("Unknown market item. Use **Price List** to browse valid items.", ephemeral=True)
-
         try:
             qty = int(str(self.qty_input.value or "").strip())
         except Exception:
@@ -11518,13 +11527,215 @@ class MarketTradeModal(discord.ui.Modal):
             return await itx.followup.send("Quantity must be positive.", ephemeral=True)
         if qty > MAX_STACK:
             return await itx.followup.send(f"Quantity too large (max {MAX_STACK}).", ephemeral=True)
-
         if self.mode == "buy":
-            ok, msg = await _market_buy(uid, item_key, qty)
+            ok, msg = await _market_buy(uid, self.item_key, qty)
         else:
-            ok, msg = await _market_sell(uid, item_key, qty)
+            ok, msg = await _market_sell(uid, self.item_key, qty)
         _ = ok
         return await itx.followup.send(msg, ephemeral=True)
+
+
+class MarketDropdownSearchModal(discord.ui.Modal):
+    def __init__(self, parent_view: "MarketDropdownView"):
+        mode_name = "Buy" if parent_view.mode == "buy" else "Sell"
+        super().__init__(title=f"Poké Mart • {mode_name} Search")
+        self.parent_view = parent_view
+        self.query_input = discord.ui.TextInput(
+            label="Search items",
+            placeholder="Name or item id (e.g. ultra, potion, nugget)",
+            required=False,
+            max_length=64,
+            default=str(parent_view.search_query or ""),
+        )
+        self.add_item(self.query_input)
+
+    async def on_submit(self, itx: discord.Interaction):
+        if not self.parent_view._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        self.parent_view.search_query = str(self.query_input.value or "").strip()
+        self.parent_view.page = 0
+        await self.parent_view._refresh_message(itx)
+
+
+class MarketDropdownView(discord.ui.View):
+    ITEMS_PER_PAGE = 25
+
+    def __init__(self, author_id: int, area_id: str, mode: str):
+        super().__init__(timeout=180)
+        self.author_id = int(author_id)
+        self.area_id = str(area_id)
+        self.mode = "buy" if str(mode).lower() == "buy" else "sell"
+        self.search_query: str = ""
+        self.page: int = 0
+        self._rebuild_items()
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return int(itx.user.id) == self.author_id
+
+    def _all_rows(self) -> list[tuple[str, str, int, str]]:
+        return _market_mode_rows(self.mode)
+
+    def _filtered_rows(self) -> list[tuple[str, str, int, str]]:
+        rows = self._all_rows()
+        q = item_id_from_user(self.search_query)
+        if not q:
+            return rows
+        out: list[tuple[str, str, int, str]] = []
+        for item_id, disp, price, category in rows:
+            if (
+                q in item_id_from_user(item_id)
+                or q in item_id_from_user(disp)
+                or q in item_id_from_user(category)
+            ):
+                out.append((item_id, disp, price, category))
+        return out
+
+    def _paged_rows(self) -> tuple[list[tuple[str, str, int, str]], int, int]:
+        rows = self._filtered_rows()
+        total = len(rows)
+        pages = max(1, math.ceil(total / self.ITEMS_PER_PAGE))
+        self.page = max(0, min(int(self.page), pages - 1))
+        start = self.page * self.ITEMS_PER_PAGE
+        end = start + self.ITEMS_PER_PAGE
+        return rows[start:end], total, pages
+
+    async def _build_embed(self, uid: str) -> discord.Embed:
+        mode_name = "Buy" if self.mode == "buy" else "Sell"
+        page_rows, total, pages = self._paged_rows()
+        desc = "Choose an item from the dropdown, then enter quantity."
+        if self.mode == "buy":
+            desc += "\nTreasure items are sell-only and do not appear here."
+        if self.search_query:
+            desc += f"\nSearch: **{self.search_query}**"
+        emb = discord.Embed(
+            title=f"Poké Mart • {mode_name} Menu",
+            description=desc,
+            color=0x4CAF50 if self.mode == "buy" else 0x2196F3,
+        )
+        if page_rows:
+            lines = []
+            for _item_id, disp, price, category in page_rows[:12]:
+                if self.mode == "buy":
+                    lines.append(f"• **{disp}** — {price:,} ({category})")
+                else:
+                    lines.append(f"• **{disp}** — Sell for {price:,} ({category})")
+            emb.add_field(name="Items (current page preview)", value="\n".join(lines)[:1024], inline=False)
+        else:
+            emb.add_field(name="Items", value="No items matched your search.", inline=False)
+        coins = await db.get_currency(uid, "coins")
+        emb.set_footer(text=f"Results: {total} • Page {self.page + 1}/{pages} • Balance: {coins:,} {PKDollar_NAME}")
+        return emb
+
+    def _rebuild_items(self) -> None:
+        self.clear_items()
+        page_rows, total, pages = self._paged_rows()
+        options: list[discord.SelectOption] = []
+        for item_id, disp, price, category in page_rows:
+            desc = f"{category} • {'Buy' if self.mode == 'buy' else 'Sell'} {price:,}"
+            options.append(discord.SelectOption(label=disp[:100], value=item_id, description=desc[:100]))
+        if not options:
+            options = [discord.SelectOption(label="No matching items", value="__none__", description="Try a different search.")]
+        sel = discord.ui.Select(
+            placeholder=("Select an item to buy…" if self.mode == "buy" else "Select an item to sell…"),
+            min_values=1,
+            max_values=1,
+            options=options,
+            disabled=(total <= 0),
+            custom_id=f"mart:dropdown:{self.mode}",
+        )
+        sel.callback = self._on_pick_item
+        self.add_item(sel)
+
+        prev_btn = discord.ui.Button(
+            label="Prev",
+            style=discord.ButtonStyle.secondary,
+            disabled=(self.page <= 0),
+            custom_id=f"mart:page_prev:{self.mode}",
+        )
+        prev_btn.callback = self._on_prev
+        self.add_item(prev_btn)
+
+        next_btn = discord.ui.Button(
+            label="Next",
+            style=discord.ButtonStyle.secondary,
+            disabled=(self.page >= (pages - 1)),
+            custom_id=f"mart:page_next:{self.mode}",
+        )
+        next_btn.callback = self._on_next
+        self.add_item(next_btn)
+
+        search_btn = discord.ui.Button(
+            label="Search",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"mart:search:{self.mode}",
+        )
+        search_btn.callback = self._on_search
+        self.add_item(search_btn)
+
+        clear_btn = discord.ui.Button(
+            label="Clear Search",
+            style=discord.ButtonStyle.secondary,
+            disabled=(not bool(self.search_query)),
+            custom_id=f"mart:search_clear:{self.mode}",
+        )
+        clear_btn.callback = self._on_clear_search
+        self.add_item(clear_btn)
+
+    async def _refresh_message(self, itx: discord.Interaction) -> None:
+        if not _is_pokemart(self.area_id):
+            if itx.response.is_done():
+                return await itx.followup.send("Market access is only available in a Poké Mart.", ephemeral=True)
+            return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
+        uid = str(itx.user.id)
+        self._rebuild_items()
+        emb = await self._build_embed(uid)
+        try:
+            await itx.response.edit_message(embed=emb, view=self)
+        except Exception:
+            try:
+                if not itx.response.is_done():
+                    await itx.response.send_message(embed=emb, view=self, ephemeral=True)
+                else:
+                    await itx.followup.send(embed=emb, view=self, ephemeral=True)
+            except Exception:
+                pass
+
+    async def _on_pick_item(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not _is_pokemart(self.area_id):
+            return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
+        values = list(getattr(itx.data, "values", []) or []) if hasattr(itx, "data") else []
+        if not values and isinstance(itx.data, dict):
+            values = list(itx.data.get("values") or [])
+        item_key = str(values[0] if values else "").strip()
+        if not item_key or item_key == "__none__":
+            return await itx.response.send_message("No item selected.", ephemeral=True)
+        await itx.response.send_modal(MarketQuantityModal(self.author_id, self.area_id, self.mode, item_key))
+
+    async def _on_prev(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        self.page = max(0, int(self.page) - 1)
+        await self._refresh_message(itx)
+
+    async def _on_next(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        self.page = int(self.page) + 1
+        await self._refresh_message(itx)
+
+    async def _on_search(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        await itx.response.send_modal(MarketDropdownSearchModal(self))
+
+    async def _on_clear_search(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        self.search_query = ""
+        self.page = 0
+        await self._refresh_message(itx)
 
 
 class AdventurePokeMartView(discord.ui.View):
@@ -11542,11 +11753,11 @@ class AdventurePokeMartView(discord.ui.View):
         return int(itx.user.id) == self.author_id
 
     def _build_buttons(self):
-        buy_btn = discord.ui.Button(label="Buy Item", style=discord.ButtonStyle.success, custom_id="mart:buy")
+        buy_btn = discord.ui.Button(label="Buy Menu", style=discord.ButtonStyle.success, custom_id="mart:buy")
         buy_btn.callback = self._on_buy
         self.add_item(buy_btn)
 
-        sell_btn = discord.ui.Button(label="Sell Item", style=discord.ButtonStyle.primary, custom_id="mart:sell")
+        sell_btn = discord.ui.Button(label="Sell Menu", style=discord.ButtonStyle.primary, custom_id="mart:sell")
         sell_btn.callback = self._on_sell
         self.add_item(sell_btn)
 
@@ -11564,14 +11775,18 @@ class AdventurePokeMartView(discord.ui.View):
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
         if not _is_pokemart(self.area_id):
             return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
-        await itx.response.send_modal(MarketTradeModal(self.author_id, self.area_id, "buy"))
+        view = MarketDropdownView(self.author_id, self.area_id, "buy")
+        emb = await view._build_embed(str(itx.user.id))
+        await itx.response.send_message(embed=emb, view=view, ephemeral=True)
 
     async def _on_sell(self, itx: discord.Interaction):
         if not self._guard(itx):
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
         if not _is_pokemart(self.area_id):
             return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
-        await itx.response.send_modal(MarketTradeModal(self.author_id, self.area_id, "sell"))
+        view = MarketDropdownView(self.author_id, self.area_id, "sell")
+        emb = await view._build_embed(str(itx.user.id))
+        await itx.response.send_message(embed=emb, view=view, ephemeral=True)
 
     async def _on_price_list(self, itx: discord.Interaction):
         if not self._guard(itx):
@@ -13105,7 +13320,7 @@ async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_o
             balance = await db.get_currency(uid, "coins")
             desc = (
                 f"Welcome to the Poké Mart.\n\n"
-                f"Use **Buy Item** or **Sell Item** to trade from the market list.\n"
+                f"Use **Buy Menu** or **Sell Menu** to trade from the market list.\n"
                 f"Your balance: **{balance:,} {PKDollar_NAME}**"
             )
             emb, files = _embed_with_image(city.get("name", area_id), desc, img)
