@@ -712,6 +712,12 @@ _USER_GEN_CACHE_TTL_SECONDS = 300.0
 _USER_GEN_CACHE: dict[str, tuple[int, float]] = {}
 _ADMIN_CHECK_CACHE_TTL_SECONDS = 120.0
 _ADMIN_CHECK_CACHE: dict[str, tuple[bool, float]] = {}
+_REQUIRED_ROLE_CACHE_TTL_SECONDS = 120.0
+_REQUIRED_ROLE_CACHE: dict[int, tuple[bool, float]] = {}
+_REQUIRED_ROLE_BLOCK_MESSAGE = (
+    f"❌ You need <@&{VERIFY_ROLE_ID}> in the OS server to use this bot.\n"
+    "Join the OS server and complete verification first."
+)
 
 
 def _get_cached_access_verified(user_id: int) -> Optional[bool]:
@@ -764,6 +770,88 @@ def _set_cached_admin_check(user_id: str, is_admin: bool) -> None:
     _ADMIN_CHECK_CACHE[str(user_id)] = (bool(is_admin), float(time.time()))
 
 
+def _get_cached_required_role(user_id: int | str) -> Optional[bool]:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return None
+    rec = _REQUIRED_ROLE_CACHE.get(uid)
+    if rec is None:
+        return None
+    val, ts = rec
+    if (time.time() - float(ts)) > _REQUIRED_ROLE_CACHE_TTL_SECONDS:
+        _REQUIRED_ROLE_CACHE.pop(uid, None)
+        return None
+    return bool(val)
+
+
+def _set_cached_required_role(user_id: int | str, has_role: bool) -> None:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return
+    _REQUIRED_ROLE_CACHE[uid] = (bool(has_role), float(time.time()))
+
+
+def _is_verify_button_interaction(interaction: discord.Interaction) -> bool:
+    try:
+        data = interaction.data
+        if not isinstance(data, dict):
+            return False
+        return str(data.get("custom_id", "")).strip() == VERIFY_BUTTON_CUSTOM_ID
+    except Exception:
+        return False
+
+
+async def _has_required_os_role(user_id: int | str, *, force_refresh: bool = False) -> bool:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    if not force_refresh:
+        cached = _get_cached_required_role(uid)
+        if cached is not None:
+            return bool(cached)
+    guild = bot.get_guild(VERIFY_GUILD_ID)
+    if guild is None:
+        _set_cached_required_role(uid, False)
+        return False
+    member = guild.get_member(uid)
+    if member is None:
+        try:
+            member = await guild.fetch_member(uid)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            member = None
+        except Exception:
+            member = None
+    has_role = bool(member and any(int(r.id) == VERIFY_ROLE_ID for r in getattr(member, "roles", [])))
+    _set_cached_required_role(uid, has_role)
+    return has_role
+
+
+async def _send_required_role_block(interaction: discord.Interaction) -> None:
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(_REQUIRED_ROLE_BLOCK_MESSAGE, ephemeral=True)
+        else:
+            await interaction.response.send_message(_REQUIRED_ROLE_BLOCK_MESSAGE, ephemeral=True)
+    except Exception:
+        pass
+
+
+async def _check_required_role_interaction(
+    interaction: discord.Interaction, *, allow_verify_button: bool = False
+) -> bool:
+    if not interaction.user:
+        return False
+    if allow_verify_button and _is_verify_button_interaction(interaction):
+        return True
+    if await _has_required_os_role(interaction.user.id):
+        return True
+    await _send_required_role_block(interaction)
+    return False
+
+
 def _is_static_admin(user_id: int | str) -> bool:
     try:
         uid = int(user_id)
@@ -788,7 +876,7 @@ async def _is_admin_user(user_id: int | str) -> bool:
 
 
 class _BannedCheckTree(app_commands.CommandTree):
-    """CommandTree that blocks banned users and enforces access code gate."""
+    """CommandTree that blocks banned users and enforces access gates."""
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not interaction.user:
@@ -806,7 +894,11 @@ class _BannedCheckTree(app_commands.CommandTree):
                 pass
             return False
 
-        # 2) Access code gate (skip if no code configured)
+        # 2) Role gate: user must hold OS verification role
+        if not await _check_required_role_interaction(interaction):
+            return False
+
+        # 3) Access code gate (skip if no code configured)
         if BOT_ACCESS_CODE:
             bypass = uid in (OWNER_IDS | CODE_BYPASS_IDS)
             cmd_name = (interaction.data or {}).get("name", "")
@@ -830,6 +922,44 @@ class _BannedCheckTree(app_commands.CommandTree):
 
 
 bot = commands.Bot(command_prefix='.', intents=intents, tree_cls=_BannedCheckTree)
+# Enforce role-gate for all UI interactions (buttons/selects/modals), including in other servers.
+_ORIG_VIEW_INTERACTION_CHECK = discord.ui.View.interaction_check
+_ORIG_MODAL_INTERACTION_CHECK = discord.ui.Modal.interaction_check
+
+
+async def _role_gated_view_interaction_check(self, interaction: discord.Interaction) -> bool:
+    if not await _check_required_role_interaction(interaction, allow_verify_button=True):
+        return False
+    return await _ORIG_VIEW_INTERACTION_CHECK(self, interaction)
+
+
+async def _role_gated_modal_interaction_check(self, interaction: discord.Interaction) -> bool:
+    if not await _check_required_role_interaction(interaction):
+        return False
+    return await _ORIG_MODAL_INTERACTION_CHECK(self, interaction)
+
+
+if not getattr(discord.ui.View.interaction_check, "_required_role_gate_patch", False):
+    _role_gated_view_interaction_check._required_role_gate_patch = True  # type: ignore[attr-defined]
+    discord.ui.View.interaction_check = _role_gated_view_interaction_check
+
+if not getattr(discord.ui.Modal.interaction_check, "_required_role_gate_patch", False):
+    _role_gated_modal_interaction_check._required_role_gate_patch = True  # type: ignore[attr-defined]
+    discord.ui.Modal.interaction_check = _role_gated_modal_interaction_check
+
+
+@bot.check
+async def _required_role_prefix_command_check(ctx: commands.Context) -> bool:
+    if not getattr(ctx, "author", None):
+        return False
+    if await _has_required_os_role(ctx.author.id):
+        return True
+    try:
+        await ctx.reply(_REQUIRED_ROLE_BLOCK_MESSAGE, mention_author=False)
+    except Exception:
+        pass
+    return False
+
 # ==== OWNER / ADMIN CHECKS ====
 
 
@@ -20201,11 +20331,13 @@ class VerifyRulesView(discord.ui.View):
             return
 
         if role in member.roles:
+            _set_cached_required_role(interaction.user.id, True)
             await interaction.response.send_message("You already have the role.", ephemeral=True)
             return
 
         try:
             await member.add_roles(role, reason="Accepted rules via verification button")
+            _set_cached_required_role(interaction.user.id, True)
             await interaction.response.send_message("✅ Verified! Role assigned.", ephemeral=True)
         except discord.Forbidden:
             await interaction.response.send_message("I don't have permission to assign that role.", ephemeral=True)
@@ -20652,6 +20784,8 @@ class ReleaseConfirmView(discord.ui.View):
         self.confirmed = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await _check_required_role_interaction(interaction):
+            return False
         if int(interaction.user.id) != self.author_id:
             await interaction.response.send_message("This isn't for you.", ephemeral=True)
             return False
