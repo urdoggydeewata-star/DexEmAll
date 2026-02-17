@@ -9849,6 +9849,42 @@ def _evo_day_phase_utc() -> str:
     return "day" if 6 <= hour < 18 else "night"
 
 
+_ITEM_EVOLUTION_FALLBACK: dict[str, dict[str, str]] = {
+    "eevee": {
+        "water-stone": "vaporeon",
+        "thunder-stone": "jolteon",
+        "fire-stone": "flareon",
+        "leaf-stone": "leafeon",
+        "ice-stone": "glaceon",
+    },
+    "pikachu": {"thunder-stone": "raichu"},
+    "nidorina": {"moon-stone": "nidoqueen"},
+    "nidorino": {"moon-stone": "nidoking"},
+    "clefairy": {"moon-stone": "clefable"},
+    "jigglypuff": {"moon-stone": "wigglytuff"},
+    "gloom": {"leaf-stone": "vileplume", "sun-stone": "bellossom"},
+    "poliwhirl": {"water-stone": "poliwrath"},
+    "weepinbell": {"leaf-stone": "victreebel"},
+    "shellder": {"water-stone": "cloyster"},
+    "staryu": {"water-stone": "starmie"},
+    "exeggcute": {"leaf-stone": "exeggutor"},
+    "vulpix": {"fire-stone": "ninetales"},
+    "growlithe": {"fire-stone": "arcanine"},
+    "togetic": {"shiny-stone": "togekiss"},
+    "roselia": {"shiny-stone": "roserade"},
+    "misdreavus": {"dusk-stone": "mismagius"},
+    "murkrow": {"dusk-stone": "honchkrow"},
+}
+
+
+def _fallback_item_evolution_target(species_name: str, item_id: str) -> Optional[str]:
+    sp = _daycare_norm_species(species_name)
+    item = _daycare_norm_item(item_id)
+    if not sp or not item:
+        return None
+    return _ITEM_EVOLUTION_FALLBACK.get(sp, {}).get(item)
+
+
 async def _evo_move_type_match(conn, moves_norm: set[str], required_type: str) -> bool:
     if not moves_norm:
         return False
@@ -10094,7 +10130,7 @@ async def _get_item_use_evolution(
     item_norm = _daycare_norm_item(item_id)
     if not item_norm:
         return None
-    return await _find_evolution_for_trigger(
+    target = await _find_evolution_for_trigger(
         conn,
         species_name,
         expected_trigger="use-item",
@@ -10105,6 +10141,10 @@ async def _get_item_use_evolution(
         item_used=item_norm,
         area_id=area_id,
     )
+    if target:
+        return target
+    # Fallback for older/simplified evolution payloads that omit per-branch details.
+    return _fallback_item_evolution_target(species_name, item_norm)
 
 
 async def _get_any_item_evolution_target(conn, species_name: str) -> Optional[str]:
