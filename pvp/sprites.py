@@ -136,6 +136,11 @@ def find_sprite(
                     p = form_folder / fn
                     if p.exists():
                         return p
+                # Explicit icon/box fallback when directional assets are absent.
+                for fn in ("icon.png", "box.png"):
+                    p = form_folder / fn
+                    if p.exists():
+                        return p
                 # last-resort: any gif/png in form folder matching perspective
                 for p in list(form_folder.glob(f"*{perspective}.gif")) + list(form_folder.glob(f"*{perspective}.png")):
                     if p.is_file():
@@ -148,6 +153,12 @@ def find_sprite(
         return None
 
     for fn in _candidates(perspective, shiny, female, prefer_animated):
+        p = folder / fn
+        if p.exists():
+            return p
+
+    # Explicit icon/box fallback when directional assets are absent.
+    for fn in ("icon.png", "box.png"):
         p = folder / fn
         if p.exists():
             return p

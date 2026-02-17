@@ -7307,7 +7307,16 @@ def _fallback_static_panel_file(
                     res = _PILImage.Resampling.NEAREST
                 except Exception:
                     res = _PILImage.NEAREST
-                spr.thumbnail(max_size, resample=res)
+                # Upscale tiny icon sprites so fallback panel still shows visible mons.
+                w, h = spr.size
+                if w > 0 and h > 0:
+                    max_w = max(1, int(max_size[0]))
+                    max_h = max(1, int(max_size[1]))
+                    scale = min(max_w / float(w), max_h / float(h))
+                    if scale != 1.0:
+                        nw = max(1, int(round(w * scale)))
+                        nh = max(1, int(round(h * scale)))
+                        spr = spr.resize((nw, nh), resample=res)
                 return spr
             except Exception:
                 return None
