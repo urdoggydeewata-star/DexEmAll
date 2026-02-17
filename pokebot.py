@@ -268,6 +268,14 @@ def _patch_pvp_streaming_reliability() -> None:
                 if stream_channel is None or not hasattr(stream_channel, "send"):
                     return None
 
+                stream_key = None
+                try:
+                    stream_key = (int(getattr(st, "turn", 0) or 0), str(turn_summary or "").strip())
+                    if stream_key == getattr(st, "_stream_last_sent_key", None):
+                        return getattr(st, "_last_stream_message", None)
+                except Exception:
+                    stream_key = None
+
                 try:
                     st.stream_channel = stream_channel
                     st.stream_channel_id = getattr(stream_channel, "id", None)
@@ -277,6 +285,9 @@ def _patch_pvp_streaming_reliability() -> None:
                 try:
                     msg = await original_send_stream(stream_channel, st, turn_summary, gif_file)
                     if msg is not None:
+                        if stream_key is not None:
+                            st._stream_last_sent_key = stream_key
+                        st._last_stream_message = msg
                         return msg
                 except Exception as e:
                     print(f"[StreamPatch] _send_stream_panel primary send failed: {e}")
@@ -297,10 +308,29 @@ def _patch_pvp_streaming_reliability() -> None:
                         description=desc,
                         color=discord.Color.purple(),
                     )
-                    return await stream_channel.send(embed=emb)
+                    msg = await stream_channel.send(embed=emb)
+                    if stream_key is not None:
+                        st._stream_last_sent_key = stream_key
+                    st._last_stream_message = msg
+                    return msg
                 except Exception as e:
-                    print(f"[StreamPatch] stream fallback send failed: {e}")
-                    return None
+                    print(f"[StreamPatch] stream embed fallback failed: {e}")
+                    try:
+                        txt = f"📺 Stream update • Turn {getattr(st, 'turn', '?')} • {getattr(st, 'fmt_label', 'Battle')}"
+                        if turn_summary:
+                            summary_text = str(turn_summary).strip()
+                            if summary_text:
+                                if len(summary_text) > 1500:
+                                    summary_text = "...\n" + summary_text[-1300:]
+                                txt += f"\n{summary_text}"
+                        msg = await stream_channel.send(txt)
+                        if stream_key is not None:
+                            st._stream_last_sent_key = stream_key
+                        st._last_stream_message = msg
+                        return msg
+                    except Exception as e2:
+                        print(f"[StreamPatch] stream text fallback failed: {e2}")
+                        return None
 
             _wrapped_send_stream_panel._dex_stream_patch = True  # type: ignore[attr-defined]
             _pvp_panel._send_stream_panel = _wrapped_send_stream_panel
@@ -348,6 +378,29 @@ def _patch_pvp_streaming_reliability() -> None:
 
             _wrapped_turn_loop._dex_stream_patch = True  # type: ignore[attr-defined]
             _pvp_panel._turn_loop = _wrapped_turn_loop
+
+        original_send_player_panel = getattr(_pvp_panel, "_send_player_panel", None)
+        if callable(original_send_player_panel) and not getattr(original_send_player_panel, "_dex_stream_patch", False):
+
+            async def _wrapped_send_player_panel(itx, st, for_user_id, view, gif_file=None, extra_lines=None):
+                result = await original_send_player_panel(itx, st, for_user_id, view, gif_file, extra_lines)
+                try:
+                    if bool(getattr(st, "streaming_enabled", False)) and int(for_user_id) == int(getattr(st, "p1_id", -1)):
+                        ch = getattr(st, "stream_channel", None) or getattr(itx, "channel", None)
+                        if ch is not None and hasattr(ch, "send"):
+                            st.stream_channel = ch
+                            st.stream_channel_id = getattr(ch, "id", None)
+                            summary_lines = list(getattr(st, "_last_turn_log", []) or [])
+                            summary_text = "\n".join(summary_lines).strip() if summary_lines else "Battle in progress..."
+                            send_fn = getattr(_pvp_panel, "_send_stream_panel", None)
+                            if callable(send_fn):
+                                await send_fn(ch, st, summary_text, None)
+                except Exception as e:
+                    print(f"[StreamPatch] _send_player_panel stream mirror failed: {e}")
+                return result
+
+            _wrapped_send_player_panel._dex_stream_patch = True  # type: ignore[attr-defined]
+            _pvp_panel._send_player_panel = _wrapped_send_player_panel
 
         accept_view_cls = getattr(_pvp_panel, "AcceptView", None)
         if accept_view_cls is not None:
