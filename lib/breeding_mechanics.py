@@ -17,12 +17,16 @@ _PRE_EVO_MAP: dict[str, str] = {}
 _PRE_EVO_MAP_TS: float = 0.0
 _PRE_EVO_MAP_TTL = 60.0 * 60.0 * 6.0  # 6h
 
-_SPECIAL_OFFSPRING_POOLS: dict[str, tuple[str, ...]] = {
-    # Canonical mixed offspring lines.
-    "nidoran-f": ("nidoran-f", "nidoran-m"),
-    "nidoran-m": ("nidoran-f", "nidoran-m"),
-    "illumise": ("illumise", "volbeat"),
-    "volbeat": ("illumise", "volbeat"),
+_FEMALE_CHILD_SPECIES_OVERRIDES: dict[str, str] = {
+    # Custom rule support requested: female Nidorina/Nidoqueen produces Nidoran line.
+    "nidorina": "nidoran-f",
+    "nidoqueen": "nidoran-f",
+}
+
+_EGG_GROUP_OVERRIDES: dict[str, set[str]] = {
+    # Custom compatibility support for requested Nidorina/Nidoqueen breeding behavior.
+    "nidorina": {"monster", "field"},
+    "nidoqueen": {"monster", "field"},
 }
 
 
@@ -263,17 +267,11 @@ def breeding_source_parent(parent_a: dict, parent_b: dict) -> dict:
     return parent_a
 
 
-def apply_special_offspring_rules(child_species: str, parent_a: dict, parent_b: dict) -> str:
+def apply_female_species_child_override(child_species: str, parent_a: dict, parent_b: dict) -> str:
     source = breeding_source_parent(parent_a, parent_b)
     source_species = norm_species(source.get("species"))
-    pool = _SPECIAL_OFFSPRING_POOLS.get(source_species)
-    if not pool:
-        return norm_species(child_species)
-    try:
-        picked = random.choice(list(pool))
-    except Exception:
-        picked = source_species
-    return norm_species(picked or child_species)
+    override = _FEMALE_CHILD_SPECIES_OVERRIDES.get(source_species)
+    return norm_species(override or child_species)
 
 
 def apply_incense_baby_rules(
@@ -381,6 +379,14 @@ def pair_info(parent_a: dict, parent_b: dict, entry_a: dict | None, entry_b: dic
 
     egg1 = parse_egg_groups(entry_a)
     egg2 = parse_egg_groups(entry_b)
+    if not egg1:
+        egg1 = set(_EGG_GROUP_OVERRIDES.get(s1, set()))
+    if not egg2:
+        egg2 = set(_EGG_GROUP_OVERRIDES.get(s2, set()))
+    if egg1 & {"undiscovered", "no-eggs"} and s1 in _EGG_GROUP_OVERRIDES:
+        egg1 = set(_EGG_GROUP_OVERRIDES[s1])
+    if egg2 & {"undiscovered", "no-eggs"} and s2 in _EGG_GROUP_OVERRIDES:
+        egg2 = set(_EGG_GROUP_OVERRIDES[s2])
     blocked_groups = {"undiscovered", "no-eggs"}
     if egg1 & blocked_groups or egg2 & blocked_groups:
         fail["reason"] = "One parent belongs to the Undiscovered egg group."
@@ -417,6 +423,11 @@ def pair_info(parent_a: dict, parent_b: dict, entry_a: dict | None, entry_b: dic
         child_species = s1
     else:
         child_species = s1 if g1 == "female" else (s2 if g2 == "female" else s1)
+        child_species = _FEMALE_CHILD_SPECIES_OVERRIDES.get(child_species, child_species)
+
+    if norm_species(child_species) == "ditto":
+        fail["reason"] = "Ditto cannot be obtained from eggs."
+        return fail
 
     rate = 1.15 if (s1 == s2 and not (ditto1 or ditto2)) else (0.85 if (ditto1 or ditto2) else 0.95)
     return {
@@ -603,7 +614,9 @@ async def create_egg(
         incense_babies,
         pre_evo_map_data=pre_map_data,
     )
-    child_species = apply_special_offspring_rules(child_species, parent_a, parent_b)
+    child_species = apply_female_species_child_override(child_species, parent_a, parent_b)
+    if norm_species(child_species) == "ditto":
+        return None
     child_entry = await species_entry_fetch(child_species)
     if not child_entry:
         return None
