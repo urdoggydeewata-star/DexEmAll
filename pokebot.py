@@ -11618,27 +11618,48 @@ class MarketQuantityModal(discord.ui.Modal):
         self.add_item(self.qty_input)
 
     async def on_submit(self, itx: discord.Interaction):
+        deferred = False
+
+        async def _reply(msg: str) -> None:
+            try:
+                if deferred or itx.response.is_done():
+                    await itx.followup.send(msg, ephemeral=True)
+                else:
+                    await itx.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+
         if int(itx.user.id) != self.author_id:
-            return await itx.response.send_message("This isn't for you.", ephemeral=True)
-        await itx.response.defer(ephemeral=True, thinking=False)
+            return await _reply("This isn't for you.")
+        try:
+            await itx.response.defer(ephemeral=True, thinking=True)
+            deferred = True
+        except Exception:
+            deferred = False
         uid = str(itx.user.id)
         state = await _get_adventure_state(uid)
         if str(state.get("area_id") or "") != self.area_id or not _is_pokemart(self.area_id):
-            return await itx.followup.send("Market access is only available while you're inside a Poké Mart.", ephemeral=True)
+            return await _reply("Market access is only available while you're inside a Poké Mart.")
         try:
             qty = int(str(self.qty_input.value or "").strip())
         except Exception:
-            return await itx.followup.send("Quantity must be a valid integer.", ephemeral=True)
+            return await _reply("Quantity must be a valid integer.")
         if qty <= 0:
-            return await itx.followup.send("Quantity must be positive.", ephemeral=True)
+            return await _reply("Quantity must be positive.")
         if qty > MAX_STACK:
-            return await itx.followup.send(f"Quantity too large (max {MAX_STACK}).", ephemeral=True)
-        if self.mode == "buy":
-            ok, msg = await _market_buy(uid, self.item_key, qty)
-        else:
-            ok, msg = await _market_sell(uid, self.item_key, qty)
-        _ = ok
-        return await itx.followup.send(msg, ephemeral=True)
+            return await _reply(f"Quantity too large (max {MAX_STACK}).")
+        try:
+            if self.mode == "buy":
+                ok, msg = await _market_buy(uid, self.item_key, qty)
+            else:
+                ok, msg = await _market_sell(uid, self.item_key, qty)
+            _ = ok
+            return await _reply(str(msg))
+        except Exception as e:
+            print(f"[market] quantity modal trade failed: mode={self.mode} item={self.item_key} qty={qty} err={e}")
+            import traceback
+            traceback.print_exc()
+            return await _reply(f"❌ Market trade failed: {e}")
 
 
 class MarketDropdownSearchModal(discord.ui.Modal):
@@ -11811,12 +11832,7 @@ class MarketDropdownView(discord.ui.View):
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
         if not _is_pokemart(self.area_id):
             return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
-        data = itx.data if isinstance(itx.data, dict) else {}
-        raw_values = data.get("values") if isinstance(data, dict) else None
-        if isinstance(raw_values, (list, tuple)):
-            values = [str(v) for v in raw_values if v is not None]
-        else:
-            values = []
+        values = _itx_select_values(itx)
         item_key = str(values[0] if values else "").strip()
         if not item_key or item_key == "__none__":
             return await itx.response.send_message("No item selected.", ephemeral=True)
