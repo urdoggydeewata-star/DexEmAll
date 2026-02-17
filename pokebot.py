@@ -11811,9 +11811,12 @@ class MarketDropdownView(discord.ui.View):
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
         if not _is_pokemart(self.area_id):
             return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
-        values = list(getattr(itx.data, "values", []) or []) if hasattr(itx, "data") else []
-        if not values and isinstance(itx.data, dict):
-            values = list(itx.data.get("values") or [])
+        data = itx.data if isinstance(itx.data, dict) else {}
+        raw_values = data.get("values") if isinstance(data, dict) else None
+        if isinstance(raw_values, (list, tuple)):
+            values = [str(v) for v in raw_values if v is not None]
+        else:
+            values = []
         item_key = str(values[0] if values else "").strip()
         if not item_key or item_key == "__none__":
             return await itx.response.send_message("No item selected.", ephemeral=True)
