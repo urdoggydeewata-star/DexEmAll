@@ -714,6 +714,10 @@ _ADMIN_CHECK_CACHE_TTL_SECONDS = 120.0
 _ADMIN_CHECK_CACHE: dict[str, tuple[bool, float]] = {}
 _REQUIRED_ROLE_CACHE_TTL_SECONDS = 120.0
 _REQUIRED_ROLE_CACHE: dict[int, tuple[bool, float]] = {}
+_ROLE_GATE_EXEMPT_CACHE_TTL_SECONDS = 300.0
+_ROLE_GATE_EXEMPT_CACHE: dict[int, tuple[bool, float]] = {}
+_ROLE_GATE_EXEMPT_TABLE_READY = False
+_ROLE_GATE_EXEMPT_TABLE_LOCK = asyncio.Lock()
 _REQUIRED_ROLE_BLOCK_MESSAGE = (
     f"❌ You need <@&{VERIFY_ROLE_ID}> in the OS server to use this bot.\n"
     "Join the OS server and complete verification first."
@@ -793,6 +797,171 @@ def _set_cached_required_role(user_id: int | str, has_role: bool) -> None:
     _REQUIRED_ROLE_CACHE[uid] = (bool(has_role), float(time.time()))
 
 
+def _get_cached_role_gate_exempt(user_id: int | str) -> Optional[bool]:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return None
+    rec = _ROLE_GATE_EXEMPT_CACHE.get(uid)
+    if rec is None:
+        return None
+    val, ts = rec
+    if (time.time() - float(ts)) > _ROLE_GATE_EXEMPT_CACHE_TTL_SECONDS:
+        _ROLE_GATE_EXEMPT_CACHE.pop(uid, None)
+        return None
+    return bool(val)
+
+
+def _set_cached_role_gate_exempt(user_id: int | str, is_exempt: bool) -> None:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return
+    _ROLE_GATE_EXEMPT_CACHE[uid] = (bool(is_exempt), float(time.time()))
+
+
+async def _ensure_role_gate_exempt_table() -> None:
+    global _ROLE_GATE_EXEMPT_TABLE_READY
+    if _ROLE_GATE_EXEMPT_TABLE_READY:
+        return
+    async with _ROLE_GATE_EXEMPT_TABLE_LOCK:
+        if _ROLE_GATE_EXEMPT_TABLE_READY:
+            return
+        try:
+            async with db.session() as conn:
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS role_gate_exempt_users (
+                      user_id TEXT PRIMARY KEY,
+                      added_by TEXT,
+                      note TEXT,
+                      added_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                await conn.commit()
+            _ROLE_GATE_EXEMPT_TABLE_READY = True
+        except Exception:
+            _ROLE_GATE_EXEMPT_TABLE_READY = False
+
+
+async def _is_role_gate_exempt(user_id: int | str, *, force_refresh: bool = False) -> bool:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    if not force_refresh:
+        cached = _get_cached_role_gate_exempt(uid)
+        if cached is not None:
+            return bool(cached)
+    val = False
+    try:
+        await _ensure_role_gate_exempt_table()
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT 1 FROM role_gate_exempt_users WHERE user_id = ? LIMIT 1",
+                (str(uid),),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+        val = bool(row)
+    except Exception:
+        val = False
+    _set_cached_role_gate_exempt(uid, val)
+    return val
+
+
+async def _grant_role_gate_exempt(
+    user_id: int | str,
+    *,
+    added_by: int | str | None = None,
+    note: str | None = None,
+) -> bool:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    try:
+        await _ensure_role_gate_exempt_table()
+        async with db.session() as conn:
+            await conn.execute(
+                """
+                INSERT INTO role_gate_exempt_users (user_id, added_by, note)
+                VALUES (?, ?, ?)
+                ON CONFLICT (user_id) DO UPDATE SET
+                  added_by = excluded.added_by,
+                  note = excluded.note
+                """,
+                (
+                    str(uid),
+                    (str(added_by) if added_by is not None else None),
+                    ((str(note).strip() or None) if note is not None else None),
+                ),
+            )
+            await conn.commit()
+        _set_cached_role_gate_exempt(uid, True)
+        return True
+    except Exception:
+        return False
+
+
+async def _revoke_role_gate_exempt(user_id: int | str) -> bool:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    try:
+        await _ensure_role_gate_exempt_table()
+        async with db.session() as conn:
+            await conn.execute(
+                "DELETE FROM role_gate_exempt_users WHERE user_id = ?",
+                (str(uid),),
+            )
+            await conn.commit()
+        _ROLE_GATE_EXEMPT_CACHE.pop(uid, None)
+        return True
+    except Exception:
+        return False
+
+
+async def _list_role_gate_exempt(limit: int = 100) -> list[dict]:
+    out: list[dict] = []
+    lim = max(1, min(int(limit or 100), 500))
+    try:
+        await _ensure_role_gate_exempt_table()
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT user_id, added_by, note, added_at FROM role_gate_exempt_users ORDER BY added_at DESC LIMIT ?",
+                (lim,),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+        for row in rows or []:
+            if hasattr(row, "keys"):
+                out.append(dict(row))
+            else:
+                out.append(
+                    {
+                        "user_id": row[0] if len(row) > 0 else None,
+                        "added_by": row[1] if len(row) > 1 else None,
+                        "note": row[2] if len(row) > 2 else None,
+                        "added_at": row[3] if len(row) > 3 else None,
+                    }
+                )
+    except Exception:
+        return []
+    return out
+
+
+def _parse_user_id_input(raw: str | int | None) -> Optional[int]:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if s.startswith("<@") and s.endswith(">"):
+        s = s.strip("<@!>")
+    return int(s) if s.isdigit() else None
+
+
 def _is_verify_button_interaction(interaction: discord.Interaction) -> bool:
     try:
         data = interaction.data
@@ -844,6 +1013,10 @@ async def _check_required_role_interaction(
 ) -> bool:
     if not interaction.user:
         return False
+    if int(interaction.user.id) in OWNER_IDS:
+        return True
+    if await _is_role_gate_exempt(interaction.user.id):
+        return True
     if allow_verify_button and _is_verify_button_interaction(interaction):
         return True
     if await _has_required_os_role(interaction.user.id):
@@ -952,6 +1125,10 @@ if not getattr(discord.ui.Modal.interaction_check, "_required_role_gate_patch", 
 async def _required_role_prefix_command_check(ctx: commands.Context) -> bool:
     if not getattr(ctx, "author", None):
         return False
+    if int(ctx.author.id) in OWNER_IDS:
+        return True
+    if await _is_role_gate_exempt(ctx.author.id):
+        return True
     if await _has_required_os_role(ctx.author.id):
         return True
     try:
@@ -1803,6 +1980,69 @@ async def admin_remove(interaction: discord.Interaction, member: discord.Member)
     await interaction.response.send_message(
         f"✅ Removed {member.mention} (`{uid}`) from admin whitelist.", ephemeral=True
     )
+
+
+@bot.tree.command(name="verified_add", description="(Owner) Exempt a player from the OS role requirement.")
+@owners_only()
+@app_commands.describe(user="User mention or user ID", note="Optional note for why this user is exempt")
+async def verified_add(interaction: discord.Interaction, user: str, note: str | None = None):
+    uid = _parse_user_id_input(user)
+    if uid is None:
+        return await interaction.response.send_message("❌ Invalid user. Provide a mention like `<@123>` or a numeric ID.", ephemeral=True)
+    if uid in OWNER_IDS:
+        return await interaction.response.send_message("ℹ️ Owners are already exempt from the role rule.", ephemeral=True)
+    ok = await _grant_role_gate_exempt(uid, added_by=interaction.user.id, note=note)
+    if not ok:
+        return await interaction.response.send_message("❌ Failed to add exemption. Try again.", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ Added <@{uid}> (`{uid}`) to the verified exemption list (role rule bypass).",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="verified_remove", description="(Owner) Remove a player from role-rule exemptions.")
+@owners_only()
+@app_commands.describe(user="User mention or user ID")
+async def verified_remove(interaction: discord.Interaction, user: str):
+    uid = _parse_user_id_input(user)
+    if uid is None:
+        return await interaction.response.send_message("❌ Invalid user. Provide a mention like `<@123>` or a numeric ID.", ephemeral=True)
+    if uid in OWNER_IDS:
+        return await interaction.response.send_message("❌ Owners cannot be removed from exemption.", ephemeral=True)
+    ok = await _revoke_role_gate_exempt(uid)
+    if not ok:
+        return await interaction.response.send_message("❌ Failed to remove exemption. Try again.", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ Removed <@{uid}> (`{uid}`) from the verified exemption list.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="verified_list", description="(Owner) List players exempt from the OS role rule.")
+@owners_only()
+async def verified_list(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=False)
+    rows = await _list_role_gate_exempt(limit=100)
+    if not rows:
+        return await interaction.followup.send("No verified role-rule exemptions are currently set.", ephemeral=True)
+    lines: list[str] = []
+    for row in rows[:50]:
+        uid = str(row.get("user_id") or "").strip()
+        if not uid:
+            continue
+        added_by = str(row.get("added_by") or "").strip()
+        note = str(row.get("note") or "").strip()
+        if len(note) > 60:
+            note = note[:57] + "..."
+        by_txt = f" by <@{added_by}>" if added_by.isdigit() else ""
+        note_txt = f" — {note}" if note else ""
+        lines.append(f"• <@{uid}> (`{uid}`){by_txt}{note_txt}")
+    if not lines:
+        return await interaction.followup.send("No verified role-rule exemptions are currently set.", ephemeral=True)
+    msg = "**Verified role-rule exemptions:**\n" + "\n".join(lines)
+    if len(msg) > 1900:
+        msg = msg[:1897] + "..."
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 @bot.tree.command(name="hatchnow", description="(Owner) Instantly hatch one daycare egg for testing.")
