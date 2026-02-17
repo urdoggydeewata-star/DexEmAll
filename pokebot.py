@@ -1,14 +1,12 @@
-# ======= BirbxNa1og_PokemonBot — global slash + DB-backed =======
 import os
 import sys
 import pathlib
 import json
 from io import BytesIO
 
-# Optional Pillow for route panel cropping
 try:
     from PIL import Image  # type: ignore
-except Exception:  # Pillow not installed
+except Exception:
     Image = None  # type: ignore
 import random
 import math
@@ -49,6 +47,20 @@ if TYPE_CHECKING:
 import lib
 from lib import db
 from lib.owner_settings import load_owner_settings
+from lib.market_catalog import (
+    MARKET_DISPLAY_NAMES,
+    MARKET_PRICE_CATALOG,
+    MARKET_SELL_PRICES,
+    market_display_name as _catalog_market_display_name,
+    market_item_variants as _catalog_market_item_variants,
+    normalize_market_key as _catalog_normalize_market_key,
+    resolve_market_key as _catalog_resolve_market_key,
+)
+from lib.adventure_history import (
+    history_entry as _history_entry,
+    history_pop as _history_pop,
+    history_push as _history_push,
+)
 try:
     from lib import db_cache
 except ImportError:
@@ -6840,98 +6852,7 @@ ROUTE_MOVE_ITEMS_BY_TIER: Dict[str, List[Tuple[str, str]]] = {
     ],
 }
 
-# Poké Mart economy table (from shared "Sellable Items in Pokémon" spec).
-# Values are used directly for both buy and sell in market flow.
-MARKET_PRICE_CATALOG: Dict[str, List[Tuple[str, str, int]]] = {
-    "Treasure Items": [
-        ("nugget", "Nugget", 5000),
-        ("big_nugget", "Big Nugget", 10000),
-        ("pearl", "Pearl", 700),
-        ("big_pearl", "Big Pearl", 3750),
-        ("stardust", "Stardust", 1000),
-        ("star_piece", "Star Piece", 4900),
-        ("tiny_mushroom", "Tiny Mushroom", 250),
-        ("big_mushroom", "Big Mushroom", 2500),
-        ("shoal_salt", "Shoal Salt", 10),
-        ("shoal_shell", "Shoal Shell", 10),
-    ],
-    "Healing Items": [
-        ("potion", "Potion", 800),
-        ("super_potion", "Super Potion", 1800),
-        ("hyper_potion", "Hyper Potion", 3500),
-        ("full_restore", "Full Restore", 7500),
-        ("revive", "Revive", 4000),
-        ("fresh_water", "Fresh Water", 600),
-        ("soda_pop", "Soda Pop", 900),
-        ("lemonade", "Lemonade", 1200),
-        ("moomoo_milk", "Moomoo Milk", 1500),
-        ("antidote", "Antidote", 400),
-        ("burn_heal", "Burn Heal", 500),
-        ("ice_heal", "Ice Heal", 500),
-        ("awakening", "Awakening", 500),
-        ("paralyze_heal", "Parlyz Heal", 450),
-        ("full_heal", "Full Heal", 1200),
-    ],
-    "PP Recovery": [
-        ("ether", "Ether", 1500),
-        ("elixir", "Elixir", 3500),
-    ],
-    "Evolution Stones": [
-        ("fire_stone", "Fire Stone", 2100),
-        ("water_stone", "Water Stone", 2100),
-        ("thunder_stone", "Thunder Stone", 2100),
-        ("leaf_stone", "Leaf Stone", 2100),
-        ("moon_stone", "Moon Stone", 2100),
-        ("sun_stone", "Sun Stone", 2100),
-    ],
-    "Poké Balls": [
-        ("poke_ball", "Poké Ball", 100),
-        ("great_ball", "Great Ball", 300),
-        ("ultra_ball", "Ultra Ball", 600),
-        ("repeat_ball", "Repeat Ball", 500),
-        ("timer_ball", "Timer Ball", 500),
-        ("net_ball", "Net Ball", 500),
-        ("dive_ball", "Dive Ball", 500),
-        ("nest_ball", "Nest Ball", 500),
-        ("luxury_ball", "Luxury Ball", 500),
-    ],
-    "Other Battle / Escape Items": [
-        ("poke_doll", "Poké Doll", 500),
-        ("fluffy_tail", "Fluffy Tail", 500),
-    ],
-    "Held Items": [
-        ("leftovers", "Leftovers", 2000),
-        ("quick_claw", "Quick Claw", 50),
-        ("kings_rock", "King's Rock", 100),
-        ("scope_lens", "Scope Lens", 100),
-        ("focus_band", "Focus Band", 100),
-        ("choice_band", "Choice Band", 100),
-        ("exp_share", "Exp. Share", 1500),
-        ("amulet_coin", "Amulet Coin", 100),
-        ("everstone", "Everstone", 100),
-        ("lucky_egg", "Lucky Egg", 5000),
-        ("macho_brace", "Macho Brace", 1500),
-        ("soothe_bell", "Soothe Bell", 100),
-    ],
-}
-MARKET_ITEM_ALIASES: Dict[str, str] = {
-    "pokeball": "poke_ball",
-    "poke_ball": "poke_ball",
-    "great_ball": "great_ball",
-    "ultra_ball": "ultra_ball",
-    "parlyz_heal": "paralyze_heal",
-    "kingsrock": "kings_rock",
-}
-MARKET_SELL_PRICES: Dict[str, int] = {
-    item_id: int(price)
-    for rows in MARKET_PRICE_CATALOG.values()
-    for item_id, _disp, price in rows
-}
-MARKET_DISPLAY_NAMES: Dict[str, str] = {
-    item_id: disp
-    for rows in MARKET_PRICE_CATALOG.values()
-    for item_id, disp, _price in rows
-}
+# :: market catalog moved to lib.market_catalog
 
 ADVENTURE_ROUTES = {
     "route-1": {
@@ -7703,37 +7624,20 @@ def _is_pokemart(area_id: str) -> bool:
 
 
 def _market_normalize_key(raw: str) -> str:
-    key = item_id_from_user(str(raw or ""))
-    return MARKET_ITEM_ALIASES.get(key, key)
+    # ::market
+    return _catalog_normalize_market_key(str(raw or ""))
 
 
 def _market_resolve_item_key(raw: str) -> Optional[str]:
-    key = _market_normalize_key(raw)
-    if key in MARKET_SELL_PRICES:
-        return key
-    # Accept display names from the catalog.
-    key2 = item_id_from_user(str(raw or ""))
-    for item_id, display in MARKET_DISPLAY_NAMES.items():
-        if item_id_from_user(display) == key2:
-            return item_id
-    return None
+    return _catalog_resolve_market_key(str(raw or ""))
 
 
 def _market_item_variants(item_key: str) -> tuple[str, ...]:
-    base = item_id_from_user(item_key)
-    out = [base, base.replace("_", "-")]
-    if base == "paralyze_heal":
-        out.append("parlyz_heal")
-        out.append("paralyze-heal")
-    dedup: list[str] = []
-    for k in out:
-        if k and k not in dedup:
-            dedup.append(k)
-    return tuple(dedup)
+    return _catalog_market_item_variants(str(item_key or ""))
 
 
 def _market_display(item_key: str) -> str:
-    return MARKET_DISPLAY_NAMES.get(item_key, pretty_item_name(item_key))
+    return _catalog_market_display_name(str(item_key or ""))
 
 
 def _market_price_embed() -> discord.Embed:
@@ -7788,7 +7692,7 @@ async def _market_buy(owner_id: str, item_key: str, qty_requested: int) -> tuple
     if price <= 0:
         return False, "That item is not sold in this Poké Mart."
     variants = _market_item_variants(item_key)
-    canonical_item_id = item_id_from_user(item_key)
+    canonical_item_id = _market_normalize_key(item_key)
     display = _market_display(item_key)
     async with DB_WRITE_LOCK:
         async with db.session() as conn:
@@ -7892,61 +7796,30 @@ def _adv_default_state() -> dict:
     return {
         "area_id": "pallet-town",
         "last_city": "pallet-town",
-        "area_history": [],      # stack for back navigation
+        "area_history": [],
         "cleared_cities": [],
         "cleared_routes": [],
-        "gym_badges": [],         # badge ids (e.g. "boulder") for gym cities
-        "defeated_trainers": {},  # trainer_id -> last_defeated_ts
-        "discovered": {},         # route_id -> [species]
-        "rival_defeated": [],     # list of rival battle ids
-        "repeat_seen": [],        # species seen/caught for Repeat Ball
-        "dex_seen": 0,            # rough dex count for crit capture odds
-        "daycare": {},            # per-city daycare data
+        "gym_badges": [],
+        "defeated_trainers": {},
+        "discovered": {},
+        "rival_defeated": [],
+        "repeat_seen": [],
+        "dex_seen": 0,
+        "daycare": {},
     }
 
 
 def _adv_history_entry(state: dict, area_id: str | None) -> Any:
-    aid = str(area_id or "").strip() or "pallet-town"
-    if aid == "route-1":
-        rp = (state.get("route_panels") or {}).get("route-1")
-        panel = 1
-        if isinstance(rp, dict):
-            try:
-                panel = max(1, min(int(rp.get("panel", 1)), 3))
-            except Exception:
-                panel = 1
-        return {"area_id": "route-1", "route_panel": int(panel)}
-    return aid
+    # ::nav
+    return _history_entry(state, area_id)
 
 
 def _adv_history_push(state: dict, area_id: str | None) -> None:
-    hist = state.get("area_history")
-    if not isinstance(hist, list):
-        hist = []
-    hist.append(_adv_history_entry(state, area_id))
-    state["area_history"] = hist[-15:]
+    _history_push(state, area_id, max_len=15)
 
 
 def _adv_history_pop(state: dict, default_area: str = "pallet-town") -> str:
-    hist = state.get("area_history")
-    if not isinstance(hist, list) or not hist:
-        return str(default_area or "pallet-town")
-    raw = hist.pop()
-    state["area_history"] = hist
-    if isinstance(raw, dict):
-        area = str(raw.get("area_id") or "").strip() or str(default_area or "pallet-town")
-        if area == "route-1":
-            panel = 3
-            try:
-                panel = max(1, min(int(raw.get("route_panel", 3)), 3))
-            except Exception:
-                panel = 3
-            rp = state.setdefault("route_panels", {})
-            rp["route-1"] = {"panel": int(panel), "pos": ("end" if panel >= 3 else "start")}
-            state["route_panels"] = rp
-        return area
-    prev = str(raw or "").strip()
-    return prev or str(default_area or "pallet-town")
+    return _history_pop(state, default_area)
 
 
 async def _get_adventure_state(user_id: str) -> dict:
