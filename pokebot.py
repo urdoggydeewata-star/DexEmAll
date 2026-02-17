@@ -2992,6 +2992,12 @@ async def take_item(interaction: discord.Interaction, name: str, slot: int | Non
 
 
 MAX_STACK = 999
+GLOBAL_ITEM_BUY_LOCK_MESSAGE = (
+    "🛒 Item purchases from this global panel are locked.\n"
+    "Use **/adventure** and enter a **Poké Mart** to buy/sell items."
+)
+
+
 class QuantityModal(discord.ui.Modal, title="Buy item"):
     def __init__(self, parent_view: "BuyItemView", source_message: discord.Message):
         super().__init__()
@@ -3009,128 +3015,8 @@ class QuantityModal(discord.ui.Modal, title="Buy item"):
 
     async def on_submit(self, itx: discord.Interaction):
         await itx.response.defer(ephemeral=True)  # ACK immediately
-
-        try:
-            # Parse qty
-            try:
-                qty_requested = int(str(self.qty_input.value).strip())
-            except Exception:
-                return await itx.followup.send("❌ Please enter a valid integer.", ephemeral=False)
-            if qty_requested <= 0:
-                return await itx.followup.send("❌ Quantity must be positive.", ephemeral=False)
-            if qty_requested > MAX_STACK:
-                return await itx.followup.send(f"❌ Max per purchase is **{MAX_STACK}**.", ephemeral=False)
-
-            unit   = int(self.parent_view.price or 0)
-            owner  = str(self.parent_view.owner_id)
-            item_id = self.parent_view.item_row["id"]
-
-            # Open DB once; do everything atomically
-            async with DB_WRITE_LOCK:
-                conn = await open_db()
-                try:
-                    # Postgres uses BEGIN; SQLite uses BEGIN IMMEDIATE
-                    await conn.execute("BEGIN" if getattr(db, "DB_IS_POSTGRES", False) else "BEGIN IMMEDIATE")
-
-                    # read balance (currencies JSON or coins fallback)
-                    cur = await conn.execute("SELECT * FROM users WHERE user_id=? LIMIT 1", (owner,))
-                    row = await cur.fetchone()
-                    await cur.close()
-                    row_dict = dict(row) if row else None
-                    balance = int(db.get_currency_from_row(row_dict, "coins"))
-
-                    # current qty for this item
-                    cur = await conn.execute(
-                        "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
-                        (owner, item_id)
-                    )
-                    r = await cur.fetchone()
-                    current_qty = int(r[0]) if r else 0
-                    await cur.close()
-
-                    if current_qty >= MAX_STACK:
-                        await conn.execute("ROLLBACK")
-                        return await itx.followup.send(
-                            f"❌ You already have **{current_qty}/{MAX_STACK}**. You can’t carry more.",
-                            ephemeral=True
-                        )
-
-                    # allowed by stack cap
-                    allowed_by_cap = MAX_STACK - current_qty
-                    allowed = min(qty_requested, allowed_by_cap)
-
-                    # cost for allowed amount
-                    total_cost = unit * allowed
-
-                    # balance check (only if item costs money)
-                    if unit > 0 and balance < total_cost:
-                        await conn.execute("ROLLBACK")
-                        return await itx.followup.send(
-                            f"❌ Not enough PokéDollars. Cost: **{total_cost:,} {PKDollar_NAME}**, you have **{balance:,} {PKDollar_NAME}**.",
-                            ephemeral=True
-                        )
-
-                    # ensure user row exists (currencies JSON)
-                    await conn.execute(
-                        "INSERT INTO users(user_id, coins, currencies) VALUES(?, 0, '{\"coins\": 0}'::jsonb) "
-                        "ON CONFLICT(user_id) DO NOTHING",
-                        (owner,)
-                    )
-
-                    # deduct coins (currencies JSON)
-                    if unit > 0 and total_cost > 0:
-                        await db.add_currency_conn(conn, owner, "coins", -total_cost)
-
-                    # upsert item
-                    if allowed > 0:
-                        await conn.execute(
-                            "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,?) "
-                            "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = MIN(user_items.qty + excluded.qty, ?);",
-                            (owner, item_id, allowed, MAX_STACK)
-                        )
-
-                    # new qty
-                    cur = await conn.execute(
-                        "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
-                        (owner, item_id)
-                    )
-                    r = await cur.fetchone()
-                    new_qty = int(r[0]) if r else current_qty
-                    await cur.close()
-
-                    await conn.commit()
-                    db.invalidate_bag_cache(owner)
-                finally:
-                    await conn.close()
-
-            # refresh panel
-            self.parent_view.have_qty = new_qty
-            embed = build_item_embed(
-                self.parent_view.item_row,
-                self.parent_view.owner_id,
-                self.parent_view.price,
-                new_qty
-            )
-
-            try:
-                await self.source_message.edit(embed=embed, view=self.parent_view)
-            except Exception:
-                await itx.followup.send(embed=embed, view=self.parent_view, ephemeral=False)
-
-            bought_text = f"Bought **{allowed}×**" if allowed > 0 else "Couldn’t buy any"
-            item_name = pretty_item_name(self.parent_view.item_row.get("name") or item_id)
-
-            # If we reduced due to cap, tell the user
-            extra = ""
-            if allowed < qty_requested:
-                extra = f" (reduced by bag cap: {current_qty} ➜ {new_qty}/{MAX_STACK})"
-
-            cost_text = f" for **{total_cost:,} {PKDollar_NAME}**" if total_cost else ""
-            await itx.followup.send(f"✅ {bought_text} **{item_name}**{cost_text}.{extra}", ephemeral=False)
-
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            await itx.followup.send(f"⚠️ Purchase failed: `{type(e).__name__}: {e}`", ephemeral=True)
+        # Legacy global buy flow is intentionally disabled.
+        return await itx.followup.send(GLOBAL_ITEM_BUY_LOCK_MESSAGE, ephemeral=True)
 class BuyItemView(discord.ui.View):
     def __init__(self, owner_id: int, item_row: dict, price: int, have_qty: int):
         super().__init__(timeout=90)
@@ -3140,8 +3026,9 @@ class BuyItemView(discord.ui.View):
         self.have_qty = have_qty
 
         self.buy_btn = discord.ui.Button(
-            label=f"Buy… ({self.price:,} {PKDollar_NAME} each)",
-            style=discord.ButtonStyle.success
+            label="Buy in Poké Mart",
+            style=discord.ButtonStyle.secondary,
+            disabled=True,
         )
         self.add_item(self.buy_btn)
         self.buy_btn.callback = self.on_buy_click
@@ -3151,11 +3038,10 @@ class BuyItemView(discord.ui.View):
     async def on_buy_click(self, itx: discord.Interaction):
         if itx.user.id != self.owner_id:
             return await itx.response.send_message("This shop panel isn’t for you.", ephemeral=True)
+        return await itx.response.send_message(GLOBAL_ITEM_BUY_LOCK_MESSAGE, ephemeral=True)
 
-        msg = self.bound_message or itx.message
-        modal = QuantityModal(self, msg)
-        await itx.response.send_modal(modal)
-@bot.tree.command(name="item", description="Show info about an item and buy it.")
+
+@bot.tree.command(name="item", description="Show info about an item.")
 @app_commands.describe(name="Item id or name (e.g. 'poke ball', 'choice scarf')")
 async def item_cmd(interaction: discord.Interaction, name: str):
     start_time = time.time()
