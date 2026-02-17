@@ -4375,11 +4375,12 @@ class BattleState:
                     if not mon_target:
                         continue
                     ball_name = act.get("value", {}).get("ball", "poké ball")
+                    ball_label = _normalize_ball_name(str(ball_name)).title()
                     try:
                         caught, shakes = _attempt_capture(mon_target, ball_name, self)
                         target_display = _format_pokemon_name(mon_target)
                         if caught:
-                            log.append(f"**{self.p1_name}** threw a {ball_name.title()}! It shook {shakes} time(s) and **caught {target_display}!**")
+                            log.append(f"**{self.p1_name}** threw a {ball_label}! It shook {shakes} time(s) and **caught {target_display}!**")
                             self.winner = self.p1_id
                             self._caught_wild_mon = mon_target  # so pokebot can add to team
                             self._throw_shakes = shakes  # for shake-by-shake embeds
@@ -4388,20 +4389,20 @@ class BattleState:
                         else:
                             # Different messages by shake count (battle continues)
                             if shakes == 0:
-                                msg = f"**{self.p1_name}** threw a {ball_name.title()}! Oh no! The Pokémon broke free!"
+                                msg = f"**{self.p1_name}** threw a {ball_label}! Oh no! The Pokémon broke free!"
                             elif shakes == 1:
-                                msg = f"**{self.p1_name}** threw a {ball_name.title()}! Aww! It appeared to be caught!"
+                                msg = f"**{self.p1_name}** threw a {ball_label}! Aww! It appeared to be caught!"
                             elif shakes == 2:
-                                msg = f"**{self.p1_name}** threw a {ball_name.title()}! Aargh! Almost had it!"
+                                msg = f"**{self.p1_name}** threw a {ball_label}! Aargh! Almost had it!"
                             else:  # 3 shakes
-                                msg = f"**{self.p1_name}** threw a {ball_name.title()}! Shoot! It was so close, too!"
+                                msg = f"**{self.p1_name}** threw a {ball_label}! Shoot! It was so close, too!"
                             log.append(msg)
                             self._throw_shakes = shakes  # for shake-by-shake embeds
                     except Exception as capture_err:
                         # Do not abort the whole battle when a throw-specific error occurs.
                         print(f"[PvP] Capture resolution error: {capture_err}")
                         self._throw_shakes = 0
-                        log.append(f"**{self.p1_name}** threw a {ball_name.title()}! Oh no! The Pokémon broke free!")
+                        log.append(f"**{self.p1_name}** threw a {ball_label}! Oh no! The Pokémon broke free!")
                     continue
                 continue
             if act.get("_processed"):
@@ -6567,7 +6568,11 @@ _BALLS_BASIC = {
 }
 
 def _normalize_item(name: str) -> str:
-    return name.lower().replace("é", "e").replace("-", " ").replace("_", " ").strip()
+    n = str(name or "").strip().lower().replace("é", "e")
+    # Normalize common dash variants and separators to spaces.
+    for ch in ("-", "_", "–", "—", "‑", "‒", "−", "﹣", "－", ":"):
+        n = n.replace(ch, " ")
+    return " ".join(n.split())
 
 
 _BALL_NAME_ALIASES = {
@@ -6603,7 +6608,7 @@ _BALL_NAME_ALIASES = {
 
 def _normalize_ball_name(name: str) -> str:
     n = _normalize_item(name)
-    compact = n.replace(" ", "")
+    compact = "".join(ch for ch in n if ch.isalnum())
     if n in _BALLS_BASIC:
         return n
     if compact in _BALL_NAME_ALIASES:
@@ -6887,7 +6892,8 @@ def _ball_multiplier(ball_name: str, mon: Mon, battle_state: BattleState) -> flo
         turn = max(1, int(getattr(battle_state, "turn", 1) or 1))
     except Exception:
         turn = 1
-    types = [t.lower() for t in getattr(mon, "types", []) or []]
+    # Mon.types is typically (type1, type2_or_none); ignore missing secondary type.
+    types = [str(t).lower() for t in (getattr(mon, "types", []) or []) if t]
     try:
         level = float(getattr(mon, "level", 1) or 1)
     except Exception:
@@ -6990,7 +6996,12 @@ def _ball_multiplier(ball_name: str, mon: Mon, battle_state: BattleState) -> flo
 
 def _attempt_capture(mon: Mon, ball_name: str, battle_state: BattleState) -> Tuple[bool, int]:
     """Return (caught, shakes). shakes counts successful shakes."""
-    ball_mod = _ball_multiplier(ball_name, mon, battle_state)
+    try:
+        ball_mod = _ball_multiplier(ball_name, mon, battle_state)
+    except Exception:
+        # Never abort capture flow from ball/type parsing issues.
+        b = _normalize_ball_name(ball_name)
+        ball_mod = _BALLS_BASIC.get(b, 1.0) or 1.0
     if ball_mod >= 9999:
         return True, 1
     try:
