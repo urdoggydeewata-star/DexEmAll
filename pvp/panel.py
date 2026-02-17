@@ -645,6 +645,9 @@ class BattleState:
         self.winner: Optional[int] = None
         self.stream_message: Optional[discord.Message] = None  # Stream message for public viewing
         self.streaming_enabled: bool = False  # Whether streaming is enabled
+        self.stream_channel: Optional[Any] = None
+        self.stream_channel_id: Optional[int] = None
+        self._stream_started: bool = False
 
         # UI per-turn lock (don't confuse with choice lock below)
         self._locked: Dict[int, bool] = {self.p1_id: False, self.p2_id: False}
@@ -7646,7 +7649,15 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
     try:
         # Keep per-turn stream history: send one message each turn with
         # both image and turn-by-turn summary text (legacy behavior).
-        msg = await channel.send(embed=embed, file=file)
+        if file is not None:
+            try:
+                msg = await channel.send(embed=embed, file=file)
+            except Exception as file_err:
+                # Fallback to embed-only stream message if attachment upload fails.
+                print(f"[Stream] Attachment send failed; retrying embed-only: {file_err}")
+                msg = await channel.send(embed=embed)
+        else:
+            msg = await channel.send(embed=embed)
         return msg
     except Exception as e:
         print(f"[Stream] Error sending stream: {e}")
@@ -7664,6 +7675,60 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
                     gif_path_to_cleanup.unlink(missing_ok=True)
             except Exception:
                 pass
+
+
+async def _resolve_stream_channel(
+    st: BattleState,
+    p1_itx: Optional[discord.Interaction],
+    p2_itx: Optional[discord.Interaction],
+) -> Optional[Any]:
+    """
+    Resolve a stable channel object for stream posts.
+    Prefers the channel captured at battle start, then interaction channels,
+    then cache/fetch via stored channel ID.
+    """
+    ch = getattr(st, "stream_channel", None)
+    if ch is not None and hasattr(ch, "send"):
+        return ch
+
+    for itx in (p1_itx, p2_itx):
+        try:
+            c = getattr(itx, "channel", None)
+            if c is not None and hasattr(c, "send"):
+                st.stream_channel = c
+                st.stream_channel_id = getattr(c, "id", None)
+                return c
+        except Exception:
+            continue
+
+    channel_id = getattr(st, "stream_channel_id", None)
+    if not channel_id:
+        return None
+
+    client = None
+    for itx in (p1_itx, p2_itx):
+        client = getattr(itx, "client", None)
+        if client is not None:
+            break
+    if client is None:
+        return None
+
+    try:
+        c = client.get_channel(int(channel_id))
+        if c is not None and hasattr(c, "send"):
+            st.stream_channel = c
+            return c
+    except Exception:
+        pass
+
+    try:
+        c = await client.fetch_channel(int(channel_id))
+        if c is not None and hasattr(c, "send"):
+            st.stream_channel = c
+            return c
+    except Exception:
+        pass
+    return None
 
 
 # Helper function to safely send messages that handles webhook token expiration
@@ -8112,6 +8177,19 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
         # No separate "battle started" embed; we'll include pre-battle info in the first panel.
         st._battle_start_announced = True
         st._complete_init()
+        # Stream kickoff panel at battle start so users immediately see streaming output.
+        if st.streaming_enabled and not getattr(st, "_stream_started", False):
+            try:
+                stream_ch = await _resolve_stream_channel(st, p1_itx, p2_itx)
+                if stream_ch is not None:
+                    render_result = await _render_gif_for_panel(st, st.p1_id, hide_hp_text=True)
+                    msg = await _send_stream_panel(stream_ch, st, "Battle has begun!", render_result)
+                    if msg is not None:
+                        st._last_stream_message = msg
+            except Exception as e:
+                print(f"[Stream] Error sending initial stream panel: {e}")
+            finally:
+                st._stream_started = True
 
     # Check if active Pokémon are fainted - FORCE MANUAL SWITCH
     p1_active_mon = st._active(st.p1_id)
@@ -9080,7 +9158,10 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
     
     async def send_stream_update():
         """Send stream panel update in background (non-blocking for players)"""
-        if not st.streaming_enabled or not p1_itx.channel:
+        if not st.streaming_enabled:
+            return
+        stream_channel = await _resolve_stream_channel(st, p1_itx, p2_itx)
+        if stream_channel is None:
             return
         # Serialize stream rendering/edits so updates stay in order per battle.
         stream_lock = getattr(st, "_stream_update_lock", None)
@@ -9092,7 +9173,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                 turn_summary_text = "\n".join(formatted_turn_log)
                 # Render GIF for stream (shows current battle state with HP hidden)
                 render_result = await _render_gif_for_panel(st, st.p1_id, hide_hp_text=True)
-                msg = await _send_stream_panel(p1_itx.channel, st, turn_summary_text, render_result)
+                msg = await _send_stream_panel(stream_channel, st, turn_summary_text, render_result)
                 if msg is not None:
                     st._last_stream_message = msg
         except Exception as e:
@@ -9360,6 +9441,9 @@ class AcceptView(discord.ui.View):
             
             st = BattleState(fmt_label, gen, self.challenger_id, self.opponent_id, p1_party, p2_party, p1_name, p2_name, p1_is_bot=p1_is_bot, p2_is_bot=p2_is_bot)
             st.streaming_enabled = self.streaming_enabled
+            # Persist stream destination so updates don't depend on a single interaction object.
+            st.stream_channel = channel
+            st.stream_channel_id = getattr(channel, "id", None)
             
             # For bot players, create a dummy interaction
             if p2_is_bot and not p2_itx:
