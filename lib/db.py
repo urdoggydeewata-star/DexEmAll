@@ -1147,7 +1147,12 @@ async def upsert_item_master(item_id: str,
     """Create/update an item in master catalog (items.id)."""
     conn = await connect()
     try:
-        await conn.execute("INSERT INTO items (id) VALUES (?) ON CONFLICT (id) DO NOTHING", (item_id,))
+        # items.name is NOT NULL in PostgreSQL; provide name on insert to avoid constraint violation
+        name_val = name if name is not None else item_id.replace("-", " ").replace("_", " ").title()
+        await conn.execute(
+            "INSERT INTO items (id, name) VALUES (?, ?) ON CONFLICT (id) DO NOTHING",
+            (item_id, name_val),
+        )
         sets, vals = [], []
         if name is not None:
             sets.append("name = ?"); vals.append(name)

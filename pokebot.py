@@ -6765,19 +6765,40 @@ TM_SELLER_PRICE = 500  # Coins per TM (Gen 1)
 # Seller has 25 TMs (rolled from 1–50 via script, fixed)
 TM_SELLER_ITEMS = [GEN1_TMS[i - 1] for i in (1, 3, 5, 6, 7, 9, 11, 12, 15, 17, 20, 21, 22, 23, 24, 31, 34, 35, 37, 40, 42, 44, 45, 49, 50)]
 
-# Route move item drop: when user presses "Next" to move across a route, roll for a random item from this pool.
-ROUTE_MOVE_ITEM_DROP_CHANCE = 1.00  # Probability per move (e.g. 15%)
-ROUTE_MOVE_ITEM_POOL: List[Tuple[str, str]] = [
-    ("potion", "Potion"),
-    ("antidote", "Antidote"),
-    ("pokeball", "Poké Ball"),
-    ("great-ball", "Great Ball"),
-    ("super-potion", "Super Potion"),
-    ("paralyze-heal", "Paralyze Heal"),
-    ("awakening", "Awakening"),
-    ("burn-heal", "Burn Heal"),
-    ("ice-heal", "Ice Heal"),
+# Route move item drop: roll for ball type (Poké Ball common, Great Ball uncommon, Ultra Ball rare),
+# then give that ball + one item from the tier's pool. Rarer balls = better rewards.
+ROUTE_MOVE_ITEM_DROP_CHANCE = 0.10  # Probability per move (e.g. 15%)
+# (ball_id, ball_display_name, weight) - higher weight = more common
+ROUTE_MOVE_BALL_TIERS: List[Tuple[str, str, int]] = [
+    ("pokeball", "Poké Ball", 70),    # Most common
+    ("great-ball", "Great Ball", 25),  # Uncommon
+    ("ultra-ball", "Ultra Ball", 5),  # Rarest
 ]
+# Item pools per tier: (item_id, display_name). Rarer tiers have better items.
+ROUTE_MOVE_ITEMS_BY_TIER: Dict[str, List[Tuple[str, str]]] = {
+    "pokeball": [
+        ("potion", "Potion"),
+        ("antidote", "Antidote"),
+        ("paralyze-heal", "Paralyze Heal"),
+        ("awakening", "Awakening"),
+        ("burn-heal", "Burn Heal"),
+        ("ice-heal", "Ice Heal"),
+    ],
+    "great-ball": [
+        ("super-potion", "Super Potion"),
+        ("pokeball", "Poké Ball"),
+        ("great-ball", "Great Ball"),
+        ("full-heal", "Full Heal"),
+        ("revive", "Revive"),
+    ],
+    "ultra-ball": [
+        ("hyper-potion", "Hyper Potion"),
+        ("ultra-ball", "Ultra Ball"),
+        ("max-potion", "Max Potion"),
+        ("full-restore", "Full Restore"),
+        ("tm-fragment", "TM Fragment"),
+    ],
+}
 
 ADVENTURE_ROUTES = {
     "route-1": {
@@ -7504,23 +7525,43 @@ RIVAL_BATTLES = {
 }
 
 
-async def _try_route_move_item_drop(itx: discord.Interaction, user_id: str) -> None:
-    """Roll for a random item from ROUTE_MOVE_ITEM_POOL (same kind of trigger as random encounter on route move)."""
-    if not ROUTE_MOVE_ITEM_POOL:
-        return
+def _weighted_choice(items: List[Tuple[str, str, int]]) -> Tuple[str, str]:
+    """Pick (ball_id, ball_display_name) from weighted list of (id, name, weight)."""
+    total = sum(w for _, _, w in items)
+    r = random.uniform(0, total)
+    for ball_id, display_name, weight in items:
+        r -= weight
+        if r <= 0:
+            return (ball_id, display_name)
+    return items[-1][0], items[-1][1]
+
+
+async def _roll_and_give_route_move_item_async(user_id: str) -> Optional[str]:
+    """
+    Roll for drop chance, then weighted ball type (Poké Ball > Great Ball > Ultra Ball).
+    Give the ball + one item from that tier's pool. Rarer balls = better rewards.
+    Returns the message to show or None if no drop.
+    """
+    if not ROUTE_MOVE_BALL_TIERS or not ROUTE_MOVE_ITEMS_BY_TIER:
+        return None
     if random.random() >= ROUTE_MOVE_ITEM_DROP_CHANCE:
-        return
-    item_id, display_name = random.choice(ROUTE_MOVE_ITEM_POOL)
+        return None
+    ball_id, ball_name = _weighted_choice(ROUTE_MOVE_BALL_TIERS)
+    tier_pool = ROUTE_MOVE_ITEMS_BY_TIER.get(ball_id)
+    if not tier_pool:
+        return None
+    item_id, item_name = random.choice(tier_pool)
     try:
-        await db.upsert_item_master(item_id, name=display_name)
+        await db.upsert_item_master(ball_id, name=ball_name)
+        await db.give_item(user_id, ball_id, 1)
+        await db.upsert_item_master(item_id, name=item_name)
         await db.give_item(user_id, item_id, 1)
+        return f"You found a **{ball_name}**! Inside was a **{item_name}**."
     except Exception as e:
         print(f"[Adventure] Route move item drop give_item failed: {e}")
-        return
-    try:
-        await itx.followup.send(f"You found a **{display_name}** on the ground!", ephemeral=False)
-    except Exception as e:
-        print(f"[Adventure] Route move item drop followup.send failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def _adv_default_state() -> dict:
@@ -11393,82 +11434,153 @@ class AdventureRouteView(discord.ui.View):
     def _r1_set(self, state: dict, panel: int) -> None:
         state.setdefault("route_panels", {})[self.area_id] = {"panel": int(panel)}
 
-
     async def _r1_try_wild_encounter(self, itx: discord.Interaction, state: dict, *, force: bool = False) -> None:
         """Roll (or force) a wild encounter using Route 1 grass encounters."""
-        route = ADVENTURE_ROUTES.get(self.area_id, {})
-        # Default movement encounter chance; can be tuned via env var
+        await _route1_try_wild_encounter(itx, state, force=force)
+
+
+async def _route1_try_wild_encounter(itx: discord.Interaction, state: dict, *, force: bool = False) -> None:
+    """Roll (or force) a wild encounter on Route 1. Used by both ephemeral and persistent view."""
+    area_id = "route-1"
+    route = ADVENTURE_ROUTES.get(area_id, {})
+    try:
+        chance = float(os.environ.get("ROUTE_MOVE_ENCOUNTER_CHANCE", "0.35"))
+    except Exception:
+        chance = 0.35
+    if not force and random.random() > chance:
+        return
+
+    all_encounters = []
+    for p in (route.get("grass_paths") or {}).values():
+        enc = (p or {}).get("encounters") or []
+        all_encounters.extend(enc)
+
+    if not all_encounters:
+        return
+
+    enc_specs = []
+    weights = []
+    version = "red"
+    for e in all_encounters:
+        if isinstance(e, str):
+            enc_specs.append({"species": e, "min_level": 3, "max_level": 3})
+            weights.append(1)
+        elif isinstance(e, dict):
+            ver = e.get("version")
+            if ver and ver.lower() not in str(version).lower():
+                continue
+            enc_specs.append(
+                {
+                    "species": e.get("species"),
+                    "min_level": int(e.get("min_level", 3)),
+                    "max_level": int(e.get("max_level", e.get("min_level", 3))),
+                }
+            )
+            weights.append(int(e.get("weight", 1)))
+
+    if not enc_specs:
+        return
+
+    choice = random.choices(enc_specs, weights=weights, k=1)[0]
+    species = choice["species"]
+    state.setdefault("repeat_seen", [])
+    if species and species.lower() not in [s.lower() for s in state["repeat_seen"]]:
+        state["repeat_seen"].append(species)
+        state["dex_seen"] = state.get("dex_seen", 0) + 1
+    try:
+        asyncio.create_task(pokedex_mark_seen(str(itx.user.id), species, caught=False))
+    except Exception:
+        pass
+
+    lvl = random.randint(choice["min_level"], choice["max_level"])
+    wild_mon = await _build_mon_from_species(species, level=lvl)
+    if not wild_mon:
+        return
+
+    route_display = route.get("name", area_id)
+    won = await _start_pve_battle(itx, [wild_mon], f"Wild {species.title()}", area_id=area_id, route_display_name=route_display)
+    if won is _PVE_ALREADY_IN_BATTLE:
+        return
+    if won is None:
+        return await itx.followup.send("Couldn't start the encounter battle. Please try again.", ephemeral=False)
+    if won:
+        _add_discovered(state, area_id, species)
         try:
-            chance = float(os.environ.get("ROUTE_MOVE_ENCOUNTER_CHANCE", "0.35"))
-        except Exception:
-            chance = 0.35
-        if not force and random.random() > chance:
-            return
-
-        # Collect all encounter tables across grass_paths (ignoring blockers)
-        all_encounters = []
-        for p in (route.get("grass_paths") or {}).values():
-            enc = (p or {}).get("encounters") or []
-            all_encounters.extend(enc)
-
-        if not all_encounters:
-            return
-
-        # Weighted encounter selection (same logic as _on_path)
-        enc_specs = []
-        weights = []
-        version = "red"
-        for e in all_encounters:
-            if isinstance(e, str):
-                enc_specs.append({"species": e, "min_level": 3, "max_level": 3})
-                weights.append(1)
-            elif isinstance(e, dict):
-                ver = e.get("version")
-                if ver and ver.lower() not in str(version).lower():
-                    continue
-                enc_specs.append(
-                    {
-                        "species": e.get("species"),
-                        "min_level": int(e.get("min_level", 3)),
-                        "max_level": int(e.get("max_level", e.get("min_level", 3))),
-                    }
-                )
-                weights.append(int(e.get("weight", 1)))
-
-        if not enc_specs:
-            return
-
-        choice = random.choices(enc_specs, weights=weights, k=1)[0]
-        species = choice["species"]
-        # track seen species for Repeat Ball / dex counts
-        state.setdefault("repeat_seen", [])
-        if species and species.lower() not in [s.lower() for s in state["repeat_seen"]]:
-            state["repeat_seen"].append(species)
-            state["dex_seen"] = state.get("dex_seen", 0) + 1
-        try:
-            asyncio.create_task(pokedex_mark_seen(str(itx.user.id), species, caught=False))
+            asyncio.create_task(pokedex_mark_seen(str(itx.user.id), species, caught=True))
         except Exception:
             pass
 
-        lvl = random.randint(choice["min_level"], choice["max_level"])
-        wild_mon = await _build_mon_from_species(species, level=lvl)
-        if not wild_mon:
-            return
 
-        route_display = route.get("name", self.area_id)
-        won = await _start_pve_battle(itx, [wild_mon], f"Wild {species.title()}", area_id=self.area_id, route_display_name=route_display)
-        if won is _PVE_ALREADY_IN_BATTLE:
-            return
-        if won is None:
-            return await itx.followup.send("Couldn't start the encounter battle. Please try again.", ephemeral=False)
-        if won:
-            _add_discovered(state, self.area_id, species)
-            try:
-                asyncio.create_task(pokedex_mark_seen(str(itx.user.id), species, caught=True))
-            except Exception:
-                pass
+def _r1_get_panel(state: dict) -> int:
+    """Get current Route 1 panel (1–3) from state."""
+    rp = (state.get("route_panels") or {}).get("route-1")
+    if not isinstance(rp, dict):
+        return 1
+    return max(1, min(int(rp.get("panel", 1)), 3))
 
+
+def _r1_set_panel(state: dict, panel: int) -> None:
+    """Set Route 1 panel in state."""
+    state.setdefault("route_panels", {})["route-1"] = {"panel": int(panel)}
+
+
+class AdventureRoute1PersistentView(discord.ui.View):
+    """Persistent view so Route 1 arrow buttons work after bot restart or view timeout."""
+    def __init__(self):
+        super().__init__(timeout=None)
+        back_btn = discord.ui.Button(label="⬇️", style=discord.ButtonStyle.secondary, custom_id="adv:r1:back")
+        back_btn.callback = self._handle_back
+        self.add_item(back_btn)
+        fwd_btn = discord.ui.Button(label="⬆️", style=discord.ButtonStyle.primary, custom_id="adv:r1:fwd")
+        fwd_btn.callback = self._handle_fwd
+        self.add_item(fwd_btn)
+
+    async def _handle_back(self, itx: discord.Interaction, button: discord.ui.Button):
+        await self._handle_route1_move(itx, "back")
+
+    async def _handle_fwd(self, itx: discord.Interaction, button: discord.ui.Button):
+        await self._handle_route1_move(itx, "fwd")
+
+    async def _handle_route1_move(self, itx: discord.Interaction, direction: str) -> None:
+        print(f"[Adventure] Persistent view _handle_route1_move called, direction={direction}")
+        await itx.response.defer(ephemeral=False, thinking=False)
+        uid = str(itx.user.id)
+        state = await _get_adventure_state(uid)
+        if state.get("area_id") != "route-1":
+            print(f"[Adventure] Persistent view: user not on route-1 (area_id={state.get('area_id')}), sending panel only")
+            await _send_adventure_panel(itx, state, edit_original=False)
+            return
+        route = ADVENTURE_ROUTES.get("route-1", {})
+        panel = _r1_get_panel(state)
+        moved_within_route = False
+        if direction == "fwd":
+            if panel < 3:
+                _r1_set_panel(state, panel + 1)
+                moved_within_route = True
+            else:
+                next_area = route.get("next")
+                if next_area:
+                    state["area_id"] = next_area
+                state.get("route_panels", {}).pop("route-1", None)
+        else:
+            if panel > 1:
+                _r1_set_panel(state, panel - 1)
+                moved_within_route = True
+            else:
+                state["area_id"] = route.get("prev") or "pallet-town"
+                state.get("route_panels", {}).pop("route-1", None)
+        await _save_adventure_state(uid, state)
+        print(f"[Adventure] Persistent view: moved_within_route={moved_within_route}, sending panel with roll_route1_item={moved_within_route}")
+        if moved_within_route:
+            await _route1_try_wild_encounter(itx, state)
+            await _save_adventure_state(uid, state)
+        await _send_adventure_panel(itx, state, edit_original=False, roll_route1_item=moved_within_route)
+
+
+class _AdventureRouteViewRoute1Methods:
+    """Mixin-style: methods that belong in AdventureRouteView (Route 1 arrow handlers)."""
     async def _on_back_route1(self, itx: discord.Interaction):
+        print("[Adventure] Ephemeral view _on_back_route1 (⬇️) called")
         if not self._guard(itx):
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
         if not itx.response.is_done():
@@ -11486,25 +11598,18 @@ class AdventureRouteView(discord.ui.View):
             self._r1_set(state, panel - 1)
             moved_within_route = True
         else:
-            # leaving route backwards -> previous city
             state["area_id"] = prev_area
             state.get("route_panels", {}).pop(self.area_id, None)
 
-        # Persist panel/city movement first so any battle-triggered refresh
-        # reads the latest panel instead of stale DB state.
         await _save_adventure_state(str(itx.user.id), state)
+        print(f"[Adventure] Ephemeral view (back): moved_within_route={moved_within_route}, roll_route1_item={moved_within_route}")
         if moved_within_route:
             await self._r1_try_wild_encounter(itx, state, force=False)
-            # Persist encounter side-effects (dex seen/discovered updates).
             await _save_adventure_state(str(itx.user.id), state)
-        # Update the message the user clicked (component interaction)
-        await _send_adventure_panel(itx, state, edit_original=False)
-        # Item drop after panel so it always has a valid followup; same trigger as encounter
-        if moved_within_route:
-            await _try_route_move_item_drop(itx, str(itx.user.id))
-
+        await _send_adventure_panel(itx, state, edit_original=False, roll_route1_item=moved_within_route)
 
     async def _on_forward_route1(self, itx: discord.Interaction):
+        print("[Adventure] Ephemeral view _on_forward_route1 (⬆️) called")
         if not self._guard(itx):
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
         # Always respond quickly so Discord doesn't drop the interaction
@@ -11529,16 +11634,11 @@ class AdventureRouteView(discord.ui.View):
             state.get("route_panels", {}).pop(self.area_id, None)
 
         await _save_adventure_state(str(itx.user.id), state)
+        print(f"[Adventure] Ephemeral view: moved_within_route={moved_within_route}, calling _send_adventure_panel with roll_route1_item={moved_within_route}")
         if moved_within_route:
-            # movement can trigger encounter
             await self._r1_try_wild_encounter(itx, state, force=False)
-            # Persist encounter side-effects (dex seen/discovered updates).
             await _save_adventure_state(str(itx.user.id), state)
-        # Update the message the user clicked (component interaction)
-        await _send_adventure_panel(itx, state, edit_original=False)
-        # Item drop after panel so it always has a valid followup; same trigger as encounter
-        if moved_within_route:
-            await _try_route_move_item_drop(itx, str(itx.user.id))
+        await _send_adventure_panel(itx, state, edit_original=False, roll_route1_item=moved_within_route)
 
 
     async def _on_force_route1(self, itx: discord.Interaction):
@@ -11824,7 +11924,7 @@ async def _cancel_previous_panel_for_user(bot: discord.Client, uid: str) -> None
     except Exception:
         pass
 
-async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_original: bool) -> None:
+async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_original: bool, route_move_item_message: Optional[str] = None, roll_route1_item: bool = False) -> None:
     # If this is a button-press (component interaction), edit the clicked message.
     is_component = getattr(itx, 'type', None) == discord.InteractionType.component and getattr(itx, 'message', None) is not None
     msg = None
@@ -11931,6 +12031,12 @@ async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_o
             panel = int((state.get("route_panels", {}).get(area_id, {}) or {}).get("panel", 1))
             pos = str((state.get("route_panels", {}).get(area_id, {}) or {}).get("pos", "start"))
 
+            # Roll and give route move item here so it always runs when this panel is sent after a move
+            if roll_route1_item:
+                print(f"[Adventure] _send_adventure_panel: roll_route1_item=True for route-1, calling item drop for uid={uid}")
+                route_move_item_message = await _roll_and_give_route_move_item_async(uid)
+                print(f"[Adventure] _send_adventure_panel: item drop returned message={route_move_item_message!r}")
+
             # Use pre-sliced panel images if available
             panels = route.get("panels") or []
             if isinstance(panels, list) and len(panels) >= 3:
@@ -11944,12 +12050,16 @@ async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_o
             desc = f"Use ⬆️/⬇️ to walk through the route. (Panel {panel}/3)\nMoving may trigger an encounter. Use ⚔️ Battle to force one."
 
             emb, files = _embed_with_image(route.get("name", area_id), desc, img_panel)
+            if route_move_item_message:
+                emb.add_field(name="", value=route_move_item_message, inline=False)
 
         else:
 
             desc = "Choose a grass path to encounter Pokémon."
 
             emb, files = _embed_with_image(route.get("name", area_id), desc, img)
+            if route_move_item_message:
+                emb.add_field(name="", value=route_move_item_message, inline=False)
         view = AdventureRouteView(itx.user.id, area_id, state)
 
     if is_component:
@@ -12037,6 +12147,11 @@ async def refresh_cmd(interaction: discord.Interaction):
     # Fallback: send adventure panel
     state = await _get_adventure_state(uid)
     await _send_adventure_panel(interaction, state, edit_original=True)
+
+# Patch AdventureRouteView with Route1/mixin methods (mixin defined after the view)
+for _attr in dir(_AdventureRouteViewRoute1Methods):
+    if _attr.startswith("_on_") and not _attr.startswith("_on_timeout"):
+        setattr(AdventureRouteView, _attr, getattr(_AdventureRouteViewRoute1Methods, _attr))
 
 @bot.tree.command(name="route", description="Encounter a discovered Pokémon from a cleared route.")
 @app_commands.describe(number="Route number (e.g., 1)")
@@ -18609,6 +18724,11 @@ async def on_ready():
         print("[beta] Beta claim view registered")
     except Exception as e:
         print(f"[beta] add_view error: {e}")
+    try:
+        bot.add_view(AdventureRoute1PersistentView())
+        print("[adventure] Route 1 persistent view registered")
+    except Exception as e:
+        print(f"[adventure] Route 1 persistent view add_view error: {e}")
     try:
         await bot.load_extension("pvp.pvprules")
         print("[PvP] pvp.pvprules loaded")
