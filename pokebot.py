@@ -8188,7 +8188,6 @@ async def _market_buy(owner_id: str, item_key: str, qty_requested: int) -> tuple
     price = int(MARKET_SELL_PRICES.get(canonical_item_id, 0))
     if price <= 0:
         return False, "That item is not sold in this Poké Mart."
-    variants = _market_item_variants(canonical_item_id)
     async with DB_WRITE_LOCK:
         async with db.session() as conn:
             await conn.execute(
@@ -8211,14 +8210,30 @@ async def _market_buy(owner_id: str, item_key: str, qty_requested: int) -> tuple
                     f"you have **{balance:,}**."
                 )
 
-            await db.add_currency_conn(conn, owner_id, "coins", -total_cost)
+            # Ensure item exists in master table before touching user_items (FK-safe).
             await conn.execute(
-                "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,?) "
-                "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = LEAST(user_items.qty + excluded.qty, ?::int);",
-                (owner_id, canonical_item_id, qty_allowed, MAX_STACK),
+                "INSERT INTO items (id, name) VALUES (?, ?) ON CONFLICT (id) DO NOTHING",
+                (canonical_item_id, display),
             )
+            deducted = False
+            try:
+                await db.add_currency_conn(conn, owner_id, "coins", -total_cost)
+                deducted = True
+                await conn.execute(
+                    "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,?) "
+                    "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = LEAST(user_items.qty + excluded.qty, ?::int);",
+                    (owner_id, canonical_item_id, qty_allowed, MAX_STACK),
+                )
+            except Exception:
+                # Session wrapper may execute statements outside a single SQL transaction.
+                # Best-effort refund to avoid players losing money on failed item grant.
+                if deducted:
+                    try:
+                        await db.add_currency_conn(conn, owner_id, "coins", total_cost)
+                    except Exception:
+                        pass
+                raise
             await conn.commit()
-    await db.upsert_item_master(canonical_item_id, name=display)
     try:
         db.invalidate_bag_cache(owner_id)
     except Exception:
