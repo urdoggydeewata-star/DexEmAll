@@ -1804,6 +1804,112 @@ async def admin_remove(interaction: discord.Interaction, member: discord.Member)
         f"✅ Removed {member.mention} (`{uid}`) from admin whitelist.", ephemeral=True
     )
 
+
+@bot.tree.command(name="hatchnow", description="(Owner) Instantly hatch one daycare egg for testing.")
+@owners_only()
+@app_commands.describe(
+    target="Target trainer (defaults to yourself).",
+    source="Where to hatch from.",
+    index="Egg position in that source (1-based).",
+)
+@app_commands.choices(
+    source=[
+        app_commands.Choice(name="Auto (incubator first)", value="auto"),
+        app_commands.Choice(name="Incubator", value="incubating"),
+        app_commands.Choice(name="Daycare waiting eggs", value="daycare"),
+    ]
+)
+async def hatchnow(
+    interaction: discord.Interaction,
+    target: discord.User | None = None,
+    source: app_commands.Choice[str] | None = None,
+    index: app_commands.Range[int, 1, 30] = 1,
+):
+    await interaction.response.defer(ephemeral=True, thinking=False)
+    target_user = target or interaction.user
+    uid = str(target_user.id)
+    mode = str(source.value if source else "auto").strip().lower()
+    idx = max(0, int(index) - 1)
+
+    state = await _get_adventure_state(uid)
+    rec = _daycare_get_record(state, DAYCARE_CITY_ID)
+    incubating = rec.get("incubating") if isinstance(rec.get("incubating"), list) else []
+    waiting = rec.get("eggs") if isinstance(rec.get("eggs"), list) else []
+
+    egg_list: list[Any]
+    source_label: str
+    source_key: str
+    if mode == "incubating":
+        egg_list = incubating
+        source_label = "incubator"
+        source_key = "incubating"
+    elif mode == "daycare":
+        egg_list = waiting
+        source_label = "daycare waiting eggs"
+        source_key = "eggs"
+    else:
+        if incubating:
+            egg_list = incubating
+            source_label = "incubator"
+            source_key = "incubating"
+        else:
+            egg_list = waiting
+            source_label = "daycare waiting eggs"
+            source_key = "eggs"
+
+    if not egg_list:
+        return await interaction.followup.send(
+            f"❌ No eggs available in **{source_label}** for <@{target_user.id}>.",
+            ephemeral=True,
+        )
+    if idx >= len(egg_list):
+        return await interaction.followup.send(
+            f"❌ Invalid egg index. {source_label.title()} currently has **{len(egg_list)}** egg(s).",
+            ephemeral=True,
+        )
+
+    egg = egg_list[idx]
+    if not isinstance(egg, dict):
+        return await interaction.followup.send(
+            f"❌ Egg data at index **{idx + 1}** is invalid.",
+            ephemeral=True,
+        )
+
+    hatched = await _daycare_hatch_to_team(uid, egg)
+    if not hatched:
+        return await interaction.followup.send(
+            "❌ Instant hatch failed. Check breeding metadata for this egg.",
+            ephemeral=True,
+        )
+
+    try:
+        rec[source_key].pop(idx)
+    except Exception:
+        rec[source_key] = [e for i, e in enumerate(list(rec.get(source_key) or [])) if i != idx]
+    await _save_adventure_state(uid, state)
+
+    species_txt = str(hatched.get("species") or "Pokémon").replace("-", " ").title()
+    dest = str(hatched.get("destination") or "box")
+    if dest == "team":
+        slot = int(hatched.get("team_slot") or 0)
+        dest_txt = f"team slot **{slot}**" if slot > 0 else "the team"
+    else:
+        bno = int(hatched.get("box_no") or 0)
+        bpos = int(hatched.get("box_pos") or 0)
+        if bno > 0 and bpos > 0:
+            dest_txt = f"**Box {bno}, Slot {bpos}**"
+        else:
+            dest_txt = "the PC Box"
+
+    await interaction.followup.send(
+        (
+            f"✅ Instantly hatched **{species_txt}** for <@{target_user.id}> "
+            f"from **{source_label}** (egg #{idx + 1}).\n"
+            f"Destination: {dest_txt}."
+        ),
+        ephemeral=True,
+    )
+
 # =========================
 #  Utility / admin-only slash
 # =========================
