@@ -39,7 +39,7 @@ from discord import app_commands, ui, Interaction, Embed
 
 from db_async import connect as db_connect
 from pvp.engine import build_mon
-from pvp.panel import _base_pp, _max_pp
+from pvp.panel import _base_pp
 import pvp.panel as _pvp_panel
 if TYPE_CHECKING:
     from pvp.engine import Mon
@@ -259,6 +259,13 @@ def _patch_pvp_streaming_reliability() -> None:
     - Posts a public clarification that private panels != public stream.
     """
     try:
+        # Modern pvp.panel already has reliable streaming with per-turn summary+image.
+        # Do not override it from pokebot.py unless those helpers are missing.
+        if (
+            callable(getattr(_pvp_panel, "_send_stream_panel", None))
+            and callable(getattr(_pvp_panel, "_resolve_stream_channel", None))
+        ):
+            return
         original_send_stream = getattr(_pvp_panel, "_send_stream_panel", None)
         if callable(original_send_stream) and not getattr(original_send_stream, "_dex_stream_patch", False):
 
@@ -5501,7 +5508,7 @@ async def _ensure_starter_mon_row(uid: str, species: str, mon: dict, entry: dict
         moves = []
     if not moves:
         moves = ["Tackle"]
-    pps = [_max_pp(m, generation=1) for m in moves[:4]]
+    pps = [_base_pp(m, generation=1) for m in moves[:4]]
 
     try:
         async with db.session() as conn:
@@ -9783,7 +9790,17 @@ async def _load_pp_from_db(st: "BattleState", uid: int) -> None:
                         st._pp[key] = {}
                     if moves and isinstance(pps, list) and len(pps) == len(moves):
                         for m, left in zip(moves, pps):
-                            st._pp[key][m] = int(left)
+                            try:
+                                base_pp = int(_base_pp(m, generation=st.gen))
+                            except Exception:
+                                base_pp = 20
+                            try:
+                                left_i = int(left)
+                            except Exception:
+                                left_i = base_pp
+                            # Clamp stale inflated rows (e.g. legacy 64/56) to legal base PP.
+                            left_i = max(0, min(left_i, max(1, base_pp)))
+                            st._pp[key][m] = left_i
             break
         except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
             if attempt == 0:
@@ -9802,7 +9819,26 @@ async def _save_party_state_from_battle(st: "BattleState", uid: int) -> None:
             key = (uid, idx)
             pp_store = st._pp.get(key, {})
             move_list = (mon.moves or [])[:4]
-            moves_pp = [int(pp_store.get(m, _max_pp(m, generation=st.gen))) for m in move_list]
+            norm_pp_store: dict[str, int] = {}
+            for k, v in (pp_store or {}).items():
+                try:
+                    norm_pp_store[_norm_move_name(str(k))] = int(v)
+                except Exception:
+                    continue
+            moves_pp: list[int] = []
+            for m in move_list:
+                try:
+                    base_pp = int(_base_pp(m, generation=st.gen))
+                except Exception:
+                    base_pp = 20
+                left = pp_store.get(m)
+                if left is None:
+                    left = norm_pp_store.get(_norm_move_name(str(m)))
+                try:
+                    left_i = int(left) if left is not None else int(base_pp)
+                except Exception:
+                    left_i = int(base_pp)
+                moves_pp.append(max(0, min(left_i, max(1, int(base_pp)))))
             await conn.execute(
                 "UPDATE pokemons SET hp_now=?, moves_pp=? WHERE id=?",
                 (int(mon.hp), json.dumps(moves_pp, ensure_ascii=False), int(db_id)),
@@ -10770,7 +10806,7 @@ async def _heal_party(user_id: str) -> int:
                 moves = json.loads(row["moves"]) if row.get("moves") else []
             except Exception:
                 moves = []
-            max_pp = [_max_pp(m, generation=user_gen) for m in moves[:4]] if moves else []
+            max_pp = [_base_pp(m, generation=user_gen) for m in moves[:4]] if moves else []
             await conn.execute(
                 "UPDATE pokemons SET hp=?, hp_now=?, moves_pp=? WHERE id=?",
                 (hp_max, hp_max, json.dumps(max_pp, ensure_ascii=False), int(row["id"])),
@@ -14478,8 +14514,8 @@ TEAM_BATTLE_SYNC_DURATION_MS = _battle_sync_frame_duration_ms()
 TEAM_DEFAULT_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
 TEAM_MIN_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
 TEAM_MAX_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
-TEAM_MAX_SPRITE_FRAMES = 32
-TEAM_MAX_COMPOSITE_FRAMES = 32
+TEAM_MAX_SPRITE_FRAMES = 64
+TEAM_MAX_COMPOSITE_FRAMES = 64
 TEAM_FETCH_SHOWDOWN_FOR_TEAM = False
 TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
     {"box_xy": (236, 93), "box_wh": (177, 197), "sprite_c": (324, 173), "label_xy": (246, 256), "level_right": (402, 256)},
@@ -14672,7 +14708,7 @@ def _team_template_path() -> Optional[Path]:
 def _team_pick_sprite_path(row: dict) -> Optional[Path]:
     if _team_is_egg_row(row):
         stage = _team_egg_stage(row)
-        stage = max(0, min(3, int(stage)))
+        stage = max(0, min(len(TEAM_EGG_STAGE_PATHS) - 1, int(stage)))
         for p in (TEAM_EGG_STAGE_PATHS[stage], ASSETS_DIR / "item_icons" / "mystery_egg.png"):
             try:
                 if p.exists() and p.is_file() and p.stat().st_size > 0:
@@ -14685,6 +14721,24 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
     form = _species_folder_name(str(row.get("form") or ""))
     shiny = bool(int(row.get("shiny") or 0))
     is_female = str(row.get("gender") or "").strip().lower() == "female"
+
+    # Keep /team sprite source aligned with battle renderer resolution logic.
+    try:
+        resolved = _pvp_sprites.find_sprite(
+            species,
+            gen=5,
+            perspective="front",
+            shiny=shiny,
+            female=is_female,
+            prefer_animated=True,
+            form=(form or None),
+        )
+        if resolved is not None:
+            rp = Path(resolved)
+            if rp.exists() and rp.is_file() and rp.stat().st_size > 0:
+                return rp
+    except Exception:
+        pass
 
     folders: list[Path] = []
     if species and form:
