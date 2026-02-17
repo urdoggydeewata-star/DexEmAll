@@ -293,38 +293,81 @@ def _patch_pvp_streaming_reliability() -> None:
                 except Exception:
                     pass
 
-                try:
-                    msg = await original_send_stream(stream_channel, st, summary_text or None, gif_file)
-                    if msg is not None:
-                        if stream_key is not None:
-                            st._stream_last_sent_key = stream_key
-                        st._last_stream_message = msg
-                        return msg
-                except Exception as e:
-                    print(f"[StreamPatch] _send_stream_panel primary send failed: {e}")
+                p1 = _pvp_panel._format_pokemon_name(st._active(st.p1_id))
+                p2 = _pvp_panel._format_pokemon_name(st._active(st.p2_id))
+                desc = f"Turn {getattr(st, 'turn', '?')} • {getattr(st, 'fmt_label', 'Battle')} (Gen {getattr(st, 'gen', '?')})"
+                if summary_text:
+                    _sum = summary_text
+                    if len(_sum) > 2500:
+                        _sum = "...\n" + _sum[-2300:]
+                    desc += f"\n\n**Turn Summary:**\n{_sum}"
+                field_text_fn = getattr(_pvp_panel, "_field_conditions_text", None)
+                if callable(field_text_fn):
+                    try:
+                        field_text = field_text_fn(getattr(st, "field", None))
+                        if field_text:
+                            desc += f"\n{field_text}"
+                    except Exception:
+                        pass
+                emb = discord.Embed(
+                    title=f"📺 Battle Stream: **{p1}** vs **{p2}**",
+                    description=desc,
+                    color=discord.Color.purple(),
+                )
 
-                # Fallback: ensure at least one public embed goes out.
+                # Resolve a stream image file:
+                # - use supplied gif_file when provided,
+                # - otherwise render a fresh panel for this turn.
+                file_obj = None
+                gif_path_to_cleanup = None
                 try:
-                    p1 = _pvp_panel._format_pokemon_name(st._active(st.p1_id))
-                    p2 = _pvp_panel._format_pokemon_name(st._active(st.p2_id))
-                    desc = f"Turn {getattr(st, 'turn', '?')} • {getattr(st, 'fmt_label', 'Battle')} (Gen {getattr(st, 'gen', '?')})"
-                    if summary_text:
-                        _sum = summary_text
-                        if len(_sum) > 2500:
-                            _sum = "...\n" + _sum[-2300:]
-                        desc += f"\n\n**Turn Summary:**\n{_sum}"
-                    emb = discord.Embed(
-                        title=f"📺 Battle Stream: **{p1}** vs **{p2}**",
-                        description=desc,
-                        color=discord.Color.purple(),
-                    )
-                    msg = await stream_channel.send(embed=emb)
-                    if stream_key is not None:
-                        st._stream_last_sent_key = stream_key
-                    st._last_stream_message = msg
-                    return msg
+                    if gif_file:
+                        if isinstance(gif_file, tuple) and len(gif_file) == 2:
+                            file_obj, gif_path_to_cleanup = gif_file
+                        elif isinstance(gif_file, discord.File):
+                            file_obj = gif_file
+                        elif isinstance(gif_file, (Path, str)):
+                            p = Path(gif_file)
+                            if p.exists():
+                                file_obj = discord.File(p, filename=p.name)
+                                gif_path_to_cleanup = p
+                    if file_obj is None:
+                        render_fn = getattr(_pvp_panel, "_render_gif_for_panel", None)
+                        if callable(render_fn):
+                            render_result = await render_fn(st, st.p1_id, hide_hp_text=True)
+                            if isinstance(render_result, tuple) and len(render_result) == 2:
+                                file_obj, gif_path_to_cleanup = render_result
+                            elif isinstance(render_result, discord.File):
+                                file_obj = render_result
+                    if file_obj is None:
+                        static_fn = getattr(_pvp_panel, "_fallback_static_panel_file", None)
+                        if callable(static_fn):
+                            file_obj = static_fn(st, st.p1_id, hide_hp_text=True, filename_prefix="stream-panel")
                 except Exception as e:
-                    print(f"[StreamPatch] stream embed fallback failed: {e}")
+                    print(f"[StreamPatch] stream render fallback failed: {e}")
+
+                msg = None
+                try:
+                    if file_obj is not None:
+                        try:
+                            emb.set_image(url=f"attachment://{file_obj.filename}")
+                        except Exception:
+                            pass
+                        try:
+                            # Preferred: embed + image
+                            msg = await stream_channel.send(embed=emb, file=file_obj)
+                        except Exception as e:
+                            print(f"[StreamPatch] embed+file send failed: {e}")
+                            # Fallback: text + image attachment (works even if embed path breaks)
+                            plain_text = f"📺 Battle Stream: {p1} vs {p2}\n{desc}"
+                            if len(plain_text) > 1800:
+                                plain_text = plain_text[:1800] + "…"
+                            msg = await stream_channel.send(content=plain_text, file=file_obj)
+                    else:
+                        # No image available; still send the embed summary
+                        msg = await stream_channel.send(embed=emb)
+                except Exception as e:
+                    print(f"[StreamPatch] stream embed/image send failed: {e}")
                     try:
                         txt = f"📺 Stream update • Turn {getattr(st, 'turn', '?')} • {getattr(st, 'fmt_label', 'Battle')}"
                         if summary_text:
@@ -333,13 +376,27 @@ def _patch_pvp_streaming_reliability() -> None:
                                 _sum = "...\n" + _sum[-1300:]
                             txt += f"\n{_sum}"
                         msg = await stream_channel.send(txt)
-                        if stream_key is not None:
-                            st._stream_last_sent_key = stream_key
-                        st._last_stream_message = msg
-                        return msg
                     except Exception as e2:
                         print(f"[StreamPatch] stream text fallback failed: {e2}")
-                        return None
+                        msg = None
+                finally:
+                    if file_obj is not None:
+                        try:
+                            file_obj.close()
+                        except Exception:
+                            pass
+                    if gif_path_to_cleanup is not None:
+                        try:
+                            if Path(gif_path_to_cleanup).exists():
+                                Path(gif_path_to_cleanup).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+                if msg is not None:
+                    if stream_key is not None:
+                        st._stream_last_sent_key = stream_key
+                    st._last_stream_message = msg
+                return msg
 
             _wrapped_send_stream_panel._dex_stream_patch = True  # type: ignore[attr-defined]
             _pvp_panel._send_stream_panel = _wrapped_send_stream_panel
