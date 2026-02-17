@@ -6740,6 +6740,23 @@ ADVENTURE_CITIES = {
         "gym_badge": "boulder",
         "gym_closed": True,
         "heal": True,
+        # Sub-areas: (area_id, label) - buttons that navigate to buildings with sprite sheet regions
+        "sub_areas": [
+            ("viridian-pokemon-center", "Pokémon Center"),
+            ("viridian-pokemart", "Poké Mart"),
+        ],
+    },
+    # Viridian City sub-areas - direct images
+    "viridian-pokemon-center": {
+        "name": "Pokémon Center",
+        "parent_city": "viridian-city",
+        "image": ASSETS_CITIES / "viridian-pokecenter.png",
+        "heal": True,
+    },
+    "viridian-pokemart": {
+        "name": "Poké Mart",
+        "parent_city": "viridian-city",
+        "image": ASSETS_CITIES / "viridian-pokemart.png",
     },
 }
 
@@ -9151,6 +9168,37 @@ def _embed_with_route_panel(title: str, description: str, image_path: Path, pane
     except Exception:
         return _embed_with_image(title, description, image_path)
 
+
+def _embed_with_sprite_region(
+    title: str, description: str, sprite_sheet_path: Path, region: tuple[int, int, int, int]
+) -> tuple[discord.Embed, list[discord.File]]:
+    """
+    Crop a region (x, y, w, h) from a sprite sheet and use it as the embed image.
+    region: (x, y, width, height) - top-left coords and size in pixels.
+    """
+    if Image is None:
+        return _embed_with_image(title, description, sprite_sheet_path)
+    try:
+        p = Path(sprite_sheet_path)
+        if not p.exists():
+            return _embed_with_image(title, description, sprite_sheet_path)
+        x, y, w, h = region
+        if w <= 0 or h <= 0:
+            return _embed_with_image(title, description, sprite_sheet_path)
+        img = Image.open(str(p)).convert("RGBA")
+        cropped = img.crop((x, y, x + w, y + h))
+        buf = BytesIO()
+        cropped.save(buf, format="PNG")
+        buf.seek(0)
+        filename = f"sprite_region_{p.stem}_{x}_{y}_{w}x{h}.png"
+        f = discord.File(fp=buf, filename=filename)
+        emb = discord.Embed(title=title, description=description)
+        emb.set_image(url=f"attachment://{filename}")
+        return emb, [f]
+    except Exception:
+        return _embed_with_image(title, description, sprite_sheet_path)
+
+
 async def _player_lead_for_display(user_id: str) -> str:
     """Best-effort lead name from team_slot 1 (or any slotted mon)."""
     try:
@@ -10985,6 +11033,16 @@ class AdventureCityView(discord.ui.View):
             )
             daycare_btn.callback = self._on_daycare
             self.add_item(daycare_btn)
+        sub_areas = city.get("sub_areas")
+        if sub_areas and isinstance(sub_areas, (list, tuple)):
+            for sub_id, sub_label in sub_areas:
+                sub_btn = discord.ui.Button(
+                    label=sub_label,
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"adv:area:{sub_id}",
+                )
+                sub_btn.callback = self._on_sub_area
+                self.add_item(sub_btn)
         cleared = _city_is_cleared(self.state, self.area_id)
         routes = city.get("routes")
         if routes and isinstance(routes, (list, tuple)):
@@ -11045,6 +11103,26 @@ class AdventureCityView(discord.ui.View):
         await itx.response.defer(ephemeral=True, thinking=False)
         state = await _get_adventure_state(str(itx.user.id))
         _, next_id = itx.data["custom_id"].split("adv:daycare:", 1)
+        hist = state.get("area_history", [])
+        hist.append(state.get("area_id"))
+        state["area_history"] = hist[-15:]
+        state["area_id"] = next_id
+        await _save_adventure_state(str(itx.user.id), state)
+        await _send_adventure_panel(itx, state, edit_original=True)
+
+    async def _on_sub_area(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.5:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        await itx.response.defer(ephemeral=True, thinking=False)
+        state = await _get_adventure_state(str(itx.user.id))
+        _, next_id = itx.data["custom_id"].split("adv:area:", 1)
         hist = state.get("area_history", [])
         hist.append(state.get("area_id"))
         state["area_history"] = hist[-15:]
@@ -12394,16 +12472,39 @@ async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_o
             view = AdventureDaycareView(itx.user.id, area_id, state, rec, parent_rows, pair_info)
         else:
             cleared = _city_is_cleared(state, area_id)
-            img = city.get("image_cleared") if cleared else city.get("image_uncleared")
-            desc = "You are in the city. Choose your next action."
-            if not cleared and city.get("rival_battle"):
-                desc = "Your rival is waiting for a battle."
-            # Track last visited city for blackout fallback
-            if state.get("last_city") != area_id:
-                state["last_city"] = area_id
+            # Sub-areas use sprite sheet regions; main cities use image_uncleared/image_cleared
+            sprite_sheet = city.get("sprite_sheet")
+            sprite_region = city.get("sprite_region")
+            direct_image = city.get("image")
+            used_sprite = False
+            if sprite_sheet and sprite_region and isinstance(sprite_region, (list, tuple)) and len(sprite_region) >= 4:
+                sheet_path = Path(sprite_sheet)
+                if sheet_path.exists():
+                    emb, files = _embed_with_sprite_region(
+                        city.get("name", area_id),
+                        "Choose your next action.",
+                        sheet_path,
+                        tuple(sprite_region[:4]),
+                    )
+                    used_sprite = True
+            if not used_sprite:
+                # Sub-areas: try direct image; main cities: use image_cleared/image_uncleared
+                if direct_image and Path(direct_image).exists():
+                    img = direct_image
+                elif not city.get("parent_city"):
+                    img = city.get("image_cleared") if cleared else city.get("image_uncleared")
+                else:
+                    img = sprite_sheet or city.get("image_uncleared")  # sub-area fallback
+                desc = "You are in the city. Choose your next action."
+                if not cleared and city.get("rival_battle"):
+                    desc = "Your rival is waiting for a battle."
+                emb, files = _embed_with_image(city.get("name", area_id), desc, img)
+            # Track last visited city for blackout fallback (use parent_city for sub-areas)
+            effective_city = city.get("parent_city") or area_id
+            if state.get("last_city") != effective_city:
+                state["last_city"] = effective_city
                 await _save_adventure_state(str(itx.user.id), state)
-            emb, files = _embed_with_image(city.get("name", area_id), desc, img)
-            has_surf = await _team_has_surf(str(itx.user.id))
+            has_surf = await _team_has_surf(str(itx.user.id)) if not city.get("parent_city") else False
             view = AdventureCityView(itx.user.id, area_id, state, has_surf=has_surf)
     else:
         route = ADVENTURE_ROUTES.get(area_id, {})
