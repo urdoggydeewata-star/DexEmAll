@@ -15564,7 +15564,7 @@ class MPokeInfo(commands.Cog):
         if Image is None:
             return None
         try:
-            from PIL import ImageDraw  # type: ignore
+            from PIL import ImageDraw, ImageSequence  # type: ignore
         except Exception:
             return None
 
@@ -15590,105 +15590,195 @@ class MPokeInfo(commands.Cog):
         def _pt(x: int, y: int) -> tuple[int, int]:
             return int(round(x * sx)), int(round(y * sy))
 
-        draw = ImageDraw.Draw(base)
+        def _clip_text(text: str, font, max_width: int) -> str:
+            t = str(text or "").strip()
+            if not t or font is None:
+                return t
+            if self._mpokeinfo_text_width(draw_probe, t, font) <= int(max_width):
+                return t
+            suffix = "..."
+            if self._mpokeinfo_text_width(draw_probe, suffix, font) > int(max_width):
+                return ""
+            lo, hi = 0, len(t)
+            best = suffix
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                cand = f"{t[:mid].rstrip()}{suffix}"
+                if self._mpokeinfo_text_width(draw_probe, cand, font) <= int(max_width):
+                    best = cand
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            return best
 
-        font_stats = self._mpokeinfo_font(max(8, int(round(13 * scale))), bold=True)
+        # Use a probe draw so we can fit/clip text cleanly.
+        draw_probe = ImageDraw.Draw(base)
+
+        # Load sprite frames first so we can emit animated GIF output when possible.
+        sprite_frames: list[Any] = []
+        sprite_duration_ms = 95
+        sprite_path = self._pick_sprite_path(species, gender, shiny, current_form)
+        if sprite_path is not None:
+            try:
+                with Image.open(str(sprite_path)) as src:
+                    is_anim = bool(getattr(src, "is_animated", False))
+                    if is_anim:
+                        try:
+                            d = int(src.info.get("duration") or 95)
+                            sprite_duration_ms = max(55, min(160, d))
+                        except Exception:
+                            sprite_duration_ms = 95
+                        for i, fr in enumerate(ImageSequence.Iterator(src)):
+                            if i >= 24:
+                                break
+                            sprite_frames.append(fr.convert("RGBA"))
+                    else:
+                        sprite_frames = [src.convert("RGBA")]
+            except Exception:
+                sprite_frames = []
+
+        if sprite_frames:
+            union_bbox = None
+            for fr in sprite_frames:
+                try:
+                    bb = fr.split()[-1].getbbox()
+                except Exception:
+                    bb = None
+                if bb is None:
+                    continue
+                if union_bbox is None:
+                    union_bbox = bb
+                else:
+                    union_bbox = (
+                        min(union_bbox[0], bb[0]),
+                        min(union_bbox[1], bb[1]),
+                        max(union_bbox[2], bb[2]),
+                        max(union_bbox[3], bb[3]),
+                    )
+            processed_frames: list[Any] = []
+            max_sw = max(16, int(round(84 * sx)))
+            max_sh = max(16, int(round(76 * sy)))
+            for fr in sprite_frames:
+                sprite = fr
+                if union_bbox is not None:
+                    try:
+                        crop = fr.crop(union_bbox)
+                        if crop.size[0] > 0 and crop.size[1] > 0:
+                            sprite = crop
+                    except Exception:
+                        pass
+                try:
+                    sprite.thumbnail((max_sw, max_sh), resample=resample)
+                except Exception:
+                    pass
+                processed_frames.append(sprite)
+            sprite_frames = processed_frames
+
+        # Draw all static text/icons onto a base panel once.
+        panel_static = base.copy()
+        draw = ImageDraw.Draw(panel_static)
+        font_stats = self._mpokeinfo_font(max(8, int(round(11 * scale))), bold=True)
 
         # --- top row / summary ---
         ot_name = str(getattr(interaction.user, "display_name", None) or interaction.user.name or "Trainer").strip()
-        ot_line = f"OT {ot_name}"
+        ot_name = re.sub(r"\s+", " ", ot_name)
         ot_font = self._mpokeinfo_fit_font(
-            draw,
-            ot_line,
-            max_width=max(48, int(round(122 * sx))),
-            start_size=max(8, int(round(12 * scale))),
-            min_size=max(7, int(round(9 * scale))),
+            draw_probe,
+            ot_name,
+            max_width=max(42, int(round(104 * sx))),
+            start_size=max(8, int(round(10 * scale))),
+            min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        self._mpokeinfo_draw_shadow_text(draw, _pt(82, 16), ot_line, font=ot_font)
+        ot_text = _clip_text(f"OT {ot_name}", ot_font, max(42, int(round(104 * sx))))
+        self._mpokeinfo_draw_shadow_text(draw, _pt(82, 15), ot_text, font=ot_font)
 
         gsym = "♂" if gender == "male" else "♀" if gender == "female" else "∅" if gender == "genderless" else "?"
-        lv_line = f"Lv {int(level)} {gsym}"
+        lv_line = f"| lv {int(level)}{gsym}"
         lv_font = self._mpokeinfo_fit_font(
-            draw,
+            draw_probe,
             lv_line,
-            max_width=max(24, int(round(60 * sx))),
-            start_size=max(8, int(round(12 * scale))),
-            min_size=max(7, int(round(9 * scale))),
+            max_width=max(24, int(round(56 * sx))),
+            start_size=max(8, int(round(10 * scale))),
+            min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        lv_right = _pt(258, 16)[0]
-        lv_w = self._mpokeinfo_text_width(draw, lv_line, lv_font)
-        self._mpokeinfo_draw_shadow_text(draw, (lv_right - lv_w, _pt(258, 16)[1]), lv_line, font=lv_font)
+        lv_line = _clip_text(lv_line, lv_font, max(24, int(round(56 * sx))))
+        lv_right = _pt(258, 15)[0]
+        lv_w = self._mpokeinfo_text_width(draw_probe, lv_line, lv_font)
+        self._mpokeinfo_draw_shadow_text(draw, (lv_right - lv_w, _pt(258, 15)[1]), lv_line, font=lv_font)
 
         primary_type = str(types[0] if types else "Normal").upper()
         badge_left, badge_top = _pt(198, 31)
-        badge_w = max(28, int(round(63 * sx)))
-        badge_h = max(10, int(round(14 * sy)))
+        badge_w = max(24, int(round(63 * sx)))
+        badge_h = max(10, int(round(13 * sy)))
         try:
             draw.rectangle(
                 (badge_left, badge_top, badge_left + badge_w, badge_top + badge_h),
-                fill=(162, 169, 182, 215),
-                outline=(196, 205, 220, 240),
+                fill=(160, 168, 181, 205),
+                outline=(188, 198, 214, 228),
                 width=max(1, int(round(1 * scale))),
             )
         except Exception:
             pass
         type_font = self._mpokeinfo_fit_font(
-            draw,
+            draw_probe,
             primary_type,
-            max_width=max(20, badge_w - 4),
-            start_size=max(8, int(round(10 * scale))),
+            max_width=max(18, badge_w - 4),
+            start_size=max(8, int(round(9 * scale))),
             min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        type_w = self._mpokeinfo_text_width(draw, primary_type, type_font)
+        primary_type = _clip_text(primary_type, type_font, max(18, badge_w - 4))
+        type_w = self._mpokeinfo_text_width(draw_probe, primary_type, type_font)
         type_x = int(badge_left + ((badge_w - type_w) // 2))
-        type_y = int(badge_top + max(0, (badge_h - int(round(10 * scale))) // 2) - 1)
+        type_y = int(badge_top + max(0, (badge_h - int(round(9 * scale))) // 2) - 1)
         self._mpokeinfo_draw_shadow_text(
             draw,
             (type_x, type_y),
             primary_type,
             font=type_font,
             fill=(240, 246, 251, 255),
-            shadow=(66, 72, 80, 220),
+            shadow=(60, 66, 74, 210),
         )
 
         nature_text = str(mon.get("nature") or "Hardy").replace("-", " ").replace("_", " ").title()
         nature_font = self._mpokeinfo_fit_font(
-            draw,
+            draw_probe,
             nature_text,
-            max_width=max(28, int(round(108 * sx))),
-            start_size=max(8, int(round(12 * scale))),
-            min_size=max(7, int(round(9 * scale))),
+            max_width=max(26, int(round(108 * sx))),
+            start_size=max(8, int(round(10 * scale))),
+            min_size=max(7, int(round(8 * scale))),
             bold=False,
         )
+        nature_text = _clip_text(nature_text, nature_font, max(26, int(round(108 * sx))))
         self._mpokeinfo_draw_shadow_text(draw, _pt(266, 34), nature_text, font=nature_font)
 
         exp_text = "MAX EXP" if exp_to_next_val is None else f"{int(exp_to_next_val):,} EXP"
         exp_font = self._mpokeinfo_fit_font(
-            draw,
+            draw_probe,
             exp_text,
-            max_width=max(28, int(round(108 * sx))),
-            start_size=max(8, int(round(12 * scale))),
-            min_size=max(7, int(round(9 * scale))),
+            max_width=max(26, int(round(108 * sx))),
+            start_size=max(8, int(round(10 * scale))),
+            min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        exp_w = self._mpokeinfo_text_width(draw, exp_text, exp_font)
+        exp_text = _clip_text(exp_text, exp_font, max(26, int(round(108 * sx))))
+        exp_w = self._mpokeinfo_text_width(draw_probe, exp_text, exp_font)
         exp_right = _pt(372, 65)[0]
         self._mpokeinfo_draw_shadow_text(draw, (exp_right - exp_w, _pt(372, 65)[1]), exp_text, font=exp_font)
 
         fr_pct = max(0, min(100, int(round((max(0, int(friendship_value)) / 255.0) * 100.0))))
         fr_text = f"{fr_pct}%"
         fr_font = self._mpokeinfo_fit_font(
-            draw,
+            draw_probe,
             fr_text,
-            max_width=max(18, int(round(108 * sx))),
-            start_size=max(8, int(round(12 * scale))),
-            min_size=max(7, int(round(9 * scale))),
+            max_width=max(16, int(round(108 * sx))),
+            start_size=max(8, int(round(10 * scale))),
+            min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        fr_w = self._mpokeinfo_text_width(draw, fr_text, fr_font)
+        fr_w = self._mpokeinfo_text_width(draw_probe, fr_text, fr_font)
         fr_right = _pt(372, 96)[0]
         self._mpokeinfo_draw_shadow_text(draw, (fr_right - fr_w, _pt(372, 96)[1]), fr_text, font=fr_font)
 
@@ -15698,59 +15788,34 @@ class MPokeInfo(commands.Cog):
             if ftitle and ftitle.lower() not in species_display.lower():
                 species_display = f"{species_display} ({ftitle})"
         pokemon_font = self._mpokeinfo_fit_font(
-            draw,
+            draw_probe,
             species_display,
             max_width=max(24, int(round(108 * sx))),
-            start_size=max(8, int(round(12 * scale))),
-            min_size=max(7, int(round(9 * scale))),
+            start_size=max(8, int(round(10 * scale))),
+            min_size=max(7, int(round(8 * scale))),
             bold=False,
         )
+        species_display = _clip_text(species_display, pokemon_font, max(24, int(round(108 * sx))))
         self._mpokeinfo_draw_shadow_text(draw, _pt(266, 126), species_display, font=pokemon_font)
 
         # --- main sprite region ---
         nickname = str(mon.get("nickname") or species_display).strip() or species_display
         nick_font = self._mpokeinfo_fit_font(
-            draw,
+            draw_probe,
             nickname,
-            max_width=max(32, int(round(136 * sx))),
-            start_size=max(8, int(round(12 * scale))),
-            min_size=max(7, int(round(9 * scale))),
+            max_width=max(28, int(round(136 * sx))),
+            start_size=max(8, int(round(10 * scale))),
+            min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
+        nickname = _clip_text(nickname, nick_font, max(28, int(round(136 * sx))))
         self._mpokeinfo_draw_shadow_text(draw, _pt(86, 132), nickname, font=nick_font)
 
-        sprite_path = self._pick_sprite_path(species, gender, shiny, current_form)
-        if sprite_path is not None:
-            try:
-                with Image.open(str(sprite_path)) as src:
-                    try:
-                        if bool(getattr(src, "is_animated", False)):
-                            src.seek(0)
-                    except Exception:
-                        pass
-                    sprite = src.convert("RGBA")
-                try:
-                    alpha = sprite.split()[-1]
-                    bb = alpha.getbbox()
-                    if bb is not None:
-                        sprite = sprite.crop(bb)
-                except Exception:
-                    pass
-                max_sw = max(18, int(round(90 * sx)))
-                max_sh = max(18, int(round(82 * sy)))
-                sprite.thumbnail((max_sw, max_sh), resample=resample)
-                cx, cy = _pt(162, 81)
-                dx = int(cx - (sprite.width // 2))
-                dy = int(cy - (sprite.height // 2))
-                base.alpha_composite(sprite, dest=(dx, dy))
-            except Exception:
-                pass
-
         if shiny:
-            shiny_font = self._mpokeinfo_font(max(9, int(round(14 * scale))), bold=True)
+            shiny_font = self._mpokeinfo_font(max(8, int(round(12 * scale))), bold=True)
             self._mpokeinfo_draw_shadow_text(
                 draw,
-                _pt(93, 77),
+                _pt(92, 76),
                 "✦",
                 font=shiny_font,
                 fill=(255, 98, 180, 255),
@@ -15763,8 +15828,8 @@ class MPokeInfo(commands.Cog):
             try:
                 with Image.open(str(held_icon)) as src:
                     icon = src.convert("RGBA")
-                icon.thumbnail((max(10, int(round(22 * sx))), max(10, int(round(22 * sy)))), resample=resample)
-                base.alpha_composite(icon, dest=_pt(229, 73))
+                icon.thumbnail((max(10, int(round(20 * sx))), max(10, int(round(20 * sy)))), resample=resample)
+                panel_static.alpha_composite(icon, dest=_pt(229, 73))
             except Exception:
                 pass
 
@@ -15773,47 +15838,48 @@ class MPokeInfo(commands.Cog):
         if not moves_clean:
             moves_clean = ["—"]
         move_start_x, move_start_y = _pt(86, 162)
-        move_line_h = max(12, int(round(17 * sy)))
+        move_line_h = max(12, int(round(18 * sy)))
         for idx, mv in enumerate(moves_clean[:4]):
             y = int(move_start_y + (idx * move_line_h))
             mv_font = self._mpokeinfo_fit_font(
-                draw,
+                draw_probe,
                 mv,
-                max_width=max(28, int(round(138 * sx))),
-                start_size=max(8, int(round(12 * scale))),
-                min_size=max(7, int(round(9 * scale))),
+                max_width=max(24, int(round(138 * sx))),
+                start_size=max(8, int(round(10 * scale))),
+                min_size=max(7, int(round(8 * scale))),
                 bold=False,
             )
+            mv = _clip_text(mv, mv_font, max(24, int(round(138 * sx))))
             self._mpokeinfo_draw_shadow_text(draw, (move_start_x, y), mv, font=mv_font, fill=(240, 245, 250, 255))
 
-        ability_text = str(mon.get("ability") or "Unknown").replace("-", " ").replace("_", " ").title()
-        if not ability_text.strip():
-            ability_text = "Unknown"
+        ability_text = str(mon.get("ability") or "Unknown").replace("-", " ").replace("_", " ").title() or "Unknown"
         ability_font = self._mpokeinfo_fit_font(
-            draw,
+            draw_probe,
             ability_text,
-            max_width=max(28, int(round(136 * sx))),
-            start_size=max(8, int(round(12 * scale))),
-            min_size=max(7, int(round(9 * scale))),
+            max_width=max(24, int(round(136 * sx))),
+            start_size=max(8, int(round(10 * scale))),
+            min_size=max(7, int(round(8 * scale))),
             bold=False,
         )
+        ability_text = _clip_text(ability_text, ability_font, max(24, int(round(136 * sx))))
         ability_center_x = _pt(156, 0)[0]
         ability_y = _pt(0, 238)[1]
-        ability_w = self._mpokeinfo_text_width(draw, ability_text, ability_font)
+        ability_w = self._mpokeinfo_text_width(draw_probe, ability_text, ability_font)
         self._mpokeinfo_draw_shadow_text(draw, (ability_center_x - (ability_w // 2), ability_y), ability_text, font=ability_font)
 
         item_text = pretty_item_name(held_item_raw) if held_item_raw else "None"
         item_font = self._mpokeinfo_fit_font(
-            draw,
+            draw_probe,
             item_text,
-            max_width=max(28, int(round(136 * sx))),
-            start_size=max(8, int(round(12 * scale))),
-            min_size=max(7, int(round(9 * scale))),
+            max_width=max(24, int(round(136 * sx))),
+            start_size=max(8, int(round(10 * scale))),
+            min_size=max(7, int(round(8 * scale))),
             bold=False,
         )
+        item_text = _clip_text(item_text, item_font, max(24, int(round(136 * sx))))
         item_center_x = _pt(156, 0)[0]
         item_y = _pt(0, 272)[1]
-        item_w = self._mpokeinfo_text_width(draw, item_text, item_font)
+        item_w = self._mpokeinfo_text_width(draw_probe, item_text, item_font)
         self._mpokeinfo_draw_shadow_text(draw, (item_center_x - (item_w // 2), item_y), item_text, font=item_font)
 
         # --- stats table ---
@@ -15852,9 +15918,9 @@ class MPokeInfo(commands.Cog):
             ival = f"{max(0, min(31, int(iv_vals.get(key, 0)))):02d}"
             eval_ = f"{max(0, min(252, int(ev_vals.get(key, 0)))):03d}"
 
-            sval_w = self._mpokeinfo_text_width(draw, sval, font_stats)
-            ival_w = self._mpokeinfo_text_width(draw, ival, font_stats)
-            eval_w = self._mpokeinfo_text_width(draw, eval_, font_stats)
+            sval_w = self._mpokeinfo_text_width(draw_probe, sval, font_stats)
+            ival_w = self._mpokeinfo_text_width(draw_probe, ival, font_stats)
+            eval_w = self._mpokeinfo_text_width(draw_probe, eval_, font_stats)
 
             self._mpokeinfo_draw_shadow_text(
                 draw,
@@ -15880,9 +15946,47 @@ class MPokeInfo(commands.Cog):
                 shadow=(18, 90, 84, 220),
             )
 
+        # Emit animated panel if animated sprite exists; otherwise static PNG.
+        if sprite_frames:
+            cx, cy = _pt(162, 80)
+            if len(sprite_frames) > 1:
+                out_frames: list[Any] = []
+                for spr in sprite_frames:
+                    fr = panel_static.copy()
+                    dx = int(cx - (spr.width // 2))
+                    dy = int(cy - (spr.height // 2))
+                    try:
+                        fr.alpha_composite(spr, dest=(dx, dy))
+                    except Exception:
+                        pass
+                    out_frames.append(fr)
+                if out_frames:
+                    out = BytesIO()
+                    try:
+                        out_frames[0].save(
+                            out,
+                            format="GIF",
+                            save_all=True,
+                            append_images=out_frames[1:],
+                            duration=int(max(55, min(180, sprite_duration_ms))),
+                            loop=0,
+                            disposal=2,
+                        )
+                    except Exception:
+                        return None
+                    out.seek(0)
+                    filename = f"mpokeinfo_{int(mon.get('id') or 0)}.gif"
+                    return discord.File(fp=out, filename=filename)
+            # Single frame fallback.
+            try:
+                spr = sprite_frames[0]
+                panel_static.alpha_composite(spr, dest=(int(cx - (spr.width // 2)), int(cy - (spr.height // 2))))
+            except Exception:
+                pass
+
         out = BytesIO()
         try:
-            base.save(out, format="PNG")
+            panel_static.save(out, format="PNG")
         except Exception:
             return None
         out.seek(0)
