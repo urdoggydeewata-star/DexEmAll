@@ -16042,31 +16042,32 @@ class MPokeInfo(commands.Cog):
         )
         _draw_centered_in_box(ot_name, ot_font, left=ot_box_left, y=ot_box_y, width=ot_box_w, height=ot_box_h)
 
-        lv_line = f"Lv {int(level)}"
+        lv_line = f"{int(level)}"
         lv_box_left, lv_box_y = _pt(202, 13)
         lv_box_w = max(22, int(round(56 * sx)))
         lv_box_h = max(10, int(round(13 * sy)))
         gender_key = str(gender or "").strip().lower()
         gender_symbol = {"male": "♂", "female": "♀", "genderless": "∅"}.get(gender_key)
-        gender_slot_w = max(0, int(round(10 * sx))) if gender_symbol else 0
-        lv_text_w = max(12, int(lv_box_w - gender_slot_w))
         lv_font = self._mpokeinfo_fit_font(
             draw_probe,
             lv_line,
-            max_width=lv_text_w,
+            max_width=max(12, int(lv_box_w)),
             start_size=max(8, int(round(10 * scale))),
             min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        _draw_centered_in_box(
-            lv_line,
-            lv_font,
-            left=lv_box_left,
-            y=lv_box_y,
-            width=lv_text_w,
-            height=lv_box_h,
-        )
+        lv_line = _clip_text(lv_line, lv_font, max(12, int(lv_box_w)))
+        try:
+            lvb = draw_probe.textbbox((0, 0), lv_line, font=lv_font)
+            lv_h = max(1, int(lvb[3] - lvb[1]))
+        except Exception:
+            lv_h = max(8, int(round(9 * sy)))
+        lv_w = self._mpokeinfo_text_width(draw_probe, lv_line, lv_font)
 
+        gender_font = None
+        gfill = (214, 214, 226, 255)
+        gw = 0
+        gh = max(8, int(round(9 * sy)))
         if gender_symbol:
             try:
                 from PIL import ImageFont  # type: ignore
@@ -16083,7 +16084,21 @@ class MPokeInfo(commands.Cog):
                 gh = max(1, int(gb[3] - gb[1]))
             except Exception:
                 gh = max(8, int(round(9 * sy)))
-            gx = int(lv_box_left + lv_text_w + max(0, ((gender_slot_w - gw) // 2)))
+
+        gap = max(1, int(round(2 * sx))) if gender_symbol else 0
+        group_w = int(lv_w + (gap + gw if gender_symbol else 0))
+        group_x = int(lv_box_left + max(0, ((lv_box_w - group_w) // 2)))
+        lv_y = int(lv_box_y + max(0, ((lv_box_h - lv_h) // 2) - 1))
+        self._mpokeinfo_draw_shadow_text(
+            draw,
+            (group_x, lv_y),
+            lv_line,
+            font=lv_font,
+            fill=(236, 244, 248, 255),
+            shadow=(0, 0, 0, 220),
+        )
+        if gender_symbol and gender_font is not None:
+            gx = int(group_x + lv_w + gap)
             gy = int(lv_box_y + max(0, ((lv_box_h - gh) // 2) - 1))
             self._mpokeinfo_draw_shadow_text(
                 draw,
@@ -16812,6 +16827,9 @@ async def _dispatch_pokeinfo_alias(
             return
         except TypeError:
             pass
+        except Exception:
+            import traceback
+            traceback.print_exc()
         try:
             await cb(
                 interaction,
@@ -17469,8 +17487,8 @@ def _team_species_visual_scale(row: dict) -> float:
     if db_cache is None:
         species_norm = _daycare_norm_species(row.get("species"))
         if species_norm == "stakataka":
-            return 0.58
-        return 1.0
+            return 0.74
+        return 1.05
     species_raw = str(row.get("species") or "").strip().lower().replace("_", "-")
     if not species_raw:
         return 1.0
@@ -17478,7 +17496,7 @@ def _team_species_visual_scale(row: dict) -> float:
     # Wide/tall forms like Stakataka can clip into the name strip if rendered by
     # generic height scaling, so cap them with a hand-tuned value.
     if species_norm == "stakataka":
-        return 0.58
+        return 0.74
     candidates = [
         species_raw,
         species_raw.replace("-", " "),
@@ -17513,11 +17531,11 @@ def _team_species_visual_scale(row: dict) -> float:
         if height_m is not None:
             break
     if height_m is None:
-        return 1.0
+        return 1.05
     h = max(0.2, min(6.0, float(height_m)))
     denom = (math.log1p(6.0) - math.log1p(0.2)) or 1.0
     norm = (math.log1p(h) - math.log1p(0.2)) / denom
-    return max(0.78, min(1.34, 0.80 + (0.54 * norm)))
+    return max(0.84, min(1.46, 0.86 + (0.60 * norm)))
 
 
 def _team_is_egg_row(row: dict) -> bool:
@@ -18182,8 +18200,8 @@ def _team_overview_panel_file(
             geom = slot_layout[slot - 1]
             slot_w, slot_h = geom["box_wh"]
             visual_scale = _team_species_visual_scale(row)
-            max_w = max(30, min(max(30, slot_w - max(10, int(round(10 * s)))), int(round(128 * sx * visual_scale))))
-            max_h = max(30, min(max(30, slot_h - max(46, int(round(54 * s)))), int(round(124 * sy * visual_scale))))
+            max_w = max(30, min(max(30, slot_w - max(10, int(round(10 * s)))), int(round(140 * sx * visual_scale))))
+            max_h = max(30, min(max(30, slot_h - max(46, int(round(54 * s)))), int(round(140 * sy * visual_scale))))
             sprite_max = (max_w, max_h)
             sprite_min = (max(24, int(round(max_w * 0.72))), max(24, int(round(max_h * 0.72))))
             frames, _ = _team_load_sprite_frames(
@@ -18196,7 +18214,7 @@ def _team_overview_panel_file(
             y_off = 0
             try:
                 if _daycare_norm_species(row.get("species")) == "stakataka":
-                    y_off = -max(2, int(round(12 * sy)))
+                    y_off = -max(2, int(round(8 * sy)))
             except Exception:
                 y_off = 0
             sprite_data[slot] = {"frames": frames, "y_off": y_off}

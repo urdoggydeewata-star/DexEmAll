@@ -14,15 +14,34 @@ except ImportError:
     db_cache = None
 
 _POKEDEX_FORMS_TABLE_AVAILABLE: Optional[bool] = None
+_OPTIONAL_TABLE_AVAILABILITY: Dict[str, bool] = {}
+
+
+def _is_missing_optional_table_error(exc: Exception, table_name: str) -> bool:
+    msg = str(exc or "").lower()
+    t = str(table_name or "").lower().strip()
+    if not t:
+        return False
+    return (
+        ("no such table" in msg and t in msg)
+        or ("undefined table" in msg and t in msg)
+        or ("relation" in msg and t in msg and "does not exist" in msg)
+    )
+
+
+def _is_optional_table_disabled(table_name: str) -> bool:
+    t = str(table_name or "").lower().strip()
+    return bool(t) and _OPTIONAL_TABLE_AVAILABILITY.get(t) is False
+
+
+def _disable_optional_table(table_name: str) -> None:
+    t = str(table_name or "").lower().strip()
+    if t:
+        _OPTIONAL_TABLE_AVAILABILITY[t] = False
 
 
 def _is_missing_pokedex_forms_error(exc: Exception) -> bool:
-    msg = str(exc or "").lower()
-    return (
-        ("no such table" in msg and "pokedex_forms" in msg)
-        or ("undefined table" in msg and "pokedex_forms" in msg)
-        or ("relation" in msg and "pokedex_forms" in msg and "does not exist" in msg)
-    )
+    return _is_missing_optional_table_error(exc, "pokedex_forms")
 
 
 def _open():
@@ -374,19 +393,22 @@ async def get_party_for_engine(user_id: int, *, save_to_battle_cache: bool = Fal
                         if bsid in species_ids:
                             mega_by_species_id.setdefault(bsid, []).append(mrow)
                 else:
-                    ph = ",".join(["?"] * len(species_ids))
-                    mega_rows = conn.execute(
-                        f"""
-                        SELECT base_species_id, mega_form, mega_stone, form_key, stats, types, abilities, introduced_in
-                        FROM mega_evolution
-                        WHERE base_species_id IN ({ph})
-                        """,
-                        tuple(species_ids),
-                    ).fetchall()
-                    for mrow in mega_rows:
-                        bsid = mrow["base_species_id"]
-                        mega_by_species_id.setdefault(bsid, []).append(dict(mrow) if hasattr(mrow, "keys") else mrow)
-            except Exception:
+                    if not _is_optional_table_disabled("mega_evolution"):
+                        ph = ",".join(["?"] * len(species_ids))
+                        mega_rows = conn.execute(
+                            f"""
+                            SELECT base_species_id, mega_form, mega_stone, form_key, stats, types, abilities, introduced_in
+                            FROM mega_evolution
+                            WHERE base_species_id IN ({ph})
+                            """,
+                            tuple(species_ids),
+                        ).fetchall()
+                        for mrow in mega_rows:
+                            bsid = mrow["base_species_id"]
+                            mega_by_species_id.setdefault(bsid, []).append(dict(mrow) if hasattr(mrow, "keys") else mrow)
+            except Exception as e:
+                if _is_missing_optional_table_error(e, "mega_evolution"):
+                    _disable_optional_table("mega_evolution")
                 mega_by_species_id = {}
 
         for row in rows:
@@ -596,7 +618,7 @@ def get_form_overrides(species_name: str, form_key: str) -> Optional[Dict[str, A
                             "abilities": _parse_form_field(r.get("abilities"), []),
                         }
     global _POKEDEX_FORMS_TABLE_AVAILABLE
-    if _POKEDEX_FORMS_TABLE_AVAILABLE is False:
+    if _POKEDEX_FORMS_TABLE_AVAILABLE is False or _is_optional_table_disabled("pokedex_forms"):
         return None
     with get_connection() as con:
         try:
@@ -623,6 +645,7 @@ def get_form_overrides(species_name: str, form_key: str) -> Optional[Dict[str, A
         except Exception as e:
             if _is_missing_pokedex_forms_error(e):
                 _POKEDEX_FORMS_TABLE_AVAILABLE = False
+                _disable_optional_table("pokedex_forms")
                 return None
             raise
         if not r:
