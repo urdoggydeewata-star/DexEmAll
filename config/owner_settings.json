@@ -1,0 +1,32 @@
+{
+  "owner_ids": [
+    764310943781617716
+  ],
+  "admin_ids": [],
+  "banned_ids": [
+    891797928396587059
+  ],
+  "code_bypass_ids": [],
+  "dev_guild_id": 889548793912123392,
+  "embed_echo": {
+    "guild_id": 889548793912123392,
+    "channel_ids": [
+      907370913002049628,
+      1459363727483600990,
+      1465864011223535774
+    ],
+    "user_ids": null,
+    "delete_source": true,
+    "ignore_prefix_commands": true
+  },
+  "verify": {
+    "guild_id": 889548793912123392,
+    "channel_id": 907370913002049628,
+    "role_id": 907370845167566929,
+    "button_custom_id": "verify:accept_rules"
+  },
+  "beta": {
+    "announcement_channel_id": 1464033412183752808,
+    "claim_custom_id": "beta_claim"
+  }
+}

@@ -7580,37 +7580,77 @@ async def _render_gif_for_panel(st: BattleState, for_user_id: int, hide_hp_text:
 
 async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn_summary: Optional[str] = None, gif_file: Optional[Any] = None):
     """Send or update the stream panel (P1 view, no buttons)"""
-    # Build description (no HP bars/text - they're visible in the GIF)
-    desc_parts = [
-        f"Turn {st.turn} • {st.fmt_label} (Gen {st.gen})"
-    ]
-    
-    # Add turn summary if provided (trim to keep embed under limits).
-    if turn_summary:
-        summary_text = str(turn_summary).strip()
-        if len(summary_text) > 3000:
-            summary_text = "...\n" + summary_text[-2800:]
-        desc_parts.append(f"\n**Turn Summary:**\n{summary_text}")
-    
-    # Add field conditions if any
-    field_text = _field_conditions_text(st.field)
-    if field_text:
-        desc_parts.append("\n" + field_text)
-    
-    # Get active Pokémon for title formatting
+    def _safe_int(v: Any, default: int) -> int:
+        try:
+            return int(v)
+        except Exception:
+            return int(default)
+
+    turn_no = 0
+    try:
+        turn_no = int(getattr(st, "turn", 0) or 0)
+    except Exception:
+        turn_no = 0
+    turn_label = max(1, turn_no - 1) if turn_no > 0 else 1
+
+    # Prefer per-turn summary payload, fallback to cached turn log.
+    summary_text = str(turn_summary or "").strip()
+    if not summary_text:
+        try:
+            cached_lines = [
+                str(line).strip()
+                for line in (getattr(st, "_last_turn_log", []) or [])
+                if str(line).strip()
+            ]
+            if cached_lines:
+                summary_text = "\n".join(cached_lines).strip()
+        except Exception:
+            summary_text = ""
+    if len(summary_text) > 3000:
+        summary_text = "...\n" + summary_text[-2800:]
+    if not summary_text:
+        summary_text = "No significant actions were recorded this turn."
+
+    # Get active Pokémon for embed title/HP fields.
     p1_active = st._active(st.p1_id)
     p2_active = st._active(st.p2_id)
-    p1_display = _format_pokemon_name(p1_active)
-    p2_display = _format_pokemon_name(p2_active)
-    
-    # Build description text
-    description_text = "\n".join(desc_parts) if desc_parts else "Battle in progress..."
-    
+    p1_display = _format_pokemon_name(p1_active) if p1_active else "Pokémon"
+    p2_display = _format_pokemon_name(p2_active) if p2_active else "Pokémon"
+
     embed = discord.Embed(
-        title=f"📺 Battle Stream: **{p1_display}** vs **{p2_display}**",
-        description=description_text,
-        color=discord.Color.purple()
+        title=f"⚔️ Turn {turn_label} Summary",
+        description=summary_text if summary_text else "Battle in progress...",
+        color=discord.Color.blurple(),
     )
+
+    if p1_active is not None:
+        p1_hp = max(0, _safe_int(getattr(p1_active, "hp", 0), 0))
+        p1_max = max(1, _safe_int(getattr(p1_active, "max_hp", 1), 1))
+        embed.add_field(
+            name=f"Your {p1_display}",
+            value=f"{_hp_bar(p1_hp, p1_max)}\n"
+                  f"**{p1_hp}/{p1_max} HP**",
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Your Pokémon", value="—", inline=False)
+
+    if p2_active is not None:
+        p2_hp = max(0, _safe_int(getattr(p2_active, "hp", 0), 0))
+        p2_max = max(1, _safe_int(getattr(p2_active, "max_hp", 1), 1))
+        embed.add_field(
+            name=f"Opponent's {p2_display}",
+            value=f"{_hp_bar(p2_hp, p2_max)}\n"
+                  f"**{p2_hp}/{p2_max} HP**",
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Opponent's Pokémon", value="—", inline=False)
+
+    # Add field conditions if any (same card style as turn summary embeds).
+    field_text = _field_conditions_text(st.field)
+    if field_text:
+        embed.add_field(name="🌍 Field Conditions", value=field_text, inline=False)
     
     # Handle gif_file - it might be:
     # - (discord.File, Path)  (preferred; caller rendered already)
@@ -7660,18 +7700,31 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
     try:
         # Keep per-turn stream history: send one message each turn with
         # both image and turn-by-turn summary text (legacy behavior).
+        send_kwargs: Dict[str, Any] = {"embed": embed}
         if file is not None:
+            send_kwargs["file"] = file
             try:
-                msg = await channel.send(embed=embed, file=file)
+                msg = await channel.send(**send_kwargs)
             except Exception as file_err:
                 # Fallback to embed-only stream message if attachment upload fails.
                 print(f"[Stream] Attachment send failed; retrying embed-only: {file_err}")
-                msg = await channel.send(embed=embed)
+                send_kwargs.pop("file", None)
+                msg = await channel.send(**send_kwargs)
         else:
-            msg = await channel.send(embed=embed)
+            msg = await channel.send(**send_kwargs)
         return msg
     except Exception as e:
         print(f"[Stream] Error sending stream: {e}")
+        try:
+            fallback = f"📺 Stream update • Turn {getattr(st, 'turn', '?')} • {getattr(st, 'fmt_label', 'Battle')}"
+            if turn_summary:
+                txt = str(turn_summary).strip()
+                if len(txt) > 1200:
+                    txt = "...\n" + txt[-1000:]
+                fallback += f"\n{txt}"
+            return await channel.send(fallback)
+        except Exception as fallback_err:
+            print(f"[Stream] Text fallback failed: {fallback_err}")
         return None
     finally:
         # Close stream attachment and best-effort cleanup of legacy render path.
@@ -8194,7 +8247,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                 stream_ch = await _resolve_stream_channel(st, p1_itx, p2_itx)
                 if stream_ch is not None:
                     render_result = await _render_gif_for_panel(st, st.p1_id, hide_hp_text=True)
-                    msg = await _send_stream_panel(stream_ch, st, "Battle has begun!", render_result)
+                    msg = await _send_stream_panel(stream_ch, st, None, render_result)
                     if msg is not None:
                         st._last_stream_message = msg
             except Exception as e:
@@ -8979,6 +9032,21 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
 
     species_display_map = _build_species_display_map(st)
     formatted_turn_log = [_format_log_line(line, species_display_map) for line in turn_log]
+    if not formatted_turn_log:
+        try:
+            last_log = [
+                _format_log_line(line, species_display_map)
+                for line in (getattr(st, "_last_turn_log", []) or [])
+                if str(line).strip()
+            ]
+            formatted_turn_log = last_log if last_log else ["No significant actions this turn."]
+        except Exception:
+            formatted_turn_log = ["No significant actions this turn."]
+    formatted_turn_text = "\n".join(str(x) for x in formatted_turn_log if str(x).strip()).strip()
+    if len(formatted_turn_text) > 3500:
+        formatted_turn_text = "...\n" + formatted_turn_text[-3400:]
+    if not formatted_turn_text:
+        formatted_turn_text = "No significant actions this turn."
     
     # Add current Pokemon HP status
     p1_mon = st._active(st.p1_id)
@@ -9016,7 +9084,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
         turn_title = f"⚔️ Turn {st.turn - 1} Summary"
     turn_embed = discord.Embed(
         title=turn_title,
-        description="\n".join(formatted_turn_log),
+        description=formatted_turn_text,
         color=discord.Color.blue()
     )
     
@@ -9077,7 +9145,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
     # Build P2's turn summary with sprite (prepare in parallel)
     turn_embed2 = discord.Embed(
         title=turn_title,
-        description="\n".join(formatted_turn_log),
+        description=formatted_turn_text,
         color=discord.Color.red()
     )
     
@@ -9181,25 +9249,42 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
             st._stream_update_lock = stream_lock
         try:
             async with stream_lock:
-                turn_summary_text = "\n".join(formatted_turn_log)
+                summary_lines = [
+                    str(line).strip()
+                    for line in (formatted_turn_log or [])
+                    if str(line).strip()
+                ]
+                if not summary_lines:
+                    summary_lines = [
+                        str(line).strip()
+                        for line in (getattr(st, "_last_turn_log", []) or [])
+                        if str(line).strip()
+                    ]
+                if not summary_lines:
+                    summary_lines = ["No significant actions this turn."]
+                turn_summary_text = "\n".join(summary_lines).strip()
+                try:
+                    turn_no = int(getattr(st, "turn", 0) or 0)
+                except Exception:
+                    turn_no = 0
+                summary_payload = turn_summary_text if turn_summary_text else None
                 # Render GIF for stream (shows current battle state with HP hidden)
                 render_result = await _render_gif_for_panel(st, st.p1_id, hide_hp_text=True)
-                msg = await _send_stream_panel(stream_channel, st, turn_summary_text, render_result)
+                msg = await _send_stream_panel(stream_channel, st, summary_payload, render_result)
                 if msg is not None:
                     st._last_stream_message = msg
+                else:
+                    # Last-resort keepalive so stream never appears "dead".
+                    try:
+                        await stream_channel.send(f"📺 Stream update • Turn {getattr(st, 'turn', '?')}")
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"[Stream] Error updating stream: {e}")
-    
-    # Send both player summaries in parallel; don't block on stream update (fire-and-forget)
-    def _on_stream_done(t: asyncio.Task) -> None:
-        try:
-            t.result()
-        except Exception as e:
-            print(f"[Stream] send_stream_update task error: {e}")
 
-    _stream_task = asyncio.create_task(send_stream_update())
-    _stream_task.add_done_callback(_on_stream_done)
+    # Send player summaries first, then await stream send to avoid dropped updates.
     await asyncio.gather(send_p1_summary(), send_p2_summary())
+    await send_stream_update()
 
     if st.winner:
         if award_money_callback:

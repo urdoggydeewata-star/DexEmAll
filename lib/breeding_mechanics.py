@@ -17,6 +17,18 @@ _PRE_EVO_MAP: dict[str, str] = {}
 _PRE_EVO_MAP_TS: float = 0.0
 _PRE_EVO_MAP_TTL = 60.0 * 60.0 * 6.0  # 6h
 
+_FEMALE_CHILD_SPECIES_OVERRIDES: dict[str, str] = {
+    # Custom rule support requested: female Nidorina/Nidoqueen produces Nidoran line.
+    "nidorina": "nidoran-f",
+    "nidoqueen": "nidoran-f",
+}
+
+_EGG_GROUP_OVERRIDES: dict[str, set[str]] = {
+    # Custom compatibility support for requested Nidorina/Nidoqueen breeding behavior.
+    "nidorina": {"monster", "field"},
+    "nidoqueen": {"monster", "field"},
+}
+
 
 def norm_species(species: Any) -> str:
     return str(species or "").strip().lower().replace("_", "-").replace(" ", "-")
@@ -255,6 +267,13 @@ def breeding_source_parent(parent_a: dict, parent_b: dict) -> dict:
     return parent_a
 
 
+def apply_female_species_child_override(child_species: str, parent_a: dict, parent_b: dict) -> str:
+    source = breeding_source_parent(parent_a, parent_b)
+    source_species = norm_species(source.get("species"))
+    override = _FEMALE_CHILD_SPECIES_OVERRIDES.get(source_species)
+    return norm_species(override or child_species)
+
+
 def apply_incense_baby_rules(
     base_child: str,
     parent_a: dict,
@@ -342,16 +361,50 @@ def pair_info(parent_a: dict, parent_b: dict, entry_a: dict | None, entry_b: dic
     ditto1 = s1 == "ditto"
     ditto2 = s2 == "ditto"
 
+    # Canonical exception: Manaphy + Ditto can breed and produces Phione eggs.
+    if (s1 == "manaphy" and ditto2) or (s2 == "manaphy" and ditto1):
+        return {
+            "can_breed": True,
+            "reason": "Manaphy can breed with Ditto.",
+            "child_species": "manaphy",  # resolve_egg_species maps this to phione
+            "rate": 0.85,
+            "ditto_pair": True,
+            "special_rule": "manaphy-phione",
+            "egg_group_overlap": [],
+        }
+
     if ditto1 and ditto2:
         fail["reason"] = "Two Ditto cannot breed together."
         return fail
 
     egg1 = parse_egg_groups(entry_a)
     egg2 = parse_egg_groups(entry_b)
+    if not egg1:
+        egg1 = set(_EGG_GROUP_OVERRIDES.get(s1, set()))
+    if not egg2:
+        egg2 = set(_EGG_GROUP_OVERRIDES.get(s2, set()))
+    if egg1 & {"undiscovered", "no-eggs"} and s1 in _EGG_GROUP_OVERRIDES:
+        egg1 = set(_EGG_GROUP_OVERRIDES[s1])
+    if egg2 & {"undiscovered", "no-eggs"} and s2 in _EGG_GROUP_OVERRIDES:
+        egg2 = set(_EGG_GROUP_OVERRIDES[s2])
     blocked_groups = {"undiscovered", "no-eggs"}
     if egg1 & blocked_groups or egg2 & blocked_groups:
         fail["reason"] = "One parent belongs to the Undiscovered egg group."
         return fail
+
+    overlap = sorted(list((egg1 & egg2) - {"ditto"}))
+
+    # Fallback for incomplete Pokédex rows: allow opposite-gender same-species pairs.
+    if not egg1 or not egg2:
+        if not (ditto1 or ditto2) and s1 == s2 and g1 != g2 and g1 != "genderless" and g2 != "genderless":
+            return {
+                "can_breed": True,
+                "reason": "Compatible pair (egg group data fallback).",
+                "child_species": s1 if g1 == "female" else s2,
+                "rate": 1.0,
+                "ditto_pair": False,
+                "egg_group_overlap": overlap,
+            }
 
     if not (ditto1 or ditto2):
         if g1 == g2:
@@ -370,6 +423,11 @@ def pair_info(parent_a: dict, parent_b: dict, entry_a: dict | None, entry_b: dic
         child_species = s1
     else:
         child_species = s1 if g1 == "female" else (s2 if g2 == "female" else s1)
+        child_species = _FEMALE_CHILD_SPECIES_OVERRIDES.get(child_species, child_species)
+
+    if norm_species(child_species) == "ditto":
+        fail["reason"] = "Ditto cannot be obtained from eggs."
+        return fail
 
     rate = 1.15 if (s1 == s2 and not (ditto1 or ditto2)) else (0.85 if (ditto1 or ditto2) else 0.95)
     return {
@@ -378,6 +436,7 @@ def pair_info(parent_a: dict, parent_b: dict, entry_a: dict | None, entry_b: dic
         "child_species": child_species,
         "rate": rate,
         "ditto_pair": bool(ditto1 or ditto2),
+        "egg_group_overlap": overlap,
     }
 
 
@@ -555,6 +614,9 @@ async def create_egg(
         incense_babies,
         pre_evo_map_data=pre_map_data,
     )
+    child_species = apply_female_species_child_override(child_species, parent_a, parent_b)
+    if norm_species(child_species) == "ditto":
+        return None
     child_entry = await species_entry_fetch(child_species)
     if not child_entry:
         return None

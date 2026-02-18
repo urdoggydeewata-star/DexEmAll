@@ -1,14 +1,12 @@
-# ======= BirbxNa1og_PokemonBot — global slash + DB-backed =======
 import os
 import sys
 import pathlib
 import json
 from io import BytesIO
 
-# Optional Pillow for route panel cropping
 try:
     from PIL import Image  # type: ignore
-except Exception:  # Pillow not installed
+except Exception:
     Image = None  # type: ignore
 import random
 import math
@@ -48,6 +46,21 @@ if TYPE_CHECKING:
 
 import lib
 from lib import db
+from lib.owner_settings import load_owner_settings
+from lib.market_catalog import (
+    MARKET_DISPLAY_NAMES,
+    MARKET_PRICE_CATALOG,
+    MARKET_SELL_PRICES,
+    market_display_name as _catalog_market_display_name,
+    market_item_variants as _catalog_market_item_variants,
+    normalize_market_key as _catalog_normalize_market_key,
+    resolve_market_key as _catalog_resolve_market_key,
+)
+from lib.adventure_history import (
+    history_entry as _history_entry,
+    history_pop as _history_pop,
+    history_push as _history_push,
+)
 try:
     from lib import db_cache
 except ImportError:
@@ -657,23 +670,60 @@ intents.members = True            # requires Members intent enabled in Dev Porta
 intents.messages = True
 intents.message_content = True    # keep True if you still use prefix commands elsewhere
 
-# Banned user IDs (blocked from all slash commands and app interactions)
-BANNED_IDS: frozenset[int] = frozenset({
-    891797928396587059
-})
+# Owner-editable runtime settings (IDs/channels/roles live in config/owner_settings.json).
+_OWNER_SETTINGS = load_owner_settings()
+
+# ==== OWNER / ADMIN SETTINGS ====
+OWNER_IDS: set[int] = set(_OWNER_SETTINGS.owner_ids)
+STATIC_ADMIN_IDS: set[int] = set(_OWNER_SETTINGS.admin_ids)
+BANNED_IDS: frozenset[int] = frozenset(_OWNER_SETTINGS.banned_ids)
+CODE_BYPASS_IDS: frozenset[int] = frozenset(_OWNER_SETTINGS.code_bypass_ids)
+
+DEV_GUILD_ID = int(_OWNER_SETTINGS.dev_guild_id)
+DEV_GUILD = discord.Object(id=DEV_GUILD_ID)
+
+# Embed echo settings
+EMBED_ECHO_GUILD_ID: int | None = _OWNER_SETTINGS.embed_echo_guild_id
+EMBED_ECHO_CHANNEL_IDS: set[int] = set(_OWNER_SETTINGS.embed_echo_channel_ids)
+EMBED_ECHO_USER_IDS: set[int] | None = (
+    set(_OWNER_SETTINGS.embed_echo_user_ids)
+    if _OWNER_SETTINGS.embed_echo_user_ids is not None
+    else None
+)
+EMBED_ECHO_DELETE_SOURCE = bool(_OWNER_SETTINGS.embed_echo_delete_source)
+EMBED_ECHO_IGNORE_PREFIX_COMMANDS = bool(_OWNER_SETTINGS.embed_echo_ignore_prefix_commands)
+
+# Verification button settings
+VERIFY_GUILD_ID = int(_OWNER_SETTINGS.verify_guild_id)
+VERIFY_CHANNEL_ID = int(_OWNER_SETTINGS.verify_channel_id)
+VERIFY_ROLE_ID = int(_OWNER_SETTINGS.verify_role_id)
+VERIFY_BUTTON_CUSTOM_ID = str(_OWNER_SETTINGS.verify_button_custom_id)
+
+# Beta claim settings
+BETA_ANNOUNCEMENT_CHANNEL_ID = int(_OWNER_SETTINGS.beta_announcement_channel_id)
+BETA_CLAIM_CUSTOM_ID = str(_OWNER_SETTINGS.beta_claim_custom_id)
 
 # Access code gate: users must run /code <code> before using the bot (set BOT_ACCESS_CODE in .env)
 BOT_ACCESS_CODE: str = (os.getenv("BOT_ACCESS_CODE") or "").strip()
-# IDs that bypass the code gate (owners + comma-separated from env, e.g. CODE_BYPASS_IDS=123,456)
-_CODE_BYPASS_RAW = os.getenv("CODE_BYPASS_IDS", "")
-CODE_BYPASS_IDS: frozenset[int] = frozenset(
-    int(x.strip()) for x in _CODE_BYPASS_RAW.split(",") if x.strip()
-)
 
-_ACCESS_VERIFY_CACHE_TTL_SECONDS = 300.0
+_ACCESS_VERIFY_CACHE_TTL_SECONDS = 1800.0
 _ACCESS_VERIFY_CACHE: dict[int, tuple[bool, float]] = {}
 _USER_GEN_CACHE_TTL_SECONDS = 300.0
 _USER_GEN_CACHE: dict[str, tuple[int, float]] = {}
+_ADMIN_CHECK_CACHE_TTL_SECONDS = 120.0
+_ADMIN_CHECK_CACHE: dict[str, tuple[bool, float]] = {}
+_REQUIRED_ROLE_CACHE_TTL_SECONDS = 1800.0
+_REQUIRED_ROLE_CACHE: dict[int, tuple[bool, float]] = {}
+_ROLE_GATE_EXEMPT_CACHE_TTL_SECONDS = 1800.0
+_ROLE_GATE_EXEMPT_CACHE: dict[int, tuple[bool, float]] = {}
+_ROLE_GATE_EXEMPT_TABLE_READY = False
+_ROLE_GATE_EXEMPT_TABLE_LOCK = asyncio.Lock()
+_ROLE_GATE_EXEMPT_TABLE_LAST_ATTEMPT_TS = 0.0
+_ROLE_GATE_EXEMPT_TABLE_RETRY_SECONDS = 60.0
+_REQUIRED_ROLE_BLOCK_MESSAGE = (
+    f"❌ You need <@&{VERIFY_ROLE_ID}> in the OS server to use this bot.\n"
+    "Join the OS server and complete verification first."
+)
 
 
 def _get_cached_access_verified(user_id: int) -> Optional[bool]:
@@ -710,8 +760,310 @@ def _set_cached_user_gen(user_id: str, generation: int) -> None:
     _USER_GEN_CACHE[str(user_id)] = (int(generation), float(time.time()))
 
 
+def _get_cached_admin_check(user_id: str) -> Optional[bool]:
+    uid = str(user_id)
+    rec = _ADMIN_CHECK_CACHE.get(uid)
+    if rec is None:
+        return None
+    val, ts = rec
+    if (time.time() - float(ts)) > _ADMIN_CHECK_CACHE_TTL_SECONDS:
+        _ADMIN_CHECK_CACHE.pop(uid, None)
+        return None
+    return bool(val)
+
+
+def _set_cached_admin_check(user_id: str, is_admin: bool) -> None:
+    _ADMIN_CHECK_CACHE[str(user_id)] = (bool(is_admin), float(time.time()))
+
+
+def _get_cached_required_role(user_id: int | str) -> Optional[bool]:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return None
+    rec = _REQUIRED_ROLE_CACHE.get(uid)
+    if rec is None:
+        return None
+    val, ts = rec
+    if (time.time() - float(ts)) > _REQUIRED_ROLE_CACHE_TTL_SECONDS:
+        _REQUIRED_ROLE_CACHE.pop(uid, None)
+        return None
+    return bool(val)
+
+
+def _set_cached_required_role(user_id: int | str, has_role: bool) -> None:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return
+    _REQUIRED_ROLE_CACHE[uid] = (bool(has_role), float(time.time()))
+
+
+def _get_cached_role_gate_exempt(user_id: int | str) -> Optional[bool]:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return None
+    rec = _ROLE_GATE_EXEMPT_CACHE.get(uid)
+    if rec is None:
+        return None
+    val, ts = rec
+    if (time.time() - float(ts)) > _ROLE_GATE_EXEMPT_CACHE_TTL_SECONDS:
+        _ROLE_GATE_EXEMPT_CACHE.pop(uid, None)
+        return None
+    return bool(val)
+
+
+def _set_cached_role_gate_exempt(user_id: int | str, is_exempt: bool) -> None:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return
+    _ROLE_GATE_EXEMPT_CACHE[uid] = (bool(is_exempt), float(time.time()))
+
+
+async def _ensure_role_gate_exempt_table() -> None:
+    global _ROLE_GATE_EXEMPT_TABLE_READY, _ROLE_GATE_EXEMPT_TABLE_LAST_ATTEMPT_TS
+    if _ROLE_GATE_EXEMPT_TABLE_READY:
+        return
+    now = float(time.time())
+    if (now - float(_ROLE_GATE_EXEMPT_TABLE_LAST_ATTEMPT_TS)) < _ROLE_GATE_EXEMPT_TABLE_RETRY_SECONDS:
+        return
+    async with _ROLE_GATE_EXEMPT_TABLE_LOCK:
+        if _ROLE_GATE_EXEMPT_TABLE_READY:
+            return
+        now = float(time.time())
+        if (now - float(_ROLE_GATE_EXEMPT_TABLE_LAST_ATTEMPT_TS)) < _ROLE_GATE_EXEMPT_TABLE_RETRY_SECONDS:
+            return
+        _ROLE_GATE_EXEMPT_TABLE_LAST_ATTEMPT_TS = now
+        try:
+            async with db.session() as conn:
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS role_gate_exempt_users (
+                      user_id TEXT PRIMARY KEY,
+                      added_by TEXT,
+                      note TEXT,
+                      added_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                await conn.commit()
+            _ROLE_GATE_EXEMPT_TABLE_READY = True
+        except Exception:
+            _ROLE_GATE_EXEMPT_TABLE_READY = False
+
+
+async def _is_role_gate_exempt(user_id: int | str, *, force_refresh: bool = False) -> bool:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    if not force_refresh:
+        cached = _get_cached_role_gate_exempt(uid)
+        if cached is not None:
+            return bool(cached)
+    val = False
+    try:
+        await _ensure_role_gate_exempt_table()
+        if not _ROLE_GATE_EXEMPT_TABLE_READY:
+            _set_cached_role_gate_exempt(uid, False)
+            return False
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT 1 FROM role_gate_exempt_users WHERE user_id = ? LIMIT 1",
+                (str(uid),),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+        val = bool(row)
+    except Exception:
+        val = False
+    _set_cached_role_gate_exempt(uid, val)
+    return val
+
+
+async def _grant_role_gate_exempt(
+    user_id: int | str,
+    *,
+    added_by: int | str | None = None,
+    note: str | None = None,
+) -> bool:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    try:
+        await _ensure_role_gate_exempt_table()
+        async with db.session() as conn:
+            await conn.execute(
+                """
+                INSERT INTO role_gate_exempt_users (user_id, added_by, note)
+                VALUES (?, ?, ?)
+                ON CONFLICT (user_id) DO UPDATE SET
+                  added_by = excluded.added_by,
+                  note = excluded.note
+                """,
+                (
+                    str(uid),
+                    (str(added_by) if added_by is not None else None),
+                    ((str(note).strip() or None) if note is not None else None),
+                ),
+            )
+            await conn.commit()
+        _set_cached_role_gate_exempt(uid, True)
+        return True
+    except Exception:
+        return False
+
+
+async def _revoke_role_gate_exempt(user_id: int | str) -> bool:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    try:
+        await _ensure_role_gate_exempt_table()
+        async with db.session() as conn:
+            await conn.execute(
+                "DELETE FROM role_gate_exempt_users WHERE user_id = ?",
+                (str(uid),),
+            )
+            await conn.commit()
+        _ROLE_GATE_EXEMPT_CACHE.pop(uid, None)
+        return True
+    except Exception:
+        return False
+
+
+async def _list_role_gate_exempt(limit: int = 100) -> list[dict]:
+    out: list[dict] = []
+    lim = max(1, min(int(limit or 100), 500))
+    try:
+        await _ensure_role_gate_exempt_table()
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT user_id, added_by, note, added_at FROM role_gate_exempt_users ORDER BY added_at DESC LIMIT ?",
+                (lim,),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+        for row in rows or []:
+            if hasattr(row, "keys"):
+                out.append(dict(row))
+            else:
+                out.append(
+                    {
+                        "user_id": row[0] if len(row) > 0 else None,
+                        "added_by": row[1] if len(row) > 1 else None,
+                        "note": row[2] if len(row) > 2 else None,
+                        "added_at": row[3] if len(row) > 3 else None,
+                    }
+                )
+    except Exception:
+        return []
+    return out
+
+
+def _parse_user_id_input(raw: str | int | None) -> Optional[int]:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if s.startswith("<@") and s.endswith(">"):
+        s = s.strip("<@!>")
+    return int(s) if s.isdigit() else None
+
+
+def _is_verify_button_interaction(interaction: discord.Interaction) -> bool:
+    try:
+        data = interaction.data
+        if not isinstance(data, dict):
+            return False
+        return str(data.get("custom_id", "")).strip() == VERIFY_BUTTON_CUSTOM_ID
+    except Exception:
+        return False
+
+
+async def _has_required_os_role(user_id: int | str, *, force_refresh: bool = False) -> bool:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    if not force_refresh:
+        cached = _get_cached_required_role(uid)
+        if cached is not None:
+            return bool(cached)
+    guild = bot.get_guild(VERIFY_GUILD_ID)
+    if guild is None:
+        _set_cached_required_role(uid, False)
+        return False
+    member = guild.get_member(uid)
+    if member is None:
+        try:
+            member = await guild.fetch_member(uid)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            member = None
+        except Exception:
+            member = None
+    has_role = bool(member and any(int(r.id) == VERIFY_ROLE_ID for r in getattr(member, "roles", [])))
+    _set_cached_required_role(uid, has_role)
+    return has_role
+
+
+async def _send_required_role_block(interaction: discord.Interaction) -> None:
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(_REQUIRED_ROLE_BLOCK_MESSAGE, ephemeral=True)
+        else:
+            await interaction.response.send_message(_REQUIRED_ROLE_BLOCK_MESSAGE, ephemeral=True)
+    except Exception:
+        pass
+
+
+async def _check_required_role_interaction(
+    interaction: discord.Interaction, *, allow_verify_button: bool = False
+) -> bool:
+    if not interaction.user:
+        return False
+    if int(interaction.user.id) in OWNER_IDS:
+        return True
+    if allow_verify_button and _is_verify_button_interaction(interaction):
+        return True
+    # Fast path: most users should pass via required role check; avoid DB lookup
+    # for role-gate exemptions unless role check fails.
+    if await _has_required_os_role(interaction.user.id):
+        return True
+    if await _is_role_gate_exempt(interaction.user.id):
+        return True
+    await _send_required_role_block(interaction)
+    return False
+
+
+def _is_static_admin(user_id: int | str) -> bool:
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    return uid in OWNER_IDS or uid in STATIC_ADMIN_IDS
+
+
+async def _is_admin_user(user_id: int | str) -> bool:
+    if _is_static_admin(user_id):
+        return True
+    uid = str(user_id)
+    cached = _get_cached_admin_check(uid)
+    if cached is not None:
+        return bool(cached)
+    try:
+        val = bool(await db.is_admin(uid))
+    except Exception:
+        val = False
+    _set_cached_admin_check(uid, val)
+    return val
+
+
 class _BannedCheckTree(app_commands.CommandTree):
-    """CommandTree that blocks banned users and enforces access code gate."""
+    """CommandTree that blocks banned users and enforces access gates."""
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not interaction.user:
@@ -729,7 +1081,11 @@ class _BannedCheckTree(app_commands.CommandTree):
                 pass
             return False
 
-        # 2) Access code gate (skip if no code configured)
+        # 2) Role gate: user must hold OS verification role
+        if not await _check_required_role_interaction(interaction):
+            return False
+
+        # 3) Access code gate (skip if no code configured)
         if BOT_ACCESS_CODE:
             bypass = uid in (OWNER_IDS | CODE_BYPASS_IDS)
             cmd_name = (interaction.data or {}).get("name", "")
@@ -753,27 +1109,50 @@ class _BannedCheckTree(app_commands.CommandTree):
 
 
 bot = commands.Bot(command_prefix='.', intents=intents, tree_cls=_BannedCheckTree)
+# Enforce role-gate for all UI interactions (buttons/selects/modals), including in other servers.
+_ORIG_VIEW_INTERACTION_CHECK = discord.ui.View.interaction_check
+_ORIG_MODAL_INTERACTION_CHECK = discord.ui.Modal.interaction_check
+
+
+async def _role_gated_view_interaction_check(self, interaction: discord.Interaction) -> bool:
+    if not await _check_required_role_interaction(interaction, allow_verify_button=True):
+        return False
+    return await _ORIG_VIEW_INTERACTION_CHECK(self, interaction)
+
+
+async def _role_gated_modal_interaction_check(self, interaction: discord.Interaction) -> bool:
+    if not await _check_required_role_interaction(interaction):
+        return False
+    return await _ORIG_MODAL_INTERACTION_CHECK(self, interaction)
+
+
+if not getattr(discord.ui.View.interaction_check, "_required_role_gate_patch", False):
+    _role_gated_view_interaction_check._required_role_gate_patch = True  # type: ignore[attr-defined]
+    discord.ui.View.interaction_check = _role_gated_view_interaction_check
+
+if not getattr(discord.ui.Modal.interaction_check, "_required_role_gate_patch", False):
+    _role_gated_modal_interaction_check._required_role_gate_patch = True  # type: ignore[attr-defined]
+    discord.ui.Modal.interaction_check = _role_gated_modal_interaction_check
+
+
+@bot.check
+async def _required_role_prefix_command_check(ctx: commands.Context) -> bool:
+    if not getattr(ctx, "author", None):
+        return False
+    if int(ctx.author.id) in OWNER_IDS:
+        return True
+    # Check required role first to avoid a DB read for non-exempt users.
+    if await _has_required_os_role(ctx.author.id):
+        return True
+    if await _is_role_gate_exempt(ctx.author.id):
+        return True
+    try:
+        await ctx.reply(_REQUIRED_ROLE_BLOCK_MESSAGE, mention_author=False)
+    except Exception:
+        pass
+    return False
+
 # ==== OWNER / ADMIN CHECKS ====
-OWNER_IDS: set[int] = { 764310943781617716 }  # <-- your ID
-DEV_GUILD_ID = 889548793912123392
-DEV_GUILD = discord.Object(id=DEV_GUILD_ID)
-
-# Embed echo (set these IDs to enable)
-EMBED_ECHO_GUILD_ID: int | None = 889548793912123392
-EMBED_ECHO_CHANNEL_IDS: set[int] = {
-    907370913002049628,  # rules-and-info
-    1459363727483600990, # future-implementations
-    1465864011223535774, # sneak-peaks
-}
-EMBED_ECHO_USER_IDS: set[int] | None = None  # e.g. {123} to limit to you; None = allow all
-EMBED_ECHO_DELETE_SOURCE = True              # delete original user message after echo
-EMBED_ECHO_IGNORE_PREFIX_COMMANDS = True     # ignore messages starting with the prefix
-
-# Verification button (rules channel)
-VERIFY_GUILD_ID = 889548793912123392
-VERIFY_CHANNEL_ID = 907370913002049628
-BETA_ANNOUNCEMENT_CHANNEL_ID = 1464033412183752808
-BETA_CLAIM_CUSTOM_ID = "beta_claim"
 
 
 class BetaClaimView(discord.ui.View):
@@ -832,11 +1211,8 @@ class BetaClaimView(discord.ui.View):
 # Beta claim view is created in on_ready() (needs a running event loop) and stored on bot.beta_claim_view
 
 
-VERIFY_ROLE_ID = 907370845167566929
-VERIFY_BUTTON_CUSTOM_ID = "verify:accept_rules"
-
 def owners_only():
-    """Allow only hardcoded owner IDs."""
+    """Allow only owner IDs from owner settings."""
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.user and interaction.user.id in OWNER_IDS:
             return True
@@ -845,15 +1221,15 @@ def owners_only():
     return app_commands.check(predicate)
 
 def admin_only():
-    """Allow ONLY users listed in the DB admins table."""
+    """Allow static admins/owners and DB admins."""
     async def predicate(interaction: discord.Interaction) -> bool:
         try:
-            if await db.is_admin(str(interaction.user.id)):
+            if await _is_admin_user(interaction.user.id):
                 return True
         except Exception:
             pass
         await interaction.response.send_message(
-            "❌ You are not allowed to use this command (DB admin only).",
+            "❌ You are not allowed to use this command (admin only).",
             ephemeral=True
         )
         return False
@@ -892,9 +1268,9 @@ async def restartbot(interaction: discord.Interaction):
 @bot.tree.command(name="am_i_admin", description="Tell me if I can run DB-admin commands.")
 async def am_i_admin(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
-    in_db = await db.is_admin(str(interaction.user.id))
+    in_db = await _is_admin_user(interaction.user.id)
     await interaction.followup.send(
-        "DB Admin: " + ("YES ✅" if in_db else "NO ❌"),
+        "Admin: " + ("YES ✅" if in_db else "NO ❌"),
         ephemeral=True
     )
 
@@ -1618,6 +1994,175 @@ async def admin_remove(interaction: discord.Interaction, member: discord.Member)
     await db.remove_admin(uid)
     await interaction.response.send_message(
         f"✅ Removed {member.mention} (`{uid}`) from admin whitelist.", ephemeral=True
+    )
+
+
+@bot.tree.command(name="verified_add", description="(Owner) Exempt a player from the OS role requirement.")
+@owners_only()
+@app_commands.describe(user="User mention or user ID", note="Optional note for why this user is exempt")
+async def verified_add(interaction: discord.Interaction, user: str, note: str | None = None):
+    uid = _parse_user_id_input(user)
+    if uid is None:
+        return await interaction.response.send_message("❌ Invalid user. Provide a mention like `<@123>` or a numeric ID.", ephemeral=True)
+    if uid in OWNER_IDS:
+        return await interaction.response.send_message("ℹ️ Owners are already exempt from the role rule.", ephemeral=True)
+    ok = await _grant_role_gate_exempt(uid, added_by=interaction.user.id, note=note)
+    if not ok:
+        return await interaction.response.send_message("❌ Failed to add exemption. Try again.", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ Added <@{uid}> (`{uid}`) to the verified exemption list (role rule bypass).",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="verified_remove", description="(Owner) Remove a player from role-rule exemptions.")
+@owners_only()
+@app_commands.describe(user="User mention or user ID")
+async def verified_remove(interaction: discord.Interaction, user: str):
+    uid = _parse_user_id_input(user)
+    if uid is None:
+        return await interaction.response.send_message("❌ Invalid user. Provide a mention like `<@123>` or a numeric ID.", ephemeral=True)
+    if uid in OWNER_IDS:
+        return await interaction.response.send_message("❌ Owners cannot be removed from exemption.", ephemeral=True)
+    ok = await _revoke_role_gate_exempt(uid)
+    if not ok:
+        return await interaction.response.send_message("❌ Failed to remove exemption. Try again.", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ Removed <@{uid}> (`{uid}`) from the verified exemption list.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="verified_list", description="(Owner) List players exempt from the OS role rule.")
+@owners_only()
+async def verified_list(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=False)
+    rows = await _list_role_gate_exempt(limit=100)
+    if not rows:
+        return await interaction.followup.send("No verified role-rule exemptions are currently set.", ephemeral=True)
+    lines: list[str] = []
+    for row in rows[:50]:
+        uid = str(row.get("user_id") or "").strip()
+        if not uid:
+            continue
+        added_by = str(row.get("added_by") or "").strip()
+        note = str(row.get("note") or "").strip()
+        if len(note) > 60:
+            note = note[:57] + "..."
+        by_txt = f" by <@{added_by}>" if added_by.isdigit() else ""
+        note_txt = f" — {note}" if note else ""
+        lines.append(f"• <@{uid}> (`{uid}`){by_txt}{note_txt}")
+    if not lines:
+        return await interaction.followup.send("No verified role-rule exemptions are currently set.", ephemeral=True)
+    msg = "**Verified role-rule exemptions:**\n" + "\n".join(lines)
+    if len(msg) > 1900:
+        msg = msg[:1897] + "..."
+    await interaction.followup.send(msg, ephemeral=True)
+
+
+@bot.tree.command(name="hatchnow", description="(Owner) Instantly hatch one daycare egg for testing.")
+@owners_only()
+@app_commands.describe(
+    target="Target trainer (defaults to yourself).",
+    source="Where to hatch from.",
+    index="Egg position in that source (1-based).",
+)
+@app_commands.choices(
+    source=[
+        app_commands.Choice(name="Auto (incubator first)", value="auto"),
+        app_commands.Choice(name="Incubator", value="incubating"),
+        app_commands.Choice(name="Daycare waiting eggs", value="daycare"),
+    ]
+)
+async def hatchnow(
+    interaction: discord.Interaction,
+    target: discord.User | None = None,
+    source: app_commands.Choice[str] | None = None,
+    index: app_commands.Range[int, 1, 30] = 1,
+):
+    await interaction.response.defer(ephemeral=True, thinking=False)
+    target_user = target or interaction.user
+    uid = str(target_user.id)
+    mode = str(source.value if source else "auto").strip().lower()
+    idx = max(0, int(index) - 1)
+
+    state = await _get_adventure_state(uid)
+    rec = _daycare_get_record(state, DAYCARE_CITY_ID)
+    incubating = rec.get("incubating") if isinstance(rec.get("incubating"), list) else []
+    waiting = rec.get("eggs") if isinstance(rec.get("eggs"), list) else []
+
+    egg_list: list[Any]
+    source_label: str
+    source_key: str
+    if mode == "incubating":
+        egg_list = incubating
+        source_label = "incubator"
+        source_key = "incubating"
+    elif mode == "daycare":
+        egg_list = waiting
+        source_label = "daycare waiting eggs"
+        source_key = "eggs"
+    else:
+        if incubating:
+            egg_list = incubating
+            source_label = "incubator"
+            source_key = "incubating"
+        else:
+            egg_list = waiting
+            source_label = "daycare waiting eggs"
+            source_key = "eggs"
+
+    if not egg_list:
+        return await interaction.followup.send(
+            f"❌ No eggs available in **{source_label}** for <@{target_user.id}>.",
+            ephemeral=True,
+        )
+    if idx >= len(egg_list):
+        return await interaction.followup.send(
+            f"❌ Invalid egg index. {source_label.title()} currently has **{len(egg_list)}** egg(s).",
+            ephemeral=True,
+        )
+
+    egg = egg_list[idx]
+    if not isinstance(egg, dict):
+        return await interaction.followup.send(
+            f"❌ Egg data at index **{idx + 1}** is invalid.",
+            ephemeral=True,
+        )
+
+    hatched = await _daycare_hatch_to_team(uid, egg)
+    if not hatched:
+        return await interaction.followup.send(
+            "❌ Instant hatch failed. Check breeding metadata for this egg.",
+            ephemeral=True,
+        )
+
+    try:
+        rec[source_key].pop(idx)
+    except Exception:
+        rec[source_key] = [e for i, e in enumerate(list(rec.get(source_key) or [])) if i != idx]
+    await _save_adventure_state(uid, state)
+
+    species_txt = str(hatched.get("species") or "Pokémon").replace("-", " ").title()
+    dest = str(hatched.get("destination") or "box")
+    if dest == "team":
+        slot = int(hatched.get("team_slot") or 0)
+        dest_txt = f"team slot **{slot}**" if slot > 0 else "the team"
+    else:
+        bno = int(hatched.get("box_no") or 0)
+        bpos = int(hatched.get("box_pos") or 0)
+        if bno > 0 and bpos > 0:
+            dest_txt = f"**Box {bno}, Slot {bpos}**"
+        else:
+            dest_txt = "the PC Box"
+
+    await interaction.followup.send(
+        (
+            f"✅ Instantly hatched **{species_txt}** for <@{target_user.id}> "
+            f"from **{source_label}** (egg #{idx + 1}).\n"
+            f"Destination: {dest_txt}."
+        ),
+        ephemeral=True,
     )
 
 # =========================
@@ -2950,6 +3495,12 @@ async def take_item(interaction: discord.Interaction, name: str, slot: int | Non
 
 
 MAX_STACK = 999
+GLOBAL_ITEM_BUY_LOCK_MESSAGE = (
+    "🛒 Item purchases from this global panel are locked.\n"
+    "Use **/adventure** and enter a **Poké Mart** to buy/sell items."
+)
+
+
 class QuantityModal(discord.ui.Modal, title="Buy item"):
     def __init__(self, parent_view: "BuyItemView", source_message: discord.Message):
         super().__init__()
@@ -2967,128 +3518,8 @@ class QuantityModal(discord.ui.Modal, title="Buy item"):
 
     async def on_submit(self, itx: discord.Interaction):
         await itx.response.defer(ephemeral=True)  # ACK immediately
-
-        try:
-            # Parse qty
-            try:
-                qty_requested = int(str(self.qty_input.value).strip())
-            except Exception:
-                return await itx.followup.send("❌ Please enter a valid integer.", ephemeral=False)
-            if qty_requested <= 0:
-                return await itx.followup.send("❌ Quantity must be positive.", ephemeral=False)
-            if qty_requested > MAX_STACK:
-                return await itx.followup.send(f"❌ Max per purchase is **{MAX_STACK}**.", ephemeral=False)
-
-            unit   = int(self.parent_view.price or 0)
-            owner  = str(self.parent_view.owner_id)
-            item_id = self.parent_view.item_row["id"]
-
-            # Open DB once; do everything atomically
-            async with DB_WRITE_LOCK:
-                conn = await open_db()
-                try:
-                    # Postgres uses BEGIN; SQLite uses BEGIN IMMEDIATE
-                    await conn.execute("BEGIN" if getattr(db, "DB_IS_POSTGRES", False) else "BEGIN IMMEDIATE")
-
-                    # read balance (currencies JSON or coins fallback)
-                    cur = await conn.execute("SELECT * FROM users WHERE user_id=? LIMIT 1", (owner,))
-                    row = await cur.fetchone()
-                    await cur.close()
-                    row_dict = dict(row) if row else None
-                    balance = int(db.get_currency_from_row(row_dict, "coins"))
-
-                    # current qty for this item
-                    cur = await conn.execute(
-                        "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
-                        (owner, item_id)
-                    )
-                    r = await cur.fetchone()
-                    current_qty = int(r[0]) if r else 0
-                    await cur.close()
-
-                    if current_qty >= MAX_STACK:
-                        await conn.execute("ROLLBACK")
-                        return await itx.followup.send(
-                            f"❌ You already have **{current_qty}/{MAX_STACK}**. You can’t carry more.",
-                            ephemeral=True
-                        )
-
-                    # allowed by stack cap
-                    allowed_by_cap = MAX_STACK - current_qty
-                    allowed = min(qty_requested, allowed_by_cap)
-
-                    # cost for allowed amount
-                    total_cost = unit * allowed
-
-                    # balance check (only if item costs money)
-                    if unit > 0 and balance < total_cost:
-                        await conn.execute("ROLLBACK")
-                        return await itx.followup.send(
-                            f"❌ Not enough PokéDollars. Cost: **{total_cost:,} {PKDollar_NAME}**, you have **{balance:,} {PKDollar_NAME}**.",
-                            ephemeral=True
-                        )
-
-                    # ensure user row exists (currencies JSON)
-                    await conn.execute(
-                        "INSERT INTO users(user_id, coins, currencies) VALUES(?, 0, '{\"coins\": 0}'::jsonb) "
-                        "ON CONFLICT(user_id) DO NOTHING",
-                        (owner,)
-                    )
-
-                    # deduct coins (currencies JSON)
-                    if unit > 0 and total_cost > 0:
-                        await db.add_currency_conn(conn, owner, "coins", -total_cost)
-
-                    # upsert item
-                    if allowed > 0:
-                        await conn.execute(
-                            "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,?) "
-                            "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = MIN(user_items.qty + excluded.qty, ?);",
-                            (owner, item_id, allowed, MAX_STACK)
-                        )
-
-                    # new qty
-                    cur = await conn.execute(
-                        "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
-                        (owner, item_id)
-                    )
-                    r = await cur.fetchone()
-                    new_qty = int(r[0]) if r else current_qty
-                    await cur.close()
-
-                    await conn.commit()
-                    db.invalidate_bag_cache(owner)
-                finally:
-                    await conn.close()
-
-            # refresh panel
-            self.parent_view.have_qty = new_qty
-            embed = build_item_embed(
-                self.parent_view.item_row,
-                self.parent_view.owner_id,
-                self.parent_view.price,
-                new_qty
-            )
-
-            try:
-                await self.source_message.edit(embed=embed, view=self.parent_view)
-            except Exception:
-                await itx.followup.send(embed=embed, view=self.parent_view, ephemeral=False)
-
-            bought_text = f"Bought **{allowed}×**" if allowed > 0 else "Couldn’t buy any"
-            item_name = pretty_item_name(self.parent_view.item_row.get("name") or item_id)
-
-            # If we reduced due to cap, tell the user
-            extra = ""
-            if allowed < qty_requested:
-                extra = f" (reduced by bag cap: {current_qty} ➜ {new_qty}/{MAX_STACK})"
-
-            cost_text = f" for **{total_cost:,} {PKDollar_NAME}**" if total_cost else ""
-            await itx.followup.send(f"✅ {bought_text} **{item_name}**{cost_text}.{extra}", ephemeral=False)
-
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            await itx.followup.send(f"⚠️ Purchase failed: `{type(e).__name__}: {e}`", ephemeral=True)
+        # Legacy global buy flow is intentionally disabled.
+        return await itx.followup.send(GLOBAL_ITEM_BUY_LOCK_MESSAGE, ephemeral=True)
 class BuyItemView(discord.ui.View):
     def __init__(self, owner_id: int, item_row: dict, price: int, have_qty: int):
         super().__init__(timeout=90)
@@ -3098,8 +3529,9 @@ class BuyItemView(discord.ui.View):
         self.have_qty = have_qty
 
         self.buy_btn = discord.ui.Button(
-            label=f"Buy… ({self.price:,} {PKDollar_NAME} each)",
-            style=discord.ButtonStyle.success
+            label="Buy in Poké Mart",
+            style=discord.ButtonStyle.secondary,
+            disabled=True,
         )
         self.add_item(self.buy_btn)
         self.buy_btn.callback = self.on_buy_click
@@ -3109,11 +3541,10 @@ class BuyItemView(discord.ui.View):
     async def on_buy_click(self, itx: discord.Interaction):
         if itx.user.id != self.owner_id:
             return await itx.response.send_message("This shop panel isn’t for you.", ephemeral=True)
+        return await itx.response.send_message(GLOBAL_ITEM_BUY_LOCK_MESSAGE, ephemeral=True)
 
-        msg = self.bound_message or itx.message
-        modal = QuantityModal(self, msg)
-        await itx.response.send_modal(modal)
-@bot.tree.command(name="item", description="Show info about an item and buy it.")
+
+@bot.tree.command(name="item", description="Show info about an item.")
 @app_commands.describe(name="Item id or name (e.g. 'poke ball', 'choice scarf')")
 async def item_cmd(interaction: discord.Interaction, name: str):
     start_time = time.time()
@@ -6849,6 +7280,13 @@ ADVENTURE_CITIES = {
         "name": "Poké Mart",
         "parent_city": "viridian-city",
         "image": ASSETS_CITIES / "viridian-pokemart.png",
+        "is_pokemart": True,
+    },
+    "pallet-pokemart": {
+        "name": "Poké Mart",
+        "parent_city": "pallet-town",
+        "image": ASSETS_CITIES / "pallet-town-start.png",
+        "is_pokemart": True,
     },
 }
 
@@ -6877,40 +7315,338 @@ TM_SELLER_PRICE = 500  # Coins per TM (Gen 1)
 # Seller has 25 TMs (rolled from 1–50 via script, fixed)
 TM_SELLER_ITEMS = [GEN1_TMS[i - 1] for i in (1, 3, 5, 6, 7, 9, 11, 12, 15, 17, 20, 21, 22, 23, 24, 31, 34, 35, 37, 40, 42, 44, 45, 49, 50)]
 
-# Route move item drop: roll for ball type (Poké Ball common, Great Ball uncommon, Ultra Ball rare),
-# then give that ball + one item from the tier's pool. Rarer balls = better rewards.
-ROUTE_MOVE_ITEM_DROP_CHANCE = 0.10  # Probability per move (e.g. 15%)
-# (ball_id, ball_display_name, weight) - higher weight = more common
-ROUTE_MOVE_BALL_TIERS: List[Tuple[str, str, int]] = [
-    ("pokeball", "Poké Ball", 70),    # Most common
-    ("great-ball", "Great Ball", 25),  # Uncommon
-    ("ultra-ball", "Ultra Ball", 5),  # Rarest
+# Route move loot-ball encounter rates (absolute percentages per roll, not normalized by table sum).
+# Repeat Ball and Timer Ball use special handling in _roll_and_give_route_move_item_async.
+ROUTE_MOVE_BALL_ENCOUNTER_RATES: List[Tuple[str, str, float]] = [
+    ("poke_ball", "Poké Ball", 0.9),
+    ("great_ball", "Great Ball", 0.6),
+    ("ultra_ball", "Ultra Ball", 0.2),
+    ("master_ball", "Master Ball", 0.008),
+    ("nest_ball", "Nest Ball", 0.4),
+    ("net_ball", "Net Ball", 0.4),
+    ("dive_ball", "Dive Ball", 0.4),
+    ("heal_ball", "Heal Ball", 0.4),
+    ("dusk_ball", "Dusk Ball", 0.4),
+    ("dream_ball", "Dream Ball", 0.4),
+    ("sport_ball", "Sport Ball", 0.4),
+    ("level_ball", "Level Ball", 0.4),
+    ("moon_ball", "Moon Ball", 0.4),
+    ("friend_ball", "Friend Ball", 0.4),
+    ("love_ball", "Love Ball", 0.4),
+    ("heavy_ball", "Heavy Ball", 0.4),
+    ("fast_ball", "Fast Ball", 0.4),
+    ("premier_ball", "Premier Ball", 0.4),
+    ("repeat_ball", "Repeat Ball", 0.4),
+    ("tm_ball", "TM Ball", 0.4),
+    ("great_tm_ball", "Great TM Ball", 0.4),
+    ("ultra_tm_ball", "Ultra TM Ball", 0.4),
+    ("timer_ball", "Timer Ball", 0.4),
 ]
-# Item pools per tier: (item_id, display_name). Rarer tiers have better items.
-ROUTE_MOVE_ITEMS_BY_TIER: Dict[str, List[Tuple[str, str]]] = {
-    "pokeball": [
-        ("potion", "Potion"),
-        ("antidote", "Antidote"),
-        ("paralyze-heal", "Paralyze Heal"),
-        ("awakening", "Awakening"),
-        ("burn-heal", "Burn Heal"),
-        ("ice-heal", "Ice Heal"),
+
+ROUTE_MOVE_ITEMS_BY_BALL: Dict[str, List[Tuple[str, str, float]]] = {
+    "poke_ball": [
+        ("poke_ball", "Poké Ball", 15.69),
+        ("escape_rope", "Escape Rope", 15.69),
+        ("poke_doll", "Poké Doll", 15.69),
+        ("antidote", "Antidote", 5.88),
+        ("burn_heal", "Burn Heal", 5.88),
+        ("awakening", "Awakening", 5.88),
+        ("paralyze_heal", "Paralyze Heal", 5.88),
+        ("ice_heal", "Ice Heal", 5.88),
+        ("repel", "Repel", 5.88),
+        ("oran_berry", "Oran Berry", 5.88),
+        ("tiny_mushroom", "Tiny Mushroom", 5.88),
+        ("stardust", "Stardust", 3.92),
+        ("potion", "Potion", 1.96),
     ],
-    "great-ball": [
-        ("super-potion", "Super Potion"),
-        ("pokeball", "Poké Ball"),
-        ("great-ball", "Great Ball"),
-        ("full-heal", "Full Heal"),
-        ("revive", "Revive"),
+    "great_ball": [
+        ("great_ball", "Great Ball", 9.52),
+        ("antidote", "Antidote", 9.52),
+        ("awakening", "Awakening", 9.52),
+        ("burn_heal", "Burn Heal", 9.52),
+        ("paralyze_heal", "Paralyze Heal", 9.52),
+        ("repel", "Repel", 9.52),
+        ("berry_juice", "Berry Juice", 9.52),
+        ("shoal_shell", "Shoal Shell", 4.76),
+        ("shoal_salt", "Shoal Salt", 4.76),
+        ("stardust", "Stardust", 4.76),
+        ("pearl", "Pearl", 4.76),
+        ("super_repel", "Super Repel", 4.76),
+        ("super_potion", "Super Potion", 4.76),
     ],
-    "ultra-ball": [
-        ("hyper-potion", "Hyper Potion"),
-        ("ultra-ball", "Ultra Ball"),
-        ("max-potion", "Max Potion"),
-        ("full-restore", "Full Restore"),
-        ("tm-fragment", "TM Fragment"),
+    "ultra_ball": [
+        ("ultra_ball", "Ultra Ball", 10.53),
+        ("lemonade", "Lemonade", 10.53),
+        ("sitrus_berry", "Sitrus Berry", 10.53),
+        ("moomoo_milk", "Moomoo Milk", 10.53),
+        ("full_heal", "Full Heal", 10.53),
+        ("max_repel", "Max Repel", 10.53),
+        ("hyper_potion", "Hyper Potion", 5.26),
+        ("nugget", "Nugget", 5.26),
+        ("revive", "Revive", 5.26),
+        ("elixir", "Elixir", 5.26),
+        ("leftovers", "Leftovers", 1.05),
+    ],
+    "master_ball": [
+        ("max_elixir", "Max Elixir", 23.26),
+        ("revive", "Revive", 23.26),
+        ("revival_herb", "Revival Herb", 9.30),
+        ("max_revive", "Max Revive", 9.30),
+        ("pp_max", "PP Max", 5.81),
+        ("master_ball", "Master Ball", 5.81),
+    ],
+    "nest_ball": [
+        ("nest_ball", "Nest Ball", 9.80),
+        ("heal_powder", "Heal Powder", 9.80),
+        ("lum_berry", "Lum Berry", 9.80),
+        ("berry_juice", "Berry Juice", 9.80),
+        ("energy_powder", "Energy Powder", 9.80),
+        ("sitrus_berry", "Sitrus Berry", 9.80),
+        ("stick", "Stick", 9.80),
+        ("leaf_stone", "Leaf Stone", 4.90),
+        ("miracle_seed", "Miracle Seed", 4.90),
+        ("energy_root", "Energy Root", 4.90),
+        ("silver_powder", "Silver Powder", 4.90),
+        ("bright_powder", "Bright Powder", 4.90),
+        ("revival_herb", "Revival Herb", 0.98),
+        ("leftovers", "Leftovers", 0.98),
+    ],
+    "net_ball": [
+        ("net_ball", "Net Ball", 22.22),
+        ("super_potion", "Super Potion", 22.22),
+        ("silver_powder", "Silver Powder", 11.11),
+        ("mystic_water", "Mystic Water", 11.11),
+        ("sharp_beak", "Sharp Beak", 11.11),
+        ("pearl", "Pearl", 11.11),
+        ("nugget", "Nugget", 11.11),
+    ],
+    "dive_ball": [
+        ("dive_ball", "Dive Ball", 10.64),
+        ("fresh_water", "Fresh Water", 10.64),
+        ("soda_pop", "Soda Pop", 10.64),
+        ("lemonade", "Lemonade", 10.64),
+        ("moomoo_milk", "Moomoo Milk", 10.64),
+        ("sea_incense", "Sea Incense", 10.64),
+        ("deep_sea_tooth", "Deep Sea Tooth", 10.64),
+        ("deep_sea_scale", "Deep Sea Scale", 10.64),
+        ("zinc", "Zinc", 2.14),
+        ("helix_fossil", "Helix Fossil", 2.14),
+        ("dome_fossil", "Dome Fossil", 2.14),
+    ],
+    "heal_ball": [
+        ("heal_ball", "Heal Ball", 18.18),
+        ("potion", "Potion", 18.18),
+        ("super_potion", "Super Potion", 14.55),
+        ("moomoo_milk", "Moomoo Milk", 14.55),
+        ("full_heal", "Full Heal", 14.55),
+        ("hyper_potion", "Hyper Potion", 5.45),
+        ("max_potion", "Max Potion", 5.45),
+        ("full_restore", "Full Restore", 5.45),
+        ("revive", "Revive", 5.45),
+        ("hp_up", "HP Up", 5.45),
+    ],
+    "dusk_ball": [
+        ("dusk_ball", "Dusk Ball", 12.66),
+        ("super_potion", "Super Potion", 12.66),
+        ("ether", "Ether", 12.66),
+        ("lava_cookie", "Lava Cookie", 12.66),
+        ("stardust", "Stardust", 12.66),
+        ("pearl", "Pearl", 12.66),
+        ("black_flute", "Black Flute", 3.80),
+        ("spell_tag", "Spell Tag", 3.80),
+        ("black_glasses", "Black Glasses", 3.80),
+    ],
+    "dream_ball": [
+        ("dream_ball", "Dream Ball", 10.75),
+        ("awakening", "Awakening", 10.75),
+        ("chesto_berry", "Chesto Berry", 10.75),
+        ("super_potion", "Super Potion", 10.75),
+        ("ether", "Ether", 10.75),
+        ("lava_cookie", "Lava Cookie", 10.75),
+        ("smoke_ball", "Smoke Ball", 10.75),
+        ("stardust", "Stardust", 10.75),
+        ("pearl", "Pearl", 3.23),
+        ("twisted_spoon", "Twisted Spoon", 3.23),
+    ],
+    "sport_ball": [
+        ("sport_ball", "Sport Ball", 5.43),
+        ("black_belt", "Black Belt", 5.43),
+        ("black_glasses", "Black Glasses", 5.43),
+        ("bright_powder", "Bright Powder", 5.43),
+        ("mystic_water", "Mystic Water", 5.43),
+        ("miracle_seed", "Miracle Seed", 5.43),
+        ("charcoal", "Charcoal", 5.43),
+        ("spell_tag", "Spell Tag", 5.43),
+        ("never_melt_ice", "Never Melt Ice", 5.43),
+        ("soft_sand", "Soft Sand", 5.43),
+        ("metal_coat", "Metal Coat", 5.43),
+        ("sharp_beak", "Sharp Beak", 5.43),
+        ("silk_scarf", "Silk Scarf", 5.43),
+        ("poison_barb", "Poison Barb", 5.43),
+        ("twisted_spoon", "Twisted Spoon", 5.43),
+        ("dragon_fang", "Dragon Fang", 5.43),
+        ("hard_stone", "Hard Stone", 5.43),
+        ("magnet", "Magnet", 5.43),
+        ("choice_band", "Choice Band", 2.17),
+    ],
+    "tm_ball": [
+        ("tm-04", "Whirlwind", 6.67),
+        ("tm-06", "Toxic", 6.67),
+        ("tm-08", "Body Slam", 6.67),
+        ("tm-09", "Take Down", 6.67),
+        ("tm-11", "Bubble Beam", 6.67),
+        ("tm-12", "Water Gun", 6.67),
+        ("tm-20", "Rage", 6.67),
+        ("tm-31", "Mimic", 6.67),
+        ("tm-32", "Double Team", 6.67),
+        ("tm-33", "Reflect", 6.67),
+        ("tm-39", "Swift", 6.67),
+        ("tm-44", "Rest", 6.67),
+        ("tm-45", "Thunder Wave", 6.67),
+        ("tm-48", "Rock Slide", 6.67),
+        ("tm-50", "Substitute", 6.67),
+    ],
+    "great_tm_ball": [
+        ("tm-03", "Swords Dance", 6.25),
+        ("tm-05", "Mega Kick", 6.25),
+        ("tm-13", "Ice Beam", 6.25),
+        ("tm-14", "Blizzard", 6.25),
+        ("tm-17", "Submission", 6.25),
+        ("tm-21", "Mega Drain", 6.25),
+        ("tm-22", "Solar Beam", 6.25),
+        ("tm-23", "Dragon Rage", 6.25),
+        ("tm-24", "Thunderbolt", 6.25),
+        ("tm-25", "Thunder", 6.25),
+        ("tm-26", "Earthquake", 6.25),
+        ("tm-28", "Dig", 6.25),
+        ("tm-29", "Psychic", 6.25),
+        ("tm-38", "Fire Blast", 6.25),
+        ("tm-42", "Dream Eater", 6.25),
+        ("tm-49", "Tri Attack", 6.25),
+    ],
+    "ultra_tm_ball": [
+        ("tm-01", "Mega Punch", 5.26),
+        ("tm-02", "Razor Wind", 5.26),
+        ("tm-07", "Horn Drill", 5.26),
+        ("tm-10", "Double-Edge", 5.26),
+        ("tm-15", "Hyper Beam", 5.26),
+        ("tm-16", "Pay Day", 5.26),
+        ("tm-18", "Counter", 5.26),
+        ("tm-19", "Seismic Toss", 5.26),
+        ("tm-27", "Fissure", 5.26),
+        ("tm-30", "Teleport", 5.26),
+        ("tm-34", "Bide", 5.26),
+        ("tm-35", "Metronome", 5.26),
+        ("tm-36", "Self-Destruct", 5.26),
+        ("tm-37", "Egg Bomb", 5.26),
+        ("tm-40", "Skull Bash", 5.26),
+        ("tm-41", "Soft-Boiled", 5.26),
+        ("tm-43", "Sky Attack", 5.26),
+        ("tm-46", "Psywave", 5.26),
+        ("tm-47", "Explosion", 5.26),
+    ],
+    "level_ball": [
+        ("fire_stone", "Fire Stone", 8.85),
+        ("water_stone", "Water Stone", 8.85),
+        ("leaf_stone", "Leaf Stone", 8.85),
+        ("thunder_stone", "Thunder Stone", 8.85),
+        ("moon_stone", "Moon Stone", 8.85),
+        ("sun_stone", "Sun Stone", 8.85),
+        ("metal_coat", "Metal Coat", 8.85),
+        ("kings_rock", "King's Rock", 8.85),
+        ("up_grade", "Up-Grade", 8.85),
+        ("dragon_scale", "Dragon Scale", 8.85),
+        ("rare_candy", "Rare Candy", 2.65),
+    ],
+    "moon_ball": [
+        ("berry_juice", "Berry Juice", 8.55),
+        ("ether", "Ether", 8.55),
+        ("shoal_shell", "Shoal Shell", 8.55),
+        ("shoal_salt", "Shoal Salt", 8.55),
+        ("stardust", "Stardust", 8.55),
+        ("pearl", "Pearl", 8.55),
+        ("super_repel", "Super Repel", 8.55),
+        ("super_potion", "Super Potion", 8.55),
+        ("spell_tag", "Spell Tag", 5.98),
+    ],
+    "friend_ball": [
+        ("cheri_berry", "Cheri Berry", 4.0),
+        ("chesto_berry", "Chesto Berry", 4.0),
+        ("pecha_berry", "Pecha Berry", 4.0),
+        ("rawst_berry", "Rawst Berry", 4.0),
+        ("aspear_berry", "Aspear Berry", 4.0),
+        ("persim_berry", "Persim Berry", 4.0),
+        ("sitrus_berry", "Sitrus Berry", 4.0),
+        ("aguav_berry", "Aguav Berry", 4.0),
+        ("figy_berry", "Figy Berry", 4.0),
+        ("iapapa_berry", "Iapapa Berry", 4.0),
+        ("lum_berry", "Lum Berry", 4.0),
+        ("liechi_berry", "Liechi Berry", 4.0),
+        ("salac_berry", "Salac Berry", 4.0),
+        ("lansat_berry", "Lansat Berry", 4.0),
+        ("starf_berry", "Starf Berry", 4.0),
+        ("__bonus_berry__", "Bonus Berry", 4.0),
+    ],
+    "love_ball": [
+        ("everstone", "Everstone", 7.69),
+        ("destiny_knot", "Destiny Knot", 7.69),
+        ("oval_stone", "Oval Stone", 7.69),
+        ("lax_incense", "Lax Incense", 7.69),
+        ("sea_incense", "Sea Incense", 7.69),
+        ("heart_scale", "Heart Scale", 7.69),
+        ("power_weight", "Power Weight", 7.69),
+        ("power_bracer", "Power Bracer", 7.69),
+        ("power_belt", "Power Belt", 7.69),
+        ("power_lens", "Power Lens", 7.69),
+        ("power_band", "Power Band", 7.69),
+        ("macho_brace", "Macho Brace", 7.69),
+    ],
+    "heavy_ball": [
+        ("super_potion", "Super Potion", 10.64),
+        ("lemonade", "Lemonade", 10.64),
+        ("hard_stone", "Hard Stone", 10.64),
+        ("everstone", "Everstone", 10.64),
+        ("metal_coat", "Metal Coat", 5.32),
+        ("pp_up", "PP Up", 5.32),
+        ("dome_fossil", "Dome Fossil", 1.06),
+        ("helix_fossil", "Helix Fossil", 1.06),
+        ("old_amber", "Old Amber", 1.06),
+    ],
+    "fast_ball": [
+        ("fresh_water", "Fresh Water", 10.53),
+        ("soda_pop", "Soda Pop", 10.53),
+        ("thunder_stone", "Thunder Stone", 10.53),
+        ("pearl", "Pearl", 10.53),
+        ("stardust", "Stardust", 10.53),
+        ("magnet", "Magnet", 10.53),
+    ],
+    "premier_ball": [
+        ("tiny_mushroom", "Tiny Mushroom", 20.41),
+        ("stardust", "Stardust", 20.41),
+        ("pearl", "Pearl", 20.41),
+        ("nugget", "Nugget", 20.41),
+        ("big_pearl", "Big Pearl", 6.12),
+        ("star_piece", "Star Piece", 6.12),
+        ("big_nugget", "Big Nugget", 6.12),
     ],
 }
+ROUTE_MOVE_TIMER_POOL_KEY = "poke_ball"
+ROUTE_MOVE_LAST_STANDARD_ROLL: dict[str, tuple[str, str, str, str]] = {}
+ROUTE_MOVE_BONUS_BERRIES: List[Tuple[str, str]] = [
+    ("cheri_berry", "Cheri Berry"),
+    ("chesto_berry", "Chesto Berry"),
+    ("pecha_berry", "Pecha Berry"),
+    ("rawst_berry", "Rawst Berry"),
+    ("aspear_berry", "Aspear Berry"),
+    ("persim_berry", "Persim Berry"),
+    ("sitrus_berry", "Sitrus Berry"),
+    ("aguav_berry", "Aguav Berry"),
+    ("figy_berry", "Figy Berry"),
+    ("iapapa_berry", "Iapapa Berry"),
+    ("lum_berry", "Lum Berry"),
+]
+
+# :: market catalog moved to lib.market_catalog
 
 ADVENTURE_ROUTES = {
     "route-1": {
@@ -7669,37 +8405,107 @@ RIVAL_BATTLES = {
 }
 
 
-def _weighted_choice(items: List[Tuple[str, str, int]]) -> Tuple[str, str]:
-    """Pick (ball_id, ball_display_name) from weighted list of (id, name, weight)."""
-    total = sum(w for _, _, w in items)
-    r = random.uniform(0, total)
-    for ball_id, display_name, weight in items:
+def _weighted_choice(items: Sequence[Tuple[str, str, float]]) -> Tuple[str, str]:
+    """Pick (id, display_name) from weighted tuples (id, name, weight)."""
+    if not items:
+        return ("", "")
+    total = 0.0
+    norm: list[tuple[str, str, float]] = []
+    for key, name, weight in items:
+        w = max(0.0, float(weight or 0.0))
+        if w <= 0:
+            continue
+        norm.append((str(key), str(name), w))
+        total += w
+    if total <= 0 or not norm:
+        key, name, _ = items[-1]
+        return str(key), str(name)
+    r = random.uniform(0.0, total)
+    for key, name, weight in norm:
         r -= weight
         if r <= 0:
-            return (ball_id, display_name)
-    return items[-1][0], items[-1][1]
+            return key, name
+    return norm[-1][0], norm[-1][1]
+
+
+def _roll_route_ball_by_absolute_rate() -> tuple[str, str]:
+    """Roll route ball encounter using absolute percentage rates."""
+    if not ROUTE_MOVE_BALL_ENCOUNTER_RATES:
+        return ("__none__", "No Ball")
+    r = random.uniform(0.0, 100.0)
+    cumul = 0.0
+    for ball_id, ball_name, pct in ROUTE_MOVE_BALL_ENCOUNTER_RATES:
+        p = max(0.0, float(pct or 0.0))
+        if p <= 0.0:
+            continue
+        cumul += p
+        if r <= cumul:
+            return str(ball_id), str(ball_name)
+    return ("__none__", "No Ball")
+
+
+def _route_pick_item_from_pool(pool_key: str) -> tuple[str, str]:
+    pool = ROUTE_MOVE_ITEMS_BY_BALL.get(str(pool_key or "")) or ROUTE_MOVE_ITEMS_BY_BALL.get("poke_ball") or []
+    item_id, item_name = _weighted_choice(pool)
+    if item_id == "__bonus_berry__":
+        try:
+            return random.choice(ROUTE_MOVE_BONUS_BERRIES)
+        except Exception:
+            return ("oran_berry", "Oran Berry")
+    return item_id, item_name
 
 
 async def _roll_and_give_route_move_item_async(user_id: str) -> Optional[str]:
     """
-    Roll for drop chance, then weighted ball type (Poké Ball > Great Ball > Ultra Ball).
-    Give the ball + one item from that tier's pool. Rarer balls = better rewards.
+    Roll route loot-ball encounter and grant rewards from the configured pool table.
     Returns the message to show or None if no drop.
     """
-    if not ROUTE_MOVE_BALL_TIERS or not ROUTE_MOVE_ITEMS_BY_TIER:
+    if not ROUTE_MOVE_BALL_ENCOUNTER_RATES or not ROUTE_MOVE_ITEMS_BY_BALL:
         return None
-    if random.random() >= ROUTE_MOVE_ITEM_DROP_CHANCE:
+    ball_id, ball_name = _roll_route_ball_by_absolute_rate()
+    if not ball_id or ball_id == "__none__":
         return None
-    ball_id, ball_name = _weighted_choice(ROUTE_MOVE_BALL_TIERS)
-    tier_pool = ROUTE_MOVE_ITEMS_BY_TIER.get(ball_id)
-    if not tier_pool:
-        return None
-    item_id, item_name = random.choice(tier_pool)
-    try:
-        await db.upsert_item_master(ball_id, name=ball_name)
-        await db.give_item(user_id, ball_id, 1)
+    uid = str(user_id)
+
+    async def _grant(item_id: str, item_name: str, qty: int = 1) -> None:
+        q = max(0, int(qty or 0))
+        if q <= 0:
+            return
         await db.upsert_item_master(item_id, name=item_name)
-        await db.give_item(user_id, item_id, 1)
+        await db.give_item(uid, item_id, q)
+
+    try:
+        # Repeat Ball: duplicate previous standard roll rewards.
+        if ball_id == "repeat_ball":
+            prev = ROUTE_MOVE_LAST_STANDARD_ROLL.get(uid)
+            await _grant(ball_id, ball_name, 1)
+            if prev:
+                prev_ball_id, prev_ball_name, prev_item_id, prev_item_name = prev
+                await _grant(prev_ball_id, prev_ball_name, 2)
+                await _grant(prev_item_id, prev_item_name, 2)
+                return (
+                    f"You found a **{ball_name}**! It repeated your last route ball reward: "
+                    f"**2× {prev_ball_name}** and **2× {prev_item_name}**."
+                )
+            fallback_item_id, fallback_item_name = _route_pick_item_from_pool("poke_ball")
+            await _grant(fallback_item_id, fallback_item_name, 1)
+            return (
+                f"You found a **{ball_name}**! No previous route reward to repeat, "
+                f"so it gave a standard drop: **{fallback_item_name}**."
+            )
+
+        # Timer Ball: uses standard pool with no modifier.
+        pool_key = ROUTE_MOVE_TIMER_POOL_KEY if ball_id == "timer_ball" else ball_id
+        item_id, item_name = _route_pick_item_from_pool(pool_key)
+        if not item_id:
+            return None
+
+        await _grant(ball_id, ball_name, 1)
+        await _grant(item_id, item_name, 1)
+        ROUTE_MOVE_LAST_STANDARD_ROLL[uid] = (ball_id, ball_name, item_id, item_name)
+
+        if ball_id == "timer_ball":
+            return f"You found a **{ball_name}**! Standard reward: **{item_name}**."
         return f"You found a **{ball_name}**! Inside was a **{item_name}**."
     except Exception as e:
         print(f"[Adventure] Route move item drop give_item failed: {e}")
@@ -7708,21 +8514,244 @@ async def _roll_and_give_route_move_item_async(user_id: str) -> Optional[str]:
         return None
 
 
+def _is_pokemart(area_id: str) -> bool:
+    city = ADVENTURE_CITIES.get(str(area_id or ""), {})
+    return bool(city.get("is_pokemart"))
+
+
+def _market_normalize_key(raw: str) -> str:
+    # ::market
+    return _catalog_normalize_market_key(str(raw or ""))
+
+
+def _market_resolve_item_key(raw: str) -> Optional[str]:
+    return _catalog_resolve_market_key(str(raw or ""))
+
+
+def _market_item_variants(item_key: str) -> tuple[str, ...]:
+    return _catalog_market_item_variants(str(item_key or ""))
+
+
+def _market_display(item_key: str) -> str:
+    return _catalog_market_display_name(str(item_key or ""))
+
+
+MARKET_TREASURE_ITEM_KEYS: frozenset[str] = frozenset(
+    str(item_id)
+    for item_id, _disp, _price in MARKET_PRICE_CATALOG.get("Treasure Items", [])
+)
+
+
+def _market_is_treasure(item_key: str) -> bool:
+    return _market_normalize_key(str(item_key or "")) in MARKET_TREASURE_ITEM_KEYS
+
+
+def _market_price_embed() -> discord.Embed:
+    emb = discord.Embed(
+        title="Poké Mart Price List",
+        description=(
+            f"These prices are active for Poké Mart trading.\n"
+            f"Currency: **{PKDollar_NAME}**\n"
+            "Treasure Items are **sell-only**."
+        ),
+        color=0x4CAF50,
+    )
+    for category, rows in MARKET_PRICE_CATALOG.items():
+        if category == "Treasure Items":
+            lines = [f"• **{disp}** — Sell for {int(price):,}" for _item_id, disp, price in rows]
+        else:
+            lines = [f"• **{disp}** — {int(price):,}" for _item_id, disp, price in rows]
+        value = "\n".join(lines)[:1024] if lines else "—"
+        emb.add_field(name=category, value=value, inline=False)
+    return emb
+
+
+async def _market_total_qty(owner_id: str, item_key: str, conn: Any | None = None) -> int:
+    variants = _market_item_variants(item_key)
+    if not variants:
+        return 0
+    own_conn = conn is None
+    if own_conn:
+        try:
+            conn = await db.connect()
+        except Exception:
+            return 0
+    try:
+        placeholders = ", ".join("?" for _ in variants)
+        cur = await conn.execute(
+            f"SELECT COALESCE(SUM(qty), 0) AS total_qty FROM user_items WHERE owner_id=? AND item_id IN ({placeholders})",
+            (owner_id, *variants),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return 0
+        return int((row.get("total_qty") if hasattr(row, "keys") else row[0]) or 0)
+    except Exception:
+        return 0
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+
+async def _market_buy(owner_id: str, item_key: str, qty_requested: int) -> tuple[bool, str]:
+    qty_requested = int(qty_requested)
+    if qty_requested <= 0:
+        return False, "Quantity must be a positive number."
+    canonical_item_id = _market_normalize_key(item_key)
+    display = _market_display(canonical_item_id)
+    if _market_is_treasure(canonical_item_id):
+        return False, f"**{display}** is a treasure item and cannot be bought. Treasure items can only be sold."
+    price = int(MARKET_SELL_PRICES.get(canonical_item_id, 0))
+    if price <= 0:
+        return False, "That item is not sold in this Poké Mart."
+    async with DB_WRITE_LOCK:
+        async with db.session() as conn:
+            await conn.execute(
+                "INSERT INTO users(user_id, coins, currencies) VALUES(?, 0, '{\"coins\": 0}'::jsonb) ON CONFLICT(user_id) DO NOTHING",
+                (owner_id,),
+            )
+            current_total = await _market_total_qty(owner_id, item_key, conn=conn)
+            if current_total >= MAX_STACK:
+                return False, f"You already have **{current_total}/{MAX_STACK}** {display}."
+            qty_allowed = min(int(qty_requested), int(MAX_STACK - current_total))
+            total_cost = int(price * qty_allowed)
+
+            cur = await conn.execute("SELECT * FROM users WHERE user_id=? LIMIT 1", (owner_id,))
+            row = await cur.fetchone()
+            await cur.close()
+            balance = int(db.get_currency_from_row(dict(row) if row else None, "coins"))
+            if balance < total_cost:
+                return False, (
+                    f"Not enough {PKDollar_NAME}. Cost: **{total_cost:,}**, "
+                    f"you have **{balance:,}**."
+                )
+
+            # Ensure item exists in master table before touching user_items (FK-safe).
+            await conn.execute(
+                "INSERT INTO items (id, name) VALUES (?, ?) ON CONFLICT (id) DO NOTHING",
+                (canonical_item_id, display),
+            )
+            deducted = False
+            try:
+                await db.add_currency_conn(conn, owner_id, "coins", -total_cost)
+                deducted = True
+                await conn.execute(
+                    "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,?) "
+                    "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = LEAST(user_items.qty + excluded.qty, ?::int);",
+                    (owner_id, canonical_item_id, qty_allowed, MAX_STACK),
+                )
+            except Exception:
+                # Session wrapper may execute statements outside a single SQL transaction.
+                # Best-effort refund to avoid players losing money on failed item grant.
+                if deducted:
+                    try:
+                        await db.add_currency_conn(conn, owner_id, "coins", total_cost)
+                    except Exception:
+                        pass
+                raise
+            await conn.commit()
+    try:
+        db.invalidate_bag_cache(owner_id)
+    except Exception:
+        pass
+    return True, (
+        f"✅ Bought **{qty_allowed}× {display}** for **{price * qty_allowed:,} {PKDollar_NAME}**."
+        + (f" (capped at {MAX_STACK})" if qty_allowed < qty_requested else "")
+    )
+
+
+async def _market_sell(owner_id: str, item_key: str, qty_requested: int) -> tuple[bool, str]:
+    qty_requested = int(qty_requested)
+    if qty_requested <= 0:
+        return False, "Quantity must be a positive number."
+    canonical_item_id = _market_normalize_key(item_key)
+    price = int(MARKET_SELL_PRICES.get(canonical_item_id, 0))
+    if price <= 0:
+        return False, "That item cannot be sold here."
+    variants = _market_item_variants(canonical_item_id)
+    display = _market_display(canonical_item_id)
+    async with DB_WRITE_LOCK:
+        async with db.session() as conn:
+            placeholders = ", ".join("?" for _ in variants)
+            cur = await conn.execute(
+                f"SELECT item_id, qty FROM user_items WHERE owner_id=? AND item_id IN ({placeholders}) ORDER BY qty DESC, item_id",
+                (owner_id, *variants),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            total_owned = 0
+            parsed_rows: list[tuple[str, int]] = []
+            for row in rows or []:
+                iid = str(row["item_id"] if hasattr(row, "keys") else row[0])
+                have = int((row.get("qty") if hasattr(row, "keys") else row[1]) or 0)
+                if have <= 0:
+                    continue
+                parsed_rows.append((iid, have))
+                total_owned += have
+            if total_owned <= 0:
+                return False, f"You don't have any **{display}** to sell."
+            qty_to_sell = min(qty_requested, total_owned)
+            remain = qty_to_sell
+            for iid, have in parsed_rows:
+                if remain <= 0:
+                    break
+                take = min(remain, have)
+                new_qty = max(0, have - take)
+                await conn.execute(
+                    "UPDATE user_items SET qty=? WHERE owner_id=? AND item_id=?",
+                    (new_qty, owner_id, iid),
+                )
+                remain -= take
+            await conn.execute(
+                "INSERT INTO users(user_id, coins, currencies) VALUES(?, 0, '{\"coins\": 0}'::jsonb) ON CONFLICT(user_id) DO NOTHING",
+                (owner_id,),
+            )
+            payout = int(price * qty_to_sell)
+            await db.add_currency_conn(conn, owner_id, "coins", payout)
+            await conn.commit()
+    try:
+        db.invalidate_bag_cache(owner_id)
+    except Exception:
+        pass
+    return True, (
+        f"✅ Sold **{qty_to_sell}× {display}** for **{price * qty_to_sell:,} {PKDollar_NAME}**."
+        + (f" (only had {total_owned})" if qty_to_sell < qty_requested else "")
+    )
+
+
 def _adv_default_state() -> dict:
     return {
         "area_id": "pallet-town",
         "last_city": "pallet-town",
-        "area_history": [],      # stack for back navigation
+        "area_history": [],
         "cleared_cities": [],
         "cleared_routes": [],
-        "gym_badges": [],         # badge ids (e.g. "boulder") for gym cities
-        "defeated_trainers": {},  # trainer_id -> last_defeated_ts
-        "discovered": {},         # route_id -> [species]
-        "rival_defeated": [],     # list of rival battle ids
-        "repeat_seen": [],        # species seen/caught for Repeat Ball
-        "dex_seen": 0,            # rough dex count for crit capture odds
-        "daycare": {},            # per-city daycare data
+        "gym_badges": [],
+        "defeated_trainers": {},
+        "discovered": {},
+        "rival_defeated": [],
+        "repeat_seen": [],
+        "dex_seen": 0,
+        "daycare": {},
     }
+
+
+def _adv_history_entry(state: dict, area_id: str | None) -> Any:
+    # ::nav
+    return _history_entry(state, area_id)
+
+
+def _adv_history_push(state: dict, area_id: str | None) -> None:
+    _history_push(state, area_id, max_len=15)
+
+
+def _adv_history_pop(state: dict, default_area: str = "pallet-town") -> str:
+    return _history_pop(state, default_area)
+
 
 async def _get_adventure_state(user_id: str) -> dict:
     uid = str(user_id)
@@ -11233,6 +12262,422 @@ class TMSellerView(discord.ui.View):
             ephemeral=True,
         )
 
+
+def _market_mode_rows(mode: str) -> list[tuple[str, str, int, str]]:
+    want_buy = str(mode).lower() == "buy"
+    out: list[tuple[str, str, int, str]] = []
+    for category, rows in MARKET_PRICE_CATALOG.items():
+        if want_buy and category == "Treasure Items":
+            continue
+        for item_id, disp, price in rows:
+            out.append((str(item_id), str(disp), int(price), str(category)))
+    return out
+
+
+async def _market_sell_rows_for_owner(owner_id: str) -> tuple[list[tuple[str, str, int, str]], dict[str, int]]:
+    qty_by_item: dict[str, int] = {}
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT item_id, qty FROM user_items WHERE owner_id=? AND qty>0",
+                (str(owner_id),),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+        for row in rows or []:
+            item_id = str(row["item_id"] if hasattr(row, "keys") else row[0])
+            qty = int((row.get("qty") if hasattr(row, "keys") else row[1]) or 0)
+            if qty <= 0:
+                continue
+            canonical = _market_normalize_key(item_id)
+            if canonical not in MARKET_SELL_PRICES:
+                continue
+            qty_by_item[canonical] = int(qty_by_item.get(canonical, 0)) + int(qty)
+    except Exception:
+        return [], {}
+
+    out: list[tuple[str, str, int, str]] = []
+    for item_id, disp, price, category in _market_mode_rows("sell"):
+        if int(qty_by_item.get(item_id, 0)) > 0:
+            out.append((item_id, disp, price, category))
+    return out, qty_by_item
+
+
+class MarketQuantityModal(discord.ui.Modal):
+    def __init__(self, author_id: int, area_id: str, mode: str, item_key: str):
+        mode_name = "Buy" if str(mode).lower() == "buy" else "Sell"
+        display = _market_display(item_key)
+        super().__init__(title=f"Poké Mart • {mode_name} {display}")
+        self.author_id = int(author_id)
+        self.area_id = str(area_id)
+        self.mode = "buy" if str(mode).lower() == "buy" else "sell"
+        self.item_key = _market_normalize_key(item_key)
+        self.qty_input = discord.ui.TextInput(
+            label="Quantity",
+            placeholder="1",
+            max_length=7,
+            required=True,
+            default="1",
+        )
+        self.add_item(self.qty_input)
+
+    async def on_submit(self, itx: discord.Interaction):
+        deferred = False
+
+        async def _reply(msg: str) -> None:
+            try:
+                if deferred or itx.response.is_done():
+                    await itx.followup.send(msg, ephemeral=True)
+                else:
+                    await itx.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+
+        if int(itx.user.id) != self.author_id:
+            return await _reply("This isn't for you.")
+        try:
+            await itx.response.defer(ephemeral=True, thinking=True)
+            deferred = True
+        except Exception:
+            deferred = False
+        uid = str(itx.user.id)
+        state = await _get_adventure_state(uid)
+        if str(state.get("area_id") or "") != self.area_id or not _is_pokemart(self.area_id):
+            return await _reply("Market access is only available while you're inside a Poké Mart.")
+        try:
+            qty = int(str(self.qty_input.value or "").strip())
+        except Exception:
+            return await _reply("Quantity must be a valid integer.")
+        if qty <= 0:
+            return await _reply("Quantity must be positive.")
+        if qty > MAX_STACK:
+            return await _reply(f"Quantity too large (max {MAX_STACK}).")
+        try:
+            if self.mode == "buy":
+                ok, msg = await _market_buy(uid, self.item_key, qty)
+            else:
+                ok, msg = await _market_sell(uid, self.item_key, qty)
+            _ = ok
+            return await _reply(str(msg))
+        except Exception as e:
+            print(f"[market] quantity modal trade failed: mode={self.mode} item={self.item_key} qty={qty} err={e}")
+            import traceback
+            traceback.print_exc()
+            return await _reply(f"❌ Market trade failed: {e}")
+
+
+class MarketDropdownSearchModal(discord.ui.Modal):
+    def __init__(self, parent_view: "MarketDropdownView"):
+        mode_name = "Buy" if parent_view.mode == "buy" else "Sell"
+        super().__init__(title=f"Poké Mart • {mode_name} Search")
+        self.parent_view = parent_view
+        self.query_input = discord.ui.TextInput(
+            label="Search items",
+            placeholder="Name or item id (e.g. ultra, potion, nugget)",
+            required=False,
+            max_length=64,
+            default=str(parent_view.search_query or ""),
+        )
+        self.add_item(self.query_input)
+
+    async def on_submit(self, itx: discord.Interaction):
+        if not self.parent_view._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        self.parent_view.search_query = str(self.query_input.value or "").strip()
+        self.parent_view.page = 0
+        await self.parent_view._refresh_message(itx)
+
+
+class MarketDropdownView(discord.ui.View):
+    ITEMS_PER_PAGE = 25
+
+    def __init__(self, author_id: int, area_id: str, mode: str):
+        super().__init__(timeout=180)
+        self.author_id = int(author_id)
+        self.area_id = str(area_id)
+        self.mode = "buy" if str(mode).lower() == "buy" else "sell"
+        self.search_query: str = ""
+        self.page: int = 0
+        self._owned_qty: dict[str, int] = {}
+        self._rows_cache: list[tuple[str, str, int, str]] = (
+            _market_mode_rows(self.mode) if self.mode == "buy" else []
+        )
+        self._rebuild_items()
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return int(itx.user.id) == self.author_id
+
+    def _all_rows(self) -> list[tuple[str, str, int, str]]:
+        return list(self._rows_cache)
+
+    async def _refresh_rows(self, uid: str) -> None:
+        if self.mode == "sell":
+            rows, qty_map = await _market_sell_rows_for_owner(uid)
+            self._rows_cache = rows
+            self._owned_qty = qty_map
+        else:
+            self._rows_cache = _market_mode_rows("buy")
+            self._owned_qty = {}
+
+    def _filtered_rows(self) -> list[tuple[str, str, int, str]]:
+        rows = self._all_rows()
+        q = item_id_from_user(self.search_query)
+        if not q:
+            return rows
+        out: list[tuple[str, str, int, str]] = []
+        for item_id, disp, price, category in rows:
+            if (
+                q in item_id_from_user(item_id)
+                or q in item_id_from_user(disp)
+                or q in item_id_from_user(category)
+            ):
+                out.append((item_id, disp, price, category))
+        return out
+
+    def _paged_rows(self) -> tuple[list[tuple[str, str, int, str]], int, int]:
+        rows = self._filtered_rows()
+        total = len(rows)
+        pages = max(1, math.ceil(total / self.ITEMS_PER_PAGE))
+        self.page = max(0, min(int(self.page), pages - 1))
+        start = self.page * self.ITEMS_PER_PAGE
+        end = start + self.ITEMS_PER_PAGE
+        return rows[start:end], total, pages
+
+    async def _build_embed(self, uid: str, *, refresh_rows: bool = True) -> discord.Embed:
+        if refresh_rows:
+            await self._refresh_rows(uid)
+            self._rebuild_items()
+        mode_name = "Buy" if self.mode == "buy" else "Sell"
+        page_rows, total, pages = self._paged_rows()
+        desc = "Choose an item from the dropdown, then enter quantity."
+        if self.mode == "buy":
+            desc += "\nTreasure items are sell-only and do not appear here."
+        else:
+            desc += "\nOnly items currently in your bag are shown."
+        if self.search_query:
+            desc += f"\nSearch: **{self.search_query}**"
+        emb = discord.Embed(
+            title=f"Poké Mart • {mode_name} Menu",
+            description=desc,
+            color=0x4CAF50 if self.mode == "buy" else 0x2196F3,
+        )
+        if page_rows:
+            lines = []
+            for _item_id, disp, price, category in page_rows[:12]:
+                if self.mode == "buy":
+                    lines.append(f"• **{disp}** — {price:,} ({category})")
+                else:
+                    owned_q = int(self._owned_qty.get(_item_id, 0))
+                    lines.append(f"• **{disp}** ×{owned_q:,} — Sell for {price:,} ({category})")
+            emb.add_field(name="Items (current page preview)", value="\n".join(lines)[:1024], inline=False)
+        else:
+            if self.mode == "sell":
+                emb.add_field(name="Items", value="No sellable market items found in your bag.", inline=False)
+            else:
+                emb.add_field(name="Items", value="No items matched your search.", inline=False)
+        coins = await db.get_currency(uid, "coins")
+        emb.set_footer(text=f"Results: {total} • Page {self.page + 1}/{pages} • Balance: {coins:,} {PKDollar_NAME}")
+        return emb
+
+    def _rebuild_items(self) -> None:
+        self.clear_items()
+        page_rows, total, pages = self._paged_rows()
+        options: list[discord.SelectOption] = []
+        for item_id, disp, price, category in page_rows:
+            if self.mode == "buy":
+                desc = f"{category} • Buy {price:,}"
+            else:
+                owned_q = int(self._owned_qty.get(item_id, 0))
+                desc = f"{category} • Own {owned_q:,} • Sell {price:,}"
+            options.append(discord.SelectOption(label=disp[:100], value=item_id, description=desc[:100]))
+        if not options:
+            no_items_desc = "Try a different search." if self.mode == "buy" else "Catch/find items first, then sell."
+            options = [discord.SelectOption(label="No matching items", value="__none__", description=no_items_desc[:100])]
+        sel = discord.ui.Select(
+            placeholder=("Select an item to buy…" if self.mode == "buy" else "Select an item to sell…"),
+            min_values=1,
+            max_values=1,
+            options=options,
+            disabled=(total <= 0),
+            custom_id=f"mart:dropdown:{self.mode}",
+        )
+        sel.callback = self._on_pick_item
+        self.add_item(sel)
+
+        prev_btn = discord.ui.Button(
+            label="Prev",
+            style=discord.ButtonStyle.secondary,
+            disabled=(self.page <= 0),
+            custom_id=f"mart:page_prev:{self.mode}",
+        )
+        prev_btn.callback = self._on_prev
+        self.add_item(prev_btn)
+
+        next_btn = discord.ui.Button(
+            label="Next",
+            style=discord.ButtonStyle.secondary,
+            disabled=(self.page >= (pages - 1)),
+            custom_id=f"mart:page_next:{self.mode}",
+        )
+        next_btn.callback = self._on_next
+        self.add_item(next_btn)
+
+        search_btn = discord.ui.Button(
+            label="Search",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"mart:search:{self.mode}",
+        )
+        search_btn.callback = self._on_search
+        self.add_item(search_btn)
+
+        clear_btn = discord.ui.Button(
+            label="Clear Search",
+            style=discord.ButtonStyle.secondary,
+            disabled=(not bool(self.search_query)),
+            custom_id=f"mart:search_clear:{self.mode}",
+        )
+        clear_btn.callback = self._on_clear_search
+        self.add_item(clear_btn)
+
+    async def _refresh_message(self, itx: discord.Interaction) -> None:
+        if not _is_pokemart(self.area_id):
+            if itx.response.is_done():
+                return await itx.followup.send("Market access is only available in a Poké Mart.", ephemeral=True)
+            return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
+        uid = str(itx.user.id)
+        await self._refresh_rows(uid)
+        self._rebuild_items()
+        emb = await self._build_embed(uid, refresh_rows=False)
+        try:
+            await itx.response.edit_message(embed=emb, view=self)
+        except Exception:
+            try:
+                if not itx.response.is_done():
+                    await itx.response.send_message(embed=emb, view=self, ephemeral=True)
+                else:
+                    await itx.followup.send(embed=emb, view=self, ephemeral=True)
+            except Exception:
+                pass
+
+    async def _on_pick_item(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not _is_pokemart(self.area_id):
+            return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
+        values = _itx_select_values(itx)
+        item_key = str(values[0] if values else "").strip()
+        if not item_key or item_key == "__none__":
+            return await itx.response.send_message("No item selected.", ephemeral=True)
+        await itx.response.send_modal(MarketQuantityModal(self.author_id, self.area_id, self.mode, item_key))
+
+    async def _on_prev(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        self.page = max(0, int(self.page) - 1)
+        await self._refresh_message(itx)
+
+    async def _on_next(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        self.page = int(self.page) + 1
+        await self._refresh_message(itx)
+
+    async def _on_search(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        await itx.response.send_modal(MarketDropdownSearchModal(self))
+
+    async def _on_clear_search(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        self.search_query = ""
+        self.page = 0
+        await self._refresh_message(itx)
+
+
+class AdventurePokeMartView(discord.ui.View):
+    def __init__(self, author_id: int, area_id: str, state: dict):
+        super().__init__(timeout=180)
+        self.author_id = int(author_id)
+        self.area_id = str(area_id)
+        self.state = state
+        self._handled = False
+        self._last_handled_id: str | None = None
+        self._last_handled_ts: float = 0.0
+        self._build_buttons()
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return int(itx.user.id) == self.author_id
+
+    def _build_buttons(self):
+        buy_btn = discord.ui.Button(label="Buy Menu", style=discord.ButtonStyle.success, custom_id="mart:buy")
+        buy_btn.callback = self._on_buy
+        self.add_item(buy_btn)
+
+        sell_btn = discord.ui.Button(label="Sell Menu", style=discord.ButtonStyle.primary, custom_id="mart:sell")
+        sell_btn.callback = self._on_sell
+        self.add_item(sell_btn)
+
+        list_btn = discord.ui.Button(label="Price List", style=discord.ButtonStyle.secondary, custom_id="mart:list")
+        list_btn.callback = self._on_price_list
+        self.add_item(list_btn)
+
+        if self.state.get("area_history"):
+            back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, custom_id="mart:back")
+            back_btn.callback = self._on_back
+            self.add_item(back_btn)
+
+    async def _on_buy(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not _is_pokemart(self.area_id):
+            return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
+        view = MarketDropdownView(self.author_id, self.area_id, "buy")
+        emb = await view._build_embed(str(itx.user.id))
+        await itx.response.send_message(embed=emb, view=view, ephemeral=True)
+
+    async def _on_sell(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not _is_pokemart(self.area_id):
+            return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
+        view = MarketDropdownView(self.author_id, self.area_id, "sell")
+        emb = await view._build_embed(str(itx.user.id))
+        await itx.response.send_message(embed=emb, view=view, ephemeral=True)
+
+    async def _on_price_list(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not _is_pokemart(self.area_id):
+            return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
+        uid = str(itx.user.id)
+        coins = await db.get_currency(uid, "coins")
+        emb = _market_price_embed()
+        emb.set_footer(text=f"Your balance: {coins:,} {PKDollar_NAME}")
+        await itx.response.send_message(embed=emb, ephemeral=True)
+
+    async def _on_back(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id")
+        now = time.time()
+        if self._handled and self._last_handled_id == cid and (now - self._last_handled_ts) < 1.0:
+            return await itx.response.send_message("Already handled.", ephemeral=True)
+        self._handled = True
+        self._last_handled_id = cid
+        self._last_handled_ts = now
+        try:
+            await itx.response.defer(ephemeral=True, thinking=False)
+            state = await _get_adventure_state(str(itx.user.id))
+            if not isinstance(state.get("area_history"), list) or not state.get("area_history"):
+                return await itx.followup.send("No previous area.", ephemeral=False)
+            state["area_id"] = _adv_history_pop(state, "pallet-town")
+            await _save_adventure_state(str(itx.user.id), state)
+            await _send_adventure_panel(itx, state, edit_original=True)
+        finally:
+            self._handled = False
+
+
 class AdventureCityView(discord.ui.View):
     def __init__(self, author_id: int, area_id: str, state: dict, *, has_surf: bool = False):
         super().__init__(timeout=180)
@@ -11335,9 +12780,7 @@ class AdventureCityView(discord.ui.View):
         await itx.response.defer(ephemeral=True, thinking=False)
         state = await _get_adventure_state(str(itx.user.id))
         _, next_id = itx.data["custom_id"].split("adv:daycare:", 1)
-        hist = state.get("area_history", [])
-        hist.append(state.get("area_id"))
-        state["area_history"] = hist[-15:]
+        _adv_history_push(state, state.get("area_id"))
         state["area_id"] = next_id
         await _save_adventure_state(str(itx.user.id), state)
         await _send_adventure_panel(itx, state, edit_original=True)
@@ -11355,9 +12798,7 @@ class AdventureCityView(discord.ui.View):
         await itx.response.defer(ephemeral=True, thinking=False)
         state = await _get_adventure_state(str(itx.user.id))
         _, next_id = itx.data["custom_id"].split("adv:area:", 1)
-        hist = state.get("area_history", [])
-        hist.append(state.get("area_id"))
-        state["area_history"] = hist[-15:]
+        _adv_history_push(state, state.get("area_id"))
         state["area_id"] = next_id
         await _save_adventure_state(str(itx.user.id), state)
         await _send_adventure_panel(itx, state, edit_original=True)
@@ -11375,9 +12816,7 @@ class AdventureCityView(discord.ui.View):
         await itx.response.defer(ephemeral=True, thinking=False)
         state = await _get_adventure_state(str(itx.user.id))
         _, next_id = itx.data["custom_id"].split("adv:next:", 1)
-        hist = state.get("area_history", [])
-        hist.append(state.get("area_id"))
-        state["area_history"] = hist[-15:]
+        _adv_history_push(state, state.get("area_id"))
         # Reset panel route navigation when entering so it always starts at Panel 1.
         if next_id in _get_panel_routes():
             rp = state.get("route_panels") or {}
@@ -11469,12 +12908,9 @@ class AdventureCityView(discord.ui.View):
         try:
             await itx.response.defer(ephemeral=True, thinking=False)
             state = await _get_adventure_state(str(itx.user.id))
-            hist = state.get("area_history") or []
-            if not hist:
+            if not isinstance(state.get("area_history"), list) or not state.get("area_history"):
                 return await itx.followup.send("No previous area.", ephemeral=False)
-            prev = hist.pop()
-            state["area_history"] = hist
-            state["area_id"] = prev or "pallet-town"
+            state["area_id"] = _adv_history_pop(state, "pallet-town")
             await _save_adventure_state(str(itx.user.id), state)
             await _send_adventure_panel(itx, state, edit_original=True)
         finally:
@@ -11887,13 +13323,10 @@ class AdventureDaycareView(discord.ui.View):
         self._last_handled_ts = now
         await itx.response.defer(ephemeral=True, thinking=False)
         state = await _get_adventure_state(str(itx.user.id))
-        hist = state.get("area_history") or []
-        if hist:
-            prev = hist.pop()
-            state["area_history"] = hist
-            state["area_id"] = prev or DAYCARE_CITY_ID
-        else:
+        if not isinstance(state.get("area_history"), list) or not state.get("area_history"):
             state["area_id"] = DAYCARE_CITY_ID
+        else:
+            state["area_id"] = _adv_history_pop(state, DAYCARE_CITY_ID)
         await _save_adventure_state(str(itx.user.id), state)
         await _send_adventure_panel(itx, state, edit_original=True)
 
@@ -12160,9 +13593,7 @@ class AdventureRouteView(discord.ui.View):
                     # Stay on current area and re-send panel so user can click Next again to advance
                     await _send_adventure_panel(itx, state, edit_original=True)
                     return
-            hist = state.get("area_history", [])
-            hist.append(state.get("area_id"))
-            state["area_history"] = hist[-15:]
+            _adv_history_push(state, state.get("area_id"))
             state["area_id"] = next_id
             await _save_adventure_state(str(itx.user.id), state)
             await _send_adventure_panel(itx, state, edit_original=True)
@@ -12182,12 +13613,9 @@ class AdventureRouteView(discord.ui.View):
         try:
             await itx.response.defer(ephemeral=True, thinking=False)
             state = await _get_adventure_state(str(itx.user.id))
-            hist = state.get("area_history") or []
-            if not hist:
+            if not isinstance(state.get("area_history"), list) or not state.get("area_history"):
                 return await itx.followup.send("No previous area.", ephemeral=False)
-            prev = hist.pop()
-            state["area_history"] = hist
-            state["area_id"] = prev or "pallet-town"
+            state["area_id"] = _adv_history_pop(state, "pallet-town")
             await _save_adventure_state(str(itx.user.id), state)
             await _send_adventure_panel(itx, state, edit_original=True)
         finally:
@@ -12361,6 +13789,7 @@ class AdventureRoute1PersistentView(discord.ui.View):
             else:
                 next_area = route.get("next")
                 if next_area:
+                    _adv_history_push(state, "route-1")
                     state["area_id"] = next_area
                 state.get("route_panels", {}).pop(area_id, None)
         else:
@@ -12431,6 +13860,7 @@ class _AdventureRouteViewRoute1Methods:
         else:
             # leaving route -> next city
             if next_area:
+                _adv_history_push(state, self.area_id)
                 state["area_id"] = next_area
             state.get("route_panels", {}).pop(self.area_id, None)
 
@@ -12803,6 +14233,27 @@ async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_o
                 egg_count=eggs_waiting,
             )
             view = AdventureDaycareView(itx.user.id, area_id, state, rec, parent_rows, pair_info)
+        elif city.get("is_pokemart"):
+            direct_image = city.get("image")
+            if direct_image and Path(direct_image).exists():
+                img = direct_image
+            elif city.get("parent_city"):
+                parent_city = ADVENTURE_CITIES.get(str(city.get("parent_city")), {})
+                img = parent_city.get("image_cleared") or parent_city.get("image_uncleared")
+            else:
+                img = city.get("image_uncleared") or city.get("image_cleared")
+            balance = await db.get_currency(uid, "coins")
+            desc = (
+                f"Welcome to the Poké Mart.\n\n"
+                f"Use **Buy Menu** or **Sell Menu** to trade from the market list.\n"
+                f"Your balance: **{balance:,} {PKDollar_NAME}**"
+            )
+            emb, files = _embed_with_image(city.get("name", area_id), desc, img)
+            effective_city = city.get("parent_city") or area_id
+            if state.get("last_city") != effective_city:
+                state["last_city"] = effective_city
+                await _save_adventure_state(str(itx.user.id), state)
+            view = AdventurePokeMartView(itx.user.id, area_id, state)
         else:
             cleared = _city_is_cleared(state, area_id)
             # Sub-areas use sprite sheet regions; main cities use image_uncleared/image_cleared
@@ -14084,6 +15535,24 @@ class MPokeInfo(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(MPokeInfo(bot))
+
+
+@bot.tree.command(name="pkinfo", description="Alias for /mpokeinfo (team Pokémon details).")
+@app_commands.describe(
+    name="Pokémon species (e.g. pikachu)",
+    slot="Team slot (1–6) if you have duplicates",
+)
+async def pkinfo_alias(interaction: Interaction, name: str, slot: Optional[int] = None):
+    cog = bot.get_cog("MPokeInfo")
+    if isinstance(cog, MPokeInfo):
+        return await cog.mpokeinfo(interaction, name, slot)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("❌ PK info system is not loaded yet. Try again in a moment.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ PK info system is not loaded yet. Try again in a moment.", ephemeral=True)
+    except Exception:
+        pass
 ## Friendship :
 def item_id_from_user(s: str) -> str:
     """Normalize user text -> canonical item id (lowercase + underscores)."""
@@ -14470,6 +15939,8 @@ def _team_hp_bar(pct: int, width: int = 10) -> str:
 
 
 TEAM_TEMPLATE_PATHS: tuple[Path, ...] = (
+    ASSETS_DIR / "ui" / "team-beta.png",
+    ASSETS_DIR / "ui" / "team-beta",
     ASSETS_DIR / "ui" / "team-template.png",
     ASSETS_DIR / "ui" / "team_panel_template.png",
     ASSETS_DIR / "team-template.png",
@@ -14481,6 +15952,17 @@ TEAM_TRAINER_FOOTER_RECT = (42, 430, 212, 491)
 TEAM_TRAINER_NAME_CENTER_X = 127
 TEAM_TRAINER_LABEL_Y = 38
 TEAM_TRAINER_NAME_Y = 62
+TEAM_REGION_BY_GEN: dict[int, str] = {
+    1: "Kanto",
+    2: "Johto",
+    3: "Hoenn",
+    4: "Sinnoh",
+    5: "Unova",
+    6: "Kalos",
+    7: "Alola",
+    8: "Galar",
+    9: "Paldea",
+}
 TEAM_SHOWDOWN_CACHE_DIR = ASSETS_DIR / "ui" / "team-anim-cache"
 TEAM_SHOWDOWN_STYLE_DIR = "gen5ani"
 TEAM_SHOWDOWN_UA = "Mozilla/5.0 (DexEmAll Team Renderer)"
@@ -14537,6 +16019,67 @@ TEAM_EGG_STAGE_LABELS: tuple[str, ...] = (
 
 _TEAM_OVERVIEW_RENDER_CACHE: dict[str, tuple[float, bytes, str]] = {}
 _TEAM_WARM_CACHE_TS: dict[str, float] = {}
+
+
+def _team_region_for_gen(gen: Optional[int]) -> str:
+    try:
+        g = int(gen or 0)
+    except Exception:
+        return "Unknown"
+    return TEAM_REGION_BY_GEN.get(g, "Unknown")
+
+
+def _team_species_visual_scale(row: dict) -> float:
+    """
+    Compute a per-species sprite scale factor for /team overview.
+    Uses cached Pokédex height when available so larger Pokémon render bigger.
+    """
+    if _team_is_egg_row(row):
+        return 0.92
+    if db_cache is None:
+        return 1.0
+    species_raw = str(row.get("species") or "").strip().lower().replace("_", "-")
+    if not species_raw:
+        return 1.0
+    candidates = [
+        species_raw,
+        species_raw.replace("-", " "),
+        _daycare_norm_species(species_raw),
+    ]
+    height_m: Optional[float] = None
+    for key in candidates:
+        if not key:
+            continue
+        try:
+            entry = db_cache.get_cached_pokedex(key)
+        except Exception:
+            entry = None
+        if not entry:
+            continue
+        for hk in ("height_m", "heightMeters", "height_meters", "height", "height_dm"):
+            raw_h = entry.get(hk)
+            if raw_h in (None, "", 0, "0"):
+                continue
+            try:
+                h = float(raw_h)
+            except Exception:
+                continue
+            # Some datasets store decimeters as integer in "height".
+            if hk in ("height", "height_dm") and h > 20.0:
+                h = h / 10.0
+            if hk in ("height", "height_dm") and h > 8.0:
+                h = h / 10.0
+            if h > 0:
+                height_m = h
+                break
+        if height_m is not None:
+            break
+    if height_m is None:
+        return 1.0
+    h = max(0.2, min(6.0, float(height_m)))
+    denom = (math.log1p(6.0) - math.log1p(0.2)) or 1.0
+    norm = (math.log1p(h) - math.log1p(0.2)) / denom
+    return max(0.78, min(1.34, 0.80 + (0.54 * norm)))
 
 
 def _team_is_egg_row(row: dict) -> bool:
@@ -14731,7 +16274,13 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
         )
         if resolved is not None:
             rp = Path(resolved)
-            if rp.exists() and rp.is_file() and rp.stat().st_size > 0:
+            # Ignore icon fallback at this stage; prefer real front sprites/animations.
+            if (
+                rp.exists()
+                and rp.is_file()
+                and rp.stat().st_size > 0
+                and rp.name.lower() != "icon.png"
+            ):
                 return rp
     except Exception:
         pass
@@ -14813,10 +16362,27 @@ def _team_font(size: int, *, bold: bool = False):
         from PIL import ImageFont  # type: ignore
     except Exception:
         return None
-    candidates = [
+    # Use battle renderer Pokemon font path when available.
+    try:
+        from pvp.renderer import _get_pokemon_font_path as _renderer_pokemon_font_path  # type: ignore
+        path = _renderer_pokemon_font_path()
+        if path:
+            return ImageFont.truetype(str(path), int(size))
+    except Exception:
+        pass
+    # Fallback font candidates.
+    candidates: list[str] = []
+    candidates.extend([
+        "pvp/_common/fonts/Pokemon GB.ttf",
+        "pvp/_common/fonts/PokemonGb-RAeo.ttf",
+        "pvp/_common/fonts/pokemon-gb.ttf",
+        "pvp/_common/fonts/pokemongb.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ]
+    ])
     for fp in candidates:
         try:
             return ImageFont.truetype(fp, int(size))
@@ -14849,7 +16415,12 @@ def _team_fit_font(draw, text: str, *, max_width: int, start_size: int, min_size
     return _team_font(min_size, bold=bold)
 
 
-def _team_load_sprite_frames(path: Optional[Path], *, max_size: tuple[int, int], resample) -> tuple[list[Any], int]:
+def _team_load_sprite_frames(
+    path: Optional[Path],
+    *,
+    max_size: tuple[int, int],
+    resample,
+) -> tuple[list[Any], int]:
     if path is None or Image is None:
         return [], TEAM_BATTLE_SYNC_DURATION_MS
     try:
@@ -14862,6 +16433,7 @@ def _team_load_sprite_frames(path: Optional[Path], *, max_size: tuple[int, int],
         return [], TEAM_BATTLE_SYNC_DURATION_MS
     duration = TEAM_BATTLE_SYNC_DURATION_MS
     frames: list[Any] = []
+
     if ImageSequence is not None and bool(getattr(img, "is_animated", False)):
         try:
             for i, fr in enumerate(ImageSequence.Iterator(img)):
@@ -14879,10 +16451,11 @@ def _team_load_sprite_frames(path: Optional[Path], *, max_size: tuple[int, int],
             frames = [sprite]
         except Exception:
             frames = []
+
     return frames, duration
 
 
-def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None]) -> str:
+def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None], *, current_gen: Optional[int] = None) -> str:
     snapshot: list[Any] = []
     for slot in range(1, 7):
         row = slots.get(slot)
@@ -14907,6 +16480,7 @@ def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None]) ->
     raw = json.dumps(
         {
             "target": str(target_name or ""),
+            "current_gen": int(current_gen or 0),
             "slots": snapshot,
             "sync_ms": int(TEAM_BATTLE_SYNC_DURATION_MS),
         },
@@ -14917,14 +16491,19 @@ def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None]) ->
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
-def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -> Optional[discord.File]:
+def _team_overview_panel_file(
+    target_name: str,
+    slots: dict[int, dict | None],
+    *,
+    current_gen: Optional[int] = None,
+) -> Optional[discord.File]:
     if Image is None:
         return None
     try:
         from PIL import ImageDraw  # type: ignore
     except Exception:
         return None
-    cache_key = _team_overview_cache_key(target_name, slots)
+    cache_key = _team_overview_cache_key(target_name, slots, current_gen=current_gen)
     now = float(time.time())
     cached = _TEAM_OVERVIEW_RENDER_CACHE.get(cache_key)
     if cached is not None:
@@ -14953,11 +16532,6 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
         def _pt(x: int, y: int) -> tuple[int, int]:
             return (int(round(x * sx)), int(round(y * sy)))
 
-        def _rc(rect: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
-            x0, y0 = _pt(rect[0], rect[1])
-            x1, y1 = _pt(rect[2], rect[3])
-            return x0, y0, x1, y1
-
         def _layout_scaled(src: dict[str, tuple[int, int]]) -> dict[str, tuple[int, int]]:
             x, y = src["box_xy"]
             w, h = src["box_wh"]
@@ -14972,89 +16546,123 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                 "level_right": _pt(rx, ry),
             }
 
-        def _sample_rgba(x: int, y: int, fallback: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        def _draw_text_with_outline(
+            d,
+            xy: tuple[int, int],
+            text: str,
+            *,
+            font,
+            fill: tuple[int, int, int, int],
+            stroke: tuple[int, int, int, int] = (16, 16, 20, 240),
+            stroke_px: int = 1,
+        ) -> None:
+            t = str(text or "")
+            if not t or font is None:
+                return
+            x, y = int(xy[0]), int(xy[1])
+            sw = max(1, int(stroke_px))
             try:
-                sxp = max(0, min(int(x), bw - 1))
-                syp = max(0, min(int(y), bh - 1))
-                px = base.getpixel((sxp, syp))
-                if isinstance(px, tuple):
-                    if len(px) == 4:
-                        return (int(px[0]), int(px[1]), int(px[2]), int(px[3]))
-                    if len(px) == 3:
-                        return (int(px[0]), int(px[1]), int(px[2]), 255)
-                p = int(px)
-                return (p, p, p, 255)
+                d.text((x, y), t, font=font, fill=fill, stroke_width=sw, stroke_fill=stroke)
+                return
             except Exception:
-                return fallback
+                pass
+            for ox in range(-sw, sw + 1):
+                for oy in range(-sw, sw + 1):
+                    if ox == 0 and oy == 0:
+                        continue
+                    d.text((x + ox, y + oy), t, font=font, fill=stroke)
+            d.text((x, y), t, font=font, fill=fill)
+
+        def _draw_pixel_shadow_text(
+            d,
+            xy: tuple[int, int],
+            text: str,
+            *,
+            font,
+            fill: tuple[int, int, int, int] = (242, 244, 252, 255),
+            shadow: tuple[int, int, int, int] = (0, 0, 0, 220),
+            shadow_offset: tuple[int, int] = (1, 1),
+        ) -> None:
+            t = str(text or "")
+            if not t or font is None:
+                return
+            x, y = int(xy[0]), int(xy[1])
+            sx_off, sy_off = int(shadow_offset[0]), int(shadow_offset[1])
+            try:
+                d.text((x + sx_off, y + sy_off), t, font=font, fill=shadow)
+                d.text((x, y), t, font=font, fill=fill)
+            except Exception:
+                pass
 
         slot_layout = tuple(_layout_scaled(g) for g in TEAM_SLOT_LAYOUT)
 
         draw = ImageDraw.Draw(base)
 
-        # Clear trainer card area, then re-draw a generic "Trainer" header + scaled player name.
-        hdr_rect = _rc(TEAM_TRAINER_HEADER_RECT)
-        art_rect = _rc(TEAM_TRAINER_ART_RECT)
-        ftr_rect = _rc(TEAM_TRAINER_FOOTER_RECT)
-        header_fill = _sample_rgba(hdr_rect[0] + 6, hdr_rect[1] + 6, (20, 18, 27, 255))
-        footer_fill = _sample_rgba(ftr_rect[0] + 6, ftr_rect[1] + 6, (20, 18, 27, 255))
-        art_fill = _sample_rgba(art_rect[0] + 8, art_rect[1] + 56, (47, 34, 59, 255))
-        draw.rectangle(hdr_rect, fill=header_fill)
-        draw.rectangle(art_rect, fill=art_fill)
-        draw.rectangle(ftr_rect, fill=footer_fill)
-
-        # Subtle hatch pattern in trainer card so it doesn't look flat/unfinished.
-        tx0, ty0, tx1, ty1 = art_rect
-        line_color = (
-            max(0, int(art_fill[0]) - 14),
-            max(0, int(art_fill[1]) - 12),
-            max(0, int(art_fill[2]) - 10),
-            min(255, int(art_fill[3])),
-        )
-        step = max(8, int(round(12 * s)))
-        for x in range(tx0 - (ty1 - ty0), tx1 + step, step):
-            draw.line((x, ty1, x + (ty1 - ty0), ty0), fill=line_color, width=max(1, int(round(1 * s))))
-
+        # Overlay only text/sprites; never repaint template blocks.
+        trainer_title = "Elite Trainer"
         trainer_font = _team_font(max(12, int(round(26 * s))), bold=True)
+        header_left_x = int(round((TEAM_TRAINER_HEADER_RECT[0] + 8) * sx))
+        header_top_y = int(round(TEAM_TRAINER_LABEL_Y * sy))
+        header_name_y = int(round(TEAM_TRAINER_NAME_Y * sy))
+        header_max_w = max(48, int(round((TEAM_TRAINER_HEADER_RECT[2] - TEAM_TRAINER_HEADER_RECT[0] - 16) * sx)))
         name_font = _team_fit_font(
             draw,
             target_name,
-            max_width=max(72, int(round(158 * sx))),
-            start_size=max(12, int(round(24 * s))),
-            min_size=max(9, int(round(11 * s))),
+            max_width=header_max_w,
+            start_size=max(11, int(round(22 * s))),
+            min_size=max(8, int(round(11 * s))),
             bold=True,
         )
         if trainer_font:
-            tw = _team_text_width(draw, "Trainer", trainer_font)
-            cx, ty = _pt(TEAM_TRAINER_NAME_CENTER_X, TEAM_TRAINER_LABEL_Y)
-            draw.text((cx - tw // 2, ty), "Trainer", font=trainer_font, fill=(240, 240, 248, 255))
+            title_font = _team_fit_font(
+                draw,
+                trainer_title,
+                max_width=header_max_w,
+                start_size=max(11, int(round(23 * s))),
+                min_size=max(8, int(round(11 * s))),
+                bold=True,
+            )
+            _draw_pixel_shadow_text(
+                draw,
+                (header_left_x, header_top_y),
+                trainer_title,
+                font=(title_font or trainer_font),
+                fill=(242, 244, 252, 255),
+                shadow=(0, 0, 0, 220),
+            )
         if name_font:
-            nw = _team_text_width(draw, target_name, name_font)
-            cx, ny = _pt(TEAM_TRAINER_NAME_CENTER_X, TEAM_TRAINER_NAME_Y)
-            draw.text((cx - nw // 2, ny), target_name, font=name_font, fill=(220, 228, 250, 255))
+            _draw_pixel_shadow_text(
+                draw,
+                (header_left_x, header_name_y),
+                target_name,
+                font=name_font,
+                fill=(240, 242, 250, 255),
+                shadow=(0, 0, 0, 215),
+            )
 
-        # Clear each slot's pokemon/text regions so user template can be reused safely.
-        for geom in slot_layout:
-            bx, by = geom["box_xy"]
-            bw, bh = geom["box_wh"]
-            inset = max(2, int(round(4 * s)))
-
-            # Keep the original template card visuals; only clean sprite center + name strip.
-            label_bg = _sample_rgba(bx + inset + 6, by + bh - max(10, int(round(8 * s))), (24, 18, 32, 255))
-            label_h = max(22, int(round(45 * s)))
-            draw.rectangle((bx + inset, by + bh - label_h, bx + bw - inset, by + bh - inset), fill=label_bg)
-
-            cx, cy = geom["sprite_c"]
-            r = max(16, int(round(52 * s)))
-            center_bg = _sample_rgba(cx, cy - r + max(2, int(round(8 * s))), (118, 90, 142, 255))
-            line_col = _sample_rgba(cx - r + max(4, int(round(9 * s))), cy, (64, 47, 82, 255))
-            dot_col = _sample_rgba(cx, cy, (95, 74, 120, 255))
-            edge_col = _sample_rgba(cx + r - max(4, int(round(7 * s))), cy - r + max(4, int(round(8 * s))), (63, 44, 83, 255))
-            draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=center_bg, outline=edge_col, width=max(1, int(round(2 * s))))
-            line_h = max(1, int(round(2 * s)))
-            margin = max(4, int(round(6 * s)))
-            draw.rectangle((cx - r + margin, cy - line_h, cx + r - margin, cy + line_h), fill=line_col)
-            cr = max(6, int(round(13 * s)))
-            draw.ellipse((cx - cr, cy - cr, cx + cr, cy + cr), fill=dot_col, outline=line_col, width=max(1, int(round(2 * s))))
+        # Footer: only overlay region value beside the template's existing label text.
+        gen_num = max(1, int(current_gen or 1))
+        region_name = _team_region_for_gen(gen_num)
+        footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 98) * sx))
+        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 44) * sy))
+        footer_w = max(28, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 104) * sx)))
+        footer_font = _team_fit_font(
+            draw,
+            region_name,
+            max_width=footer_w,
+            start_size=max(8, int(round(14 * s))),
+            min_size=max(7, int(round(10 * s))),
+            bold=False,
+        )
+        if footer_font is not None:
+            _draw_pixel_shadow_text(
+                draw,
+                (footer_x, footer_y),
+                region_name,
+                font=footer_font,
+                fill=(240, 242, 250, 255),
+                shadow=(0, 0, 0, 215),
+            )
 
         # Preload sprite frames (animated front preferred).
         sprite_data: dict[int, dict[str, Any]] = {}
@@ -15066,28 +16674,21 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                 sprite_data[slot] = {"frames": []}
                 continue
             path = _team_pick_sprite_path(row)
-            sprite_max = (max(32, int(round(88 * sx))), max(32, int(round(88 * sy))))
+            sprite_max = (max(32, int(round(108 * sx))), max(32, int(round(108 * sy))))
             frames, _ = _team_load_sprite_frames(path, max_size=sprite_max, resample=resample)
             sprite_data[slot] = {"frames": frames}
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
 
-        lvl_font_slot = _team_font(max(9, int(round(18 * s))), bold=False)
+        lvl_font_slot = _team_font(max(9, int(round(17 * s))), bold=True)
         text_prep: dict[int, dict[str, Any]] = {}
         probe_draw = ImageDraw.Draw(base)
         for slot in range(1, 7):
             row = slots.get(slot)
             geom = slot_layout[slot - 1]
+            slot_w, _slot_h = geom["box_wh"]
             if not row:
-                empty_font = _team_fit_font(
-                    probe_draw,
-                    "Empty",
-                    max_width=max(28, int(round(110 * sx))),
-                    start_size=max(9, int(round(18 * s))),
-                    min_size=max(7, int(round(12 * s))),
-                    bold=True,
-                )
-                text_prep[slot] = {"label": "Empty", "font": empty_font, "lvl": "", "lvl_x": geom["level_right"][0], "label_x": geom["label_xy"][0]}
+                text_prep[slot] = {"label": "", "font": None, "lvl": "", "lvl_x": geom["level_right"][0], "label_x": geom["label_xy"][0]}
                 continue
             if _team_is_egg_row(row):
                 label = "Egg"
@@ -15095,20 +16696,43 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
             else:
                 label = _team_species_label(row)
                 lvl = f"lvl {int(row.get('level') or 1)}"
+            label_to_draw = label
             label_font = _team_fit_font(
                 probe_draw,
-                label,
-                max_width=max(28, int(round(112 * sx))),
+                label_to_draw,
+                max_width=max(36, int(round((slot_w - max(42, int(round(52 * s))))))),
                 start_size=max(9, int(round(19 * s))),
-                min_size=max(7, int(round(10 * s))),
+                min_size=max(7, int(round(9 * s))),
                 bold=True,
             )
             lvl_x = geom["level_right"][0]
+            lvl_w = 0
             if lvl_font_slot:
-                lw = _team_text_width(probe_draw, lvl, lvl_font_slot)
-                lvl_x = int(geom["level_right"][0] - lw)
+                lvl_w = _team_text_width(probe_draw, lvl, lvl_font_slot)
+                lvl_x = int(geom["level_right"][0] - lvl_w)
+            if label_font:
+                label_w = _team_text_width(probe_draw, label_to_draw, label_font)
+                min_gap = max(10, int(round(14 * s)))
+                label_start_x = int(geom["label_xy"][0])
+                label_end_limit = int(lvl_x - min_gap)
+                if label_start_x + label_w > label_end_limit:
+                    tighter_max = max(22, label_end_limit - label_start_x)
+                    label_font = _team_fit_font(
+                        probe_draw,
+                        label_to_draw,
+                        max_width=tighter_max,
+                        start_size=max(8, int(round(16 * s))),
+                        min_size=max(7, int(round(9 * s))),
+                        bold=True,
+                    )
+                    if label_font:
+                        label_w = _team_text_width(probe_draw, label_to_draw, label_font)
+                    # Final hard guard: trim label if still colliding with lvl text.
+                    while label_font and label_to_draw and (label_start_x + label_w > label_end_limit):
+                        label_to_draw = label_to_draw[:-1]
+                        label_w = _team_text_width(probe_draw, label_to_draw, label_font) if label_to_draw else 0
             text_prep[slot] = {
-                "label": label,
+                "label": label_to_draw,
                 "font": label_font,
                 "lvl": lvl,
                 "lvl_x": lvl_x,
@@ -15123,28 +16747,25 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
             row = slots.get(slot)
             slot_text = text_prep.get(slot) or {}
             if not row:
-                if slot_text.get("font"):
-                    text_draw.text(
-                        geom["label_xy"],
-                        str(slot_text.get("label") or "Empty"),
-                        font=slot_text["font"],
-                        fill=(195, 194, 210, 255),
-                    )
                 continue
-            if slot_text.get("font"):
-                text_draw.text(
+            if slot_text.get("font") and str(slot_text.get("label") or "").strip():
+                _draw_pixel_shadow_text(
+                    text_draw,
                     (int(slot_text.get("label_x") or geom["label_xy"][0]), geom["label_xy"][1]),
                     str(slot_text.get("label") or ""),
                     font=slot_text["font"],
-                    fill=(238, 240, 252, 255),
+                    fill=(240, 242, 250, 255),
+                    shadow=(0, 0, 0, 220),
                 )
             lvl = str(slot_text.get("lvl") or "")
             if lvl and lvl_font_slot:
-                text_draw.text(
+                _draw_pixel_shadow_text(
+                    text_draw,
                     (int(slot_text.get("lvl_x") or geom["level_right"][0]), geom["level_right"][1]),
                     lvl,
                     font=lvl_font_slot,
-                    fill=(230, 230, 240, 255),
+                    fill=(236, 240, 250, 255),
+                    shadow=(0, 0, 0, 210),
                 )
 
         out_frames: list[Any] = []
@@ -15178,10 +16799,10 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                     else:
                         src_i = 0
                     sprite = frames[src_i]
-                    sx = int(geom["sprite_c"][0] - (sprite.width // 2))
-                    sy = int(geom["sprite_c"][1] - (sprite.height // 2))
+                    dx = int(geom["sprite_c"][0] - (sprite.width // 2))
+                    dy = int(geom["sprite_c"][1] - (sprite.height // 2))
                     try:
-                        frame.alpha_composite(sprite, dest=(sx, sy))
+                        frame.alpha_composite(sprite, dest=(dx, dy))
                     except Exception:
                         pass
             frame.alpha_composite(text_layer)
@@ -15215,11 +16836,19 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
 
 
 class TeamPanelView(discord.ui.View):
-    def __init__(self, author_id: int, target_name: str, slots: dict[int, dict | None]):
+    def __init__(
+        self,
+        author_id: int,
+        target_name: str,
+        slots: dict[int, dict | None],
+        *,
+        current_gen: Optional[int] = None,
+    ):
         super().__init__(timeout=240)
         self.author_id = int(author_id)
         self.target_name = target_name
         self.slots = dict(slots)
+        self.current_gen = max(1, int(current_gen or 1))
         self._build_buttons()
 
     def _build_buttons(self):
@@ -15245,7 +16874,7 @@ class TeamPanelView(discord.ui.View):
         # Keep overview clean: image-only panel + slot buttons.
         emb = discord.Embed(color=0x5865F2)
         files: list[discord.File] = []
-        panel = _team_overview_panel_file(self.target_name, self.slots)
+        panel = _team_overview_panel_file(self.target_name, self.slots, current_gen=self.current_gen)
         if panel:
             emb.set_image(url=f"attachment://{panel.filename}")
             files.append(panel)
@@ -15510,7 +17139,12 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
                         "_egg_stage": stage,
                     }
 
-    view = TeamPanelView(interaction.user.id, target.display_name, slots)
+    try:
+        target_gen = await _user_selected_gen(uid)
+    except Exception:
+        target_gen = 1
+
+    view = TeamPanelView(interaction.user.id, target.display_name, slots, current_gen=target_gen)
     emb, files = view._overview_payload()
     await interaction.followup.send(embed=emb, files=files, view=view, ephemeral=True)
     if hatch_messages and uid == str(interaction.user.id):
@@ -20010,11 +21644,13 @@ class VerifyRulesView(discord.ui.View):
             return
 
         if role in member.roles:
+            _set_cached_required_role(interaction.user.id, True)
             await interaction.response.send_message("You already have the role.", ephemeral=True)
             return
 
         try:
             await member.add_roles(role, reason="Accepted rules via verification button")
+            _set_cached_required_role(interaction.user.id, True)
             await interaction.response.send_message("✅ Verified! Role assigned.", ephemeral=True)
         except discord.Forbidden:
             await interaction.response.send_message("I don't have permission to assign that role.", ephemeral=True)
@@ -20461,6 +22097,8 @@ class ReleaseConfirmView(discord.ui.View):
         self.confirmed = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await _check_required_role_interaction(interaction):
+            return False
         if int(interaction.user.id) != self.author_id:
             await interaction.response.send_message("This isn't for you.", ephemeral=True)
             return False
@@ -20486,7 +22124,7 @@ async def release_pokemon(interaction: discord.Interaction, slot: app_commands.R
     uid = str(interaction.user.id)
     
     # Check if user is admin (admins bypass safety checks)
-    is_admin = await db.is_admin(uid)
+    is_admin = await _is_admin_user(uid)
     
     # Get the Pokémon in the specified slot
     conn = await db.connect()
@@ -20610,7 +22248,7 @@ async def clear_team(interaction: discord.Interaction):
     uid = str(interaction.user.id)
     
     # Check if user is admin (admins bypass safety checks)
-    is_admin = await db.is_admin(uid)
+    is_admin = await _is_admin_user(uid)
     
     conn = await db.connect()
     try:
