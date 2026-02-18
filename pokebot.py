@@ -163,6 +163,7 @@ _patch_pvp_sprite_icon_fallback()
 # pokedex_forms. Cache this probe so commands fail soft instead of repeatedly
 # throwing SQL errors (which can cascade into pool timeouts).
 _POKEDEX_FORMS_TABLE_AVAILABLE: Optional[bool] = None
+_OPTIONAL_TABLE_AVAILABILITY: dict[str, bool] = {}
 
 
 def _is_missing_table_error(exc: Exception, table_name: str) -> bool:
@@ -177,9 +178,25 @@ def _is_missing_table_error(exc: Exception, table_name: str) -> bool:
     )
 
 
-async def _safe_pokedex_forms_fetchone(conn: Any, sql: str, params: tuple[Any, ...] = ()) -> Any:
-    global _POKEDEX_FORMS_TABLE_AVAILABLE
-    if _POKEDEX_FORMS_TABLE_AVAILABLE is False:
+def _is_optional_table_disabled(table_name: str) -> bool:
+    return _OPTIONAL_TABLE_AVAILABILITY.get(str(table_name or "").lower(), True) is False
+
+
+def _disable_optional_table(table_name: str) -> None:
+    t = str(table_name or "").lower().strip()
+    if t:
+        _OPTIONAL_TABLE_AVAILABILITY[t] = False
+
+
+async def _safe_optional_fetchone(
+    conn: Any,
+    sql: str,
+    params: tuple[Any, ...] = (),
+    *,
+    tables: tuple[str, ...] = (),
+) -> Any:
+    check_tables = tuple(str(t or "").lower().strip() for t in tables if str(t or "").strip())
+    if check_tables and any(_is_optional_table_disabled(t) for t in check_tables):
         return None
     cur = None
     try:
@@ -187,9 +204,10 @@ async def _safe_pokedex_forms_fetchone(conn: Any, sql: str, params: tuple[Any, .
         row = await cur.fetchone()
         return row
     except Exception as e:
-        if _is_missing_table_error(e, "pokedex_forms"):
-            _POKEDEX_FORMS_TABLE_AVAILABLE = False
-            return None
+        for t in check_tables:
+            if _is_missing_table_error(e, t):
+                _disable_optional_table(t)
+                return None
         raise
     finally:
         if cur is not None:
@@ -199,9 +217,15 @@ async def _safe_pokedex_forms_fetchone(conn: Any, sql: str, params: tuple[Any, .
                 pass
 
 
-async def _safe_pokedex_forms_fetchall(conn: Any, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
-    global _POKEDEX_FORMS_TABLE_AVAILABLE
-    if _POKEDEX_FORMS_TABLE_AVAILABLE is False:
+async def _safe_optional_fetchall(
+    conn: Any,
+    sql: str,
+    params: tuple[Any, ...] = (),
+    *,
+    tables: tuple[str, ...] = (),
+) -> list[Any]:
+    check_tables = tuple(str(t or "").lower().strip() for t in tables if str(t or "").strip())
+    if check_tables and any(_is_optional_table_disabled(t) for t in check_tables):
         return []
     cur = None
     try:
@@ -209,9 +233,10 @@ async def _safe_pokedex_forms_fetchall(conn: Any, sql: str, params: tuple[Any, .
         rows = await cur.fetchall()
         return list(rows or [])
     except Exception as e:
-        if _is_missing_table_error(e, "pokedex_forms"):
-            _POKEDEX_FORMS_TABLE_AVAILABLE = False
-            return []
+        for t in check_tables:
+            if _is_missing_table_error(e, t):
+                _disable_optional_table(t)
+                return []
         raise
     finally:
         if cur is not None:
@@ -219,6 +244,26 @@ async def _safe_pokedex_forms_fetchall(conn: Any, sql: str, params: tuple[Any, .
                 await cur.close()
             except Exception:
                 pass
+
+
+async def _safe_pokedex_forms_fetchone(conn: Any, sql: str, params: tuple[Any, ...] = ()) -> Any:
+    global _POKEDEX_FORMS_TABLE_AVAILABLE
+    if _POKEDEX_FORMS_TABLE_AVAILABLE is False:
+        return None
+    row = await _safe_optional_fetchone(conn, sql, params, tables=("pokedex_forms",))
+    if row is None and _is_optional_table_disabled("pokedex_forms"):
+        _POKEDEX_FORMS_TABLE_AVAILABLE = False
+    return row
+
+
+async def _safe_pokedex_forms_fetchall(conn: Any, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
+    global _POKEDEX_FORMS_TABLE_AVAILABLE
+    if _POKEDEX_FORMS_TABLE_AVAILABLE is False:
+        return []
+    rows = await _safe_optional_fetchall(conn, sql, params, tables=("pokedex_forms",))
+    if _is_optional_table_disabled("pokedex_forms"):
+        _POKEDEX_FORMS_TABLE_AVAILABLE = False
+    return rows
 
 # Warm up renderer once to avoid first-GIF stall (no-op if renderer missing)
 try:
@@ -17227,7 +17272,7 @@ def _team_species_visual_scale(row: dict) -> float:
     if db_cache is None:
         species_norm = _daycare_norm_species(row.get("species"))
         if species_norm == "stakataka":
-            return 0.72
+            return 0.58
         return 1.0
     species_raw = str(row.get("species") or "").strip().lower().replace("_", "-")
     if not species_raw:
@@ -17236,7 +17281,7 @@ def _team_species_visual_scale(row: dict) -> float:
     # Wide/tall forms like Stakataka can clip into the name strip if rendered by
     # generic height scaling, so cap them with a hand-tuned value.
     if species_norm == "stakataka":
-        return 0.72
+        return 0.58
     candidates = [
         species_raw,
         species_raw.replace("-", " "),
@@ -17907,7 +17952,7 @@ def _team_overview_panel_file(
         gen_num = max(1, int(current_gen or 1))
         region_name = _team_region_for_gen(gen_num)
         footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 96) * sx))
-        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 12) * sy))
+        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 8) * sy))
         footer_w = max(32, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 102) * sx)))
         footer_font = _team_fit_font(
             draw,
@@ -17951,7 +17996,13 @@ def _team_overview_panel_file(
                 allow_upscale=True,
                 min_size=sprite_min,
             )
-            sprite_data[slot] = {"frames": frames}
+            y_off = 0
+            try:
+                if _daycare_norm_species(row.get("species")) == "stakataka":
+                    y_off = -max(2, int(round(12 * sy)))
+            except Exception:
+                y_off = 0
+            sprite_data[slot] = {"frames": frames, "y_off": y_off}
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
 
@@ -18111,7 +18162,7 @@ def _team_overview_panel_file(
                         src_i = 0
                     sprite = frames[src_i]
                     dx = int(geom["sprite_c"][0] - (sprite.width // 2))
-                    dy = int(geom["sprite_c"][1] - (sprite.height // 2))
+                    dy = int(geom["sprite_c"][1] - (sprite.height // 2) + int(data.get("y_off") or 0))
                     try:
                         frame.alpha_composite(sprite, dest=(dx, dy))
                     except Exception:
@@ -21854,16 +21905,16 @@ async def generate_pokeinfo_embed(
 
             # Fallback: if not found in pokedex_forms, try mega_evolution overrides
             if not form_row:
-                cur = await con.execute(
+                mrow = await _safe_optional_fetchone(
+                    con,
                     """
                     SELECT stats, types, abilities
                     FROM mega_evolution
                     WHERE base_species_id = ? AND mega_form = ?
                     """,
-                    (species_id, form_key)
+                    (species_id, form_key),
+                    tables=("mega_evolution",),
                 )
-                mrow = await cur.fetchone()
-                await cur.close()
                 if mrow:
                     mrow = dict(mrow)
                     form_row = {
@@ -22069,16 +22120,16 @@ class PokeInfoFormView(discord.ui.View):
 
                 # Fallback to mega_evolution overrides when not present in pokedex_forms
                 if not form_row:
-                    cur = await con.execute(
+                    mrow = await _safe_optional_fetchone(
+                        con,
                         """
                         SELECT stats, types, abilities
                         FROM mega_evolution
                         WHERE base_species_id = ? AND mega_form = ?
                         """,
-                        (self.species_id, new_form_key)
+                        (self.species_id, new_form_key),
+                        tables=("mega_evolution",),
                     )
-                    mrow = await cur.fetchone()
-                    await cur.close()
                 if mrow:
                         mrow = dict(mrow)
                         form_row = {
@@ -22090,16 +22141,16 @@ class PokeInfoFormView(discord.ui.View):
 
             # Second fallback for button view: primal_reversion
             if not form_row:
-                cur = await con.execute(
+                prow = await _safe_optional_fetchone(
+                    con,
                     """
                     SELECT stats, types, abilities
                     FROM primal_reversion
                     WHERE base_species_id = ? AND primal_form = ?
                     """,
-                    (self.species_id, new_form_key)
+                    (self.species_id, new_form_key),
+                    tables=("primal_reversion",),
                 )
-                prow = await cur.fetchone()
-                await cur.close()
                 if prow:
                     prow = dict(prow)
                     form_row = {
@@ -22521,16 +22572,16 @@ async def pokeinfo(
 
                 # Fallback: mega_evolution overrides if still not found
                 if not form_row:
-                    cur = await con.execute(
+                    mrow = await _safe_optional_fetchone(
+                        con,
                         """
                         SELECT stat_changes, type_changes, ability_change
                         FROM mega_evolution
                         WHERE base_species_id = ? AND mega_form = ?
                         """,
-                        (_r(base_row, "id"), form_key)
+                        (_r(base_row, "id"), form_key),
+                        tables=("mega_evolution",),
                     )
-                    mrow = await cur.fetchone()
-                    await cur.close()
                     if mrow:
                         mrow = dict(mrow)
                         raw_stats = _r(base_row, "stats")
@@ -22572,16 +22623,16 @@ async def pokeinfo(
 
                 # Second fallback: primal_reversion overrides
                 if not form_row:
-                    cur = await con.execute(
+                    prow = await _safe_optional_fetchone(
+                        con,
                         """
                         SELECT stat_changes, type_changes, ability_change
                         FROM primal_reversion
                         WHERE base_species_id = ? AND primal_form = ?
                         """,
-                        (_r(base_row, "id"), form_key)
+                        (_r(base_row, "id"), form_key),
+                        tables=("primal_reversion",),
                     )
-                    prow = await cur.fetchone()
-                    await cur.close()
                     if prow:
                         prow = dict(prow)
                         raw_stats = _r(base_row, "stats")
@@ -22828,28 +22879,28 @@ async def pokeinfo(
         )
         
         # Mega Evolution forms
-        cur = await con.execute(
+        mega_rows = await _safe_optional_fetchall(
+            con,
             "SELECT mega_form, form_key FROM mega_evolution WHERE base_species_id = ? ORDER BY mega_form",
-            (_r(base_row, "id"),)
+            (_r(base_row, "id"),),
+            tables=("mega_evolution",),
         )
-        mega_rows = await cur.fetchall()
-        await cur.close()
         
         # Gigantamax forms
-        cur = await con.execute(
+        gmax_rows = await _safe_optional_fetchall(
+            con,
             "SELECT gmax_form, form_key FROM gigantamax WHERE base_species_id = ? ORDER BY gmax_form",
-            (_r(base_row, "id"),)
+            (_r(base_row, "id"),),
+            tables=("gigantamax",),
         )
-        gmax_rows = await cur.fetchall()
-        await cur.close()
         
         # Primal Reversion forms
-        cur = await con.execute(
+        primal_rows = await _safe_optional_fetchall(
+            con,
             "SELECT primal_form, form_key FROM primal_reversion WHERE base_species_id = ? ORDER BY primal_form",
-            (_r(base_row, "id"),)
+            (_r(base_row, "id"),),
+            tables=("primal_reversion",),
         )
-        primal_rows = await cur.fetchall()
-        await cur.close()
         
         # Combine all forms
         all_forms = []
