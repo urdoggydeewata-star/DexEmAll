@@ -15555,6 +15555,7 @@ class MPokeInfo(commands.Cog):
         types: list[str],
         exp_to_next_val: Optional[int],
         friendship_value: int,
+        is_locked: bool,
         hp_max: int,
         stats_obj: dict,
         ivs_map: dict,
@@ -15800,16 +15801,30 @@ class MPokeInfo(commands.Cog):
 
         # --- main sprite region ---
         nickname = str(mon.get("nickname") or species_display).strip() or species_display
+        nick_xy = _pt(86, 132)
+        nick_max_w = max(28, int(round(136 * sx)))
+        if bool(is_locked):
+            lock_font = self._mpokeinfo_font(max(7, int(round(9 * scale))), bold=True)
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                _pt(82, 132),
+                "L",
+                font=lock_font,
+                fill=(255, 214, 126, 255),
+                shadow=(84, 54, 10, 220),
+            )
+            nick_xy = _pt(92, 132)
+            nick_max_w = max(24, int(round(130 * sx)))
         nick_font = self._mpokeinfo_fit_font(
             draw_probe,
             nickname,
-            max_width=max(28, int(round(136 * sx))),
+            max_width=nick_max_w,
             start_size=max(8, int(round(10 * scale))),
             min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        nickname = _clip_text(nickname, nick_font, max(28, int(round(136 * sx))))
-        self._mpokeinfo_draw_shadow_text(draw, _pt(86, 132), nickname, font=nick_font)
+        nickname = _clip_text(nickname, nick_font, nick_max_w)
+        self._mpokeinfo_draw_shadow_text(draw, nick_xy, nickname, font=nick_font)
 
         if shiny:
             shiny_font = self._mpokeinfo_font(max(8, int(round(12 * scale))), bold=True)
@@ -15994,7 +16009,7 @@ class MPokeInfo(commands.Cog):
         return discord.File(fp=out, filename=filename)
 
     # --------------------- command ---------------------
-    @app_commands.command(name="mpokeinfo", description="Show details for a Pokémon on your team.")
+    @app_commands.command(name="mypokeinfo", description="Show details for a Pokémon on your team.")
     @app_commands.describe(
         name="Pokémon species (e.g. pikachu)",
         slot="Team slot (1–6) if you have duplicates"
@@ -16004,6 +16019,7 @@ class MPokeInfo(commands.Cog):
             await interaction.response.defer(ephemeral=False)
         uid = str(interaction.user.id)
         user_gen = await _user_selected_gen(uid)
+        is_locked = False
 
         # Single DB session: resolve + fetch full row. Parallel dex fetch overlapped with get_pokemon.
         async with db.session() as conn:
@@ -16011,6 +16027,15 @@ class MPokeInfo(commands.Cog):
             if not mon:
                 return
             species = str(mon.get("species") or "unknown")
+            try:
+                mon_id = int(mon.get("id") or 0)
+            except Exception:
+                mon_id = 0
+            if mon_id > 0:
+                try:
+                    is_locked = await _is_pokemon_locked(uid, mon_id, conn=conn)
+                except Exception:
+                    is_locked = False
             dex_task = asyncio.create_task(ensure_species_and_learnsets(species))
             full = await db.get_pokemon(uid, int(mon["id"]), conn=conn)
             if not full:
@@ -16050,7 +16075,7 @@ class MPokeInfo(commands.Cog):
         gender  = str(mon.get("gender") or "").lower()
 
         # Redesigned compact/phone-friendly layout.
-        title = f"{'★ ' if shiny else ''}{species.replace('-', ' ').title()} Lv {level}"
+        title = f"{'🔒 ' if is_locked else ''}{'★ ' if shiny else ''}{species.replace('-', ' ').title()} Lv {level}"
         emb = discord.Embed(
             title=title,
             colour=(discord.Colour.gold() if shiny else discord.Colour.blurple()),
@@ -16062,6 +16087,8 @@ class MPokeInfo(commands.Cog):
             current_form = dex.get("form_name")
         if current_form and current_form != "normal":
             emb.title = f"{'★ ' if shiny else ''}{species.replace('-', ' ').title()} ({str(current_form).title()}) Lv {level}"
+            if is_locked:
+                emb.title = f"🔒 {emb.title}"
 
         held_field = await self._label_with_emoji(interaction.guild, mon.get("held_item"))
         if not held_field or held_field.strip() in ("", "—"):
@@ -16182,6 +16209,7 @@ class MPokeInfo(commands.Cog):
             types=types,
             exp_to_next_val=exp_to_next_val,
             friendship_value=fr,
+            is_locked=is_locked,
             hp_max=hp_max,
             stats_obj=stats_obj,
             ivs_map=ivs_map,
@@ -16214,6 +16242,7 @@ class MPokeInfo(commands.Cog):
         overview_lines = [
             f"OT: {ot_text}",
             f"Team: {team_text}",
+            f"Lock: {'Locked 🔒' if is_locked else 'Unlocked'}",
             f"Type: {type_text}",
             f"Tera Type: {tera_text}",
             f"Nature: {nature_text}",
@@ -16249,7 +16278,7 @@ async def setup(bot: commands.Bot):
     await bot.add_cog(MPokeInfo(bot))
 
 
-@bot.tree.command(name="pkinfo", description="Alias for /mpokeinfo (team Pokémon details).")
+@bot.tree.command(name="pkinfo", description="Alias for /mypokeinfo (team Pokémon details).")
 @app_commands.describe(
     name="Pokémon species (e.g. pikachu)",
     slot="Team slot (1–6) if you have duplicates",
@@ -16320,7 +16349,7 @@ async def pkname_command(
 
     await interaction.followup.send(
         f"✅ Nickname set: **{species_display}** → **{cleaned}**\n"
-        f"Used in `/team` and the `/mpokeinfo` name slot.",
+        f"Used in `/team` and the `/mypokeinfo` name slot.",
         ephemeral=True,
     )
 
@@ -17325,6 +17354,7 @@ def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None], *,
             "level": int(row.get("level") or 0),
             "hp_now": int(row.get("hp_now") or 0),
             "hp_max": int(row.get("hp") or 0),
+            "locked": int(bool(row.get("is_locked"))),
         }
         if species_norm == "egg":
             item["egg_progress"] = round(float(row.get("_egg_progress") or 0.0), 3)
@@ -17540,6 +17570,7 @@ def _team_overview_panel_file(
                 cycle_lengths.append(len(frames))
 
         lvl_font_slot = _team_font(max(7, int(round(11 * s))), bold=False)
+        lock_badge_font = _team_font(max(6, int(round(8 * s))), bold=True)
         text_prep: dict[int, dict[str, Any]] = {}
         probe_draw = ImageDraw.Draw(base)
         for slot in range(1, 7):
@@ -17599,6 +17630,49 @@ def _team_overview_panel_file(
             slot_text = text_prep.get(slot) or {}
             if not row:
                 continue
+            if bool(row.get("is_locked")):
+                bx, by = geom["box_xy"]
+                pad = max(2, int(round(3 * s)))
+                badge_w = max(10, int(round(13 * s)))
+                badge_h = max(9, int(round(11 * s)))
+                x0 = int(bx + pad)
+                y0 = int(by + pad)
+                x1 = int(x0 + badge_w)
+                y1 = int(y0 + badge_h)
+                try:
+                    text_draw.rounded_rectangle(
+                        (x0, y0, x1, y1),
+                        radius=max(2, int(round(2 * s))),
+                        fill=(246, 197, 77, 235),
+                        outline=(68, 44, 15, 255),
+                        width=1,
+                    )
+                except Exception:
+                    text_draw.rectangle(
+                        (x0, y0, x1, y1),
+                        fill=(246, 197, 77, 235),
+                        outline=(68, 44, 15, 255),
+                        width=1,
+                    )
+                if lock_badge_font is not None:
+                    lt = "L"
+                    lw = _team_text_width(text_draw, lt, lock_badge_font)
+                    try:
+                        tb = text_draw.textbbox((0, 0), lt, font=lock_badge_font)
+                        lh = max(1, int(tb[3] - tb[1]))
+                    except Exception:
+                        lh = max(6, int(round(7 * s)))
+                    lx = int(x0 + max(1, ((badge_w - lw) // 2)))
+                    ly = int(y0 + max(0, ((badge_h - lh) // 2) - 1))
+                    _draw_text_with_outline(
+                        text_draw,
+                        (lx, ly),
+                        lt,
+                        font=lock_badge_font,
+                        fill=(44, 31, 9, 255),
+                        stroke=(255, 244, 218, 220),
+                        stroke_px=1,
+                    )
             if slot_text.get("font") and str(slot_text.get("label") or "").strip():
                 _draw_pixel_shadow_text(
                     text_draw,
@@ -17779,6 +17853,7 @@ class TeamPanelView(discord.ui.View):
         ability = str(row.get("ability") or "Unknown").replace("-", " ").title()
         emb.add_field(name="Ability", value=ability, inline=True)
         emb.add_field(name="Friendship", value=str(int(row.get("friendship") or 0)), inline=True)
+        emb.add_field(name="Lock", value=("🔒 Locked" if bool(row.get("is_locked")) else "—"), inline=True)
         held_item = str(row.get("held_item") or "").strip()
         item_emoji = (row.get("item_emoji") or "").strip()
         if held_item:
@@ -17937,6 +18012,11 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
             nickname_map = await _get_pokemon_nickname_map(uid, row_ids)
     except Exception:
         nickname_map = {}
+    locked_ids: set[int] = set()
+    try:
+        locked_ids = await _get_locked_pokemon_ids(uid)
+    except Exception:
+        locked_ids = set()
 
     # Map slots
     slots: dict[int, dict | None] = {i: None for i in range(1, 7)}
@@ -17959,6 +18039,7 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
             rid = 0
         if rid > 0 and rid in nickname_map:
             row["nickname"] = nickname_map[rid]
+        row["is_locked"] = bool(rid > 0 and rid in locked_ids)
         try:
             slot_i = int(row["team_slot"])
             if 1 <= slot_i <= 6:
@@ -19396,14 +19477,22 @@ async def _box_mon_info_payload(owner_id: str, box_no: int, box_pos: int) -> tup
         "moves": row[11],
     }
     species = str(d.get("species") or "Unknown").replace("-", " ").title()
+    mon_id = int(d.get("id") or 0)
+    is_locked = False
+    if mon_id > 0:
+        try:
+            is_locked = await _is_pokemon_locked(owner_id, mon_id)
+        except Exception:
+            is_locked = False
     shiny = bool(d.get("shiny"))
-    title = f"{'✨ ' if shiny else ''}{species} — Box {box_no}, Slot {box_pos}"
+    title = f"{'🔒 ' if is_locked else ''}{'✨ ' if shiny else ''}{species} — Box {box_no}, Slot {box_pos}"
     emb = discord.Embed(title=title, color=(0xF1C40F if shiny else 0x5865F2))
     emb.add_field(name="Level", value=str(int(d.get("level") or 1)), inline=True)
     emb.add_field(name="Gender", value=str(d.get("gender") or "Unknown").title(), inline=True)
     emb.add_field(name="Nature", value=str(d.get("nature") or "Hardy").title(), inline=True)
     emb.add_field(name="Ability", value=str(d.get("ability") or "Unknown").replace("-", " ").title(), inline=True)
     emb.add_field(name="Friendship", value=str(int(d.get("friendship") or 0)), inline=True)
+    emb.add_field(name="Lock", value=("🔒 Locked" if is_locked else "—"), inline=True)
     held = str(d.get("held_item") or "").strip()
     emb.add_field(name="Held Item", value=(pretty_item_name(held) if held else "None"), inline=True)
     try:
@@ -19636,7 +19725,7 @@ async def boxtake_command(
     await interaction.followup.send(("✅ " if changed else "❌ ") + out, ephemeral=True)
 
 
-@bot.tree.command(name="boxpk", description="View mpokeinfo-style details for a boxed Pokémon.")
+@bot.tree.command(name="boxpk", description="View mypokeinfo-style details for a boxed Pokémon.")
 @app_commands.describe(box_no="Box number", pos="Slot position")
 async def boxpk_command(
     interaction: discord.Interaction,
@@ -22899,7 +22988,7 @@ async def on_ready():
     except Exception as e:
         print(f"[on_ready] db.init_schema error: {e}")
 
-    # 1a) Warm the DB connection pool for faster first queries (/team, /mpokeinfo, etc.)
+    # 1a) Warm the DB connection pool for faster first queries (/team, /mypokeinfo, etc.)
     #     Tune via env: DB_POOL_MIN, DB_POOL_MAX, DB_POOL_ACQUIRE_TIMEOUT, DB_STICKY_CONN=0 to avoid pinning.
     try:
         warmed = await db.warm_pool(3)
