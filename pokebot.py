@@ -7293,12 +7293,12 @@ TM_SELLER_PRICE = 500  # Coins per TM (Gen 1)
 # Seller has 25 TMs (rolled from 1–50 via script, fixed)
 TM_SELLER_ITEMS = [GEN1_TMS[i - 1] for i in (1, 3, 5, 6, 7, 9, 11, 12, 15, 17, 20, 21, 22, 23, 24, 31, 34, 35, 37, 40, 42, 44, 45, 49, 50)]
 
-# Route move loot table (updated): ball encounter weights + per-ball item pools.
+# Route move loot-ball encounter rates (absolute percentages per roll, not normalized by table sum).
 # Repeat Ball and Timer Ball use special handling in _roll_and_give_route_move_item_async.
-ROUTE_MOVE_BALL_ENCOUNTER_WEIGHTS: List[Tuple[str, str, float]] = [
-    ("poke_ball", "Poké Ball", 8.26),
-    ("great_ball", "Great Ball", 4.95),
-    ("ultra_ball", "Ultra Ball", 1.65),
+ROUTE_MOVE_BALL_ENCOUNTER_RATES: List[Tuple[str, str, float]] = [
+    ("poke_ball", "Poké Ball", 9.0),
+    ("great_ball", "Great Ball", 6.0),
+    ("ultra_ball", "Ultra Ball", 2.0),
     ("master_ball", "Master Ball", 0.08),
     ("dream_ball", "Dream Ball", 4.0),
     ("net_ball", "Net Ball", 4.0),
@@ -7314,12 +7314,7 @@ ROUTE_MOVE_BALL_ENCOUNTER_WEIGHTS: List[Tuple[str, str, float]] = [
     ("premier_ball", "Premier Ball", 4.0),
     ("repeat_ball", "Repeat Ball", 4.0),
     ("timer_ball", "Timer Ball", 4.0),
-    # Remaining probability from shared table is treated as "no ball found".
-    ("__none__", "No Ball", 28.98),
 ]
-# Global dampener for route loot-ball frequency.
-# Table weights are still used when a roll happens.
-ROUTE_MOVE_BALL_GLOBAL_ROLL_CHANCE = 0.20
 
 ROUTE_MOVE_ITEMS_BY_BALL: Dict[str, List[Tuple[str, str, float]]] = {
     "poke_ball": [
@@ -8281,6 +8276,22 @@ def _weighted_choice(items: Sequence[Tuple[str, str, float]]) -> Tuple[str, str]
     return norm[-1][0], norm[-1][1]
 
 
+def _roll_route_ball_by_absolute_rate() -> tuple[str, str]:
+    """Roll route ball encounter using absolute percentage rates."""
+    if not ROUTE_MOVE_BALL_ENCOUNTER_RATES:
+        return ("__none__", "No Ball")
+    r = random.uniform(0.0, 100.0)
+    cumul = 0.0
+    for ball_id, ball_name, pct in ROUTE_MOVE_BALL_ENCOUNTER_RATES:
+        p = max(0.0, float(pct or 0.0))
+        if p <= 0.0:
+            continue
+        cumul += p
+        if r <= cumul:
+            return str(ball_id), str(ball_name)
+    return ("__none__", "No Ball")
+
+
 def _route_pick_item_from_pool(pool_key: str) -> tuple[str, str]:
     pool = ROUTE_MOVE_ITEMS_BY_BALL.get(str(pool_key or "")) or ROUTE_MOVE_ITEMS_BY_BALL.get("poke_ball") or []
     item_id, item_name = _weighted_choice(pool)
@@ -8297,11 +8308,9 @@ async def _roll_and_give_route_move_item_async(user_id: str) -> Optional[str]:
     Roll route loot-ball encounter and grant rewards from the configured pool table.
     Returns the message to show or None if no drop.
     """
-    if not ROUTE_MOVE_BALL_ENCOUNTER_WEIGHTS or not ROUTE_MOVE_ITEMS_BY_BALL:
+    if not ROUTE_MOVE_BALL_ENCOUNTER_RATES or not ROUTE_MOVE_ITEMS_BY_BALL:
         return None
-    if random.random() > float(ROUTE_MOVE_BALL_GLOBAL_ROLL_CHANCE):
-        return None
-    ball_id, ball_name = _weighted_choice(ROUTE_MOVE_BALL_ENCOUNTER_WEIGHTS)
+    ball_id, ball_name = _roll_route_ball_by_absolute_rate()
     if not ball_id or ball_id == "__none__":
         return None
     uid = str(user_id)
