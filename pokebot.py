@@ -3,6 +3,7 @@ import os
 import sys
 import pathlib
 import json
+import hashlib
 from io import BytesIO
 
 # Optional Pillow for route panel cropping
@@ -39,6 +40,10 @@ from discord import app_commands, ui, Interaction, Embed
 from db_async import connect as db_connect
 from pvp.engine import build_mon
 from pvp.panel import _base_pp, _max_pp
+try:
+    from pvp import sprites as _pvp_sprites
+except Exception:
+    _pvp_sprites = None  # type: ignore[assignment]
 if TYPE_CHECKING:
     from pvp.engine import Mon
     from pvp.panel import BattleState
@@ -10795,6 +10800,974 @@ async def walk_cmd(inter: discord.Interaction, name: str, slot: int | None = Non
         f"👟 You walked with **{mon['species'].title()}**{auto}. Friendship set to **0**.",
         ephemeral=True
     )
+
+
+def _team_species_label(row: dict) -> str:
+    species = str(row.get("species") or "Unknown").replace("-", " ").replace("_", " ").title()
+    form = str(row.get("form") or "").strip()
+    form_norm = form.lower().replace("_", "-").strip()
+    species_norm = str(row.get("species") or "").strip().lower().replace("_", "-")
+    # Keep default Mimikyu label concise even when form is disguised.
+    if species_norm == "mimikyu" and (
+        form_norm in {"disguised", "mimikyu-disguised", "disguised-form", "mimikyu-disguised-form"}
+        or "disguised" in form_norm
+    ):
+        return "Mimikyu"
+    if form:
+        form_title = form.replace("-", " ").replace("_", " ").title()
+        if form_title.lower() not in species.lower():
+            species = f"{species} ({form_title})"
+    return species
+
+
+def _team_parse_moves(raw: Any) -> list[str]:
+    moves = raw
+    if isinstance(moves, str):
+        try:
+            moves = json.loads(moves)
+        except Exception:
+            moves = [moves]
+    if not isinstance(moves, (list, tuple)):
+        return []
+    out: list[str] = []
+    for m in moves[:4]:
+        if isinstance(m, str):
+            name = m.strip()
+        elif isinstance(m, dict):
+            name = str(m.get("name") or "").strip()
+        else:
+            name = str(m).strip()
+        if name:
+            out.append(name.replace("-", " ").title())
+    return out
+
+
+def _team_hp_values(row: dict) -> tuple[int, int, int]:
+    try:
+        hp_max = int(row.get("hp") or 1)
+    except Exception:
+        hp_max = 1
+    hp_max = max(1, hp_max)
+    try:
+        hp_now = int(row.get("hp_now") if row.get("hp_now") is not None else hp_max)
+    except Exception:
+        hp_now = hp_max
+    hp_now = max(0, min(hp_now, hp_max))
+    pct = int(round((hp_now / max(1, hp_max)) * 100))
+    return hp_now, hp_max, pct
+
+
+def _team_hp_bar(pct: int, width: int = 10) -> str:
+    pct = max(0, min(100, int(pct)))
+    filled = int(round((pct / 100.0) * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+TEAM_TEMPLATE_PATHS: tuple[Path, ...] = (
+    ASSETS_DIR / "ui" / "team-beta.png",
+    ASSETS_DIR / "ui" / "team-template.png",
+    ASSETS_DIR / "ui" / "team_panel_template.png",
+    ASSETS_DIR / "team-template.png",
+)
+TEAM_TEMPLATE_BASE_SIZE: tuple[int, int] = (808, 537)
+TEAM_TEMPLATE_STEM_BASE_SIZES: dict[str, tuple[int, int]] = {
+    "team-beta": (800, 488),
+    "team-template": (808, 537),
+    "team_panel_template": (808, 537),
+}
+TEAM_TRAINER_HEADER_RECT = (42, 34, 212, 84)
+TEAM_TRAINER_FOOTER_RECT = (42, 430, 212, 491)
+TEAM_TRAINER_LABEL_Y = 38
+TEAM_TRAINER_NAME_Y = 62
+TEAM_REGION_BY_GEN: dict[int, str] = {
+    1: "Kanto",
+    2: "Johto",
+    3: "Hoenn",
+    4: "Sinnoh",
+    5: "Unova",
+    6: "Kalos",
+    7: "Alola",
+    8: "Galar",
+    9: "Paldea",
+}
+TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
+    {"box_xy": (236, 93), "box_wh": (177, 197), "sprite_c": (324, 173), "label_xy": (246, 256), "level_right": (402, 256)},
+    {"box_xy": (415, 93), "box_wh": (177, 197), "sprite_c": (503, 173), "label_xy": (425, 256), "level_right": (581, 256)},
+    {"box_xy": (593, 93), "box_wh": (177, 197), "sprite_c": (681, 173), "label_xy": (603, 256), "level_right": (759, 256)},
+    {"box_xy": (236, 294), "box_wh": (177, 197), "sprite_c": (324, 374), "label_xy": (246, 457), "level_right": (402, 457)},
+    {"box_xy": (415, 294), "box_wh": (177, 197), "sprite_c": (503, 374), "label_xy": (425, 457), "level_right": (581, 457)},
+    {"box_xy": (593, 294), "box_wh": (177, 197), "sprite_c": (681, 374), "label_xy": (603, 457), "level_right": (759, 457)},
+)
+TEAM_EGG_STAGE_PATHS: tuple[Path, ...] = (
+    ASSETS_DIR / "ui" / "egg-stages" / "egg-stage-1-intact.png",
+    ASSETS_DIR / "ui" / "egg-stages" / "egg-stage-2-slightly-cracked.png",
+    ASSETS_DIR / "ui" / "egg-stages" / "egg-stage-3-cracked.png",
+    ASSETS_DIR / "ui" / "egg-stages" / "egg-stage-4-more-cracked.png",
+    ASSETS_DIR / "ui" / "egg-stages" / "egg-stage-5-heavily-cracked.png",
+    ASSETS_DIR / "ui" / "egg-stages" / "egg-stage-6-extremely-cracked.png",
+)
+TEAM_EGG_STAGE_LABELS: tuple[str, ...] = (
+    "Intact",
+    "Slightly cracked",
+    "Cracked",
+    "More cracked",
+    "Heavily cracked",
+    "Extremely cracked",
+)
+
+
+def _battle_sync_frame_duration_ms() -> int:
+    """Match team animation cadence to battle renderer default."""
+    try:
+        fn = globals().get("render_turn_gif")
+        if callable(fn):
+            sig = inspect.signature(fn)
+            p = sig.parameters.get("duration_ms")
+            if p is not None and p.default is not inspect._empty:
+                return max(40, min(220, int(p.default)))
+    except Exception:
+        pass
+    return 100
+
+
+TEAM_BATTLE_SYNC_DURATION_MS = _battle_sync_frame_duration_ms()
+TEAM_MAX_SPRITE_FRAMES = 64
+TEAM_MAX_COMPOSITE_FRAMES = 64
+TEAM_OVERVIEW_CACHE_TTL_SECONDS = 12.0
+TEAM_WARM_CACHE_INTERVAL_SECONDS = 120.0
+_TEAM_OVERVIEW_RENDER_CACHE: dict[str, tuple[float, bytes, str]] = {}
+_TEAM_WARM_CACHE_TS: dict[str, float] = {}
+
+
+def _team_region_for_gen(gen: Optional[int]) -> str:
+    try:
+        g = int(gen or 0)
+    except Exception:
+        return "Unknown"
+    return TEAM_REGION_BY_GEN.get(g, "Unknown")
+
+
+def _team_is_egg_row(row: dict) -> bool:
+    return _species_folder_name(str(row.get("species") or "")) == "egg"
+
+
+def _team_egg_stage(row: dict) -> int:
+    if not _team_is_egg_row(row):
+        return 0
+    max_stage = max(0, len(TEAM_EGG_STAGE_PATHS) - 1)
+    try:
+        stage = int(row.get("_egg_stage"))
+        return max(0, min(max_stage, stage))
+    except Exception:
+        pass
+    try:
+        progress = float(row.get("_egg_progress") or 0.0)
+        hatch_steps = max(1.0, float(row.get("_egg_hatch_steps") or 0.0))
+        ratio = max(0.0, min(1.0, progress / hatch_steps))
+    except Exception:
+        ratio = 0.0
+    if ratio < 0.20:
+        return 0
+    if ratio < 0.40:
+        return 1
+    if ratio < 0.60:
+        return 2
+    if ratio < 0.80:
+        return 3
+    if ratio < 0.99:
+        return 4
+    return 5
+
+
+def _team_egg_progress_pct(row: dict) -> int:
+    if not _team_is_egg_row(row):
+        return 0
+    try:
+        progress = float(row.get("_egg_progress") or 0.0)
+        hatch_steps = max(1.0, float(row.get("_egg_hatch_steps") or 0.0))
+        return max(0, min(100, int(round((progress / hatch_steps) * 100.0))))
+    except Exception:
+        return 0
+
+
+def _team_species_visual_scale(row: dict) -> float:
+    """
+    Compute mild per-species scaling from cached Pokédex height.
+    """
+    if _team_is_egg_row(row):
+        return 0.94
+    if db_cache is None:
+        return 1.0
+    species_raw = _species_folder_name(str(row.get("species") or ""))
+    if not species_raw:
+        return 1.0
+    candidates = [species_raw, species_raw.replace("-", " ")]
+    if "-" in species_raw:
+        candidates.append(species_raw.split("-")[0])
+    height_m: Optional[float] = None
+    for key in candidates:
+        if not key:
+            continue
+        try:
+            entry = db_cache.get_cached_pokedex(key)
+        except Exception:
+            entry = None
+        if not entry:
+            continue
+        for hk in ("height_m", "heightMeters", "height_meters", "height", "height_dm"):
+            raw_h = entry.get(hk)
+            if raw_h in (None, "", 0, "0"):
+                continue
+            try:
+                h = float(raw_h)
+            except Exception:
+                continue
+            if hk in ("height", "height_dm") and h > 20.0:
+                h = h / 10.0
+            if hk in ("height", "height_dm") and h > 8.0:
+                h = h / 10.0
+            if h > 0:
+                height_m = h
+                break
+        if height_m is not None:
+            break
+    if height_m is None:
+        return 1.0
+    h = max(0.2, min(6.0, float(height_m)))
+    denom = (math.log1p(6.0) - math.log1p(0.2)) or 1.0
+    norm = (math.log1p(h) - math.log1p(0.2)) / denom
+    return max(0.82, min(1.32, 0.84 + (0.48 * norm)))
+
+
+def _team_template_path() -> Optional[Path]:
+    for p in TEAM_TEMPLATE_PATHS:
+        try:
+            if p.exists() and p.is_file() and p.stat().st_size > 0:
+                return p
+        except Exception:
+            continue
+    for base in (ASSETS_DIR / "ui", ASSETS_DIR):
+        try:
+            if not base.exists() or not base.is_dir():
+                continue
+        except Exception:
+            continue
+        try:
+            for p in sorted(base.glob("*.png")):
+                stem = p.stem.lower()
+                if "team" in stem and "tm" not in stem and p.stat().st_size > 0:
+                    return p
+        except Exception:
+            continue
+    return None
+
+
+def _team_pick_sprite_path(row: dict) -> Optional[Path]:
+    if _team_is_egg_row(row):
+        stage = max(0, min(len(TEAM_EGG_STAGE_PATHS) - 1, int(_team_egg_stage(row))))
+        for p in (TEAM_EGG_STAGE_PATHS[stage], ASSETS_DIR / "item_icons" / "mystery_egg.png"):
+            try:
+                if p.exists() and p.is_file() and p.stat().st_size > 0:
+                    return p
+            except Exception:
+                continue
+        return None
+
+    species = _species_folder_name(str(row.get("species") or ""))
+    form = _species_folder_name(str(row.get("form") or ""))
+    shiny = bool(int(row.get("shiny") or 0))
+    is_female = str(row.get("gender") or "").strip().lower() == "female"
+
+    if _pvp_sprites is not None:
+        try:
+            resolved = _pvp_sprites.find_sprite(
+                species,
+                gen=5,
+                perspective="front",
+                shiny=shiny,
+                female=is_female,
+                prefer_animated=True,
+                form=(form or None),
+            )
+            if resolved is not None:
+                rp = Path(resolved)
+                if rp.exists() and rp.is_file() and rp.stat().st_size > 0 and rp.name.lower() != "icon.png":
+                    return rp
+        except Exception:
+            pass
+
+    folders: list[Path] = []
+    if species and form and form not in {"base", "default", "normal"}:
+        if form.startswith(f"{species}-"):
+            folders.append(SPRITES_DIR / form)
+        else:
+            folders.append(SPRITES_DIR / f"{species}-{form}")
+    if species:
+        folders.append(SPRITES_DIR / species)
+
+    animated_candidates: list[str] = []
+    if is_female:
+        if shiny:
+            animated_candidates += ["female-animated-shiny-front.gif"]
+        animated_candidates += ["female-animated-front.gif"]
+    if shiny:
+        animated_candidates += ["animated-shiny-front.gif"]
+    animated_candidates += ["animated-front.gif"]
+
+    for folder in folders:
+        try:
+            if not folder.is_dir():
+                continue
+        except Exception:
+            continue
+        for name in animated_candidates:
+            p = folder / name
+            try:
+                if p.exists() and p.is_file() and p.stat().st_size > 0:
+                    return p
+            except Exception:
+                continue
+
+    static_candidates: list[str] = []
+    if is_female:
+        if shiny:
+            static_candidates += ["female-shiny-front.png"]
+        static_candidates += ["female-front.png"]
+    if shiny:
+        static_candidates += ["shiny-front.png"]
+    static_candidates += ["front.png", "icon.png"]
+
+    for folder in folders:
+        try:
+            if not folder.is_dir():
+                continue
+        except Exception:
+            continue
+        for name in static_candidates:
+            p = folder / name
+            try:
+                if p.exists() and p.is_file() and p.stat().st_size > 0:
+                    return p
+            except Exception:
+                continue
+    return None
+
+
+def _team_font(size: int, *, bold: bool = False):
+    if Image is None:
+        return None
+    try:
+        from PIL import ImageFont  # type: ignore
+    except Exception:
+        return None
+    try:
+        from pvp.renderer import _get_pokemon_font_path as _renderer_pokemon_font_path  # type: ignore
+        path = _renderer_pokemon_font_path()
+        if path:
+            return ImageFont.truetype(str(path), int(size))
+    except Exception:
+        pass
+    candidates = [
+        "pvp/_common/fonts/Pokemon GB.ttf",
+        "pvp/_common/fonts/PokemonGb-RAeo.ttf",
+        "pvp/_common/fonts/pokemon-gb.ttf",
+        "pvp/_common/fonts/pokemongb.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for fp in candidates:
+        try:
+            return ImageFont.truetype(fp, int(size))
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+
+def _team_text_width(draw, text: str, font) -> int:
+    try:
+        box = draw.textbbox((0, 0), text, font=font)
+        return max(0, int(box[2] - box[0]))
+    except Exception:
+        try:
+            return int(draw.textlength(text, font=font))
+        except Exception:
+            return len(text) * 8
+
+
+def _team_fit_font(draw, text: str, *, max_width: int, start_size: int, min_size: int = 10, bold: bool = False):
+    for size in range(int(start_size), int(min_size) - 1, -1):
+        f = _team_font(size, bold=bold)
+        if f is None:
+            continue
+        if _team_text_width(draw, text, f) <= int(max_width):
+            return f
+    return _team_font(min_size, bold=bold)
+
+
+def _team_load_sprite_frames(
+    path: Optional[Path],
+    *,
+    max_size: tuple[int, int],
+    resample,
+) -> tuple[list[Any], int]:
+    if path is None or Image is None:
+        return [], TEAM_BATTLE_SYNC_DURATION_MS
+    try:
+        from PIL import ImageSequence  # type: ignore
+    except Exception:
+        ImageSequence = None  # type: ignore
+
+    frames: list[Any] = []
+    duration = TEAM_BATTLE_SYNC_DURATION_MS
+
+    try:
+        with Image.open(str(path)) as img:
+            if ImageSequence is not None and bool(getattr(img, "is_animated", False)):
+                try:
+                    for i, fr in enumerate(ImageSequence.Iterator(img)):
+                        if i >= TEAM_MAX_SPRITE_FRAMES:
+                            break
+                        if i == 0:
+                            try:
+                                duration = max(40, min(220, int(fr.info.get("duration", duration))))
+                            except Exception:
+                                duration = TEAM_BATTLE_SYNC_DURATION_MS
+                        frames.append(fr.convert("RGBA"))
+                except Exception:
+                    frames = []
+            if not frames:
+                frames = [img.convert("RGBA")]
+    except Exception:
+        return [], TEAM_BATTLE_SYNC_DURATION_MS
+
+    # Union-alpha crop keeps sprites visually centered and avoids tiny rendering from large transparent margins.
+    union_bbox = None
+    for fr in frames:
+        try:
+            bb = fr.getbbox()
+        except Exception:
+            bb = None
+        if not bb:
+            continue
+        if union_bbox is None:
+            union_bbox = bb
+        else:
+            union_bbox = (
+                min(union_bbox[0], bb[0]),
+                min(union_bbox[1], bb[1]),
+                max(union_bbox[2], bb[2]),
+                max(union_bbox[3], bb[3]),
+            )
+
+    out_frames: list[Any] = []
+    for fr in frames:
+        sprite = fr
+        if union_bbox is not None:
+            try:
+                sprite = sprite.crop(union_bbox)
+            except Exception:
+                pass
+        try:
+            sprite.thumbnail(max_size, resample=resample)
+        except Exception:
+            pass
+        out_frames.append(sprite)
+    return out_frames, duration
+
+
+def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None], *, current_gen: Optional[int] = None) -> str:
+    snapshot: list[Any] = []
+    for slot in range(1, 7):
+        row = slots.get(slot)
+        if not row:
+            snapshot.append(None)
+            continue
+        item = {
+            "species": _species_folder_name(str(row.get("species") or "")),
+            "form": _species_folder_name(str(row.get("form") or "")),
+            "shiny": int(bool(row.get("shiny"))),
+            "gender": str(row.get("gender") or "").strip().lower(),
+            "level": int(row.get("level") or 0),
+            "hp_now": int(row.get("hp_now") or 0),
+            "hp_max": int(row.get("hp") or 0),
+        }
+        if _team_is_egg_row(row):
+            item["egg_progress"] = round(float(row.get("_egg_progress") or 0.0), 3)
+            item["egg_hatch_steps"] = round(float(row.get("_egg_hatch_steps") or 0.0), 3)
+            item["egg_stage"] = int(_team_egg_stage(row))
+        snapshot.append(item)
+
+    raw = json.dumps(
+        {
+            "target": str(target_name or ""),
+            "current_gen": int(current_gen or 0),
+            "slots": snapshot,
+            "sync_ms": int(TEAM_BATTLE_SYNC_DURATION_MS),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _team_overview_panel_file(
+    target_name: str,
+    slots: dict[int, dict | None],
+    *,
+    current_gen: Optional[int] = None,
+) -> Optional[discord.File]:
+    if Image is None:
+        return None
+    try:
+        from PIL import ImageDraw  # type: ignore
+    except Exception:
+        return None
+
+    cache_key = _team_overview_cache_key(target_name, slots, current_gen=current_gen)
+    now = float(time.time())
+    cached = _TEAM_OVERVIEW_RENDER_CACHE.get(cache_key)
+    if cached is not None:
+        ts, data, ext = cached
+        if (now - float(ts)) <= TEAM_OVERVIEW_CACHE_TTL_SECONDS and data:
+            return discord.File(fp=BytesIO(data), filename=f"team_panel_{cache_key}.{ext}")
+        _TEAM_OVERVIEW_RENDER_CACHE.pop(cache_key, None)
+
+    try:
+        try:
+            resample = Image.Resampling.NEAREST
+        except Exception:
+            resample = Image.NEAREST
+
+        template = _team_template_path()
+        if template is not None:
+            with Image.open(str(template)) as tpl:
+                base = tpl.convert("RGBA")
+            base_w0, base_h0 = TEAM_TEMPLATE_STEM_BASE_SIZES.get(template.stem.lower(), base.size)
+        else:
+            base = Image.new("RGBA", (800, 488), (92, 56, 106, 255))
+            base_w0, base_h0 = TEAM_TEMPLATE_BASE_SIZE
+
+        bw, bh = base.size
+        sx = bw / float(max(1, base_w0))
+        sy = bh / float(max(1, base_h0))
+        s = min(sx, sy)
+
+        def _pt(x: int, y: int) -> tuple[int, int]:
+            return (int(round(x * sx)), int(round(y * sy)))
+
+        def _layout_scaled(src: dict[str, tuple[int, int]]) -> dict[str, tuple[int, int]]:
+            x, y = src["box_xy"]
+            w, h = src["box_wh"]
+            cx, cy = src["sprite_c"]
+            lx, ly = src["label_xy"]
+            rx, ry = src["level_right"]
+            return {
+                "box_xy": _pt(x, y),
+                "box_wh": (max(1, int(round(w * sx))), max(1, int(round(h * sy)))),
+                "sprite_c": _pt(cx, cy),
+                "label_xy": _pt(lx, ly),
+                "level_right": _pt(rx, ry),
+            }
+
+        def _draw_pixel_shadow_text(
+            d,
+            xy: tuple[int, int],
+            text: str,
+            *,
+            font,
+            fill: tuple[int, int, int, int] = (242, 244, 252, 255),
+            shadow: tuple[int, int, int, int] = (0, 0, 0, 220),
+            shadow_offset: tuple[int, int] = (1, 1),
+        ) -> None:
+            t = str(text or "")
+            if not t or font is None:
+                return
+            x, y = int(xy[0]), int(xy[1])
+            sx_off, sy_off = int(shadow_offset[0]), int(shadow_offset[1])
+            try:
+                d.text((x + sx_off, y + sy_off), t, font=font, fill=shadow)
+                d.text((x, y), t, font=font, fill=fill)
+            except Exception:
+                pass
+
+        slot_layout = tuple(_layout_scaled(g) for g in TEAM_SLOT_LAYOUT)
+        draw = ImageDraw.Draw(base)
+
+        trainer_title = "Trainer"
+        header_left_x = int(round((TEAM_TRAINER_HEADER_RECT[0] + 8) * sx))
+        header_top_y = int(round(TEAM_TRAINER_LABEL_Y * sy))
+        header_name_y = int(round(TEAM_TRAINER_NAME_Y * sy))
+        header_max_w = max(48, int(round((TEAM_TRAINER_HEADER_RECT[2] - TEAM_TRAINER_HEADER_RECT[0] - 16) * sx)))
+        trainer_font = _team_fit_font(
+            draw,
+            trainer_title,
+            max_width=header_max_w,
+            start_size=max(11, int(round(23 * s))),
+            min_size=max(8, int(round(11 * s))),
+            bold=True,
+        )
+        name_font = _team_fit_font(
+            draw,
+            target_name,
+            max_width=header_max_w,
+            start_size=max(11, int(round(22 * s))),
+            min_size=max(8, int(round(11 * s))),
+            bold=True,
+        )
+        _draw_pixel_shadow_text(
+            draw,
+            (header_left_x, header_top_y),
+            trainer_title,
+            font=trainer_font,
+            fill=(242, 244, 252, 255),
+            shadow=(0, 0, 0, 220),
+        )
+        _draw_pixel_shadow_text(
+            draw,
+            (header_left_x, header_name_y),
+            target_name,
+            font=name_font,
+            fill=(240, 242, 250, 255),
+            shadow=(0, 0, 0, 215),
+        )
+
+        # Center region text in the footer display area.
+        gen_num = max(1, int(current_gen or 1))
+        region_name = _team_region_for_gen(gen_num)
+        footer_left = int(round(TEAM_TRAINER_FOOTER_RECT[0] * sx))
+        footer_right = int(round(TEAM_TRAINER_FOOTER_RECT[2] * sx))
+        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 44) * sy))
+        footer_max_w = max(28, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 8) * sx)))
+        footer_font = _team_fit_font(
+            draw,
+            region_name,
+            max_width=footer_max_w,
+            start_size=max(8, int(round(14 * s))),
+            min_size=max(7, int(round(10 * s))),
+            bold=False,
+        )
+        if footer_font is not None:
+            region_w = _team_text_width(draw, region_name, footer_font)
+            footer_x = footer_left + max(0, ((footer_right - footer_left - region_w) // 2))
+            _draw_pixel_shadow_text(
+                draw,
+                (footer_x, footer_y),
+                region_name,
+                font=footer_font,
+                fill=(240, 242, 250, 255),
+                shadow=(0, 0, 0, 215),
+            )
+
+        sprite_data: dict[int, dict[str, Any]] = {}
+        cycle_lengths: list[int] = []
+        base_duration = TEAM_BATTLE_SYNC_DURATION_MS
+        for slot in range(1, 7):
+            row = slots.get(slot)
+            if not row:
+                sprite_data[slot] = {"frames": []}
+                continue
+            path = _team_pick_sprite_path(row)
+            scale_mult = _team_species_visual_scale(row)
+            edge = max(32, int(round(108 * min(sx, sy) * scale_mult)))
+            frames, _ = _team_load_sprite_frames(path, max_size=(edge, edge), resample=resample)
+            sprite_data[slot] = {"frames": frames}
+            if len(frames) > 1:
+                cycle_lengths.append(len(frames))
+
+        lvl_font_slot = _team_font(max(9, int(round(17 * s))), bold=True)
+        text_prep: dict[int, dict[str, Any]] = {}
+        probe_draw = ImageDraw.Draw(base)
+        for slot in range(1, 7):
+            row = slots.get(slot)
+            geom = slot_layout[slot - 1]
+            slot_w, _slot_h = geom["box_wh"]
+            if not row:
+                text_prep[slot] = {"label": "", "font": None, "lvl": "", "lvl_x": geom["level_right"][0], "label_x": geom["label_xy"][0]}
+                continue
+            if _team_is_egg_row(row):
+                label = "Egg"
+                lvl = f"{_team_egg_progress_pct(row)}%"
+            else:
+                label = _team_species_label(row)
+                lvl = f"lvl {int(row.get('level') or 1)}"
+            label_to_draw = label
+            label_font = _team_fit_font(
+                probe_draw,
+                label_to_draw,
+                max_width=max(36, int(round((slot_w - max(42, int(round(52 * s))))))),
+                start_size=max(9, int(round(19 * s))),
+                min_size=max(7, int(round(9 * s))),
+                bold=True,
+            )
+            lvl_x = geom["level_right"][0]
+            if lvl_font_slot:
+                lvl_w = _team_text_width(probe_draw, lvl, lvl_font_slot)
+                lvl_x = int(geom["level_right"][0] - lvl_w)
+            if label_font:
+                label_w = _team_text_width(probe_draw, label_to_draw, label_font)
+                min_gap = max(10, int(round(14 * s)))
+                label_start_x = int(geom["label_xy"][0])
+                label_end_limit = int(lvl_x - min_gap)
+                if label_start_x + label_w > label_end_limit:
+                    tighter_max = max(22, label_end_limit - label_start_x)
+                    label_font = _team_fit_font(
+                        probe_draw,
+                        label_to_draw,
+                        max_width=tighter_max,
+                        start_size=max(8, int(round(16 * s))),
+                        min_size=max(7, int(round(9 * s))),
+                        bold=True,
+                    )
+                    if label_font:
+                        label_w = _team_text_width(probe_draw, label_to_draw, label_font)
+                    while label_font and label_to_draw and (label_start_x + label_w > label_end_limit):
+                        label_to_draw = label_to_draw[:-1]
+                        label_w = _team_text_width(probe_draw, label_to_draw, label_font) if label_to_draw else 0
+            text_prep[slot] = {
+                "label": label_to_draw,
+                "font": label_font,
+                "lvl": lvl,
+                "lvl_x": lvl_x,
+                "label_x": geom["label_xy"][0],
+            }
+
+        text_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        text_draw = ImageDraw.Draw(text_layer)
+        for slot in range(1, 7):
+            geom = slot_layout[slot - 1]
+            row = slots.get(slot)
+            slot_text = text_prep.get(slot) or {}
+            if not row:
+                continue
+            if slot_text.get("font") and str(slot_text.get("label") or "").strip():
+                _draw_pixel_shadow_text(
+                    text_draw,
+                    (int(slot_text.get("label_x") or geom["label_xy"][0]), geom["label_xy"][1]),
+                    str(slot_text.get("label") or ""),
+                    font=slot_text["font"],
+                    fill=(240, 242, 250, 255),
+                    shadow=(0, 0, 0, 220),
+                )
+            lvl = str(slot_text.get("lvl") or "")
+            if lvl and lvl_font_slot:
+                _draw_pixel_shadow_text(
+                    text_draw,
+                    (int(slot_text.get("lvl_x") or geom["level_right"][0]), geom["level_right"][1]),
+                    lvl,
+                    font=lvl_font_slot,
+                    fill=(236, 240, 250, 255),
+                    shadow=(0, 0, 0, 210),
+                )
+
+        out_frames: list[Any] = []
+        frame_count = 1
+        max_cycle_len = 1
+        if cycle_lengths:
+            max_cycle_len = max(max(1, int(n)) for n in cycle_lengths)
+            frame_count = min(TEAM_MAX_COMPOSITE_FRAMES, max_cycle_len)
+        frame_count = max(1, int(frame_count))
+        duration_scale = float(max_cycle_len) / float(frame_count) if frame_count > 0 else 1.0
+        save_duration = max(40, min(500, int(round(base_duration * duration_scale))))
+
+        for fi in range(frame_count):
+            frame = base.copy()
+            for slot in range(1, 7):
+                geom = slot_layout[slot - 1]
+                row = slots.get(slot)
+                if not row:
+                    continue
+                frames = (sprite_data.get(slot) or {}).get("frames") or []
+                if not frames:
+                    continue
+                if frame_count > 1 and len(frames) > 1:
+                    src_i = int((fi * len(frames)) / frame_count) % len(frames)
+                else:
+                    src_i = 0
+                sprite = frames[src_i]
+                dx = int(geom["sprite_c"][0] - (sprite.width // 2))
+                dy = int(geom["sprite_c"][1] - (sprite.height // 2))
+                try:
+                    frame.alpha_composite(sprite, dest=(dx, dy))
+                except Exception:
+                    pass
+            frame.alpha_composite(text_layer)
+            out_frames.append(frame)
+
+        buf = BytesIO()
+        if frame_count > 1:
+            out_frames[0].save(
+                buf,
+                format="GIF",
+                save_all=True,
+                append_images=out_frames[1:],
+                duration=int(save_duration),
+                loop=0,
+                disposal=2,
+            )
+            ext = "gif"
+        else:
+            out_frames[0].save(buf, format="PNG")
+            ext = "png"
+
+        data = buf.getvalue()
+        _TEAM_OVERVIEW_RENDER_CACHE[cache_key] = (now, data, ext)
+        if len(_TEAM_OVERVIEW_RENDER_CACHE) > 96:
+            old_keys = sorted(_TEAM_OVERVIEW_RENDER_CACHE.items(), key=lambda kv: kv[1][0])[:48]
+            for k, _v in old_keys:
+                _TEAM_OVERVIEW_RENDER_CACHE.pop(k, None)
+        return discord.File(fp=BytesIO(data), filename=f"team_panel_{cache_key}.{ext}")
+    except Exception:
+        return None
+
+
+class TeamPanelView(discord.ui.View):
+    def __init__(
+        self,
+        author_id: int,
+        target_name: str,
+        slots: dict[int, dict | None],
+        *,
+        current_gen: Optional[int] = None,
+    ):
+        super().__init__(timeout=240)
+        self.author_id = int(author_id)
+        self.target_name = target_name
+        self.slots = dict(slots)
+        self.current_gen = max(1, int(current_gen or 1))
+        self._build_buttons()
+
+    def _build_buttons(self):
+        overview_btn = discord.ui.Button(label="Overview", style=discord.ButtonStyle.primary, custom_id="team:view:overview", row=0)
+        overview_btn.callback = self._on_overview
+        self.add_item(overview_btn)
+        for i in range(1, 7):
+            has_mon = bool(self.slots.get(i))
+            b = discord.ui.Button(
+                label=f"Slot {i}",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"team:view:slot:{i}",
+                row=1 if i <= 3 else 2,
+                disabled=not has_mon,
+            )
+            b.callback = self._on_slot
+            self.add_item(b)
+
+    def _guard(self, itx: discord.Interaction) -> bool:
+        return itx.user.id == self.author_id
+
+    def _overview_payload(self) -> tuple[discord.Embed, list[discord.File]]:
+        emb = discord.Embed(color=0x5865F2)
+        files: list[discord.File] = []
+        panel = _team_overview_panel_file(self.target_name, self.slots, current_gen=self.current_gen)
+        if panel:
+            emb.set_image(url=f"attachment://{panel.filename}")
+            files.append(panel)
+        return emb, files
+
+    def _slot_payload(self, slot: int) -> tuple[discord.Embed, list[discord.File]]:
+        row = self.slots.get(int(slot))
+        if not row:
+            emb = discord.Embed(title=f"{self.target_name} — Slot {slot}", description="This slot is empty.", color=0x2F3136)
+            return emb, []
+        if _team_is_egg_row(row):
+            stage = _team_egg_stage(row)
+            pct = _team_egg_progress_pct(row)
+            emb = discord.Embed(
+                title=f"{self.target_name} — Slot {slot}",
+                description=f"**Egg**\n`{_team_hp_bar(pct, width=14)}` **{pct}%** to hatch",
+                color=0xBDA7FF,
+            )
+            emb.add_field(name="Hatch Stage", value=TEAM_EGG_STAGE_LABELS[stage], inline=True)
+            emb.add_field(name="Progress", value=f"{pct}%", inline=True)
+            emb.add_field(name="Level", value=str(int(row.get("level") or 0)), inline=True)
+            emb.add_field(name="Status", value="In team incubator", inline=True)
+            emb.set_footer(text="Eggs crack more as they near hatching.")
+            files: list[discord.File] = []
+            sprite_path = _team_pick_sprite_path(row)
+            if sprite_path is not None:
+                try:
+                    f = discord.File(sprite_path, filename=sprite_path.name)
+                    emb.set_thumbnail(url=f"attachment://{sprite_path.name}")
+                    files.append(f)
+                except Exception:
+                    pass
+            return emb, files
+
+        name = _team_species_label(row)
+        shiny = bool(int(row.get("shiny") or 0))
+        gicon = _gender_icon(row.get("gender")) or "—"
+        hp_now, hp_max, pct = _team_hp_values(row)
+        emb = discord.Embed(
+            title=f"{self.target_name} — Slot {slot}",
+            description=f"**{name}**{' ✨' if shiny else ''}\n`{_team_hp_bar(pct, width=14)}` **{hp_now}/{hp_max}** ({pct}%)",
+            color=0xF1C40F if shiny else 0x5865F2,
+        )
+        emb.add_field(name="Level", value=str(int(row.get("level") or 1)), inline=True)
+        emb.add_field(name="Gender", value=gicon, inline=True)
+        emb.add_field(name="Nature", value=str(row.get("nature") or "Unknown").replace("-", " ").title(), inline=True)
+        ability = str(row.get("ability") or "Unknown").replace("-", " ").title()
+        emb.add_field(name="Ability", value=ability, inline=True)
+        emb.add_field(name="Friendship", value=str(int(row.get("friendship") or 0)), inline=True)
+        held_item = str(row.get("held_item") or "").strip()
+        item_emoji = (row.get("item_emoji") or "").strip()
+        if held_item:
+            held_disp = pretty_item_name(held_item)
+            if _is_displayable_item_emoji(item_emoji):
+                held_disp = f"{item_emoji} {held_disp}"
+        else:
+            held_disp = "None"
+        emb.add_field(name="Held Item", value=held_disp, inline=True)
+        moves = _team_parse_moves(row.get("moves"))
+        emb.add_field(
+            name="Moves",
+            value="\n".join(f"**{i+1}.** {m}" for i, m in enumerate(moves)) if moves else "—",
+            inline=False,
+        )
+        emb.set_footer(text=f"Pokémon ID #{int(row.get('id') or 0)}")
+        files = attach_sprite_to_embed(
+            emb,
+            species=str(row.get("species") or ""),
+            shiny=shiny,
+            gender=row.get("gender"),
+            form_key=row.get("form"),
+        )
+        return emb, files
+
+    async def _edit_payload(self, itx: discord.Interaction, emb: discord.Embed, files: list[discord.File]):
+        try:
+            await itx.response.edit_message(embed=emb, attachments=files, view=self)
+        except TypeError:
+            await itx.response.edit_message(embed=emb, files=files, view=self)
+        except Exception:
+            try:
+                await itx.edit_original_response(embed=emb, attachments=files, view=self)
+            except TypeError:
+                await itx.edit_original_response(embed=emb, files=files, view=self)
+
+    async def _on_overview(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        emb, files = self._overview_payload()
+        await self._edit_payload(itx, emb, files)
+
+    async def _on_slot(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = str((itx.data or {}).get("custom_id") or "")
+        try:
+            slot = int(cid.rsplit(":", 1)[-1])
+        except Exception:
+            return await itx.response.send_message("Invalid slot.", ephemeral=True)
+        emb, files = self._slot_payload(slot)
+        await self._edit_payload(itx, emb, files)
+
+
 @bot.tree.command(name="team", description="Show your current team (6 slots).")
 @app_commands.describe(user="View another user's team (optional)")
 async def team(interaction: discord.Interaction, user: discord.User | None = None):
@@ -10831,23 +11804,56 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
                             "id": p.get("id"), "species": p.get("species"), "level": p.get("level"),
                             "gender": p.get("gender"), "shiny": p.get("shiny"), "team_slot": p.get("team_slot"),
                             "held_item": p.get("held_item"), "item_emoji": item_emoji,
+                            "hp": p.get("hp"), "hp_now": p.get("hp_now"), "moves": p.get("moves"),
+                            "nature": p.get("nature"), "ability": p.get("ability"), "friendship": p.get("friendship"),
+                            "form": p.get("form"),
                         })
         except Exception:
             pass
     if rows is None:
         async with db.session() as conn:
-            cur = await conn.execute("""
-            SELECT p.id, p.species, p.level, p.gender, p.shiny, p.team_slot, p.held_item, i.emoji AS item_emoji
-            FROM pokemons p
-            LEFT JOIN items i ON i.id = p.held_item
-            WHERE p.owner_id = ? AND p.team_slot BETWEEN 1 AND 6
-            ORDER BY p.team_slot
-            """, (uid,))
-            rows = [dict(r) for r in await cur.fetchall()]
-            await cur.close()
-        # Populate cache for future /team, mpokeinfo calls (db.list_pokemons fetches and caches)
+            try:
+                cur = await conn.execute("""
+                SELECT p.id, p.species, p.level, p.gender, p.shiny, p.team_slot, p.held_item, i.emoji AS item_emoji,
+                       p.hp, p.hp_now, p.moves, p.nature, p.ability, p.friendship, p.form
+                FROM pokemons p
+                LEFT JOIN items i ON i.id = p.held_item
+                WHERE p.owner_id = ? AND p.team_slot BETWEEN 1 AND 6
+                ORDER BY p.team_slot
+                """, (uid,))
+                rows = [dict(r) for r in await cur.fetchall()]
+                await cur.close()
+            except Exception:
+                cur = await conn.execute("""
+                SELECT p.id, p.species, p.level, p.gender, p.shiny, p.team_slot, p.held_item, i.emoji AS item_emoji
+                FROM pokemons p
+                LEFT JOIN items i ON i.id = p.held_item
+                WHERE p.owner_id = ? AND p.team_slot BETWEEN 1 AND 6
+                ORDER BY p.team_slot
+                """, (uid,))
+                rows = [dict(r) for r in await cur.fetchall()]
+                await cur.close()
+                for row in rows:
+                    row.setdefault("hp", None)
+                    row.setdefault("hp_now", None)
+                    row.setdefault("moves", [])
+                    row.setdefault("nature", None)
+                    row.setdefault("ability", None)
+                    row.setdefault("friendship", 0)
+                    row.setdefault("form", None)
+
+        # Warm cache asynchronously (don't block /team response).
         try:
-            await db.list_pokemons(uid, limit=2000, offset=0)
+            now = float(time.time())
+            last_warm = float(_TEAM_WARM_CACHE_TS.get(uid, 0.0))
+            if (now - last_warm) >= TEAM_WARM_CACHE_INTERVAL_SECONDS:
+                _TEAM_WARM_CACHE_TS[uid] = now
+                async def _warm_team_cache() -> None:
+                    try:
+                        await db.list_pokemons(uid, limit=2000, offset=0)
+                    except Exception:
+                        pass
+                asyncio.create_task(_warm_team_cache())
         except Exception:
             pass
 
@@ -10858,39 +11864,29 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
             "id": r[0], "species": r[1], "level": r[2], "gender": r[3],
             "shiny": r[4], "team_slot": r[5], "held_item": r[6],
             "item_emoji": r[7] if len(r) > 7 else None,
+            "hp": r[8] if len(r) > 8 else None,
+            "hp_now": r[9] if len(r) > 9 else None,
+            "moves": r[10] if len(r) > 10 else None,
+            "nature": r[11] if len(r) > 11 else None,
+            "ability": r[12] if len(r) > 12 else None,
+            "friendship": r[13] if len(r) > 13 else None,
+            "form": r[14] if len(r) > 14 else None,
         }
-        slots[int(row["team_slot"])] = row
+        try:
+            slot_i = int(row["team_slot"])
+            if 1 <= slot_i <= 6:
+                slots[slot_i] = row
+        except Exception:
+            continue
 
-    emb = discord.Embed(title=f"{target.display_name}'s Team (6 slots)")
-    EM_SPACE = "\u2003"  # wide spacing
+    try:
+        target_gen = await _user_selected_gen(uid)
+    except Exception:
+        target_gen = 1
 
-    for i in range(1, 7):
-        row = slots[i]
-        if not row:
-            value = "No pokemon \n\u200b"  # spacer line to add height
-        else:
-            star  = " ⭐" if bool(int(row.get("shiny") or 0)) else ""
-            gicon = _gender_icon(row.get("gender"))
-            item_emoji = (row.get("item_emoji") or "").strip()
-            # Fallback: held_item stored as name — use cache only (no DB)
-            if not item_emoji and row.get("held_item") and db_cache:
-                cached = db_cache.get_cached_item(str(row["held_item"]))
-                if cached:
-                    item_emoji = (cached.get("emoji") or "").strip()
-            # Only show when displayable (unicode or <:name:id>). Skip bare :shortcode:.
-            if not _is_displayable_item_emoji(item_emoji):
-                item_emoji = ""
-
-            # More spacious two-line layout + a blank spacer line
-            line1 = f"**{gicon} {str(row['species']).title()}{star}**"
-            item_pad = f"{item_emoji} {EM_SPACE}" if item_emoji else ""
-            line2 = f"{item_pad}Lv {row['level']}  ·  ID #{row['id']}"
-            value = f"{line1}\n{line2}\n\u200b"
-
-        # inline=False => each slot gets full width = less condensed
-        emb.add_field(name=f"Slot {i}", value=value, inline=True)
-
-    await interaction.followup.send(embed=emb, ephemeral=True)
+    view = TeamPanelView(interaction.user.id, target.display_name, slots, current_gen=target_gen)
+    emb, files = view._overview_payload()
+    await interaction.followup.send(embed=emb, files=files, view=view, ephemeral=True)
 
 
 async def _create_pokemon_from_parsed(
