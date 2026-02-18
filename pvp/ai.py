@@ -2400,6 +2400,21 @@ def _defensive_ability_switch_bonus(switch_mon: Mon, target_move_types: set[str]
     return bonus
 
 
+def _is_zero_effect_damaging_move(user: Mon, target: Mon, move_name: str, field_effects: Any) -> bool:
+    """True when a damaging move is predicted to do zero type-effect damage."""
+    try:
+        move_data = get_move(move_name) or {}
+        move_category = (move_data.get("category") or move_data.get("damage_class") or "status").lower()
+        move_power = int(move_data.get("power") or 0)
+        if move_category == "status" or move_power <= 0:
+            return False
+        move_type = move_data.get("type", "Normal")
+        mult, _ = type_multiplier(move_type, target, field_effects=field_effects, user=user)
+        return float(mult) == 0.0
+    except Exception:
+        return False
+
+
 def choose_ai_action(
     ai_user_id: int,
     battle_state: Any,
@@ -2477,7 +2492,7 @@ def choose_ai_action(
     highest_damage = max(damage_cache.values()) if damage_cache else 0
 
     # Score all candidate moves.
-    scored_moves: List[Tuple[float, str, float, int]] = []  # (score, move, dmg_pct, priority)
+    scored_moves: List[Tuple[float, str, float, int, bool]] = []  # (score, move, dmg_pct, priority, zero_effect)
     setup_moves = {"swords-dance", "dragon-dance", "calm-mind", "nasty-plot", "quiver-dance", "bulk-up"}
     recovery_moves = {"recover", "roost", "slack-off", "soft-boiled", "heal-order", "strength-sap", "rest"}
     pivot_moves = {"u-turn", "volt-switch", "flip-turn", "parting-shot", "baton-pass"}
@@ -2492,6 +2507,7 @@ def choose_ai_action(
         is_damaging = power > 0 and category != "status"
         dmg = int(damage_cache.get(mv, 0))
         dmg_pct = (dmg / target_hp) * 100.0
+        is_zero_effect = _is_zero_effect_damaging_move(ai_mon, target_mon, mv, field_effects)
         is_highest_damage = bool(is_damaging and dmg >= highest_damage and highest_damage > 0)
 
         # Base tactical score from the advanced scorer.
@@ -2511,6 +2527,9 @@ def choose_ai_action(
         score *= max(0.45, min(1.05, (accuracy / 100.0) + 0.05))
 
         if is_damaging:
+            if is_zero_effect:
+                # Avoid "no effect" picks unless all options are similarly bad.
+                score -= 120.0
             # Damage pressure and KO conversion.
             score += min(12.0, dmg_pct * 0.12)
             if dmg >= target_hp:
@@ -2541,7 +2560,7 @@ def choose_ai_action(
 
         # Tiny jitter prevents perfectly deterministic bots while keeping best plays dominant.
         score += random.uniform(-0.35, 0.35)
-        scored_moves.append((score, mv, dmg_pct, priority))
+        scored_moves.append((score, mv, dmg_pct, priority, is_zero_effect))
 
     if not scored_moves:
         move = str(random.choice(available_moves))
@@ -2550,7 +2569,11 @@ def choose_ai_action(
         return {"kind": "move", "value": move}
 
     scored_moves.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_move, best_dmg_pct, best_prio = scored_moves[0]
+    best_score, best_move, best_dmg_pct, best_prio, best_is_zero_effect = scored_moves[0]
+    if best_is_zero_effect:
+        best_non_zero = next((m for m in scored_moves if not m[4]), None)
+        if best_non_zero is not None:
+            best_score, best_move, best_dmg_pct, best_prio, best_is_zero_effect = best_non_zero
     best_dmg = damage_cache.get(best_move, 0)
     can_fast_ko = best_dmg >= target_hp and (best_prio > 0 or ai_speed >= target_speed)
 
@@ -2599,13 +2622,22 @@ def choose_ai_action(
         return {"kind": "switch", "value": int(best_switch_idx)}
 
     # Move choice: sample among near-top moves, weighted by score (human-like variety).
-    top_band = [m for m in scored_moves if m[0] >= best_score - 1.75]
+    top_band = [m for m in scored_moves if m[0] >= best_score - 1.0]
+    non_zero_top = [m for m in top_band if not m[4]]
+    if non_zero_top:
+        top_band = non_zero_top
     if len(top_band) > 1:
         max_s = max(m[0] for m in top_band)
-        weights = [math.exp((m[0] - max_s) / 1.8) for m in top_band]
+        weights = [math.exp((m[0] - max_s) / 1.3) for m in top_band]
         chosen = random.choices(top_band, weights=weights, k=1)[0]
     else:
         chosen = top_band[0]
+
+    # Final guard: don't intentionally pick a zero-effect damaging move when alternatives exist.
+    if chosen[4]:
+        non_zero_any = next((m for m in scored_moves if not m[4]), None)
+        if non_zero_any is not None:
+            chosen = non_zero_any
 
     analysis[last_action_key] = "move"
     analysis[f"last_move_{ai_user_id}"] = chosen[1]

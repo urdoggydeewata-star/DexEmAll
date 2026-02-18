@@ -210,6 +210,30 @@ def _legal_ai_moves(st: "BattleState", ai_user_id: int) -> List[str]:
     return out
 
 
+def _ai_move_is_zero_effect_damaging(
+    st: "BattleState",
+    ai_user_id: int,
+    move_name: str,
+    field_effects: Any,
+) -> bool:
+    """True if move is damaging and predicted to have zero type effect on target."""
+    try:
+        ai_mon = st._active(ai_user_id)
+        target_mon = st._opp_active(ai_user_id)
+        if ai_mon is None or target_mon is None:
+            return False
+        md = _get_move_with_cache(move_name, battle_state=st, generation=getattr(st, "gen", None)) or {}
+        category = str(md.get("category") or md.get("damage_class") or "status").lower()
+        power = float(md.get("power") or 0.0)
+        if category == "status" or power <= 0:
+            return False
+        from .engine import type_multiplier
+        mult, _ = type_multiplier(md.get("type", "Normal"), target_mon, field_effects=field_effects, user=ai_mon)
+        return float(mult) == 0.0
+    except Exception:
+        return False
+
+
 def _choose_quick_fallback_move(st: "BattleState", ai_user_id: int, field_effects: Any) -> Dict[str, Any]:
     """
     Fast deterministic fallback move picker for AI timeout/error cases.
@@ -267,7 +291,10 @@ def _choose_quick_fallback_move(st: "BattleState", ai_user_id: int, field_effect
             try:
                 from .engine import type_multiplier
                 mult, _ = type_multiplier(md.get("type", "Normal"), target_mon, field_effects=field_effects, user=ai_mon)
-                if float(mult) >= 2.0:
+                if float(mult) == 0.0:
+                    # Avoid "no effect" damaging picks unless literally every option is bad.
+                    score -= 240.0
+                elif float(mult) >= 2.0:
                     score += 14.0
                 elif float(mult) < 1.0:
                     score -= 8.0
@@ -345,8 +372,15 @@ def _normalize_ai_choice(st: "BattleState", ai_user_id: int, raw_choice: Any, fi
         mv = str(choice.get("value") or "").strip()
         if mv:
             wanted = _norm_move_key(mv)
+            has_non_zero_effect_option = any(
+                not _ai_move_is_zero_effect_damaging(st, ai_user_id, lm, field_effects)
+                for lm in legal_moves
+            )
             for lm in legal_moves:
                 if _norm_move_key(lm) == wanted:
+                    # Reject "no effect" damaging move picks when a valid alternative exists.
+                    if has_non_zero_effect_option and _ai_move_is_zero_effect_damaging(st, ai_user_id, lm, field_effects):
+                        break
                     return {"kind": "move", "value": lm}
 
     # Fallback to a legal move.
@@ -358,6 +392,10 @@ async def _compute_ai_choice_with_timeout(st: "BattleState", ai_user_id: int, fi
     Run full AI on a worker thread with bounded think time.
     AI gets up to 5-10 seconds per decision; timeout/error falls back to legal action.
     """
+    legal_moves = _legal_ai_moves(st, ai_user_id)
+    if len(legal_moves) == 1:
+        return {"kind": "move", "value": legal_moves[0]}
+
     think_budget = random.uniform(_AI_THINK_TIMEOUT_MIN, _AI_THINK_TIMEOUT_MAX)
     try:
         from .ai import choose_ai_action
