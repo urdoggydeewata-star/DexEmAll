@@ -16679,7 +16679,7 @@ def _team_overview_panel_file(
         draw = ImageDraw.Draw(base)
 
         # Overlay only text/sprites; never repaint template blocks.
-        trainer_font = _team_font(max(12, int(round(26 * s))), bold=True)
+        trainer_font = _team_font(max(9, int(round(20 * s))), bold=True)
         name_font = _team_fit_font(
             draw,
             target_name,
@@ -16697,7 +16697,7 @@ def _team_overview_panel_file(
                 "Trainer",
                 font=trainer_font,
                 fill=(245, 246, 252, 255),
-                stroke_px=max(1, int(round(2 * s))),
+                stroke_px=1,
             )
         if name_font:
             nw = _team_text_width(draw, target_name, name_font)
@@ -16708,40 +16708,31 @@ def _team_overview_panel_file(
                 target_name,
                 font=name_font,
                 fill=(228, 234, 252, 255),
-                stroke_px=max(1, int(round(2 * s))),
+                stroke_px=1,
             )
 
-        # Footer: show player's selected generation (and matching region label).
+        # Footer: template already contains "Current Region :", overlay only value.
         gen_num = max(1, int(current_gen or 1))
         region_name = _team_region_for_gen(gen_num)
-        footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 8) * sx))
-        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 6) * sy))
-        footer_w = max(64, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 14) * sx)))
+        footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 96) * sx))
+        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 26) * sy))
+        footer_w = max(32, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 102) * sx)))
         footer_font = _team_fit_font(
             draw,
-            f"Current Gen : {gen_num}",
+            region_name,
             max_width=footer_w,
-            start_size=max(8, int(round(17 * s))),
-            min_size=max(7, int(round(11 * s))),
+            start_size=max(8, int(round(13 * s))),
+            min_size=max(7, int(round(9 * s))),
             bold=False,
         )
         if footer_font is not None:
-            _draw_text_with_outline(
+            _draw_pixel_shadow_text(
                 draw,
                 (footer_x, footer_y),
-                f"Current Gen : {gen_num}",
+                region_name,
                 font=footer_font,
-                fill=(242, 244, 252, 255),
-                stroke_px=max(1, int(round(2 * s))),
-            )
-            line_gap = max(10, int(round((getattr(footer_font, "size", 12) + 3) * 0.95)))
-            _draw_text_with_outline(
-                draw,
-                (footer_x, footer_y + line_gap),
-                f"Region : {region_name}",
-                font=footer_font,
-                fill=(232, 236, 249, 255),
-                stroke_px=max(1, int(round(2 * s))),
+                fill=(240, 242, 250, 255),
+                shadow=(0, 0, 0, 215),
             )
 
         # Preload sprite frames (animated front preferred).
@@ -16772,7 +16763,7 @@ def _team_overview_panel_file(
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
 
-        lvl_font_slot = _team_font(max(7, int(round(12 * s))), bold=True)
+        lvl_font_slot = _team_font(max(8, int(round(14 * s))), bold=False)
         text_prep: dict[int, dict[str, Any]] = {}
         probe_draw = ImageDraw.Draw(base)
         for slot in range(1, 7):
