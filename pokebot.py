@@ -15408,6 +15408,487 @@ class MPokeInfo(commands.Cog):
         u = bot.get_user(uid)
         return u.mention if u else f"<@{uid}>"
 
+    @staticmethod
+    def _mpokeinfo_text_width(draw, text: str, font) -> int:
+        try:
+            box = draw.textbbox((0, 0), str(text or ""), font=font)
+            return max(0, int(box[2] - box[0]))
+        except Exception:
+            try:
+                return int(draw.textlength(str(text or ""), font=font))
+            except Exception:
+                return len(str(text or "")) * 6
+
+    @staticmethod
+    def _mpokeinfo_draw_shadow_text(
+        draw,
+        xy: tuple[int, int],
+        text: str,
+        *,
+        font,
+        fill: tuple[int, int, int, int] = (236, 244, 248, 255),
+        shadow: tuple[int, int, int, int] = (0, 0, 0, 220),
+        shadow_offset: tuple[int, int] = (1, 1),
+    ) -> None:
+        txt = str(text or "")
+        if not txt or font is None:
+            return
+        x, y = int(xy[0]), int(xy[1])
+        sx, sy = int(shadow_offset[0]), int(shadow_offset[1])
+        try:
+            draw.text((x + sx, y + sy), txt, font=font, fill=shadow)
+            draw.text((x, y), txt, font=font, fill=fill)
+        except Exception:
+            pass
+
+    def _mpokeinfo_font(self, size: int, *, bold: bool = False):
+        size = max(8, int(size))
+        team_font_fn = globals().get("_team_font")
+        if callable(team_font_fn):
+            try:
+                f = team_font_fn(size, bold=bold)
+                if f is not None:
+                    return f
+            except Exception:
+                pass
+        try:
+            from PIL import ImageFont  # type: ignore
+        except Exception:
+            return None
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ]
+        for fp in candidates:
+            try:
+                return ImageFont.truetype(fp, size)
+            except Exception:
+                continue
+        try:
+            return ImageFont.load_default()
+        except Exception:
+            return None
+
+    def _mpokeinfo_fit_font(self, draw, text: str, *, max_width: int, start_size: int, min_size: int = 8, bold: bool = False):
+        for size in range(int(start_size), int(min_size) - 1, -1):
+            f = self._mpokeinfo_font(size, bold=bold)
+            if f is None:
+                continue
+            if self._mpokeinfo_text_width(draw, text, f) <= int(max_width):
+                return f
+        return self._mpokeinfo_font(max(8, int(min_size)), bold=bold)
+
+    def _pick_sprite_path(self, species: str, gender: str, shiny: bool, form: Optional[str] = None) -> Optional[Path]:
+        base_species = self._species_folder_name(species)
+        form_norm = self._species_folder_name(form or "")
+        folder_candidates: List[Path] = []
+        if form_norm and form_norm not in ("normal", "base", "default"):
+            if form_norm.startswith(f"{base_species}-"):
+                folder_candidates.append(self.sprites_base / form_norm)
+            else:
+                folder_candidates.append(self.sprites_base / f"{base_species}-{form_norm}")
+        folder_candidates.append(self.sprites_base / base_species)
+
+        is_female = (str(gender).lower() == "female")
+        filenames: List[str] = []
+        if is_female:
+            if shiny:
+                filenames += ["female-animated-shiny-front.gif", "female-shiny-front.png"]
+            filenames += ["female-animated-front.gif", "female-front.png"]
+        if shiny:
+            filenames += ["animated-shiny-front.gif", "shiny-front.png"]
+        filenames += ["animated-front.gif", "front.png", "icon.png"]
+
+        for folder in folder_candidates:
+            try:
+                if not folder.is_dir():
+                    continue
+            except Exception:
+                continue
+            for fname in filenames:
+                p = folder / fname
+                try:
+                    if p.exists() and p.is_file() and p.stat().st_size > 0:
+                        return p
+                except Exception:
+                    continue
+        return None
+
+    @staticmethod
+    def _held_item_icon_path(item_id: Optional[str]) -> Optional[Path]:
+        raw = str(item_id or "").strip().lower()
+        if not raw:
+            return None
+        candidates: list[str] = []
+        for c in (
+            raw,
+            raw.replace(" ", "_"),
+            raw.replace(" ", "-"),
+            raw.replace("-", "_"),
+            raw.replace("_", "-"),
+        ):
+            c2 = str(c or "").strip().lower()
+            if c2 and c2 not in candidates:
+                candidates.append(c2)
+        for c in candidates:
+            p = ITEM_ICON_DIR / f"{c}.png"
+            try:
+                if p.exists() and p.is_file() and p.stat().st_size > 0:
+                    return p
+            except Exception:
+                continue
+        return None
+
+    async def _render_mpokeinfo_panel(
+        self,
+        interaction: Interaction,
+        mon: dict,
+        *,
+        species: str,
+        level: int,
+        shiny: bool,
+        gender: str,
+        current_form: Optional[str],
+        types: list[str],
+        exp_to_next_val: Optional[int],
+        friendship_value: int,
+        hp_max: int,
+        stats_obj: dict,
+        ivs_map: dict,
+        evs_map: dict,
+        moves: list[str],
+    ) -> Optional[discord.File]:
+        if Image is None:
+            return None
+        try:
+            from PIL import ImageDraw  # type: ignore
+        except Exception:
+            return None
+
+        panel_path = ASSETS_DIR / "ui" / "mpokeinfo.png"
+        if not panel_path.exists():
+            return None
+        try:
+            with Image.open(str(panel_path)) as src:
+                base = src.convert("RGBA")
+        except Exception:
+            return None
+
+        try:
+            resample = Image.Resampling.NEAREST
+        except Exception:
+            resample = Image.NEAREST
+
+        w, h = base.size
+        sx = float(w) / 400.0
+        sy = float(h) / 300.0
+        scale = min(sx, sy)
+
+        def _pt(x: int, y: int) -> tuple[int, int]:
+            return int(round(x * sx)), int(round(y * sy))
+
+        draw = ImageDraw.Draw(base)
+
+        font_stats = self._mpokeinfo_font(max(8, int(round(13 * scale))), bold=True)
+
+        # --- top row / summary ---
+        ot_name = str(getattr(interaction.user, "display_name", None) or interaction.user.name or "Trainer").strip()
+        ot_line = f"OT {ot_name}"
+        ot_font = self._mpokeinfo_fit_font(
+            draw,
+            ot_line,
+            max_width=max(48, int(round(122 * sx))),
+            start_size=max(8, int(round(12 * scale))),
+            min_size=max(7, int(round(9 * scale))),
+            bold=True,
+        )
+        self._mpokeinfo_draw_shadow_text(draw, _pt(82, 16), ot_line, font=ot_font)
+
+        gsym = "♂" if gender == "male" else "♀" if gender == "female" else "∅" if gender == "genderless" else "?"
+        lv_line = f"Lv {int(level)} {gsym}"
+        lv_font = self._mpokeinfo_fit_font(
+            draw,
+            lv_line,
+            max_width=max(24, int(round(60 * sx))),
+            start_size=max(8, int(round(12 * scale))),
+            min_size=max(7, int(round(9 * scale))),
+            bold=True,
+        )
+        lv_right = _pt(258, 16)[0]
+        lv_w = self._mpokeinfo_text_width(draw, lv_line, lv_font)
+        self._mpokeinfo_draw_shadow_text(draw, (lv_right - lv_w, _pt(258, 16)[1]), lv_line, font=lv_font)
+
+        primary_type = str(types[0] if types else "Normal").upper()
+        badge_left, badge_top = _pt(198, 31)
+        badge_w = max(28, int(round(63 * sx)))
+        badge_h = max(10, int(round(14 * sy)))
+        try:
+            draw.rectangle(
+                (badge_left, badge_top, badge_left + badge_w, badge_top + badge_h),
+                fill=(162, 169, 182, 215),
+                outline=(196, 205, 220, 240),
+                width=max(1, int(round(1 * scale))),
+            )
+        except Exception:
+            pass
+        type_font = self._mpokeinfo_fit_font(
+            draw,
+            primary_type,
+            max_width=max(20, badge_w - 4),
+            start_size=max(8, int(round(10 * scale))),
+            min_size=max(7, int(round(8 * scale))),
+            bold=True,
+        )
+        type_w = self._mpokeinfo_text_width(draw, primary_type, type_font)
+        type_x = int(badge_left + ((badge_w - type_w) // 2))
+        type_y = int(badge_top + max(0, (badge_h - int(round(10 * scale))) // 2) - 1)
+        self._mpokeinfo_draw_shadow_text(
+            draw,
+            (type_x, type_y),
+            primary_type,
+            font=type_font,
+            fill=(240, 246, 251, 255),
+            shadow=(66, 72, 80, 220),
+        )
+
+        nature_text = str(mon.get("nature") or "Hardy").replace("-", " ").replace("_", " ").title()
+        nature_font = self._mpokeinfo_fit_font(
+            draw,
+            nature_text,
+            max_width=max(28, int(round(108 * sx))),
+            start_size=max(8, int(round(12 * scale))),
+            min_size=max(7, int(round(9 * scale))),
+            bold=False,
+        )
+        self._mpokeinfo_draw_shadow_text(draw, _pt(266, 34), nature_text, font=nature_font)
+
+        exp_text = "MAX EXP" if exp_to_next_val is None else f"{int(exp_to_next_val):,} EXP"
+        exp_font = self._mpokeinfo_fit_font(
+            draw,
+            exp_text,
+            max_width=max(28, int(round(108 * sx))),
+            start_size=max(8, int(round(12 * scale))),
+            min_size=max(7, int(round(9 * scale))),
+            bold=True,
+        )
+        exp_w = self._mpokeinfo_text_width(draw, exp_text, exp_font)
+        exp_right = _pt(372, 65)[0]
+        self._mpokeinfo_draw_shadow_text(draw, (exp_right - exp_w, _pt(372, 65)[1]), exp_text, font=exp_font)
+
+        fr_pct = max(0, min(100, int(round((max(0, int(friendship_value)) / 255.0) * 100.0))))
+        fr_text = f"{fr_pct}%"
+        fr_font = self._mpokeinfo_fit_font(
+            draw,
+            fr_text,
+            max_width=max(18, int(round(108 * sx))),
+            start_size=max(8, int(round(12 * scale))),
+            min_size=max(7, int(round(9 * scale))),
+            bold=True,
+        )
+        fr_w = self._mpokeinfo_text_width(draw, fr_text, fr_font)
+        fr_right = _pt(372, 96)[0]
+        self._mpokeinfo_draw_shadow_text(draw, (fr_right - fr_w, _pt(372, 96)[1]), fr_text, font=fr_font)
+
+        species_display = str(species or "").replace("-", " ").replace("_", " ").title() or "Unknown"
+        if current_form and str(current_form).strip().lower() not in {"", "normal", "base", "default"}:
+            ftitle = str(current_form).replace("-", " ").replace("_", " ").title()
+            if ftitle and ftitle.lower() not in species_display.lower():
+                species_display = f"{species_display} ({ftitle})"
+        pokemon_font = self._mpokeinfo_fit_font(
+            draw,
+            species_display,
+            max_width=max(24, int(round(108 * sx))),
+            start_size=max(8, int(round(12 * scale))),
+            min_size=max(7, int(round(9 * scale))),
+            bold=False,
+        )
+        self._mpokeinfo_draw_shadow_text(draw, _pt(266, 126), species_display, font=pokemon_font)
+
+        # --- main sprite region ---
+        nickname = str(mon.get("nickname") or species_display).strip() or species_display
+        nick_font = self._mpokeinfo_fit_font(
+            draw,
+            nickname,
+            max_width=max(32, int(round(136 * sx))),
+            start_size=max(8, int(round(12 * scale))),
+            min_size=max(7, int(round(9 * scale))),
+            bold=True,
+        )
+        self._mpokeinfo_draw_shadow_text(draw, _pt(86, 132), nickname, font=nick_font)
+
+        sprite_path = self._pick_sprite_path(species, gender, shiny, current_form)
+        if sprite_path is not None:
+            try:
+                with Image.open(str(sprite_path)) as src:
+                    try:
+                        if bool(getattr(src, "is_animated", False)):
+                            src.seek(0)
+                    except Exception:
+                        pass
+                    sprite = src.convert("RGBA")
+                try:
+                    alpha = sprite.split()[-1]
+                    bb = alpha.getbbox()
+                    if bb is not None:
+                        sprite = sprite.crop(bb)
+                except Exception:
+                    pass
+                max_sw = max(18, int(round(90 * sx)))
+                max_sh = max(18, int(round(82 * sy)))
+                sprite.thumbnail((max_sw, max_sh), resample=resample)
+                cx, cy = _pt(162, 81)
+                dx = int(cx - (sprite.width // 2))
+                dy = int(cy - (sprite.height // 2))
+                base.alpha_composite(sprite, dest=(dx, dy))
+            except Exception:
+                pass
+
+        if shiny:
+            shiny_font = self._mpokeinfo_font(max(9, int(round(14 * scale))), bold=True)
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                _pt(93, 77),
+                "✦",
+                font=shiny_font,
+                fill=(255, 98, 180, 255),
+                shadow=(120, 24, 72, 220),
+            )
+
+        held_item_raw = str(mon.get("held_item") or "").strip().lower()
+        held_icon = self._held_item_icon_path(held_item_raw)
+        if held_icon is not None:
+            try:
+                with Image.open(str(held_icon)) as src:
+                    icon = src.convert("RGBA")
+                icon.thumbnail((max(10, int(round(22 * sx))), max(10, int(round(22 * sy)))), resample=resample)
+                base.alpha_composite(icon, dest=_pt(229, 73))
+            except Exception:
+                pass
+
+        # --- moves / ability / item ---
+        moves_clean = [str(m).replace("-", " ").replace("_", " ").title() for m in list(moves or []) if str(m).strip()]
+        if not moves_clean:
+            moves_clean = ["—"]
+        move_start_x, move_start_y = _pt(86, 162)
+        move_line_h = max(12, int(round(17 * sy)))
+        for idx, mv in enumerate(moves_clean[:4]):
+            y = int(move_start_y + (idx * move_line_h))
+            mv_font = self._mpokeinfo_fit_font(
+                draw,
+                mv,
+                max_width=max(28, int(round(138 * sx))),
+                start_size=max(8, int(round(12 * scale))),
+                min_size=max(7, int(round(9 * scale))),
+                bold=False,
+            )
+            self._mpokeinfo_draw_shadow_text(draw, (move_start_x, y), mv, font=mv_font, fill=(240, 245, 250, 255))
+
+        ability_text = str(mon.get("ability") or "Unknown").replace("-", " ").replace("_", " ").title()
+        if not ability_text.strip():
+            ability_text = "Unknown"
+        ability_font = self._mpokeinfo_fit_font(
+            draw,
+            ability_text,
+            max_width=max(28, int(round(136 * sx))),
+            start_size=max(8, int(round(12 * scale))),
+            min_size=max(7, int(round(9 * scale))),
+            bold=False,
+        )
+        ability_center_x = _pt(156, 0)[0]
+        ability_y = _pt(0, 238)[1]
+        ability_w = self._mpokeinfo_text_width(draw, ability_text, ability_font)
+        self._mpokeinfo_draw_shadow_text(draw, (ability_center_x - (ability_w // 2), ability_y), ability_text, font=ability_font)
+
+        item_text = pretty_item_name(held_item_raw) if held_item_raw else "None"
+        item_font = self._mpokeinfo_fit_font(
+            draw,
+            item_text,
+            max_width=max(28, int(round(136 * sx))),
+            start_size=max(8, int(round(12 * scale))),
+            min_size=max(7, int(round(9 * scale))),
+            bold=False,
+        )
+        item_center_x = _pt(156, 0)[0]
+        item_y = _pt(0, 272)[1]
+        item_w = self._mpokeinfo_text_width(draw, item_text, item_font)
+        self._mpokeinfo_draw_shadow_text(draw, (item_center_x - (item_w // 2), item_y), item_text, font=item_font)
+
+        # --- stats table ---
+        final_stats = {
+            "hp": int(max(1, hp_max)),
+            "atk": int(stats_obj.get("attack", mon.get("atk", 0))),
+            "def": int(stats_obj.get("defense", mon.get("def", 0))),
+            "spa": int(stats_obj.get("special_attack", mon.get("spa", 0))),
+            "spd": int(stats_obj.get("special_defense", mon.get("spd", 0))),
+            "spe": int(stats_obj.get("speed", mon.get("spe", 0))),
+        }
+        iv_vals = {
+            "hp": int(ivs_map.get("hp", 0)),
+            "atk": int(ivs_map.get("atk", 0)),
+            "def": int(ivs_map.get("def", 0)),
+            "spa": int(ivs_map.get("spa", 0)),
+            "spd": int(ivs_map.get("spd", 0)),
+            "spe": int(ivs_map.get("spe", 0)),
+        }
+        ev_vals = {
+            "hp": int(evs_map.get("hp", 0)),
+            "atk": int(evs_map.get("atk", 0)),
+            "def": int(evs_map.get("def", 0)),
+            "spa": int(evs_map.get("spa", 0)),
+            "spd": int(evs_map.get("spd", 0)),
+            "spe": int(evs_map.get("spe", 0)),
+        }
+        stat_rows = ["hp", "atk", "def", "spa", "spd", "spe"]
+        stat_ys = [170, 190, 210, 230, 250, 270]
+        stat_right = _pt(299, 0)[0]
+        iv_right = _pt(333, 0)[0]
+        ev_right = _pt(374, 0)[0]
+        for key, yy in zip(stat_rows, stat_ys):
+            y = _pt(0, yy)[1]
+            sval = f"{int(final_stats.get(key, 0))}"
+            ival = f"{max(0, min(31, int(iv_vals.get(key, 0)))):02d}"
+            eval_ = f"{max(0, min(252, int(ev_vals.get(key, 0)))):03d}"
+
+            sval_w = self._mpokeinfo_text_width(draw, sval, font_stats)
+            ival_w = self._mpokeinfo_text_width(draw, ival, font_stats)
+            eval_w = self._mpokeinfo_text_width(draw, eval_, font_stats)
+
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                (stat_right - sval_w, y),
+                sval,
+                font=font_stats,
+                fill=(235, 241, 247, 255),
+            )
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                (iv_right - ival_w, y),
+                ival,
+                font=font_stats,
+                fill=(255, 82, 110, 255),
+                shadow=(95, 24, 39, 220),
+            )
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                (ev_right - eval_w, y),
+                eval_,
+                font=font_stats,
+                fill=(102, 244, 220, 255),
+                shadow=(18, 90, 84, 220),
+            )
+
+        out = BytesIO()
+        try:
+            base.save(out, format="PNG")
+        except Exception:
+            return None
+        out.seek(0)
+        filename = f"mpokeinfo_{int(mon.get('id') or 0)}.png"
+        return discord.File(fp=out, filename=filename)
+
     # --------------------- command ---------------------
     @app_commands.command(name="mpokeinfo", description="Show details for a Pokémon on your team.")
     @app_commands.describe(
@@ -15578,6 +16059,28 @@ class MPokeInfo(commands.Cog):
         else:
             moves_lines.append("—")
         moves_text = "\n".join(moves_lines)
+
+        # Preferred UI: render the custom mpokeinfo template image.
+        panel_file = await self._render_mpokeinfo_panel(
+            interaction,
+            mon,
+            species=species,
+            level=level,
+            shiny=shiny,
+            gender=gender,
+            current_form=current_form,
+            types=types,
+            exp_to_next_val=exp_to_next_val,
+            friendship_value=fr,
+            hp_max=hp_max,
+            stats_obj=stats_obj,
+            ivs_map=ivs_map,
+            evs_map=evs_map,
+            moves=moves,
+        )
+        if panel_file is not None:
+            await interaction.followup.send(file=panel_file, ephemeral=True)
+            return
 
         files: List[discord.File] = []
         try:
