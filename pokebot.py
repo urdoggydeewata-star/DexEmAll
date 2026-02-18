@@ -16177,7 +16177,13 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
         )
         if resolved is not None:
             rp = Path(resolved)
-            if rp.exists() and rp.is_file() and rp.stat().st_size > 0:
+            # Ignore icon fallback at this stage; prefer real front sprites/animations.
+            if (
+                rp.exists()
+                and rp.is_file()
+                and rp.stat().st_size > 0
+                and rp.name.lower() != "icon.png"
+            ):
                 return rp
     except Exception:
         pass
@@ -16259,14 +16265,12 @@ def _team_font(size: int, *, bold: bool = False):
         from PIL import ImageFont  # type: ignore
     except Exception:
         return None
-    # Use the same loader path as battle renderer for pixel-font consistency.
+    # Use battle renderer Pokemon font path when available.
     try:
         from pvp.renderer import _get_pokemon_font_path as _renderer_pokemon_font_path  # type: ignore
-        from pvp.renderer import _load_font_cached as _renderer_load_font_cached  # type: ignore
-        path_key = str(_renderer_pokemon_font_path() or "")
-        f = _renderer_load_font_cached(path_key, int(size))
-        if f is not None:
-            return f
+        path = _renderer_pokemon_font_path()
+        if path:
+            return ImageFont.truetype(str(path), int(size))
     except Exception:
         pass
     # Fallback font candidates.
@@ -16498,8 +16502,8 @@ def _team_overview_panel_file(
         draw = ImageDraw.Draw(base)
 
         # Overlay only text/sprites; never repaint template blocks.
-        trainer_title = "Trainer"
-        trainer_font = _team_font(max(11, int(round(23 * s))), bold=True)
+        trainer_title = "Elite Trainer"
+        trainer_font = _team_font(max(12, int(round(26 * s))), bold=True)
         header_left_x = int(round((TEAM_TRAINER_HEADER_RECT[0] + 8) * sx))
         header_top_y = int(round(TEAM_TRAINER_LABEL_Y * sy))
         header_name_y = int(round(TEAM_TRAINER_NAME_Y * sy))
@@ -16508,8 +16512,8 @@ def _team_overview_panel_file(
             draw,
             target_name,
             max_width=header_max_w,
-            start_size=max(10, int(round(19 * s))),
-            min_size=max(9, int(round(11 * s))),
+            start_size=max(11, int(round(22 * s))),
+            min_size=max(8, int(round(11 * s))),
             bold=True,
         )
         if trainer_font:
@@ -16517,7 +16521,7 @@ def _team_overview_panel_file(
                 draw,
                 trainer_title,
                 max_width=header_max_w,
-                start_size=max(10, int(round(19 * s))),
+                start_size=max(11, int(round(23 * s))),
                 min_size=max(8, int(round(11 * s))),
                 bold=True,
             )
@@ -16542,15 +16546,15 @@ def _team_overview_panel_file(
         # Footer: only overlay region value beside the template's existing label text.
         gen_num = max(1, int(current_gen or 1))
         region_name = _team_region_for_gen(gen_num)
-        footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 102) * sx))
-        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 34) * sy))
-        footer_w = max(32, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 110) * sx)))
+        footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 98) * sx))
+        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 44) * sy))
+        footer_w = max(28, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 104) * sx)))
         footer_font = _team_fit_font(
             draw,
             region_name,
             max_width=footer_w,
-            start_size=max(8, int(round(13 * s))),
-            min_size=max(7, int(round(9 * s))),
+            start_size=max(8, int(round(14 * s))),
+            min_size=max(7, int(round(10 * s))),
             bold=False,
         )
         if footer_font is not None:
@@ -16573,13 +16577,13 @@ def _team_overview_panel_file(
                 sprite_data[slot] = {"frames": []}
                 continue
             path = _team_pick_sprite_path(row)
-            sprite_max = (max(32, int(round(88 * sx))), max(32, int(round(88 * sy))))
+            sprite_max = (max(32, int(round(108 * sx))), max(32, int(round(108 * sy))))
             frames, _ = _team_load_sprite_frames(path, max_size=sprite_max, resample=resample)
             sprite_data[slot] = {"frames": frames}
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
 
-        lvl_font_slot = _team_font(max(8, int(round(15 * s))), bold=False)
+        lvl_font_slot = _team_font(max(9, int(round(17 * s))), bold=True)
         text_prep: dict[int, dict[str, Any]] = {}
         probe_draw = ImageDraw.Draw(base)
         for slot in range(1, 7):
@@ -16600,9 +16604,9 @@ def _team_overview_panel_file(
                 probe_draw,
                 label_to_draw,
                 max_width=max(36, int(round((slot_w - max(42, int(round(52 * s))))))),
-                start_size=max(9, int(round(18 * s))),
+                start_size=max(9, int(round(19 * s))),
                 min_size=max(7, int(round(9 * s))),
-                bold=False,
+                bold=True,
             )
             lvl_x = geom["level_right"][0]
             lvl_w = 0
@@ -16611,7 +16615,7 @@ def _team_overview_panel_file(
                 lvl_x = int(geom["level_right"][0] - lvl_w)
             if label_font:
                 label_w = _team_text_width(probe_draw, label_to_draw, label_font)
-                min_gap = max(8, int(round(10 * s)))
+                min_gap = max(10, int(round(14 * s)))
                 label_start_x = int(geom["label_xy"][0])
                 label_end_limit = int(lvl_x - min_gap)
                 if label_start_x + label_w > label_end_limit:
@@ -16620,9 +16624,9 @@ def _team_overview_panel_file(
                         probe_draw,
                         label_to_draw,
                         max_width=tighter_max,
-                        start_size=max(8, int(round(15 * s))),
+                        start_size=max(8, int(round(16 * s))),
                         min_size=max(7, int(round(9 * s))),
-                        bold=False,
+                        bold=True,
                     )
                     if label_font:
                         label_w = _team_text_width(probe_draw, label_to_draw, label_font)
