@@ -13076,7 +13076,7 @@ class DaycareParentSelectView(discord.ui.View):
             team_count = await _daycare_team_count(uid)
             if team_count <= 1:
                 await itx.followup.send(
-                    "You must keep at least **1 Pokémon** in your team.",
+                    "You must keep at least **1 non-egg Pokémon** in your team.",
                     ephemeral=True,
                 )
                 return
@@ -16022,6 +16022,12 @@ class MPokeInfo(commands.Cog):
                 await interaction.followup.send("Could not load Pokémon data.", ephemeral=True)
                 return
             mon = full
+            try:
+                nick = await _get_pokemon_nickname(uid, int(mon.get("id") or 0), conn=conn)
+                if nick:
+                    mon["nickname"] = nick
+            except Exception:
+                pass
             # EXP to next level (uses cache when available)
             exp_to_next_val: Optional[int] = None
             cur_exp = int(mon.get("exp") or 0)
@@ -16259,6 +16265,65 @@ async def pkinfo_alias(interaction: Interaction, name: str, slot: Optional[int] 
             await interaction.response.send_message("❌ PK info system is not loaded yet. Try again in a moment.", ephemeral=True)
     except Exception:
         pass
+
+
+@bot.tree.command(name="pkname", description="Set or clear a nickname for one of your team Pokémon.")
+@app_commands.describe(
+    name="Pokémon species (e.g. pikachu)",
+    nickname="New nickname (or: clear/none/reset/remove to remove)",
+    slot="Team slot (1–6) if you have duplicates",
+)
+async def pkname_command(
+    interaction: Interaction,
+    name: str,
+    nickname: app_commands.Range[str, 1, 40],
+    slot: Optional[int] = None,
+):
+    await interaction.response.defer(ephemeral=True)
+    uid = str(interaction.user.id)
+
+    async with db.session() as conn:
+        mon = await resolve_team_mon(interaction, name, slot, conn=conn)
+        if not mon:
+            return
+        mon_id = int(mon.get("id") or 0)
+        if mon_id <= 0:
+            return await interaction.followup.send("❌ Could not resolve that Pokémon.", ephemeral=True)
+        species_norm = _daycare_norm_species(mon.get("species"))
+        if species_norm == "egg":
+            return await interaction.followup.send("❌ Eggs cannot be nicknamed.", ephemeral=True)
+
+        species_display = str(mon.get("species") or "Pokémon").replace("-", " ").replace("_", " ").title()
+        raw_nick = str(nickname or "").strip()
+        clear_tokens = {"clear", "none", "reset", "remove", "off", "default"}
+        current_nick = await _get_pokemon_nickname(uid, mon_id, conn=conn)
+
+        if raw_nick.lower() in clear_tokens:
+            await _set_pokemon_nickname(uid, mon_id, None, conn=conn)
+            await conn.commit()
+            if current_nick:
+                return await interaction.followup.send(
+                    f"🔤 Cleared nickname for **{species_display}**.",
+                    ephemeral=True,
+                )
+            return await interaction.followup.send(
+                f"ℹ️ **{species_display}** did not have a nickname set.",
+                ephemeral=True,
+            )
+
+        cleaned = _normalize_pokemon_nickname(raw_nick, max_len=20)
+        if not cleaned:
+            return await interaction.followup.send("❌ Nickname cannot be empty.", ephemeral=True)
+
+        await _set_pokemon_nickname(uid, mon_id, cleaned, conn=conn)
+        await conn.commit()
+
+    await interaction.followup.send(
+        f"✅ Nickname set: **{species_display}** → **{cleaned}**\n"
+        f"Used in `/team` and the `/mpokeinfo` name slot.",
+        ephemeral=True,
+    )
+
 ## Friendship :
 def item_id_from_user(s: str) -> str:
     """Normalize user text -> canonical item id (lowercase + underscores)."""
@@ -16584,6 +16649,9 @@ async def evolve_cmd(inter: discord.Interaction, name: str, slot: int | None = N
 
 
 def _team_species_label(row: dict) -> str:
+    nick = str(row.get("nickname") or "").strip()
+    if nick and _daycare_norm_species(row.get("species")) != "egg":
+        return nick
     species = str(row.get("species") or "Unknown").replace("-", " ").replace("_", " ").title()
     form = str(row.get("form") or "").strip()
     form_norm = form.lower().replace("_", "-").strip()
@@ -17250,6 +17318,7 @@ def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None], *,
         species_norm = _daycare_norm_species(row.get("species"))
         item = {
             "species": species_norm,
+            "nickname": str(row.get("nickname") or "").strip(),
             "form": _species_folder_name(str(row.get("form") or "")),
             "shiny": int(bool(row.get("shiny"))),
             "gender": str(row.get("gender") or "").strip().lower(),
@@ -17854,6 +17923,21 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
         except Exception:
             pass
 
+    nickname_map: dict[int, str] = {}
+    try:
+        row_ids: list[int] = []
+        for r in rows or []:
+            try:
+                rid = int((r.get("id") if hasattr(r, "keys") else r[0]) or 0)
+            except Exception:
+                rid = 0
+            if rid > 0:
+                row_ids.append(rid)
+        if row_ids:
+            nickname_map = await _get_pokemon_nickname_map(uid, row_ids)
+    except Exception:
+        nickname_map = {}
+
     # Map slots
     slots: dict[int, dict | None] = {i: None for i in range(1, 7)}
     for r in rows:
@@ -17869,6 +17953,12 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
             "friendship": r[13] if len(r) > 13 else None,
             "form": r[14] if len(r) > 14 else None,
         }
+        try:
+            rid = int(row.get("id") or 0)
+        except Exception:
+            rid = 0
+        if rid > 0 and rid in nickname_map:
+            row["nickname"] = nickname_map[rid]
         try:
             slot_i = int(row["team_slot"])
             if 1 <= slot_i <= 6:
@@ -18592,6 +18682,154 @@ def _parse_box_int(v: str | None) -> Optional[int]:
         return None
 
 
+def _normalize_pokemon_nickname(raw: str | None, *, max_len: int = 20) -> str:
+    txt = str(raw or "").replace("\n", " ").replace("\r", " ").strip()
+    txt = re.sub(r"\s+", " ", txt)
+    txt = txt.strip()
+    if not txt:
+        return ""
+    return txt[: max(1, int(max_len))]
+
+
+async def _ensure_pokemon_nicknames_table(conn: Any | None = None) -> None:
+    own_conn = conn is None
+    if own_conn:
+        conn = await db.connect()
+    try:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pokemon_nicknames (
+                owner_id TEXT NOT NULL,
+                mon_id INTEGER NOT NULL,
+                nickname TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (owner_id, mon_id)
+            )
+            """
+        )
+        if own_conn:
+            await conn.commit()
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+
+async def _get_pokemon_nickname(owner_id: str, mon_id: int, *, conn: Any | None = None) -> Optional[str]:
+    if not owner_id or int(mon_id or 0) <= 0:
+        return None
+    own_conn = conn is None
+    if own_conn:
+        conn = await db.connect()
+    try:
+        await _ensure_pokemon_nicknames_table(conn)
+        cur = await conn.execute(
+            "SELECT nickname FROM pokemon_nicknames WHERE owner_id=? AND mon_id=? LIMIT 1",
+            (str(owner_id), int(mon_id)),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return None
+        raw = row["nickname"] if hasattr(row, "keys") else row[0]
+        nick = _normalize_pokemon_nickname(raw, max_len=20)
+        return nick or None
+    except Exception:
+        return None
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+
+async def _get_pokemon_nickname_map(owner_id: str, mon_ids: Sequence[int], *, conn: Any | None = None) -> dict[int, str]:
+    if not owner_id:
+        return {}
+    ids_clean: list[int] = []
+    seen: set[int] = set()
+    for mid in mon_ids or []:
+        try:
+            v = int(mid or 0)
+        except Exception:
+            continue
+        if v <= 0 or v in seen:
+            continue
+        seen.add(v)
+        ids_clean.append(v)
+    if not ids_clean:
+        return {}
+    own_conn = conn is None
+    if own_conn:
+        conn = await db.connect()
+    try:
+        await _ensure_pokemon_nicknames_table(conn)
+        placeholders = ", ".join("?" for _ in ids_clean)
+        cur = await conn.execute(
+            f"SELECT mon_id, nickname FROM pokemon_nicknames WHERE owner_id=? AND mon_id IN ({placeholders})",
+            (str(owner_id), *ids_clean),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        out: dict[int, str] = {}
+        for r in rows or []:
+            try:
+                mid = int((r["mon_id"] if hasattr(r, "keys") else r[0]) or 0)
+            except Exception:
+                continue
+            nick_raw = (r["nickname"] if hasattr(r, "keys") else r[1]) if r is not None else ""
+            nick = _normalize_pokemon_nickname(nick_raw, max_len=20)
+            if mid > 0 and nick:
+                out[mid] = nick
+        return out
+    except Exception:
+        return {}
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+
+async def _set_pokemon_nickname(owner_id: str, mon_id: int, nickname: str | None, *, conn: Any | None = None) -> None:
+    if not owner_id or int(mon_id or 0) <= 0:
+        return
+    nick = _normalize_pokemon_nickname(nickname, max_len=20)
+    own_conn = conn is None
+    if own_conn:
+        conn = await db.connect()
+    try:
+        await _ensure_pokemon_nicknames_table(conn)
+        if nick:
+            await conn.execute(
+                """
+                INSERT INTO pokemon_nicknames (owner_id, mon_id, nickname)
+                VALUES (?, ?, ?)
+                ON CONFLICT (owner_id, mon_id) DO UPDATE SET
+                    nickname = EXCLUDED.nickname,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (str(owner_id), int(mon_id), nick),
+            )
+        else:
+            await conn.execute(
+                "DELETE FROM pokemon_nicknames WHERE owner_id=? AND mon_id=?",
+                (str(owner_id), int(mon_id)),
+            )
+        if own_conn:
+            await conn.commit()
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+
 async def _ensure_pokemon_locks_table(conn: Any | None = None) -> None:
     own_conn = conn is None
     if own_conn:
@@ -18774,7 +19012,7 @@ async def _box_swap_positions(owner_id: str, box_no: int, team_slot: int, box_po
             await cur.close()
             team_sp = _daycare_norm_species((trow["species"] if trow and hasattr(trow, "keys") else (trow[0] if trow else "")) or "")
             if team_sp != "egg" and int(team_non_egg_count) <= 1:
-                return False, "You must keep at least one Pokémon in your team."
+                return False, "You must keep at least one non-egg Pokémon in your team."
 
             team_id = int(team_row["id"] if hasattr(team_row, "keys") else team_row[0])
             team_species = str(team_row["species"] if hasattr(team_row, "keys") else team_row[1])
@@ -18885,6 +19123,11 @@ async def _box_release_mon(owner_id: str, box_no: int, box_pos: int) -> tuple[bo
 
         await conn.execute("DELETE FROM pokemons WHERE owner_id=? AND id=?", (owner_id, mon_id))
         await conn.execute("DELETE FROM pokemon_locks WHERE owner_id=? AND mon_id=?", (owner_id, mon_id))
+        try:
+            await _ensure_pokemon_nicknames_table(conn)
+            await conn.execute("DELETE FROM pokemon_nicknames WHERE owner_id=? AND mon_id=?", (owner_id, mon_id))
+        except Exception:
+            pass
         await _box_compact_positions_conn(conn, owner_id, int(box_no))
         await conn.commit()
     db.invalidate_pokemons_cache(owner_id)
@@ -23200,7 +23443,7 @@ async def release_pokemon(interaction: discord.Interaction, slot: app_commands.R
             mon_species_norm = _daycare_norm_species(mon.get("species"))
             if mon_species_norm != "egg" and int(non_egg_team_count) <= 1:
                 return await interaction.followup.send(
-                    f"❌ You cannot release your last Pokémon! You must always have at least one Pokémon in your team.",
+                    f"❌ You cannot release your last non-egg Pokémon! You must always have at least one non-egg Pokémon in your team.",
                     ephemeral=True
                 )
 
@@ -23259,6 +23502,14 @@ async def release_pokemon(interaction: discord.Interaction, slot: app_commands.R
                 "DELETE FROM pokemon_locks WHERE owner_id = ? AND mon_id = ?",
                 (uid, mon['id']),
             )
+            try:
+                await _ensure_pokemon_nicknames_table(conn)
+                await conn.execute(
+                    "DELETE FROM pokemon_nicknames WHERE owner_id = ? AND mon_id = ?",
+                    (uid, mon['id']),
+                )
+            except Exception:
+                pass
             await conn.commit()
             db.invalidate_pokemons_cache(uid)
             await _compact_team_slots(uid)
@@ -23275,11 +23526,10 @@ async def release_pokemon(interaction: discord.Interaction, slot: app_commands.R
             pass
 
 # =========================
-#  /clearteam command
+#  legacy clearteam helper (command removed)
 # =========================
 
-@bot.tree.command(name="clearteam", description="Release all Pokémon in your team (slots 1-6).")
-async def clear_team(interaction: discord.Interaction):
+async def _clear_team_internal(interaction: discord.Interaction):
     """Release all Pokémon in the user's team."""
     await interaction.response.defer(ephemeral=False)
     uid = str(interaction.user.id)
@@ -23375,6 +23625,14 @@ async def clear_team(interaction: discord.Interaction):
                 "DELETE FROM pokemon_locks WHERE owner_id = ? AND mon_id = ?",
                 (uid, mon_id),
             )
+            try:
+                await _ensure_pokemon_nicknames_table(conn)
+                await conn.execute(
+                    "DELETE FROM pokemon_nicknames WHERE owner_id = ? AND mon_id = ?",
+                    (uid, mon_id),
+                )
+            except Exception:
+                pass
             released_count += 1
         
         # Commit the team changes first
