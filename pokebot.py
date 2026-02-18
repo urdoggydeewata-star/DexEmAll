@@ -15939,11 +15939,12 @@ def _team_hp_bar(pct: int, width: int = 10) -> str:
 
 
 TEAM_TEMPLATE_PATHS: tuple[Path, ...] = (
-    ASSETS_DIR / "ui" / "team-beta.png",
-    ASSETS_DIR / "ui" / "team-beta",
     ASSETS_DIR / "ui" / "team-template.png",
     ASSETS_DIR / "ui" / "team_panel_template.png",
     ASSETS_DIR / "team-template.png",
+    # Keep beta template as an explicit fallback only.
+    ASSETS_DIR / "ui" / "team-beta.png",
+    ASSETS_DIR / "ui" / "team-beta",
 )
 TEAM_TEMPLATE_BASE_SIZE: tuple[int, int] = (808, 537)
 TEAM_TEMPLATE_STEM_BASE_SIZES: dict[str, tuple[int, int]] = {
@@ -16657,7 +16658,7 @@ def _team_overview_panel_file(
         draw = ImageDraw.Draw(base)
 
         # Overlay only text/sprites; never repaint template blocks.
-        trainer_title = "Trainer"
+        trainer_title = "Elite Trainer"
         trainer_font = _team_font(max(12, int(round(26 * s))), bold=True)
         header_left_x = int(round((TEAM_TRAINER_HEADER_RECT[0] + 8) * sx))
         header_top_y = int(round(TEAM_TRAINER_LABEL_Y * sy))
@@ -16781,15 +16782,11 @@ def _team_overview_panel_file(
                         label_to_draw,
                         max_width=tighter_max,
                         start_size=max(8, int(round(16 * s))),
-                        min_size=max(7, int(round(9 * s))),
+                        min_size=max(6, int(round(7 * s))),
                         bold=True,
                     )
                     if label_font:
                         label_w = _team_text_width(probe_draw, label_to_draw, label_font)
-                    # Final hard guard: trim label if still colliding with lvl text.
-                    while label_font and label_to_draw and (label_start_x + label_w > label_end_limit):
-                        label_to_draw = label_to_draw[:-1]
-                        label_w = _team_text_width(probe_draw, label_to_draw, label_font) if label_to_draw else 0
             text_prep[slot] = {
                 "label": label_to_draw,
                 "font": label_font,
