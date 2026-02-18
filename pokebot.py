@@ -16397,37 +16397,36 @@ def _team_load_sprite_frames(
     if not raw_frames:
         return [], duration
 
-    # Build a stable alpha bounding box across all frames so compositing is
-    # visually centered on the Pokémon itself (not transparent padding).
-    union_bbox: Optional[tuple[int, int, int, int]] = None
-    for fr in raw_frames:
+    def _tight_crop_visible(src):
+        """Crop transparent padding so slot-centering uses visible sprite area."""
         try:
-            alpha = fr.split()[-1]
-            bb = alpha.getbbox()
+            alpha = src.split()[-1]
+        except Exception:
+            return src
+        try:
+            # Ignore very faint alpha to avoid off-center halos/shadows.
+            mask = alpha.point(lambda a: 255 if int(a) >= 72 else 0)
+            bb = mask.getbbox()
         except Exception:
             bb = None
         if bb is None:
-            continue
-        if union_bbox is None:
-            union_bbox = bb
-        else:
-            union_bbox = (
-                min(union_bbox[0], bb[0]),
-                min(union_bbox[1], bb[1]),
-                max(union_bbox[2], bb[2]),
-                max(union_bbox[3], bb[3]),
-            )
+            try:
+                bb = alpha.getbbox()
+            except Exception:
+                bb = None
+        if bb is None:
+            return src
+        try:
+            cropped = src.crop(bb)
+            if cropped.size[0] > 0 and cropped.size[1] > 0:
+                return cropped
+        except Exception:
+            pass
+        return src
 
     frames: list[Any] = []
     for fr in raw_frames:
-        sprite = fr
-        if union_bbox is not None:
-            try:
-                cropped = fr.crop(union_bbox)
-                if cropped.size[0] > 0 and cropped.size[1] > 0:
-                    sprite = cropped
-            except Exception:
-                sprite = fr
+        sprite = _tight_crop_visible(fr)
         sprite = _scale_sprite(sprite)
         frames.append(sprite)
 
