@@ -16309,6 +16309,60 @@ async def _dispatch_mypokeinfo_alias(interaction: Interaction, name: str, slot: 
         pass
 
 
+async def _dispatch_pokeinfo_alias(
+    interaction: Interaction,
+    name_or_id: str,
+    shiny: bool = False,
+    gender: Optional[str] = None,
+    gen: Optional[int] = None,
+) -> None:
+    cmd_obj = None
+    try:
+        cmd_obj = bot.tree.get_command("pokeinfo")
+    except Exception:
+        cmd_obj = None
+    if cmd_obj is None:
+        cmd_obj = globals().get("pokeinfo")
+
+    cb = getattr(cmd_obj, "callback", None)
+    if callable(cb):
+        try:
+            await cb(
+                interaction,
+                name_or_id=name_or_id,
+                shiny=bool(shiny),
+                gender=gender,
+                gen=gen,
+            )
+            return
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    # Last fallback: call the command object directly if available.
+    try:
+        if callable(cmd_obj):
+            await cmd_obj(
+                interaction,
+                name_or_id=name_or_id,
+                shiny=bool(shiny),
+                gender=gender,
+                gen=gen,
+            )
+            return
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("❌ Pokédex info command is not loaded yet. Try again in a moment.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Pokédex info command is not loaded yet. Try again in a moment.", ephemeral=True)
+    except Exception:
+        pass
+
+
 @bot.tree.command(name="mpokeinfo", description="Legacy alias for /mypokeinfo (team Pokémon details).")
 @app_commands.describe(
     name="Pokémon species (e.g. pikachu)",
@@ -16318,13 +16372,27 @@ async def mpokeinfo_alias(interaction: Interaction, name: str, slot: Optional[in
     await _dispatch_mypokeinfo_alias(interaction, name, slot)
 
 
-@bot.tree.command(name="pkinfo", description="Alias for /mypokeinfo (team Pokémon details).")
+@bot.tree.command(name="pkinfo", description="Alias for /pokeinfo (Pokédex species info).")
 @app_commands.describe(
-    name="Pokémon species (e.g. pikachu)",
-    slot="Team slot (1–6) if you have duplicates",
+    name_or_id="Name or National Dex number (e.g., bulbasaur or 1). Names like 'alolan raichu' are okay.",
+    shiny="Show shiny sprite (default: off)",
+    gender="Force sprite gender (optional)",
+    gen="Also show how many moves are legal in this generation (1–9)",
 )
-async def pkinfo_alias(interaction: Interaction, name: str, slot: Optional[int] = None):
-    await _dispatch_mypokeinfo_alias(interaction, name, slot)
+@app_commands.choices(
+    gender=[
+        app_commands.Choice(name="male", value="male"),
+        app_commands.Choice(name="female", value="female"),
+    ]
+)
+async def pkinfo_alias(
+    interaction: Interaction,
+    name_or_id: str,
+    shiny: bool = False,
+    gender: Optional[str] = None,
+    gen: Optional[int] = None,
+):
+    await _dispatch_pokeinfo_alias(interaction, name_or_id, shiny=shiny, gender=gender, gen=gen)
 
 
 @bot.tree.command(name="pkname", description="Set or clear a nickname for one of your team Pokémon.")
