@@ -15838,6 +15838,17 @@ TEAM_TRAINER_FOOTER_RECT = (42, 430, 212, 491)
 TEAM_TRAINER_NAME_CENTER_X = 127
 TEAM_TRAINER_LABEL_Y = 38
 TEAM_TRAINER_NAME_Y = 62
+TEAM_REGION_BY_GEN: dict[int, str] = {
+    1: "Kanto",
+    2: "Johto",
+    3: "Hoenn",
+    4: "Sinnoh",
+    5: "Unova",
+    6: "Kalos",
+    7: "Alola",
+    8: "Galar",
+    9: "Paldea",
+}
 TEAM_SHOWDOWN_CACHE_DIR = ASSETS_DIR / "ui" / "team-anim-cache"
 TEAM_SHOWDOWN_STYLE_DIR = "gen5ani"
 TEAM_SHOWDOWN_UA = "Mozilla/5.0 (DexEmAll Team Renderer)"
@@ -15894,6 +15905,67 @@ TEAM_EGG_STAGE_LABELS: tuple[str, ...] = (
 
 _TEAM_OVERVIEW_RENDER_CACHE: dict[str, tuple[float, bytes, str]] = {}
 _TEAM_WARM_CACHE_TS: dict[str, float] = {}
+
+
+def _team_region_for_gen(gen: Optional[int]) -> str:
+    try:
+        g = int(gen or 0)
+    except Exception:
+        return "Unknown"
+    return TEAM_REGION_BY_GEN.get(g, "Unknown")
+
+
+def _team_species_visual_scale(row: dict) -> float:
+    """
+    Compute a per-species sprite scale factor for /team overview.
+    Uses cached Pokédex height when available so larger Pokémon render bigger.
+    """
+    if _team_is_egg_row(row):
+        return 0.92
+    if db_cache is None:
+        return 1.0
+    species_raw = str(row.get("species") or "").strip().lower().replace("_", "-")
+    if not species_raw:
+        return 1.0
+    candidates = [
+        species_raw,
+        species_raw.replace("-", " "),
+        _daycare_norm_species(species_raw),
+    ]
+    height_m: Optional[float] = None
+    for key in candidates:
+        if not key:
+            continue
+        try:
+            entry = db_cache.get_cached_pokedex(key)
+        except Exception:
+            entry = None
+        if not entry:
+            continue
+        for hk in ("height_m", "heightMeters", "height_meters", "height", "height_dm"):
+            raw_h = entry.get(hk)
+            if raw_h in (None, "", 0, "0"):
+                continue
+            try:
+                h = float(raw_h)
+            except Exception:
+                continue
+            # Some datasets store decimeters as integer in "height".
+            if hk in ("height", "height_dm") and h > 20.0:
+                h = h / 10.0
+            if hk in ("height", "height_dm") and h > 8.0:
+                h = h / 10.0
+            if h > 0:
+                height_m = h
+                break
+        if height_m is not None:
+            break
+    if height_m is None:
+        return 1.0
+    h = max(0.2, min(6.0, float(height_m)))
+    denom = (math.log1p(6.0) - math.log1p(0.2)) or 1.0
+    norm = (math.log1p(h) - math.log1p(0.2)) / denom
+    return max(0.78, min(1.34, 0.80 + (0.54 * norm)))
 
 
 def _team_is_egg_row(row: dict) -> bool:
@@ -16206,7 +16278,14 @@ def _team_fit_font(draw, text: str, *, max_width: int, start_size: int, min_size
     return _team_font(min_size, bold=bold)
 
 
-def _team_load_sprite_frames(path: Optional[Path], *, max_size: tuple[int, int], resample) -> tuple[list[Any], int]:
+def _team_load_sprite_frames(
+    path: Optional[Path],
+    *,
+    max_size: tuple[int, int],
+    resample,
+    allow_upscale: bool = False,
+    min_size: tuple[int, int] | None = None,
+) -> tuple[list[Any], int]:
     if path is None or Image is None:
         return [], TEAM_BATTLE_SYNC_DURATION_MS
     try:
@@ -16219,27 +16298,58 @@ def _team_load_sprite_frames(path: Optional[Path], *, max_size: tuple[int, int],
         return [], TEAM_BATTLE_SYNC_DURATION_MS
     duration = TEAM_BATTLE_SYNC_DURATION_MS
     frames: list[Any] = []
+
+    max_w = max(1, int(max_size[0] if max_size else 1))
+    max_h = max(1, int(max_size[1] if max_size else 1))
+    min_w = max(1, int(min_size[0])) if min_size else 1
+    min_h = max(1, int(min_size[1])) if min_size else 1
+
+    def _scale_sprite(src):
+        try:
+            sw, sh = src.size
+        except Exception:
+            return src
+        if sw <= 0 or sh <= 0:
+            return src
+        max_scale = min(max_w / float(sw), max_h / float(sh))
+        if allow_upscale:
+            scale = max_scale
+            if min_size is not None:
+                min_scale = max(min_w / float(sw), min_h / float(sh))
+                scale = min(max_scale, max(min_scale, scale))
+        else:
+            scale = min(1.0, max_scale)
+        scale = max(0.05, float(scale))
+        nw = max(1, int(round(sw * scale)))
+        nh = max(1, int(round(sh * scale)))
+        if nw == sw and nh == sh:
+            return src
+        try:
+            return src.resize((nw, nh), resample)
+        except Exception:
+            return src
+
     if ImageSequence is not None and bool(getattr(img, "is_animated", False)):
         try:
             for i, fr in enumerate(ImageSequence.Iterator(img)):
                 if i >= TEAM_MAX_SPRITE_FRAMES:
                     break
                 sprite = fr.convert("RGBA")
-                sprite.thumbnail(max_size, resample=resample)
+                sprite = _scale_sprite(sprite)
                 frames.append(sprite)
         except Exception:
             frames = []
     if not frames:
         try:
             sprite = img.convert("RGBA")
-            sprite.thumbnail(max_size, resample=resample)
+            sprite = _scale_sprite(sprite)
             frames = [sprite]
         except Exception:
             frames = []
     return frames, duration
 
 
-def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None]) -> str:
+def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None], *, current_gen: Optional[int] = None) -> str:
     snapshot: list[Any] = []
     for slot in range(1, 7):
         row = slots.get(slot)
@@ -16264,6 +16374,7 @@ def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None]) ->
     raw = json.dumps(
         {
             "target": str(target_name or ""),
+            "current_gen": int(current_gen or 0),
             "slots": snapshot,
             "sync_ms": int(TEAM_BATTLE_SYNC_DURATION_MS),
         },
@@ -16274,14 +16385,19 @@ def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None]) ->
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
-def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -> Optional[discord.File]:
+def _team_overview_panel_file(
+    target_name: str,
+    slots: dict[int, dict | None],
+    *,
+    current_gen: Optional[int] = None,
+) -> Optional[discord.File]:
     if Image is None:
         return None
     try:
         from PIL import ImageDraw  # type: ignore
     except Exception:
         return None
-    cache_key = _team_overview_cache_key(target_name, slots)
+    cache_key = _team_overview_cache_key(target_name, slots, current_gen=current_gen)
     now = float(time.time())
     cached = _TEAM_OVERVIEW_RENDER_CACHE.get(cache_key)
     if cached is not None:
@@ -16310,11 +16426,6 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
         def _pt(x: int, y: int) -> tuple[int, int]:
             return (int(round(x * sx)), int(round(y * sy)))
 
-        def _rc(rect: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
-            x0, y0 = _pt(rect[0], rect[1])
-            x1, y1 = _pt(rect[2], rect[3])
-            return x0, y0, x1, y1
-
         def _layout_scaled(src: dict[str, tuple[int, int]]) -> dict[str, tuple[int, int]]:
             x, y = src["box_xy"]
             w, h = src["box_wh"]
@@ -16329,48 +16440,38 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                 "level_right": _pt(rx, ry),
             }
 
-        def _sample_rgba(x: int, y: int, fallback: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        def _draw_text_with_outline(
+            d,
+            xy: tuple[int, int],
+            text: str,
+            *,
+            font,
+            fill: tuple[int, int, int, int],
+            stroke: tuple[int, int, int, int] = (16, 16, 20, 240),
+            stroke_px: int = 1,
+        ) -> None:
+            t = str(text or "")
+            if not t or font is None:
+                return
+            x, y = int(xy[0]), int(xy[1])
+            sw = max(1, int(stroke_px))
             try:
-                sxp = max(0, min(int(x), bw - 1))
-                syp = max(0, min(int(y), bh - 1))
-                px = base.getpixel((sxp, syp))
-                if isinstance(px, tuple):
-                    if len(px) == 4:
-                        return (int(px[0]), int(px[1]), int(px[2]), int(px[3]))
-                    if len(px) == 3:
-                        return (int(px[0]), int(px[1]), int(px[2]), 255)
-                p = int(px)
-                return (p, p, p, 255)
+                d.text((x, y), t, font=font, fill=fill, stroke_width=sw, stroke_fill=stroke)
+                return
             except Exception:
-                return fallback
+                pass
+            for ox in range(-sw, sw + 1):
+                for oy in range(-sw, sw + 1):
+                    if ox == 0 and oy == 0:
+                        continue
+                    d.text((x + ox, y + oy), t, font=font, fill=stroke)
+            d.text((x, y), t, font=font, fill=fill)
 
         slot_layout = tuple(_layout_scaled(g) for g in TEAM_SLOT_LAYOUT)
 
         draw = ImageDraw.Draw(base)
 
-        # Clear trainer card area, then re-draw a generic "Trainer" header + scaled player name.
-        hdr_rect = _rc(TEAM_TRAINER_HEADER_RECT)
-        art_rect = _rc(TEAM_TRAINER_ART_RECT)
-        ftr_rect = _rc(TEAM_TRAINER_FOOTER_RECT)
-        header_fill = _sample_rgba(hdr_rect[0] + 6, hdr_rect[1] + 6, (20, 18, 27, 255))
-        footer_fill = _sample_rgba(ftr_rect[0] + 6, ftr_rect[1] + 6, (20, 18, 27, 255))
-        art_fill = _sample_rgba(art_rect[0] + 8, art_rect[1] + 56, (47, 34, 59, 255))
-        draw.rectangle(hdr_rect, fill=header_fill)
-        draw.rectangle(art_rect, fill=art_fill)
-        draw.rectangle(ftr_rect, fill=footer_fill)
-
-        # Subtle hatch pattern in trainer card so it doesn't look flat/unfinished.
-        tx0, ty0, tx1, ty1 = art_rect
-        line_color = (
-            max(0, int(art_fill[0]) - 14),
-            max(0, int(art_fill[1]) - 12),
-            max(0, int(art_fill[2]) - 10),
-            min(255, int(art_fill[3])),
-        )
-        step = max(8, int(round(12 * s)))
-        for x in range(tx0 - (ty1 - ty0), tx1 + step, step):
-            draw.line((x, ty1, x + (ty1 - ty0), ty0), fill=line_color, width=max(1, int(round(1 * s))))
-
+        # Overlay only text/sprites; never repaint template blocks.
         trainer_font = _team_font(max(12, int(round(26 * s))), bold=True)
         name_font = _team_fit_font(
             draw,
@@ -16383,35 +16484,58 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
         if trainer_font:
             tw = _team_text_width(draw, "Trainer", trainer_font)
             cx, ty = _pt(TEAM_TRAINER_NAME_CENTER_X, TEAM_TRAINER_LABEL_Y)
-            draw.text((cx - tw // 2, ty), "Trainer", font=trainer_font, fill=(240, 240, 248, 255))
+            _draw_text_with_outline(
+                draw,
+                (cx - tw // 2, ty),
+                "Trainer",
+                font=trainer_font,
+                fill=(245, 246, 252, 255),
+                stroke_px=max(1, int(round(2 * s))),
+            )
         if name_font:
             nw = _team_text_width(draw, target_name, name_font)
             cx, ny = _pt(TEAM_TRAINER_NAME_CENTER_X, TEAM_TRAINER_NAME_Y)
-            draw.text((cx - nw // 2, ny), target_name, font=name_font, fill=(220, 228, 250, 255))
+            _draw_text_with_outline(
+                draw,
+                (cx - nw // 2, ny),
+                target_name,
+                font=name_font,
+                fill=(228, 234, 252, 255),
+                stroke_px=max(1, int(round(2 * s))),
+            )
 
-        # Clear each slot's pokemon/text regions so user template can be reused safely.
-        for geom in slot_layout:
-            bx, by = geom["box_xy"]
-            bw, bh = geom["box_wh"]
-            inset = max(2, int(round(4 * s)))
-
-            # Keep the original template card visuals; only clean sprite center + name strip.
-            label_bg = _sample_rgba(bx + inset + 6, by + bh - max(10, int(round(8 * s))), (24, 18, 32, 255))
-            label_h = max(22, int(round(45 * s)))
-            draw.rectangle((bx + inset, by + bh - label_h, bx + bw - inset, by + bh - inset), fill=label_bg)
-
-            cx, cy = geom["sprite_c"]
-            r = max(16, int(round(52 * s)))
-            center_bg = _sample_rgba(cx, cy - r + max(2, int(round(8 * s))), (118, 90, 142, 255))
-            line_col = _sample_rgba(cx - r + max(4, int(round(9 * s))), cy, (64, 47, 82, 255))
-            dot_col = _sample_rgba(cx, cy, (95, 74, 120, 255))
-            edge_col = _sample_rgba(cx + r - max(4, int(round(7 * s))), cy - r + max(4, int(round(8 * s))), (63, 44, 83, 255))
-            draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=center_bg, outline=edge_col, width=max(1, int(round(2 * s))))
-            line_h = max(1, int(round(2 * s)))
-            margin = max(4, int(round(6 * s)))
-            draw.rectangle((cx - r + margin, cy - line_h, cx + r - margin, cy + line_h), fill=line_col)
-            cr = max(6, int(round(13 * s)))
-            draw.ellipse((cx - cr, cy - cr, cx + cr, cy + cr), fill=dot_col, outline=line_col, width=max(1, int(round(2 * s))))
+        # Footer: show player's selected generation (and matching region label).
+        gen_num = max(1, int(current_gen or 1))
+        region_name = _team_region_for_gen(gen_num)
+        footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 8) * sx))
+        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 6) * sy))
+        footer_w = max(64, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 14) * sx)))
+        footer_font = _team_fit_font(
+            draw,
+            f"Current Gen : {gen_num}",
+            max_width=footer_w,
+            start_size=max(8, int(round(17 * s))),
+            min_size=max(7, int(round(11 * s))),
+            bold=False,
+        )
+        if footer_font is not None:
+            _draw_text_with_outline(
+                draw,
+                (footer_x, footer_y),
+                f"Current Gen : {gen_num}",
+                font=footer_font,
+                fill=(242, 244, 252, 255),
+                stroke_px=max(1, int(round(2 * s))),
+            )
+            line_gap = max(10, int(round((getattr(footer_font, "size", 12) + 3) * 0.95)))
+            _draw_text_with_outline(
+                draw,
+                (footer_x, footer_y + line_gap),
+                f"Region : {region_name}",
+                font=footer_font,
+                fill=(232, 236, 249, 255),
+                stroke_px=max(1, int(round(2 * s))),
+            )
 
         # Preload sprite frames (animated front preferred).
         sprite_data: dict[int, dict[str, Any]] = {}
@@ -16423,8 +16547,20 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                 sprite_data[slot] = {"frames": []}
                 continue
             path = _team_pick_sprite_path(row)
-            sprite_max = (max(32, int(round(88 * sx))), max(32, int(round(88 * sy))))
-            frames, _ = _team_load_sprite_frames(path, max_size=sprite_max, resample=resample)
+            geom = slot_layout[slot - 1]
+            slot_w, slot_h = geom["box_wh"]
+            visual_scale = _team_species_visual_scale(row)
+            max_w = max(30, min(max(30, slot_w - max(10, int(round(10 * s)))), int(round(128 * sx * visual_scale))))
+            max_h = max(30, min(max(30, slot_h - max(46, int(round(54 * s)))), int(round(124 * sy * visual_scale))))
+            sprite_max = (max_w, max_h)
+            sprite_min = (max(24, int(round(max_w * 0.72))), max(24, int(round(max_h * 0.72))))
+            frames, _ = _team_load_sprite_frames(
+                path,
+                max_size=sprite_max,
+                resample=resample,
+                allow_upscale=True,
+                min_size=sprite_min,
+            )
             sprite_data[slot] = {"frames": frames}
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
@@ -16435,16 +16571,9 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
         for slot in range(1, 7):
             row = slots.get(slot)
             geom = slot_layout[slot - 1]
+            slot_w, _slot_h = geom["box_wh"]
             if not row:
-                empty_font = _team_fit_font(
-                    probe_draw,
-                    "Empty",
-                    max_width=max(28, int(round(110 * sx))),
-                    start_size=max(9, int(round(18 * s))),
-                    min_size=max(7, int(round(12 * s))),
-                    bold=True,
-                )
-                text_prep[slot] = {"label": "Empty", "font": empty_font, "lvl": "", "lvl_x": geom["level_right"][0], "label_x": geom["label_xy"][0]}
+                text_prep[slot] = {"label": "", "font": None, "lvl": "", "lvl_x": geom["level_right"][0], "label_x": geom["label_xy"][0]}
                 continue
             if _team_is_egg_row(row):
                 label = "Egg"
@@ -16455,7 +16584,7 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
             label_font = _team_fit_font(
                 probe_draw,
                 label,
-                max_width=max(28, int(round(112 * sx))),
+                max_width=max(36, int(round((slot_w - max(42, int(round(52 * s))))))),
                 start_size=max(9, int(round(19 * s))),
                 min_size=max(7, int(round(10 * s))),
                 bold=True,
@@ -16480,28 +16609,25 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
             row = slots.get(slot)
             slot_text = text_prep.get(slot) or {}
             if not row:
-                if slot_text.get("font"):
-                    text_draw.text(
-                        geom["label_xy"],
-                        str(slot_text.get("label") or "Empty"),
-                        font=slot_text["font"],
-                        fill=(195, 194, 210, 255),
-                    )
                 continue
-            if slot_text.get("font"):
-                text_draw.text(
+            if slot_text.get("font") and str(slot_text.get("label") or "").strip():
+                _draw_text_with_outline(
+                    text_draw,
                     (int(slot_text.get("label_x") or geom["label_xy"][0]), geom["label_xy"][1]),
                     str(slot_text.get("label") or ""),
                     font=slot_text["font"],
-                    fill=(238, 240, 252, 255),
+                    fill=(244, 246, 253, 255),
+                    stroke_px=max(1, int(round(2 * s))),
                 )
             lvl = str(slot_text.get("lvl") or "")
             if lvl and lvl_font_slot:
-                text_draw.text(
+                _draw_text_with_outline(
+                    text_draw,
                     (int(slot_text.get("lvl_x") or geom["level_right"][0]), geom["level_right"][1]),
                     lvl,
                     font=lvl_font_slot,
-                    fill=(230, 230, 240, 255),
+                    fill=(236, 236, 246, 255),
+                    stroke_px=max(1, int(round(2 * s))),
                 )
 
         out_frames: list[Any] = []
@@ -16535,10 +16661,10 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
                     else:
                         src_i = 0
                     sprite = frames[src_i]
-                    sx = int(geom["sprite_c"][0] - (sprite.width // 2))
-                    sy = int(geom["sprite_c"][1] - (sprite.height // 2))
+                    dx = int(geom["sprite_c"][0] - (sprite.width // 2))
+                    dy = int(geom["sprite_c"][1] - (sprite.height // 2))
                     try:
-                        frame.alpha_composite(sprite, dest=(sx, sy))
+                        frame.alpha_composite(sprite, dest=(dx, dy))
                     except Exception:
                         pass
             frame.alpha_composite(text_layer)
@@ -16572,11 +16698,19 @@ def _team_overview_panel_file(target_name: str, slots: dict[int, dict | None]) -
 
 
 class TeamPanelView(discord.ui.View):
-    def __init__(self, author_id: int, target_name: str, slots: dict[int, dict | None]):
+    def __init__(
+        self,
+        author_id: int,
+        target_name: str,
+        slots: dict[int, dict | None],
+        *,
+        current_gen: Optional[int] = None,
+    ):
         super().__init__(timeout=240)
         self.author_id = int(author_id)
         self.target_name = target_name
         self.slots = dict(slots)
+        self.current_gen = max(1, int(current_gen or 1))
         self._build_buttons()
 
     def _build_buttons(self):
@@ -16602,7 +16736,7 @@ class TeamPanelView(discord.ui.View):
         # Keep overview clean: image-only panel + slot buttons.
         emb = discord.Embed(color=0x5865F2)
         files: list[discord.File] = []
-        panel = _team_overview_panel_file(self.target_name, self.slots)
+        panel = _team_overview_panel_file(self.target_name, self.slots, current_gen=self.current_gen)
         if panel:
             emb.set_image(url=f"attachment://{panel.filename}")
             files.append(panel)
@@ -16867,7 +17001,12 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
                         "_egg_stage": stage,
                     }
 
-    view = TeamPanelView(interaction.user.id, target.display_name, slots)
+    try:
+        target_gen = await _user_selected_gen(uid)
+    except Exception:
+        target_gen = 1
+
+    view = TeamPanelView(interaction.user.id, target.display_name, slots, current_gen=target_gen)
     emb, files = view._overview_payload()
     await interaction.followup.send(embed=emb, files=files, view=view, ephemeral=True)
     if hatch_messages and uid == str(interaction.user.id):
