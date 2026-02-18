@@ -16274,15 +16274,18 @@ def _team_font(size: int, *, bold: bool = False):
         from PIL import ImageFont  # type: ignore
     except Exception:
         return None
-    # Prefer Pokemon-style pixel fonts when available, then mono/system fallbacks.
-    candidates: list[str] = []
+    # Use the same loader path as battle renderer for pixel-font consistency.
     try:
         from pvp.renderer import _get_pokemon_font_path as _renderer_pokemon_font_path  # type: ignore
-        p = _renderer_pokemon_font_path()
-        if p:
-            candidates.append(str(p))
+        from pvp.renderer import _load_font_cached as _renderer_load_font_cached  # type: ignore
+        path_key = str(_renderer_pokemon_font_path() or "")
+        f = _renderer_load_font_cached(path_key, int(size))
+        if f is not None:
+            return f
     except Exception:
         pass
+    # Fallback font candidates.
+    candidates: list[str] = []
     candidates.extend([
         "pvp/_common/fonts/Pokemon GB.ttf",
         "pvp/_common/fonts/PokemonGb-RAeo.ttf",
@@ -16554,34 +16557,42 @@ def _team_overview_panel_file(
         draw = ImageDraw.Draw(base)
 
         # Overlay only text/sprites; never repaint template blocks.
-        trainer_title = "Elite Trainer"
+        trainer_title = "Trainer"
         trainer_font = _team_font(max(11, int(round(23 * s))), bold=True)
+        header_left_x = int(round((TEAM_TRAINER_HEADER_RECT[0] + 8) * sx))
+        header_top_y = int(round(TEAM_TRAINER_LABEL_Y * sy))
+        header_name_y = int(round(TEAM_TRAINER_NAME_Y * sy))
+        header_max_w = max(48, int(round((TEAM_TRAINER_HEADER_RECT[2] - TEAM_TRAINER_HEADER_RECT[0] - 16) * sx)))
         name_font = _team_fit_font(
             draw,
             target_name,
-            max_width=max(72, int(round(158 * sx))),
+            max_width=header_max_w,
             start_size=max(10, int(round(19 * s))),
             min_size=max(9, int(round(11 * s))),
             bold=True,
         )
         if trainer_font:
-            tw = _team_text_width(draw, trainer_title, trainer_font)
-            cx, ty = _pt(TEAM_TRAINER_NAME_CENTER_X, TEAM_TRAINER_LABEL_Y)
+            title_font = _team_fit_font(
+                draw,
+                trainer_title,
+                max_width=header_max_w,
+                start_size=max(10, int(round(19 * s))),
+                min_size=max(8, int(round(11 * s))),
+                bold=True,
+            )
             _draw_text_with_outline(
                 draw,
-                (cx - tw // 2, ty),
+                (header_left_x, header_top_y),
                 trainer_title,
-                font=trainer_font,
+                font=(title_font or trainer_font),
                 fill=(248, 248, 252, 255),
                 stroke=(4, 4, 8, 255),
                 stroke_px=1,
             )
         if name_font:
-            nw = _team_text_width(draw, target_name, name_font)
-            cx, ny = _pt(TEAM_TRAINER_NAME_CENTER_X, TEAM_TRAINER_NAME_Y)
             _draw_text_with_outline(
                 draw,
-                (cx - nw // 2, ny),
+                (header_left_x, header_name_y),
                 target_name,
                 font=name_font,
                 fill=(248, 248, 252, 255),
@@ -16592,8 +16603,8 @@ def _team_overview_panel_file(
         # Footer: only overlay region value beside the template's existing label text.
         gen_num = max(1, int(current_gen or 1))
         region_name = _team_region_for_gen(gen_num)
-        footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 96) * sx))
-        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 26) * sy))
+        footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 94) * sx))
+        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 24) * sy))
         footer_w = max(36, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 102) * sx)))
         footer_font = _team_fit_font(
             draw,
@@ -16658,20 +16669,43 @@ def _team_overview_panel_file(
             else:
                 label = _team_species_label(row)
                 lvl = f"lvl {int(row.get('level') or 1)}"
+            label_to_draw = label
             label_font = _team_fit_font(
                 probe_draw,
-                label,
+                label_to_draw,
                 max_width=max(36, int(round((slot_w - max(42, int(round(52 * s))))))),
                 start_size=max(9, int(round(19 * s))),
                 min_size=max(7, int(round(10 * s))),
                 bold=True,
             )
             lvl_x = geom["level_right"][0]
+            lvl_w = 0
             if lvl_font_slot:
-                lw = _team_text_width(probe_draw, lvl, lvl_font_slot)
-                lvl_x = int(geom["level_right"][0] - lw)
+                lvl_w = _team_text_width(probe_draw, lvl, lvl_font_slot)
+                lvl_x = int(geom["level_right"][0] - lvl_w)
+            if label_font:
+                label_w = _team_text_width(probe_draw, label_to_draw, label_font)
+                min_gap = max(8, int(round(10 * s)))
+                label_start_x = int(geom["label_xy"][0])
+                label_end_limit = int(lvl_x - min_gap)
+                if label_start_x + label_w > label_end_limit:
+                    tighter_max = max(22, label_end_limit - label_start_x)
+                    label_font = _team_fit_font(
+                        probe_draw,
+                        label_to_draw,
+                        max_width=tighter_max,
+                        start_size=max(8, int(round(16 * s))),
+                        min_size=max(7, int(round(9 * s))),
+                        bold=True,
+                    )
+                    if label_font:
+                        label_w = _team_text_width(probe_draw, label_to_draw, label_font)
+                    # Final hard guard: trim label if still colliding with lvl text.
+                    while label_font and label_to_draw and (label_start_x + label_w > label_end_limit):
+                        label_to_draw = label_to_draw[:-1]
+                        label_w = _team_text_width(probe_draw, label_to_draw, label_font) if label_to_draw else 0
             text_prep[slot] = {
-                "label": label,
+                "label": label_to_draw,
                 "font": label_font,
                 "lvl": lvl,
                 "lvl_x": lvl_x,
