@@ -16088,18 +16088,20 @@ class MPokeInfo(commands.Cog):
         gap = max(1, int(round(2 * sx))) if gender_symbol else 0
         group_w = int(lv_w + (gap + gw if gender_symbol else 0))
         group_x = int(lv_box_left + max(0, ((lv_box_w - group_w) // 2)))
+        lv_nudge_x = max(1, int(round(2 * sx)))
         lv_y = int(lv_box_y + max(0, ((lv_box_h - lv_h) // 2) - 1))
         self._mpokeinfo_draw_shadow_text(
             draw,
-            (group_x, lv_y),
+            (group_x + lv_nudge_x, lv_y),
             lv_line,
             font=lv_font,
             fill=(236, 244, 248, 255),
             shadow=(0, 0, 0, 220),
         )
         if gender_symbol and gender_font is not None:
-            gx = int(group_x + lv_w + gap)
-            gy = int(lv_box_y + max(0, ((lv_box_h - gh) // 2) - 1))
+            gx = int(group_x + lv_nudge_x + lv_w + gap)
+            gender_nudge_y = -max(1, int(round(1 * sy)))
+            gy = int(lv_box_y + max(0, ((lv_box_h - gh) // 2) - 1 + gender_nudge_y))
             self._mpokeinfo_draw_shadow_text(
                 draw,
                 (gx, gy),
