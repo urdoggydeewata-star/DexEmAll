@@ -16552,6 +16552,27 @@ def _team_overview_panel_file(
                     d.text((x + ox, y + oy), t, font=font, fill=stroke)
             d.text((x, y), t, font=font, fill=fill)
 
+        def _draw_pixel_shadow_text(
+            d,
+            xy: tuple[int, int],
+            text: str,
+            *,
+            font,
+            fill: tuple[int, int, int, int] = (230, 241, 250, 255),
+            shadow: tuple[int, int, int, int] = (10, 22, 33, 185),
+            shadow_offset: tuple[int, int] = (1, 1),
+        ) -> None:
+            t = str(text or "")
+            if not t or font is None:
+                return
+            x, y = int(xy[0]), int(xy[1])
+            sx_off, sy_off = int(shadow_offset[0]), int(shadow_offset[1])
+            try:
+                d.text((x + sx_off, y + sy_off), t, font=font, fill=shadow)
+                d.text((x, y), t, font=font, fill=fill)
+            except Exception:
+                pass
+
         slot_layout = tuple(_layout_scaled(g) for g in TEAM_SLOT_LAYOUT)
 
         draw = ImageDraw.Draw(base)
@@ -16580,24 +16601,22 @@ def _team_overview_panel_file(
                 min_size=max(8, int(round(11 * s))),
                 bold=True,
             )
-            _draw_text_with_outline(
+            _draw_pixel_shadow_text(
                 draw,
                 (header_left_x, header_top_y),
                 trainer_title,
                 font=(title_font or trainer_font),
-                fill=(248, 248, 252, 255),
-                stroke=(4, 4, 8, 255),
-                stroke_px=1,
+                fill=(236, 240, 252, 255),
+                shadow=(10, 22, 33, 190),
             )
         if name_font:
-            _draw_text_with_outline(
+            _draw_pixel_shadow_text(
                 draw,
                 (header_left_x, header_name_y),
                 target_name,
                 font=name_font,
-                fill=(248, 248, 252, 255),
-                stroke=(4, 4, 8, 255),
-                stroke_px=1,
+                fill=(232, 236, 249, 255),
+                shadow=(10, 22, 33, 180),
             )
 
         # Footer: only overlay region value beside the template's existing label text.
@@ -16615,14 +16634,13 @@ def _team_overview_panel_file(
             bold=False,
         )
         if footer_font is not None:
-            _draw_text_with_outline(
+            _draw_pixel_shadow_text(
                 draw,
                 (footer_x, footer_y),
                 region_name,
                 font=footer_font,
-                fill=(248, 248, 252, 255),
-                stroke=(4, 4, 8, 255),
-                stroke_px=1,
+                fill=(230, 241, 250, 255),
+                shadow=(10, 22, 33, 175),
             )
 
         # Preload sprite frames (animated front preferred).
@@ -16722,25 +16740,23 @@ def _team_overview_panel_file(
             if not row:
                 continue
             if slot_text.get("font") and str(slot_text.get("label") or "").strip():
-                _draw_text_with_outline(
+                _draw_pixel_shadow_text(
                     text_draw,
                     (int(slot_text.get("label_x") or geom["label_xy"][0]), geom["label_xy"][1]),
                     str(slot_text.get("label") or ""),
                     font=slot_text["font"],
-                    fill=(248, 248, 252, 255),
-                    stroke=(4, 4, 8, 255),
-                    stroke_px=1,
+                    fill=(230, 241, 250, 255),
+                    shadow=(10, 22, 33, 185),
                 )
             lvl = str(slot_text.get("lvl") or "")
             if lvl and lvl_font_slot:
-                _draw_text_with_outline(
+                _draw_pixel_shadow_text(
                     text_draw,
                     (int(slot_text.get("lvl_x") or geom["level_right"][0]), geom["level_right"][1]),
                     lvl,
                     font=lvl_font_slot,
-                    fill=(248, 248, 252, 255),
-                    stroke=(4, 4, 8, 255),
-                    stroke_px=1,
+                    fill=(206, 224, 240, 255),
+                    shadow=(10, 22, 33, 170),
                 )
 
         out_frames: list[Any] = []
