@@ -4450,6 +4450,12 @@ class BattleState:
                             log.append(f"**{self.p1_name}** threw a {ball_label}! It shook {shakes} time(s) and **caught {target_display}!**")
                             self.winner = self.p1_id
                             self._caught_wild_mon = mon_target  # so pokebot can add to team
+                            self._caught_ball_name = str(ball_name or "")
+                            self._caught_ball_normalized = str(_normalize_ball_name(str(ball_name or "")) or "")
+                            try:
+                                setattr(mon_target, "_caught_ball_name", str(ball_name or ""))
+                            except Exception:
+                                pass
                             self._throw_shakes = shakes  # for shake-by-shake embeds
                             # Capture ends the battle; no further actions
                             return log, {}, None
@@ -6637,6 +6643,21 @@ _BALLS_BASIC = {
     "park ball": 1.0,
 }
 
+# Gen VII+ Ultra Beasts (for Beast Ball bonus handling).
+_ULTRA_BEAST_SPECIES = {
+    "nihilego",
+    "buzzwole",
+    "pheromosa",
+    "xurkitree",
+    "celesteela",
+    "kartana",
+    "guzzlord",
+    "poipole",
+    "naganadel",
+    "stakataka",
+    "blacephalon",
+}
+
 def _normalize_item(name: str) -> str:
     n = str(name or "").strip().lower().replace("é", "e")
     # Normalize common dash variants and separators to spaces.
@@ -7001,8 +7022,11 @@ def _ball_multiplier(ball_name: str, mon: Mon, battle_state: BattleState) -> flo
         else:
             base = 1.0
     elif b in ("repeat ball",):
-        seen = getattr(battle_state, "repeat_seen", set()) or set()
-        base = (3.5 if gen >= 7 else 3.0) if mon.species.lower() in {str(s).lower() for s in seen} else 1.0
+        caught = getattr(battle_state, "repeat_caught", None)
+        if not caught:
+            caught = getattr(battle_state, "repeat_seen", set()) or set()
+        caught_norm = {str(s).lower() for s in (caught or [])}
+        base = (3.5 if gen >= 7 else 3.0) if mon.species.lower() in caught_norm else 1.0
     elif b in ("dive ball",):
         base = (3.5 if gen >= 5 else 3.0) if in_water else 1.0
     elif b in ("heavy ball",):
@@ -7031,8 +7055,9 @@ def _ball_multiplier(ball_name: str, mon: Mon, battle_state: BattleState) -> flo
         else:
             base = 1.0
     elif b in ("lure ball",):
-        # Fishing encounters aren't explicitly tracked; use water-route context proxy.
-        if in_water:
+        # Prefer explicit fishing context; fallback to water-route proxy when unavailable.
+        is_fishing = bool(getattr(battle_state, "is_fishing_encounter", False))
+        if is_fishing or in_water:
             base = 5.0 if gen >= 7 else 3.0
         else:
             base = 1.0
@@ -7042,6 +7067,9 @@ def _ball_multiplier(ball_name: str, mon: Mon, battle_state: BattleState) -> flo
     elif b in ("fast ball",):
         try:
             mon_base_speed = float(getattr(mon, "base_speed", 0) or 0)
+            if mon_base_speed <= 0:
+                base_stats = getattr(mon, "base", {}) or {}
+                mon_base_speed = float(base_stats.get("spe", base_stats.get("speed", 0)) or 0)
         except Exception:
             mon_base_speed = 0.0
         if mon_base_speed >= 100:
@@ -7049,13 +7077,20 @@ def _ball_multiplier(ball_name: str, mon: Mon, battle_state: BattleState) -> flo
         else:
             base = 1.0
     elif b in ("beast ball",):
-        is_ub = "ultra beast" in (getattr(mon, "category", "") or "").lower() or getattr(mon, "is_ultra_beast", False)
+        species_norm = str(getattr(mon, "species", "") or "").strip().lower().replace(" ", "-")
+        is_ub = (
+            "ultra beast" in (getattr(mon, "category", "") or "").lower()
+            or bool(getattr(mon, "is_ultra_beast", False))
+            or species_norm in _ULTRA_BEAST_SPECIES
+        )
         base = 5.0 if is_ub else 0.1
     elif b in ("dream ball",):
         st = str(getattr(mon, "status", "") or "").lower()
         base = 4.0 if st in {"slp", "sleep"} else 1.0
     elif b in ("safari ball",):
         base = 1.5
+    elif b in ("sport ball",):
+        base = 1.5 if gen >= 8 else 1.0
     elif b in ("great ball",):
         base = 1.5
     elif b in ("ultra ball",):
@@ -7083,7 +7118,7 @@ def _attempt_capture(mon: Mon, ball_name: str, battle_state: BattleState) -> Tup
     b_norm = _normalize_ball_name(ball_name)
     if b_norm == "heavy ball":
         try:
-            w = float(getattr(mon, "weight", 0) or 0)
+            w = float(getattr(mon, "weight_kg", getattr(mon, "weight", 0)) or 0)
         except Exception:
             w = 0.0
         if w > 0:

@@ -4332,6 +4332,90 @@ async def _get_base_friendship(species_name: str) -> int:
             await conn.close()
         except Exception:
             pass
+
+
+def _normalize_ball_item_id(ball_name: Optional[str]) -> str:
+    """Normalize a Poké Ball identifier to canonical item_id style (snake_case)."""
+    raw = str(ball_name or "").strip().lower()
+    if not raw:
+        return "poke_ball"
+    norm = re.sub(r"[\s\-]+", "_", raw)
+    norm = re.sub(r"[^a-z0-9_]", "", norm)
+    aliases = {
+        "pokeball": "poke_ball",
+        "pok_ball": "poke_ball",
+        "poke_ball": "poke_ball",
+    }
+    return aliases.get(norm, norm)
+
+
+def _is_friend_ball(ball_item_id: Optional[str]) -> bool:
+    return _normalize_ball_item_id(ball_item_id) == "friend_ball"
+
+
+def _is_heal_ball(ball_item_id: Optional[str]) -> bool:
+    return _normalize_ball_item_id(ball_item_id) == "heal_ball"
+
+
+def _is_luxury_ball(ball_item_id: Optional[str]) -> bool:
+    return _normalize_ball_item_id(ball_item_id) == "luxury_ball"
+
+
+def _caught_friendship_for_ball(base_friendship: int, ball_item_id: Optional[str]) -> int:
+    """Apply on-catch friendship behavior from the catch ball."""
+    value = max(0, min(255, int(base_friendship or 0)))
+    if _is_friend_ball(ball_item_id):
+        # Friend Ball starts at 200 friendship.
+        value = max(value, 200)
+    return value
+
+
+def _caught_hp_for_ball(mon: "Mon", hp_max: int, ball_item_id: Optional[str]) -> int:
+    """Apply on-catch HP behavior from the catch ball."""
+    if _is_heal_ball(ball_item_id):
+        return max(1, int(hp_max or 1))
+    try:
+        cur = int(getattr(mon, "hp", hp_max) or hp_max)
+    except Exception:
+        cur = int(hp_max or 1)
+    return max(1, min(int(hp_max or 1), cur))
+
+
+async def _get_pokemon_ball(owner_id: str, mon_id: int) -> Optional[str]:
+    """Read pokeball column for a Pokémon (fails soft if column is unavailable)."""
+    conn = await db.connect()
+    try:
+        try:
+            cur = await conn.execute(
+                "SELECT pokeball FROM pokemons WHERE owner_id=? AND id=? LIMIT 1",
+                (owner_id, int(mon_id)),
+            )
+        except Exception as e:
+            if "pokeball" in str(e).lower() and (
+                "no such column" in str(e).lower() or "does not exist" in str(e).lower()
+            ):
+                return None
+            raise
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return None
+        return row["pokeball"] if hasattr(row, "keys") else row[0]
+    finally:
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
+def _friendship_delta_with_ball_bonus(delta: int, ball_item_id: Optional[str]) -> int:
+    """Luxury Ball gives +1 friendship on positive friendship gains."""
+    d = int(delta or 0)
+    if d > 0 and _is_luxury_ball(ball_item_id):
+        return d + 1
+    return d
+
+
 async def _set_friendship(owner_id: str, mon_id: int, value: int) -> None:
     """Persist friendship on pokemons(friendship) for (owner_id, id)."""
     conn = await db.connect()
@@ -10311,6 +10395,21 @@ async def pokedex_seen_species(user_id: str) -> list[str]:
         rows = await cur.fetchall()
         await cur.close()
         return [r["species"] if hasattr(r, "keys") else r[0] for r in rows]
+
+
+async def pokedex_caught_species(user_id: str) -> list[str]:
+    """Return list of species caught by user."""
+    await _ensure_pokedex_tables()
+    async with db.session() as conn:
+        cur = await conn.execute(
+            "SELECT species FROM user_pokedex WHERE owner_id=? AND caught_count>0",
+            (user_id,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [r["species"] if hasattr(r, "keys") else r[0] for r in rows]
+
+
 def _is_city(area_id: str) -> bool:
     return area_id in ADVENTURE_CITIES
 
@@ -11442,7 +11541,12 @@ def _mon_to_long_stats(short: dict) -> dict:
     }
 
 
-async def _add_caught_wild_to_team(owner_id: str, mon: "Mon") -> Optional[dict[str, Any]]:
+async def _add_caught_wild_to_team(
+    owner_id: str,
+    mon: "Mon",
+    *,
+    caught_ball: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
     """
     Create a Pokemon row from a caught wild Mon.
     If team has room it is placed in team; otherwise it is routed to PC box storage.
@@ -11460,6 +11564,21 @@ async def _add_caught_wild_to_team(owner_id: str, mon: "Mon") -> Optional[dict[s
         if not species:
             return None
         final_stats = calc_all_stats(base_long, ivs_long, evs_long, level, nature)
+        hp_max = int(max(1, final_stats.get("hp", 1)))
+        ball_item_id = _normalize_ball_item_id(
+            caught_ball
+            or getattr(mon, "_caught_ball_name", None)
+            or getattr(mon, "pokeball", None)
+            or "poke_ball"
+        )
+        try:
+            base_friendship = int(getattr(mon, "friendship", 0) or 0)
+        except Exception:
+            base_friendship = 0
+        if base_friendship <= 0:
+            base_friendship = await _get_base_friendship(species)
+        starting_friendship = _caught_friendship_for_ball(base_friendship, ball_item_id)
+        caught_hp_now = _caught_hp_for_ball(mon, hp_max, ball_item_id)
         mon_id = await db.add_pokemon_with_stats(
             owner_id=owner_id,
             species=species,
@@ -11477,14 +11596,29 @@ async def _add_caught_wild_to_team(owner_id: str, mon: "Mon") -> Optional[dict[s
         async with db.session() as conn:
             exp_group = await _get_exp_group_for_species(conn, species)
             initial_exp = await _get_exp_total_for_level(conn, exp_group, level)
-            await conn.execute(
-                "UPDATE pokemons SET exp=?, exp_group=?, hp_now=? WHERE owner_id=? AND id=?",
-                (initial_exp, exp_group, int(getattr(mon, "hp", mon.max_hp or 1)), owner_id, mon_id),
-            )
+            try:
+                await conn.execute(
+                    "UPDATE pokemons SET exp=?, exp_group=?, hp_now=?, friendship=?, pokeball=? WHERE owner_id=? AND id=?",
+                    (initial_exp, exp_group, int(caught_hp_now), int(starting_friendship), ball_item_id, owner_id, mon_id),
+                )
+            except Exception as update_err:
+                msg = str(update_err or "").lower()
+                # Backward-compatible fallback for databases that still lack pokeball column.
+                if "pokeball" in msg and ("no such column" in msg or "does not exist" in msg):
+                    await conn.execute(
+                        "UPDATE pokemons SET exp=?, exp_group=?, hp_now=?, friendship=? WHERE owner_id=? AND id=?",
+                        (initial_exp, exp_group, int(caught_hp_now), int(starting_friendship), owner_id, mon_id),
+                    )
+                else:
+                    raise
             if getattr(mon, "shiny", False):
                 await conn.execute("UPDATE pokemons SET shiny=1 WHERE owner_id=? AND id=?", (owner_id, mon_id))
             await conn.commit()
             db.invalidate_pokemons_cache(owner_id)
+        try:
+            setattr(mon, "friendship", int(starting_friendship))
+        except Exception:
+            pass
         moves = list(getattr(mon, "moves", []) or [])[:4]
         if moves:
             await db.set_pokemon_moves(owner_id, mon_id, moves)
@@ -11921,11 +12055,14 @@ async def _start_pve_battle(
     # Seed battle-state with dex/repeat info for capture logic
     try:
         seen_list = await pokedex_seen_species(str(itx.user.id))
+        caught_list = await pokedex_caught_species(str(itx.user.id))
         summary = await pokedex_summary(str(itx.user.id))
         st.repeat_seen = seen_list
+        st.repeat_caught = caught_list
         st.dex_seen = summary.get("seen", 0)
     except Exception:
         st.repeat_seen = []
+        st.repeat_caught = []
         st.dex_seen = 0
 
     await _load_pp_from_db(st, itx.user.id)
@@ -12034,6 +12171,11 @@ async def _start_pve_battle(
                         if caught_fb:
                             st.winner = st.p1_id
                             st._caught_wild_mon = wild_active
+                            st._caught_ball_name = str(fallback_ball or "")
+                            try:
+                                setattr(wild_active, "_caught_ball_name", str(fallback_ball or ""))
+                            except Exception:
+                                pass
                             display = str(getattr(wild_active, "species", "Pokémon") or "Pokémon").replace("-", " ").title()
                             msg = f"**{st.p1_name}** threw a {str(fallback_ball).replace('_', ' ').title()}! It shook {int(shakes_fb or 1)} time(s) and **caught {display}!**"
                             fb_log = list(getattr(st, "_last_turn_log", []) or [])
@@ -12168,7 +12310,16 @@ async def _start_pve_battle(
                 caught_mon = getattr(st, "_caught_wild_mon", None)
                 if caught_mon is not None:
                     try:
-                        placement = await _add_caught_wild_to_team(str(itx.user.id), caught_mon)
+                        caught_ball = (
+                            getattr(st, "_caught_ball_name", None)
+                            or getattr(caught_mon, "_caught_ball_name", None)
+                            or getattr(st, "_last_throw_ball", None)
+                        )
+                        placement = await _add_caught_wild_to_team(
+                            str(itx.user.id),
+                            caught_mon,
+                            caught_ball=caught_ball,
+                        )
                         if placement and str(placement.get("destination")) == "box":
                             display = str(getattr(caught_mon, "species", "Pokémon") or "Pokémon").replace("-", " ").title()
                             bno = placement.get("box_no")
@@ -15647,6 +15798,26 @@ class MPokeInfo(commands.Cog):
         return None
 
     @staticmethod
+    def _pokeball_icon_path(ball_id: Optional[str]) -> Optional[Path]:
+        """Resolve a Poké Ball icon path from stored ball id/name."""
+        canonical = _normalize_ball_item_id(ball_id)
+        candidates: list[str] = []
+        for c in (
+            canonical,
+            canonical.replace("_", "-"),
+            canonical.replace("_", " "),
+            "poke_ball" if canonical in {"pokeball", "poke_ball", "pok_ball"} else "",
+        ):
+            c2 = str(c or "").strip().lower()
+            if c2 and c2 not in candidates:
+                candidates.append(c2)
+        for c in candidates:
+            p = MPokeInfo._held_item_icon_path(c)
+            if p is not None:
+                return p
+        return None
+
+    @staticmethod
     def _mpokeinfo_type_badge_path(type_name: Optional[str]) -> Optional[Path]:
         raw = str(type_name or "").strip().lower()
         if not raw:
@@ -16131,6 +16302,17 @@ class MPokeInfo(commands.Cog):
             sx2, sy2 = _pt(127, 66)
             _draw_sparkle(int(sx1), int(sy1), size=max(2, int(round(2 * scale))))
             _draw_sparkle(int(sx2), int(sy2), size=max(1, int(round(1 * scale))))
+
+        ball_raw = str(mon.get("pokeball") or "poke_ball").strip().lower()
+        ball_icon = self._pokeball_icon_path(ball_raw)
+        if ball_icon is not None:
+            try:
+                with Image.open(str(ball_icon)) as src:
+                    icon = src.convert("RGBA")
+                icon.thumbnail((max(10, int(round(18 * sx))), max(10, int(round(18 * sy)))), resample=resample)
+                panel_static.alpha_composite(icon, dest=_pt(88, 40))
+            except Exception:
+                pass
 
         held_item_raw = str(mon.get("held_item") or "").strip().lower()
         held_icon = self._held_item_icon_path(held_item_raw)
@@ -16836,11 +17018,23 @@ async def _check_limit_and_cooldown(user_id: str, mon_id: int, action: str,
 async def _award_friendship(inter: discord.Interaction, mon_id: int, delta: int,
                             action: str, extra: dict | None = None):
     uid = str(inter.user.id)
-    new_val = await db.bump_friendship(uid, mon_id, delta)
-    payload = {"mon_id": mon_id, "delta": delta}
+    raw_delta = int(delta or 0)
+    ball_item_id: Optional[str] = None
+    if raw_delta > 0:
+        try:
+            ball_item_id = await _get_pokemon_ball(uid, mon_id)
+        except Exception:
+            ball_item_id = None
+    applied_delta = _friendship_delta_with_ball_bonus(raw_delta, ball_item_id)
+    new_val = await db.bump_friendship(uid, mon_id, applied_delta)
+    payload = {"mon_id": mon_id, "delta": applied_delta}
+    if applied_delta != raw_delta:
+        payload["ball_bonus"] = int(applied_delta - raw_delta)
+    if ball_item_id:
+        payload["ball"] = _normalize_ball_item_id(ball_item_id)
     if extra: payload.update(extra)
     await db.log_event(uid, action, payload)
-    return new_val
+    return new_val, applied_delta
 
 
 # ---------- /pet ----------
@@ -16896,10 +17090,13 @@ async def feed_cmd(inter: discord.Interaction, name: str, item: str, slot: int |
         return await inter.followup.send(f"You don’t have a **{pretty_item(item_id)}**.", ephemeral=True)
 
     gain = _FEED_ITEMS[item_id]
-    new_val = await _award_friendship(inter, mon["id"], gain, "friend_feed", {"item": item_id})
+    new_val, applied_gain = await _award_friendship(inter, mon["id"], gain, "friend_feed", {"item": item_id})
     auto = f" (autocorrected to **{mon['_autocorrected_to']}**)" if mon.get("_autocorrected_to") else ""
+    gain_suffix = ""
+    if applied_gain != gain:
+        gain_suffix = f" (including +{applied_gain - gain} Luxury Ball bonus)"
     await inter.followup.send(
-        f"🍓 **{mon['species'].title()}** ate the {pretty_item(item_id)}{auto}! Friendship **+{gain}** → **{new_val}**.",
+        f"🍓 **{mon['species'].title()}** ate the {pretty_item(item_id)}{auto}! Friendship **+{applied_gain}**{gain_suffix} → **{new_val}**.",
         ephemeral=True
     )
 
