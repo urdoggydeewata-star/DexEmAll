@@ -16163,14 +16163,8 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
     form = _species_folder_name(str(row.get("form") or ""))
     shiny = bool(int(row.get("shiny") or 0))
     is_female = str(row.get("gender") or "").strip().lower() == "female"
-    resolved: Optional[Path | str] = None
 
-    def _is_animated_path(p: Path) -> bool:
-        suf = str(getattr(p, "suffix", "") or "").strip().lower()
-        return suf in {".gif", ".webp", ".apng"}
-
-    # Keep /team sprite source aligned with battle renderer resolution logic,
-    # but only accept this early path if it's animated.
+    # Keep /team sprite source aligned with battle renderer resolution logic.
     try:
         resolved = _pvp_sprites.find_sprite(
             species,
@@ -16183,7 +16177,7 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
         )
         if resolved is not None:
             rp = Path(resolved)
-            if rp.exists() and rp.is_file() and rp.stat().st_size > 0 and _is_animated_path(rp):
+            if rp.exists() and rp.is_file() and rp.stat().st_size > 0:
                 return rp
     except Exception:
         pass
@@ -16232,16 +16226,7 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
             if p is not None:
                 return p
 
-    # 4) If battle resolver found a static file, keep it as fallback.
-    try:
-        if resolved is not None:
-            rp = Path(resolved)
-            if rp.exists() and rp.is_file() and rp.stat().st_size > 0:
-                return rp
-    except Exception:
-        pass
-
-    # 5) Fallback to static local sprites.
+    # 4) Fallback to static local sprites.
     static_candidates: list[str] = []
     if is_female:
         if shiny:
@@ -16334,8 +16319,6 @@ def _team_load_sprite_frames(
     *,
     max_size: tuple[int, int],
     resample,
-    allow_upscale: bool = False,
-    min_size: tuple[int, int] | None = None,
 ) -> tuple[list[Any], int]:
     if path is None or Image is None:
         return [], TEAM_BATTLE_SYNC_DURATION_MS
@@ -16348,87 +16331,25 @@ def _team_load_sprite_frames(
     except Exception:
         return [], TEAM_BATTLE_SYNC_DURATION_MS
     duration = TEAM_BATTLE_SYNC_DURATION_MS
-    raw_frames: list[Any] = []
-
-    max_w = max(1, int(max_size[0] if max_size else 1))
-    max_h = max(1, int(max_size[1] if max_size else 1))
-    min_w = max(1, int(min_size[0])) if min_size else 1
-    min_h = max(1, int(min_size[1])) if min_size else 1
-
-    def _scale_sprite(src):
-        try:
-            sw, sh = src.size
-        except Exception:
-            return src
-        if sw <= 0 or sh <= 0:
-            return src
-        max_scale = min(max_w / float(sw), max_h / float(sh))
-        if allow_upscale:
-            scale = max_scale
-            if min_size is not None:
-                min_scale = max(min_w / float(sw), min_h / float(sh))
-                scale = min(max_scale, max(min_scale, scale))
-        else:
-            scale = min(1.0, max_scale)
-        scale = max(0.05, float(scale))
-        nw = max(1, int(round(sw * scale)))
-        nh = max(1, int(round(sh * scale)))
-        if nw == sw and nh == sh:
-            return src
-        try:
-            return src.resize((nw, nh), resample)
-        except Exception:
-            return src
+    frames: list[Any] = []
 
     if ImageSequence is not None and bool(getattr(img, "is_animated", False)):
         try:
             for i, fr in enumerate(ImageSequence.Iterator(img)):
                 if i >= TEAM_MAX_SPRITE_FRAMES:
                     break
-                raw_frames.append(fr.convert("RGBA"))
+                sprite = fr.convert("RGBA")
+                sprite.thumbnail(max_size, resample=resample)
+                frames.append(sprite)
         except Exception:
-            raw_frames = []
-    if not raw_frames:
+            frames = []
+    if not frames:
         try:
-            raw_frames = [img.convert("RGBA")]
+            sprite = img.convert("RGBA")
+            sprite.thumbnail(max_size, resample=resample)
+            frames = [sprite]
         except Exception:
-            raw_frames = []
-
-    if not raw_frames:
-        return [], duration
-
-    def _tight_crop_visible(src):
-        """Crop transparent padding so slot-centering uses visible sprite area."""
-        try:
-            alpha = src.split()[-1]
-        except Exception:
-            return src
-        try:
-            # Ignore very faint alpha to avoid off-center halos/shadows.
-            mask = alpha.point(lambda a: 255 if int(a) >= 72 else 0)
-            bb = mask.getbbox()
-        except Exception:
-            bb = None
-        if bb is None:
-            try:
-                bb = alpha.getbbox()
-            except Exception:
-                bb = None
-        if bb is None:
-            return src
-        try:
-            cropped = src.crop(bb)
-            if cropped.size[0] > 0 and cropped.size[1] > 0:
-                return cropped
-        except Exception:
-            pass
-        return src
-
-    frames: list[Any] = []
-    for fr in raw_frames:
-        sprite = _tight_crop_visible(fr)
-        sprite = _scale_sprite(sprite)
-        frames.append(sprite)
+            frames = []
 
     return frames, duration
 
@@ -16652,20 +16573,8 @@ def _team_overview_panel_file(
                 sprite_data[slot] = {"frames": []}
                 continue
             path = _team_pick_sprite_path(row)
-            geom = slot_layout[slot - 1]
-            slot_w, slot_h = geom["box_wh"]
-            visual_scale = _team_species_visual_scale(row)
-            max_w = max(30, min(max(30, slot_w - max(10, int(round(10 * s)))), int(round(128 * sx * visual_scale))))
-            max_h = max(30, min(max(30, slot_h - max(46, int(round(54 * s)))), int(round(124 * sy * visual_scale))))
-            sprite_max = (max_w, max_h)
-            sprite_min = (max(24, int(round(max_w * 0.72))), max(24, int(round(max_h * 0.72))))
-            frames, _ = _team_load_sprite_frames(
-                path,
-                max_size=sprite_max,
-                resample=resample,
-                allow_upscale=True,
-                min_size=sprite_min,
-            )
+            sprite_max = (max(32, int(round(88 * sx))), max(32, int(round(88 * sy))))
+            frames, _ = _team_load_sprite_frames(path, max_size=sprite_max, resample=resample)
             sprite_data[slot] = {"frames": frames}
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
