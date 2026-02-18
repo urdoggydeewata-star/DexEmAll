@@ -22746,7 +22746,14 @@ async def pokeinfo(
         sid = _r(base_row, "id")
         sname = _r(base_row, "name")
         if db_cache:
-            forms = db_cache.get_cached_pokedex_forms()
+            try:
+                forms = db_cache.get_cached_pokedex_forms()
+            except Exception as e:
+                if _is_missing_table_error(e, "pokedex_forms"):
+                    _disable_optional_table("pokedex_forms")
+                    forms = []
+                else:
+                    forms = []
             if forms:
                 for f in forms:
                     if f.get("species_id") != sid:

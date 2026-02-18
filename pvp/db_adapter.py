@@ -593,9 +593,18 @@ def get_form_overrides(species_name: str, form_key: str) -> Optional[Dict[str, A
     Return form overrides from pokedex_forms for (species_name, form_key).
     Keys: stats (dict), types (list), abilities (list)
     """
+    global _POKEDEX_FORMS_TABLE_AVAILABLE
     sn, fk = (species_name or "").strip().lower(), (form_key or "").strip().lower()
     if db_cache:
-        forms = db_cache.get_cached_pokedex_forms()
+        try:
+            forms = db_cache.get_cached_pokedex_forms()
+        except Exception as e:
+            if _is_missing_pokedex_forms_error(e):
+                _POKEDEX_FORMS_TABLE_AVAILABLE = False
+                _disable_optional_table("pokedex_forms")
+                forms = []
+            else:
+                forms = []
         if forms:
             for r in forms:
                 rsn = (r.get("species_name") or "").strip().lower()
@@ -617,7 +626,6 @@ def get_form_overrides(species_name: str, form_key: str) -> Optional[Dict[str, A
                             "types": _parse_form_field(r.get("types"), []),
                             "abilities": _parse_form_field(r.get("abilities"), []),
                         }
-    global _POKEDEX_FORMS_TABLE_AVAILABLE
     if _POKEDEX_FORMS_TABLE_AVAILABLE is False or _is_optional_table_disabled("pokedex_forms"):
         return None
     with get_connection() as con:
