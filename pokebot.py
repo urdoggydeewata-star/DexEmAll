@@ -15710,6 +15710,7 @@ class MPokeInfo(commands.Cog):
             left: int,
             y: int,
             width: int,
+            height: Optional[int] = None,
             fill: tuple[int, int, int, int] = (236, 244, 248, 255),
             shadow: tuple[int, int, int, int] = (0, 0, 0, 220),
         ) -> str:
@@ -15718,39 +15719,81 @@ class MPokeInfo(commands.Cog):
                 return txt
             tw = self._mpokeinfo_text_width(draw_probe, txt, font)
             tx = int(left + max(0, ((int(width) - tw) // 2)))
-            self._mpokeinfo_draw_shadow_text(draw, (tx, int(y)), txt, font=font, fill=fill, shadow=shadow)
+            ty = int(y)
+            if height is not None:
+                try:
+                    tb = draw_probe.textbbox((0, 0), txt, font=font)
+                    th = max(1, int(tb[3] - tb[1]))
+                except Exception:
+                    th = max(8, int(round(9 * scale)))
+                ty = int(y + max(0, (int(height) - th) // 2 - 1))
+            self._mpokeinfo_draw_shadow_text(draw, (tx, ty), txt, font=font, fill=fill, shadow=shadow)
             return txt
+
+        def _clear_row(
+            *,
+            left: int,
+            top: int,
+            width: int,
+            height: int,
+            fill: tuple[int, int, int, int] = (28, 36, 46, 235),
+        ) -> None:
+            x0 = int(left + max(1, int(round(1 * sx))))
+            y0 = int(top + max(1, int(round(1 * sy))))
+            x1 = int(left + width - max(1, int(round(1 * sx))))
+            y1 = int(top + height - max(1, int(round(1 * sy))))
+            if x1 <= x0 or y1 <= y0:
+                return
+            try:
+                draw.rectangle((x0, y0, x1, y1), fill=fill)
+            except Exception:
+                pass
 
         # --- top row / summary ---
         ot_name = str(getattr(interaction.user, "display_name", None) or interaction.user.name or "Trainer").strip()
         ot_name = re.sub(r"\s+", " ", ot_name)
-        ot_box_left, ot_box_y = _pt(82, 15)
-        ot_box_w = max(34, int(round(98 * sx)))
+        # Template already has the OT label art/text; render only the trainer name
+        # in the dedicated name sub-area so it doesn't stack over the label.
+        ot_box_left, ot_box_y = _pt(106, 15)
+        ot_box_w = max(26, int(round(74 * sx)))
+        ot_box_h = max(10, int(round(13 * sy)))
+        _clear_row(left=ot_box_left, top=ot_box_y, width=ot_box_w, height=ot_box_h)
         ot_font = self._mpokeinfo_fit_font(
             draw_probe,
             ot_name,
             max_width=ot_box_w,
-            start_size=max(8, int(round(10 * scale))),
-            min_size=max(6, int(round(7 * scale))),
+            start_size=max(8, int(round(9 * scale))),
+            min_size=max(6, int(round(6 * scale))),
             bold=True,
         )
-        _draw_centered_in_box(ot_name, ot_font, left=ot_box_left, y=ot_box_y, width=ot_box_w)
+        _draw_centered_in_box(ot_name, ot_font, left=ot_box_left, y=ot_box_y, width=ot_box_w, height=ot_box_h)
 
-        lv_line = f"{int(level)}"
-        lv_box_left, lv_box_y = _pt(202, 15)
+        lv_line = f"Lv {int(level)}"
+        lv_box_left, lv_box_y = _pt(202, 13)
         lv_box_w = max(22, int(round(56 * sx)))
+        lv_box_h = max(10, int(round(13 * sy)))
+        _clear_row(left=lv_box_left, top=lv_box_y, width=lv_box_w, height=lv_box_h)
+        gender_key = str(gender or "").strip().lower()
+        gender_symbol = {"male": "♂", "female": "♀", "genderless": "∅"}.get(gender_key)
+        gender_slot_w = max(0, int(round(10 * sx))) if gender_symbol else 0
+        lv_text_w = max(12, int(lv_box_w - gender_slot_w))
         lv_font = self._mpokeinfo_fit_font(
             draw_probe,
             lv_line,
-            max_width=lv_box_w,
+            max_width=lv_text_w,
             start_size=max(8, int(round(10 * scale))),
             min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        _draw_centered_in_box(lv_line, lv_font, left=lv_box_left, y=lv_box_y, width=lv_box_w)
+        _draw_centered_in_box(
+            lv_line,
+            lv_font,
+            left=lv_box_left,
+            y=lv_box_y,
+            width=lv_text_w,
+            height=lv_box_h,
+        )
 
-        gender_key = str(gender or "").strip().lower()
-        gender_symbol = {"male": "♂", "female": "♀", "genderless": "∅"}.get(gender_key)
         if gender_symbol:
             try:
                 from PIL import ImageFont  # type: ignore
@@ -15762,10 +15805,16 @@ class MPokeInfo(commands.Cog):
                 gender_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
             gfill = (112, 190, 255, 255) if gender_key == "male" else (255, 156, 214, 255) if gender_key == "female" else (214, 214, 226, 255)
             gw = self._mpokeinfo_text_width(draw_probe, gender_symbol, gender_font)
-            gx = int(_pt(262, 15)[0] - gw)
+            try:
+                gb = draw_probe.textbbox((0, 0), gender_symbol, font=gender_font)
+                gh = max(1, int(gb[3] - gb[1]))
+            except Exception:
+                gh = max(8, int(round(9 * sy)))
+            gx = int(lv_box_left + lv_text_w + max(0, ((gender_slot_w - gw) // 2)))
+            gy = int(lv_box_y + max(0, ((lv_box_h - gh) // 2) - 1))
             self._mpokeinfo_draw_shadow_text(
                 draw,
-                (gx, lv_box_y),
+                (gx, gy),
                 gender_symbol,
                 font=gender_font,
                 fill=gfill,
@@ -15836,7 +15885,16 @@ class MPokeInfo(commands.Cog):
             min_size=max(7, int(round(8 * scale))),
             bold=False,
         )
-        _draw_centered_in_box(nature_text, nature_font, left=right_box_left, y=_pt(0, 34)[1], width=right_box_w)
+        right_row_h = max(11, int(round(15 * sy)))
+        _clear_row(left=right_box_left, top=_pt(0, 32)[1], width=right_box_w, height=right_row_h)
+        _draw_centered_in_box(
+            nature_text,
+            nature_font,
+            left=right_box_left,
+            y=_pt(0, 32)[1],
+            width=right_box_w,
+            height=right_row_h,
+        )
 
         exp_text = "MAX" if exp_to_next_val is None else f"{int(exp_to_next_val):,}"
         exp_font = self._mpokeinfo_fit_font(
@@ -15847,7 +15905,15 @@ class MPokeInfo(commands.Cog):
             min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        _draw_centered_in_box(exp_text, exp_font, left=right_box_left, y=_pt(0, 65)[1], width=right_box_w)
+        _clear_row(left=right_box_left, top=_pt(0, 63)[1], width=right_box_w, height=right_row_h)
+        _draw_centered_in_box(
+            exp_text,
+            exp_font,
+            left=right_box_left,
+            y=_pt(0, 63)[1],
+            width=right_box_w,
+            height=right_row_h,
+        )
 
         fr_val = max(0, min(255, int(friendship_value or 0)))
         fr_text = str(fr_val)
@@ -15859,7 +15925,15 @@ class MPokeInfo(commands.Cog):
             min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        _draw_centered_in_box(fr_text, fr_font, left=right_box_left, y=_pt(0, 96)[1], width=right_box_w)
+        _clear_row(left=right_box_left, top=_pt(0, 94)[1], width=right_box_w, height=right_row_h)
+        _draw_centered_in_box(
+            fr_text,
+            fr_font,
+            left=right_box_left,
+            y=_pt(0, 94)[1],
+            width=right_box_w,
+            height=right_row_h,
+        )
 
         species_display = str(species or "").replace("-", " ").replace("_", " ").title() or "Unknown"
         if current_form and str(current_form).strip().lower() not in {"", "normal", "base", "default"}:
@@ -15878,8 +15952,9 @@ class MPokeInfo(commands.Cog):
             species_display,
             pokemon_font,
             left=right_box_left,
-            y=_pt(0, 126)[1],
+            y=_pt(0, 124)[1],
             width=right_box_w,
+            height=right_row_h,
         )
 
         # --- main sprite region ---
