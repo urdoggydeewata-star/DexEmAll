@@ -8253,6 +8253,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                         )
                         if msg is not None:
                             st._last_stream_message = msg
+                            st._stream_initial_sent = True
                     except Exception as send_err:
                         print(f"[Stream] Initial stream send failed: {send_err}")
             except Exception as init_err:
@@ -9252,6 +9253,33 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
             st._stream_update_lock = stream_lock
         try:
             async with stream_lock:
+                try:
+                    turn_no = int(getattr(st, "turn", 0) or 0)
+                except Exception:
+                    turn_no = 0
+
+                # Turn 1 must be stream image-only (no summary). Kickoff post is handled
+                # at battle start; if that failed, retry once here with no summary.
+                if turn_no <= 1:
+                    if not bool(getattr(st, "_stream_initial_sent", False)):
+                        render_result = None
+                        try:
+                            render_result = await _render_gif_for_panel(st, st.p1_id, hide_hp_text=True)
+                        except Exception as e:
+                            print(f"[Stream] Turn-1 stream pre-render failed: {e}")
+                            render_result = None
+                        msg = await _send_stream_panel(
+                            stream_channel,
+                            st,
+                            None,
+                            render_result,
+                            force_no_summary=True,
+                        )
+                        if msg is not None:
+                            st._last_stream_message = msg
+                            st._stream_initial_sent = True
+                    return
+
                 # Keep public stream summary text aligned with the private turn summary text.
                 summary_payload = str(formatted_turn_text or "").strip()
                 if not summary_payload:
