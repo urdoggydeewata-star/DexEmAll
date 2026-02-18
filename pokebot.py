@@ -15458,27 +15458,26 @@ class MPokeInfo(commands.Cog):
         shiny   = bool(mon.get("shiny"))
         gender  = str(mon.get("gender") or "").lower()
 
-        # Phone-friendly title: ★ Species Lv N (shiny star like reference image)
+        # Redesigned compact/phone-friendly layout.
         title = f"{'★ ' if shiny else ''}{species.replace('-', ' ').title()} Lv {level}"
-
-        emb = discord.Embed(title=title, colour=discord.Colour.blurple())
+        emb = discord.Embed(
+            title=title,
+            colour=(discord.Colour.gold() if shiny else discord.Colour.blurple()),
+        )
 
         # Form for sprite and optional title
         current_form = mon.get("form")
         if not current_form and dex:
             current_form = dex.get("form_name")
         if current_form and current_form != "normal":
-            title = f"{'★ ' if shiny else ''}{species.replace('-', ' ').title()} ({current_form.title()}) Lv {level}"
-            emb.title = title
+            emb.title = f"{'★ ' if shiny else ''}{species.replace('-', ' ').title()} ({str(current_form).title()}) Lv {level}"
 
-        # Held item + Ball (same as original)
         held_field = await self._label_with_emoji(interaction.guild, mon.get("held_item"))
         if not held_field or held_field.strip() in ("", "—"):
             held_field = "None"
         ball_key = (mon.get("pokeball") or "pokeball")
         ball_field = await self._label_with_emoji(interaction.guild, ball_key)
 
-        # Types (emojis + names, same as original)
         types = await self._extract_types(species, mon, dex)
         type_parts = []
         for t in types:
@@ -15486,7 +15485,6 @@ class MPokeInfo(commands.Cog):
             type_parts.append(f"{em} {t}" if em else t)
         type_text = " / ".join(type_parts) if type_parts else "Unknown"
 
-        # Tera type
         tera_raw = mon.get("tera_type")
         tera_text = "—"
         if tera_raw:
@@ -15494,35 +15492,32 @@ class MPokeInfo(commands.Cog):
             tera_emoji = await get_emoji_global(self.bot, interaction.guild, tera_name)
             tera_text = f"{tera_emoji} {tera_name}" if tera_emoji else tera_name
 
-        # OT / gender
         ot_text = self._format_ot(self.bot, str(mon.get("owner_id") or mon.get("user_id") or ""))
         gender_icon_fn = globals().get("_gender_icon", None)
         gender_icon = gender_icon_fn(gender) if callable(gender_icon_fn) else self._gender_icon_local(gender)
         gender_display = "Male ♂" if gender == "male" else "Female ♀" if gender == "female" else (gender_icon or "—")
 
-        # Friendship (same as original: heart + value)
         fr = mon.get("friendship", mon.get("happiness", 0))
-        try: fr = int(fr or 0)
-        except Exception: fr = 0
+        try:
+            fr = int(fr or 0)
+        except Exception:
+            fr = 0
         fr = max(0, min(255, fr))
-        friendship_text = f"❤️ {fr}/255"
+        friendship_text = f"{fr}/255"
 
-        # Team slot
         team_slot = mon.get("team_slot")
         team_text = f"Slot {team_slot}" if team_slot else "—"
 
-        # Current stats: HP as current/max, then Atk, Def, ...
         stats_obj = self._as_dict(mon.get("final_stats"))
         hp_max = int(stats_obj.get("hp", mon.get("hp", 0))) or 1
         hp_now = int(mon.get("hp_now", hp_max))
+        hp_pct = int(round((float(hp_now) / float(hp_max)) * 100.0)) if hp_max > 0 else 0
+        hp_pct = max(0, min(100, hp_pct))
+        hp_bar_fill = int(round((hp_pct / 100.0) * 16.0))
+        hp_bar_fill = max(0, min(16, hp_bar_fill))
+        hp_bar = f"[{'#' * hp_bar_fill}{'-' * (16 - hp_bar_fill)}]"
         hp_display = f"{hp_now}/{hp_max}"
-        stats_line = (
-            f"HP: {hp_display}, Atk: {int(stats_obj.get('attack', mon.get('atk', 0)))}, "
-            f"Def: {int(stats_obj.get('defense', mon.get('def', 0)))}, SpA: {int(stats_obj.get('special_attack', mon.get('spa', 0)))}, "
-            f"SpD: {int(stats_obj.get('special_defense', mon.get('spd', 0)))}, Spe: {int(stats_obj.get('speed', mon.get('spe', 0)))}"
-        )
 
-        # IVs/EVs single line: HP: 21, Atk: 28, ...
         def _stat6(d: dict | None) -> dict:
             d = d if isinstance(d, dict) else {}
             return {
@@ -15533,13 +15528,30 @@ class MPokeInfo(commands.Cog):
                 "spd": int(d.get("special_defense", d.get("spd", 0))),
                 "spe": int(d.get("speed", d.get("spe", 0))),
             }
-        def _fmt6_line(d: dict | None) -> str:
-            s = _stat6(d)
-            return f"HP: {s['hp']}, Atk: {s['atk']}, Def: {s['def']}, SpA: {s['spa']}, SpD: {s['spd']}, Spe: {s['spe']}"
-        ivs_line = _fmt6_line(self._as_dict(mon.get("ivs")))
-        evs_line = _fmt6_line(self._as_dict(mon.get("evs")))
 
-        # Moves with PP: Move1 (current/base) — base for adventure; cap current at base so display never shows current > base
+        def _fmt_stat_block(s: dict) -> str:
+            return (
+                f"HP  {s['hp']:>3}  Atk {s['atk']:>3}  Def {s['def']:>3}\n"
+                f"SpA {s['spa']:>3}  SpD {s['spd']:>3}  Spe {s['spe']:>3}"
+            )
+
+        stats_line = _fmt_stat_block(
+            {
+                "hp": int(hp_now),
+                "atk": int(stats_obj.get("attack", mon.get("atk", 0))),
+                "def": int(stats_obj.get("defense", mon.get("def", 0))),
+                "spa": int(stats_obj.get("special_attack", mon.get("spa", 0))),
+                "spd": int(stats_obj.get("special_defense", mon.get("spd", 0))),
+                "spe": int(stats_obj.get("speed", mon.get("spe", 0))),
+            }
+        )
+
+        ivs_map = _stat6(self._as_dict(mon.get("ivs")))
+        evs_map = _stat6(self._as_dict(mon.get("evs")))
+        ivs_line = _fmt_stat_block(ivs_map)
+        evs_line = _fmt_stat_block(evs_map)
+        total_ivs = int(sum(max(0, int(v)) for v in ivs_map.values()))
+
         moves = self._as_list(mon.get("moves"))
         pps_raw = mon.get("moves_pp")
         if isinstance(pps_raw, str):
@@ -15549,24 +15561,24 @@ class MPokeInfo(commands.Cog):
                 pps_list = []
         else:
             pps_list = list(pps_raw)[:4] if pps_raw else []
+
+        moves_lines: List[str] = []
         if moves:
-            parts = []
             for i, m in enumerate(moves[:4]):
-                name = str(m).replace("-", " ").title()
+                m_name = str(m).replace("-", " ").title()
                 cur_pp = pps_list[i] if i < len(pps_list) and pps_list[i] is not None else None
                 try:
-                    total_pp = _base_pp(m, generation=user_gen)  # base PP for adventure; PP Maxes max it out later
+                    total_pp = _base_pp(m, generation=user_gen)
                 except Exception:
                     total_pp = cur_pp if cur_pp is not None else 20
                 if cur_pp is not None and total_pp is not None:
-                    cur_pp = min(int(cur_pp), total_pp)  # cap so we never show e.g. 56/35
+                    cur_pp = min(int(cur_pp), int(total_pp))
                 cur_str = str(cur_pp) if cur_pp is not None else "?"
-                parts.append(f"{name} ({cur_str}/{total_pp})")
-            moves_line = " | ".join(parts)
+                moves_lines.append(f"{i + 1}. {m_name} ({cur_str}/{total_pp})")
         else:
-            moves_line = "—"
+            moves_lines.append("—")
+        moves_text = "\n".join(moves_lines)
 
-        # Sprite thumbnail (right side on phone)
         files: List[discord.File] = []
         try:
             files = attach_sprite_to_embed(
@@ -15582,32 +15594,41 @@ class MPokeInfo(commands.Cog):
             except Exception:
                 pass
 
-        # 3-column inline grid (original fields, phone-friendly layout)
-        emb.add_field(name="OT", value=ot_text, inline=True)
-        emb.add_field(name="Type", value=type_text, inline=True)
-        emb.add_field(name="Tera Type", value=tera_text, inline=True)
-
-        emb.add_field(name="Nature", value=str(mon.get("nature") or "Unknown").title(), inline=True)
-        emb.add_field(name="Ability", value=str(mon.get("ability") or "Unknown").replace("-", " ").title(), inline=True)
-        emb.add_field(name="Held Item", value=held_field, inline=True)
-
-        emb.add_field(name="Ball", value=ball_field, inline=True)
-        emb.add_field(name="Gender", value=gender_display, inline=True)
-        emb.add_field(name="Team", value=team_text, inline=True)
-
         exp_next_text = "Max" if exp_to_next_val is None else f"{exp_to_next_val:,}"
-        emb.add_field(name="HP", value=hp_display, inline=True)
-        emb.add_field(name="EXP to next", value=exp_next_text, inline=True)
-        emb.add_field(name="Friendship", value=friendship_text, inline=True)
-        emb.add_field(name="Stats", value=stats_line[:1024], inline=False)
+        nature_text = str(mon.get("nature") or "Unknown").replace("-", " ").title()
+        ability_text = str(mon.get("ability") or "Unknown").replace("-", " ").title()
 
-        emb.add_field(name="IVs", value=ivs_line, inline=True)
-        emb.add_field(name="EVs", value=evs_line, inline=True)
-        emb.add_field(name="Moves", value=moves_line[:1024] or "—", inline=False)
-
+        overview_lines = [
+            f"OT: {ot_text}",
+            f"Team: {team_text}",
+            f"Type: {type_text}",
+            f"Tera Type: {tera_text}",
+            f"Nature: {nature_text}",
+            f"Ability: {ability_text}",
+            f"Held Item: {held_field}",
+            f"Ball: {ball_field}",
+            f"Gender: {gender_display}",
+        ]
         if AdminGivePokemon.can_gigantamax(species):
             can_gmax = bool(mon.get("can_gigantamax", 0))
-            emb.add_field(name="Can Gigantamax", value="✅ Yes" if can_gmax else "❌ No", inline=True)
+            overview_lines.append(f"Can Gigantamax: {'Yes' if can_gmax else 'No'}")
+
+        emb.add_field(name="Overview", value="\n".join(overview_lines)[:1024], inline=False)
+        emb.add_field(
+            name="Vitals",
+            value=(
+                f"HP: **{hp_display}** {hp_bar} ({hp_pct}%)\n"
+                f"EXP to next: **{exp_next_text}**\n"
+                f"Friendship: **{friendship_text}**\n"
+                f"Total IVs: **{total_ivs}/186**"
+            )[:1024],
+            inline=False,
+        )
+        emb.add_field(name="Battle Stats", value=f"```{stats_line}```", inline=False)
+        emb.add_field(name="IVs", value=f"```{ivs_line}```", inline=True)
+        emb.add_field(name="EVs", value=f"```{evs_line}```", inline=True)
+        emb.add_field(name="Moves", value=moves_text[:1024] or "—", inline=False)
+        emb.set_footer(text=f"Pokemon ID #{int(mon.get('id') or 0)}")
 
         await interaction.followup.send(embed=emb, files=files, ephemeral=True)
 
