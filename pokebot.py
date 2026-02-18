@@ -16637,7 +16637,7 @@ def _team_overview_panel_file(
         draw = ImageDraw.Draw(base)
 
         # Overlay only text/sprites; never repaint template blocks.
-        trainer_title = "Elite Trainer"
+        trainer_title = "Trainer"
         trainer_font = _team_font(max(12, int(round(26 * s))), bold=True)
         header_left_x = int(round((TEAM_TRAINER_HEADER_RECT[0] + 8) * sx))
         header_top_y = int(round(TEAM_TRAINER_LABEL_Y * sy))
