@@ -15816,7 +15816,6 @@ class MPokeInfo(commands.Cog):
         ot_box_left, ot_box_y = _pt(106, 15)
         ot_box_w = max(26, int(round(74 * sx)))
         ot_box_h = max(10, int(round(13 * sy)))
-        _clear_row(left=ot_box_left, top=ot_box_y, width=ot_box_w, height=ot_box_h)
         ot_font = self._mpokeinfo_fit_font(
             draw_probe,
             ot_name,
@@ -15831,7 +15830,6 @@ class MPokeInfo(commands.Cog):
         lv_box_left, lv_box_y = _pt(202, 13)
         lv_box_w = max(22, int(round(56 * sx)))
         lv_box_h = max(10, int(round(13 * sy)))
-        _clear_row(left=lv_box_left, top=lv_box_y, width=lv_box_w, height=lv_box_h)
         gender_key = str(gender or "").strip().lower()
         gender_symbol = {"male": "♂", "female": "♀", "genderless": "∅"}.get(gender_key)
         gender_slot_w = max(0, int(round(10 * sx))) if gender_symbol else 0
@@ -15945,7 +15943,6 @@ class MPokeInfo(commands.Cog):
             bold=False,
         )
         right_row_h = max(11, int(round(15 * sy)))
-        _clear_row(left=right_box_left, top=_pt(0, 32)[1], width=right_box_w, height=right_row_h)
         _draw_centered_in_box(
             nature_text,
             nature_font,
@@ -15964,7 +15961,6 @@ class MPokeInfo(commands.Cog):
             min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        _clear_row(left=right_box_left, top=_pt(0, 63)[1], width=right_box_w, height=right_row_h)
         _draw_centered_in_box(
             exp_text,
             exp_font,
@@ -15984,7 +15980,6 @@ class MPokeInfo(commands.Cog):
             min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        _clear_row(left=right_box_left, top=_pt(0, 94)[1], width=right_box_w, height=right_row_h)
         _draw_centered_in_box(
             fr_text,
             fr_font,
@@ -17230,10 +17225,18 @@ def _team_species_visual_scale(row: dict) -> float:
         # Keep eggs noticeably smaller so they don't dominate slot circles.
         return 0.68
     if db_cache is None:
+        species_norm = _daycare_norm_species(row.get("species"))
+        if species_norm == "stakataka":
+            return 0.72
         return 1.0
     species_raw = str(row.get("species") or "").strip().lower().replace("_", "-")
     if not species_raw:
         return 1.0
+    species_norm = _daycare_norm_species(species_raw)
+    # Wide/tall forms like Stakataka can clip into the name strip if rendered by
+    # generic height scaling, so cap them with a hand-tuned value.
+    if species_norm == "stakataka":
+        return 0.72
     candidates = [
         species_raw,
         species_raw.replace("-", " "),
@@ -17904,7 +17907,7 @@ def _team_overview_panel_file(
         gen_num = max(1, int(current_gen or 1))
         region_name = _team_region_for_gen(gen_num)
         footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 96) * sx))
-        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 18) * sy))
+        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 12) * sy))
         footer_w = max(32, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 102) * sx)))
         footer_font = _team_fit_font(
             draw,
