@@ -706,18 +706,20 @@ BETA_CLAIM_CUSTOM_ID = str(_OWNER_SETTINGS.beta_claim_custom_id)
 # Access code gate: users must run /code <code> before using the bot (set BOT_ACCESS_CODE in .env)
 BOT_ACCESS_CODE: str = (os.getenv("BOT_ACCESS_CODE") or "").strip()
 
-_ACCESS_VERIFY_CACHE_TTL_SECONDS = 300.0
+_ACCESS_VERIFY_CACHE_TTL_SECONDS = 1800.0
 _ACCESS_VERIFY_CACHE: dict[int, tuple[bool, float]] = {}
 _USER_GEN_CACHE_TTL_SECONDS = 300.0
 _USER_GEN_CACHE: dict[str, tuple[int, float]] = {}
 _ADMIN_CHECK_CACHE_TTL_SECONDS = 120.0
 _ADMIN_CHECK_CACHE: dict[str, tuple[bool, float]] = {}
-_REQUIRED_ROLE_CACHE_TTL_SECONDS = 120.0
+_REQUIRED_ROLE_CACHE_TTL_SECONDS = 1800.0
 _REQUIRED_ROLE_CACHE: dict[int, tuple[bool, float]] = {}
-_ROLE_GATE_EXEMPT_CACHE_TTL_SECONDS = 300.0
+_ROLE_GATE_EXEMPT_CACHE_TTL_SECONDS = 1800.0
 _ROLE_GATE_EXEMPT_CACHE: dict[int, tuple[bool, float]] = {}
 _ROLE_GATE_EXEMPT_TABLE_READY = False
 _ROLE_GATE_EXEMPT_TABLE_LOCK = asyncio.Lock()
+_ROLE_GATE_EXEMPT_TABLE_LAST_ATTEMPT_TS = 0.0
+_ROLE_GATE_EXEMPT_TABLE_RETRY_SECONDS = 60.0
 _REQUIRED_ROLE_BLOCK_MESSAGE = (
     f"❌ You need <@&{VERIFY_ROLE_ID}> in the OS server to use this bot.\n"
     "Join the OS server and complete verification first."
@@ -821,12 +823,19 @@ def _set_cached_role_gate_exempt(user_id: int | str, is_exempt: bool) -> None:
 
 
 async def _ensure_role_gate_exempt_table() -> None:
-    global _ROLE_GATE_EXEMPT_TABLE_READY
+    global _ROLE_GATE_EXEMPT_TABLE_READY, _ROLE_GATE_EXEMPT_TABLE_LAST_ATTEMPT_TS
     if _ROLE_GATE_EXEMPT_TABLE_READY:
+        return
+    now = float(time.time())
+    if (now - float(_ROLE_GATE_EXEMPT_TABLE_LAST_ATTEMPT_TS)) < _ROLE_GATE_EXEMPT_TABLE_RETRY_SECONDS:
         return
     async with _ROLE_GATE_EXEMPT_TABLE_LOCK:
         if _ROLE_GATE_EXEMPT_TABLE_READY:
             return
+        now = float(time.time())
+        if (now - float(_ROLE_GATE_EXEMPT_TABLE_LAST_ATTEMPT_TS)) < _ROLE_GATE_EXEMPT_TABLE_RETRY_SECONDS:
+            return
+        _ROLE_GATE_EXEMPT_TABLE_LAST_ATTEMPT_TS = now
         try:
             async with db.session() as conn:
                 await conn.execute(
@@ -857,6 +866,9 @@ async def _is_role_gate_exempt(user_id: int | str, *, force_refresh: bool = Fals
     val = False
     try:
         await _ensure_role_gate_exempt_table()
+        if not _ROLE_GATE_EXEMPT_TABLE_READY:
+            _set_cached_role_gate_exempt(uid, False)
+            return False
         async with db.session() as conn:
             cur = await conn.execute(
                 "SELECT 1 FROM role_gate_exempt_users WHERE user_id = ? LIMIT 1",
@@ -1015,11 +1027,13 @@ async def _check_required_role_interaction(
         return False
     if int(interaction.user.id) in OWNER_IDS:
         return True
-    if await _is_role_gate_exempt(interaction.user.id):
-        return True
     if allow_verify_button and _is_verify_button_interaction(interaction):
         return True
+    # Fast path: most users should pass via required role check; avoid DB lookup
+    # for role-gate exemptions unless role check fails.
     if await _has_required_os_role(interaction.user.id):
+        return True
+    if await _is_role_gate_exempt(interaction.user.id):
         return True
     await _send_required_role_block(interaction)
     return False
@@ -1127,9 +1141,10 @@ async def _required_role_prefix_command_check(ctx: commands.Context) -> bool:
         return False
     if int(ctx.author.id) in OWNER_IDS:
         return True
-    if await _is_role_gate_exempt(ctx.author.id):
-        return True
+    # Check required role first to avoid a DB read for non-exempt users.
     if await _has_required_os_role(ctx.author.id):
+        return True
+    if await _is_role_gate_exempt(ctx.author.id):
         return True
     try:
         await ctx.reply(_REQUIRED_ROLE_BLOCK_MESSAGE, mention_author=False)
@@ -15827,6 +15842,8 @@ def _team_hp_bar(pct: int, width: int = 10) -> str:
 
 
 TEAM_TEMPLATE_PATHS: tuple[Path, ...] = (
+    ASSETS_DIR / "ui" / "team-beta.png",
+    ASSETS_DIR / "ui" / "team-beta",
     ASSETS_DIR / "ui" / "team-template.png",
     ASSETS_DIR / "ui" / "team_panel_template.png",
     ASSETS_DIR / "team-template.png",
