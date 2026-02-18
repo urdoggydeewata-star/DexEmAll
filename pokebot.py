@@ -15442,7 +15442,7 @@ class MPokeInfo(commands.Cog):
             pass
 
     def _mpokeinfo_font(self, size: int, *, bold: bool = False):
-        size = max(8, int(size))
+        size = max(6, int(size))
         team_font_fn = globals().get("_team_font")
         if callable(team_font_fn):
             try:
@@ -15535,6 +15535,27 @@ class MPokeInfo(commands.Cog):
                 candidates.append(c2)
         for c in candidates:
             p = ITEM_ICON_DIR / f"{c}.png"
+            try:
+                if p.exists() and p.is_file() and p.stat().st_size > 0:
+                    return p
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _mpokeinfo_type_badge_path(type_name: Optional[str]) -> Optional[Path]:
+        raw = str(type_name or "").strip().lower()
+        if not raw:
+            return None
+        badge_dir = ASSETS_DIR / "ui" / "mypokeinfo-types"
+        norm = raw.replace(" ", "_").replace("-", "_")
+        aliases = [norm]
+        if norm == "???":
+            aliases.append("unknown")
+        if norm == "none":
+            aliases.append("unknown")
+        for key in aliases:
+            p = badge_dir / f"{key}.png"
             try:
                 if p.exists() and p.is_file() and p.stat().st_size > 0:
                     return p
@@ -15741,7 +15762,7 @@ class MPokeInfo(commands.Cog):
                 gender_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
             gfill = (112, 190, 255, 255) if gender_key == "male" else (255, 156, 214, 255) if gender_key == "female" else (214, 214, 226, 255)
             gw = self._mpokeinfo_text_width(draw_probe, gender_symbol, gender_font)
-            gx = int(lv_box_left + lv_box_w - gw - max(1, int(round(1 * sx))))
+            gx = int(_pt(262, 15)[0] - gw)
             self._mpokeinfo_draw_shadow_text(
                 draw,
                 (gx, lv_box_y),
@@ -15751,39 +15772,60 @@ class MPokeInfo(commands.Cog):
                 shadow=(12, 12, 12, 220),
             )
 
-        primary_type = str(types[0] if types else "Normal").upper()
+        type_tokens = [str(t or "").strip() for t in list(types or []) if str(t or "").strip()]
+        if not type_tokens:
+            type_tokens = ["Normal"]
         badge_left, badge_top = _pt(198, 31)
         badge_w = max(24, int(round(63 * sx)))
         badge_h = max(10, int(round(13 * sy)))
-        try:
-            draw.rectangle(
-                (badge_left, badge_top, badge_left + badge_w, badge_top + badge_h),
-                fill=(160, 168, 181, 205),
-                outline=(188, 198, 214, 228),
-                width=max(1, int(round(1 * scale))),
+        badge_gap = max(1, int(round(2 * sy)))
+        rendered_badge = False
+        for i, tok in enumerate(type_tokens[:2]):
+            icon_path = self._mpokeinfo_type_badge_path(tok)
+            if icon_path is None:
+                continue
+            try:
+                with Image.open(str(icon_path)) as src:
+                    icon = src.convert("RGBA")
+                icon.thumbnail((badge_w, badge_h), resample=resample)
+                row_y = int(badge_top + (i * (badge_h + badge_gap)))
+                icon_x = int(badge_left + max(0, (badge_w - icon.width) // 2))
+                icon_y = int(row_y + max(0, (badge_h - icon.height) // 2))
+                panel_static.alpha_composite(icon, dest=(icon_x, icon_y))
+                rendered_badge = True
+            except Exception:
+                continue
+        if not rendered_badge:
+            primary_type = str(type_tokens[0]).upper()
+            try:
+                draw.rectangle(
+                    (badge_left, badge_top, badge_left + badge_w, badge_top + badge_h),
+                    fill=(160, 168, 181, 205),
+                    outline=(188, 198, 214, 228),
+                    width=max(1, int(round(1 * scale))),
+                )
+            except Exception:
+                pass
+            type_font = self._mpokeinfo_fit_font(
+                draw_probe,
+                primary_type,
+                max_width=max(18, badge_w - 4),
+                start_size=max(8, int(round(9 * scale))),
+                min_size=max(7, int(round(8 * scale))),
+                bold=True,
             )
-        except Exception:
-            pass
-        type_font = self._mpokeinfo_fit_font(
-            draw_probe,
-            primary_type,
-            max_width=max(18, badge_w - 4),
-            start_size=max(8, int(round(9 * scale))),
-            min_size=max(7, int(round(8 * scale))),
-            bold=True,
-        )
-        primary_type = _clip_text(primary_type, type_font, max(18, badge_w - 4))
-        type_w = self._mpokeinfo_text_width(draw_probe, primary_type, type_font)
-        type_x = int(badge_left + ((badge_w - type_w) // 2))
-        type_y = int(badge_top + max(0, (badge_h - int(round(9 * scale))) // 2) - 1)
-        self._mpokeinfo_draw_shadow_text(
-            draw,
-            (type_x, type_y),
-            primary_type,
-            font=type_font,
-            fill=(240, 246, 251, 255),
-            shadow=(60, 66, 74, 210),
-        )
+            primary_type = _clip_text(primary_type, type_font, max(18, badge_w - 4))
+            type_w = self._mpokeinfo_text_width(draw_probe, primary_type, type_font)
+            type_x = int(badge_left + ((badge_w - type_w) // 2))
+            type_y = int(badge_top + max(0, (badge_h - int(round(9 * scale))) // 2) - 1)
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                (type_x, type_y),
+                primary_type,
+                font=type_font,
+                fill=(240, 246, 251, 255),
+                shadow=(60, 66, 74, 210),
+            )
 
         nature_text = str(mon.get("nature") or "Hardy").replace("-", " ").replace("_", " ").title()
         nature_font = self._mpokeinfo_fit_font(
@@ -15807,19 +15849,17 @@ class MPokeInfo(commands.Cog):
         )
         _draw_centered_in_box(exp_text, exp_font, left=right_box_left, y=_pt(0, 65)[1], width=right_box_w)
 
-        fr_pct = max(0, min(100, int(round((max(0, int(friendship_value)) / 255.0) * 100.0))))
-        fr_text = f"{fr_pct}%"
+        fr_val = max(0, min(255, int(friendship_value or 0)))
+        fr_text = str(fr_val)
         fr_font = self._mpokeinfo_fit_font(
             draw_probe,
             fr_text,
-            max_width=max(16, int(round(108 * sx))),
+            max_width=right_box_w,
             start_size=max(8, int(round(10 * scale))),
             min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        fr_w = self._mpokeinfo_text_width(draw_probe, fr_text, fr_font)
-        fr_right = _pt(372, 96)[0]
-        self._mpokeinfo_draw_shadow_text(draw, (fr_right - fr_w, _pt(372, 96)[1]), fr_text, font=fr_font)
+        _draw_centered_in_box(fr_text, fr_font, left=right_box_left, y=_pt(0, 96)[1], width=right_box_w)
 
         species_display = str(species or "").replace("-", " ").replace("_", " ").title() or "Unknown"
         if current_form and str(current_form).strip().lower() not in {"", "normal", "base", "default"}:
@@ -15847,17 +15887,40 @@ class MPokeInfo(commands.Cog):
         nick_box_left, nick_box_y = _pt(86, 132)
         nick_max_w = max(28, int(round(136 * sx)))
         if bool(is_locked):
-            lock_font = self._mpokeinfo_font(max(7, int(round(9 * scale))), bold=True)
-            self._mpokeinfo_draw_shadow_text(
-                draw,
-                _pt(82, 132),
-                "L",
-                font=lock_font,
-                fill=(255, 214, 126, 255),
-                shadow=(84, 54, 10, 220),
-            )
-            nick_box_left = int(nick_box_left + max(7, int(round(8 * sx))))
-            nick_max_w = max(22, int(nick_max_w - max(7, int(round(8 * sx)))))
+            lx, ly = _pt(82, 132)
+            lock_w = max(7, int(round(8 * sx)))
+            lock_h = max(8, int(round(9 * sy)))
+            shackle_h = max(3, int(round(lock_h * 0.45)))
+            body_top = int(ly + shackle_h)
+            body_bottom = int(ly + lock_h)
+            body_right = int(lx + lock_w)
+            try:
+                draw.rounded_rectangle(
+                    (lx, body_top, body_right, body_bottom),
+                    radius=max(1, int(round(1 * scale))),
+                    fill=(246, 197, 77, 248),
+                    outline=(84, 54, 10, 255),
+                    width=1,
+                )
+            except Exception:
+                draw.rectangle((lx, body_top, body_right, body_bottom), fill=(246, 197, 77, 248), outline=(84, 54, 10, 255), width=1)
+            sh_l = int(lx + max(1, int(round(1 * sx))))
+            sh_r = int(body_right - max(1, int(round(1 * sx))))
+            sh_b = int(body_top + max(1, int(round(shackle_h * 0.75))))
+            try:
+                draw.arc((sh_l, ly, sh_r, sh_b), 180, 360, fill=(255, 236, 176, 255), width=1)
+            except Exception:
+                pass
+            key_x = int(lx + (lock_w // 2))
+            key_y0 = int(body_top + max(1, int(round(1 * sy))))
+            key_y1 = int(body_bottom - max(2, int(round(2 * sy))))
+            try:
+                draw.line((key_x, key_y0, key_x, key_y1), fill=(84, 54, 10, 255), width=1)
+                draw.point((key_x, key_y1 + 1), fill=(84, 54, 10, 255))
+            except Exception:
+                pass
+            nick_box_left = int(nick_box_left + max(8, int(round(10 * sx))))
+            nick_max_w = max(20, int(nick_max_w - max(8, int(round(10 * sx)))))
         nick_font = self._mpokeinfo_fit_font(
             draw_probe,
             nickname,
@@ -15875,15 +15938,25 @@ class MPokeInfo(commands.Cog):
         )
 
         if shiny:
-            shiny_font = self._mpokeinfo_font(max(8, int(round(12 * scale))), bold=True)
-            self._mpokeinfo_draw_shadow_text(
-                draw,
-                _pt(92, 76),
-                "✦",
-                font=shiny_font,
-                fill=(255, 98, 180, 255),
-                shadow=(120, 24, 72, 220),
-            )
+            def _draw_sparkle(cx: int, cy: int, size: int = 3) -> None:
+                core = (255, 242, 166, 255)
+                glow = (255, 172, 64, 230)
+                shadow = (72, 38, 9, 210)
+                for d in range(-size, size + 1):
+                    draw.point((cx + d, cy), fill=core)
+                    draw.point((cx, cy + d), fill=core)
+                for d in range(-max(1, size - 1), max(1, size - 1) + 1):
+                    draw.point((cx + d, cy + d), fill=glow)
+                    draw.point((cx + d, cy - d), fill=glow)
+                draw.point((cx + size + 1, cy), fill=shadow)
+                draw.point((cx - size - 1, cy), fill=shadow)
+                draw.point((cx, cy + size + 1), fill=shadow)
+                draw.point((cx, cy - size - 1), fill=shadow)
+
+            sx1, sy1 = _pt(93, 74)
+            sx2, sy2 = _pt(127, 66)
+            _draw_sparkle(int(sx1), int(sy1), size=max(2, int(round(2 * scale))))
+            _draw_sparkle(int(sx2), int(sy2), size=max(1, int(round(1 * scale))))
 
         held_item_raw = str(mon.get("held_item") or "").strip().lower()
         held_icon = self._held_item_icon_path(held_item_raw)
