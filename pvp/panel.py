@@ -8236,19 +8236,10 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
         # No separate "battle started" embed; we'll include pre-battle info in the first panel.
         st._battle_start_announced = True
         st._complete_init()
-        # Stream kickoff panel at battle start so users immediately see streaming output.
+        # Mark stream initialized, but avoid posting an image-only kickoff panel.
+        # Public stream updates should mirror turn summaries (text + image together).
         if st.streaming_enabled and not getattr(st, "_stream_started", False):
-            try:
-                stream_ch = await _resolve_stream_channel(st, p1_itx, p2_itx)
-                if stream_ch is not None:
-                    render_result = await _render_gif_for_panel(st, st.p1_id, hide_hp_text=True)
-                    msg = await _send_stream_panel(stream_ch, st, None, render_result)
-                    if msg is not None:
-                        st._last_stream_message = msg
-            except Exception as e:
-                print(f"[Stream] Error sending initial stream panel: {e}")
-            finally:
-                st._stream_started = True
+            st._stream_started = True
 
     # Check if active Pokémon are fainted - FORCE MANUAL SWITCH
     p1_active_mon = st._active(st.p1_id)
@@ -9244,34 +9235,31 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
             st._stream_update_lock = stream_lock
         try:
             async with stream_lock:
-                summary_lines = [
-                    str(line).strip()
-                    for line in (formatted_turn_log or [])
-                    if str(line).strip()
-                ]
-                if not summary_lines:
-                    summary_lines = [
-                        str(line).strip()
-                        for line in (getattr(st, "_last_turn_log", []) or [])
-                        if str(line).strip()
-                    ]
-                if not summary_lines:
-                    summary_lines = ["No significant actions this turn."]
-                turn_summary_text = "\n".join(summary_lines).strip()
+                # Keep public stream summary text aligned with the private turn summary text.
+                summary_payload = str(formatted_turn_text or "").strip()
+                if not summary_payload:
+                    summary_payload = "No significant actions this turn."
+
+                # Let _send_stream_panel handle rendering/fallback internally so a render
+                # hiccup does not suppress the public summary message.
+                render_result = None
                 try:
-                    turn_no = int(getattr(st, "turn", 0) or 0)
-                except Exception:
-                    turn_no = 0
-                summary_payload = turn_summary_text if turn_summary_text else None
-                # Render GIF for stream (shows current battle state with HP hidden)
-                render_result = await _render_gif_for_panel(st, st.p1_id, hide_hp_text=True)
+                    render_result = await _render_gif_for_panel(st, st.p1_id, hide_hp_text=True)
+                except Exception as e:
+                    print(f"[Stream] Stream pre-render failed: {e}")
+                    render_result = None
+
                 msg = await _send_stream_panel(stream_channel, st, summary_payload, render_result)
                 if msg is not None:
                     st._last_stream_message = msg
                 else:
                     # Last-resort keepalive so stream never appears "dead".
                     try:
-                        await stream_channel.send(f"📺 Stream update • Turn {getattr(st, 'turn', '?')}")
+                        fallback = f"📺 Stream update • Turn {getattr(st, 'turn', '?')}"
+                        if summary_payload:
+                            txt = summary_payload[-1400:] if len(summary_payload) > 1400 else summary_payload
+                            fallback += f"\n{txt}"
+                        await stream_channel.send(fallback)
                     except Exception:
                         pass
         except Exception as e:
