@@ -15994,7 +15994,9 @@ TEAM_MIN_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
 TEAM_MAX_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
 TEAM_MAX_SPRITE_FRAMES = 64
 TEAM_MAX_COMPOSITE_FRAMES = 64
-TEAM_FETCH_SHOWDOWN_FOR_TEAM = False
+# This repo checkout may only contain icon sprites locally; allow Showdown fallback
+# so /team can render full-size animated fronts when available.
+TEAM_FETCH_SHOWDOWN_FOR_TEAM = True
 TEAM_OVERVIEW_CACHE_TTL_SECONDS = 12.0
 TEAM_WARM_CACHE_INTERVAL_SECONDS = 120.0
 TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
@@ -16455,11 +16457,13 @@ def _team_load_sprite_frames(
     except Exception:
         return [], TEAM_BATTLE_SYNC_DURATION_MS
 
-    # Use the union alpha bounds to avoid tiny sprites from oversized transparent canvases.
+    # Use union alpha bounds (alpha channel only) so transparent RGB data
+    # doesn't block cropping and cause tiny rendered sprites.
     union_bbox = None
     for fr in frames:
         try:
-            bb = fr.getbbox()
+            alpha = fr.getchannel("A")
+            bb = alpha.getbbox() if alpha is not None else fr.getbbox()
         except Exception:
             bb = None
         if not bb:
@@ -16475,6 +16479,8 @@ def _team_load_sprite_frames(
             )
 
     out_frames: list[Any] = []
+    target_w = max(1, int(max_size[0]))
+    target_h = max(1, int(max_size[1]))
     for fr in frames:
         sprite = fr
         if union_bbox is not None:
@@ -16482,8 +16488,22 @@ def _team_load_sprite_frames(
                 sprite = sprite.crop(union_bbox)
             except Exception:
                 pass
+
+        sw, sh = sprite.size
+        if sw > 0 and sh > 0:
+            # Fit large sprites down, but also scale tiny icon fallbacks up.
+            fit_scale = min(target_w / float(sw), target_h / float(sh))
+            if fit_scale != 1.0:
+                nw = max(1, int(round(sw * fit_scale)))
+                nh = max(1, int(round(sh * fit_scale)))
+                try:
+                    sprite = sprite.resize((nw, nh), resample=resample)
+                except Exception:
+                    pass
+
         try:
-            sprite.thumbnail(max_size, resample=resample)
+            if sprite.width > target_w or sprite.height > target_h:
+                sprite.thumbnail((target_w, target_h), resample=resample)
         except Exception:
             pass
         out_frames.append(sprite)
