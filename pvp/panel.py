@@ -7580,18 +7580,16 @@ async def _render_gif_for_panel(st: BattleState, for_user_id: int, hide_hp_text:
 
 async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn_summary: Optional[str] = None, gif_file: Optional[Any] = None):
     """Send or update the stream panel (P1 view, no buttons)"""
-    # Turn 1 should be image-only in stream output.
     turn_no = 0
     try:
         turn_no = int(getattr(st, "turn", 0) or 0)
-        if turn_no <= 1:
-            turn_summary = None
     except Exception:
-        pass
+        turn_no = 0
+    turn_label = max(1, turn_no - 1) if turn_no > 0 else 1
 
-    # If caller omitted a summary for later turns, fall back to the cached
-    # turn log so stream never degrades to image-only unexpectedly.
-    if turn_no > 1 and not str(turn_summary or "").strip():
+    # Prefer per-turn summary payload, fallback to cached turn log.
+    summary_text = str(turn_summary or "").strip()
+    if not summary_text:
         try:
             cached_lines = [
                 str(line).strip()
@@ -7599,45 +7597,48 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
                 if str(line).strip()
             ]
             if cached_lines:
-                turn_summary = "\n".join(cached_lines)
+                summary_text = "\n".join(cached_lines).strip()
         except Exception:
-            pass
+            summary_text = ""
+    if len(summary_text) > 3000:
+        summary_text = "...\n" + summary_text[-2800:]
 
-    # Build description (no HP bars/text - they're visible in the GIF)
-    desc_parts = [
-        f"Turn {st.turn} • {st.fmt_label} (Gen {st.gen})"
-    ]
-    stream_content: Optional[str] = None
-    
-    # Add turn summary if provided (trim to keep embed under limits).
-    if turn_summary:
-        summary_text = str(turn_summary).strip()
-        if len(summary_text) > 3000:
-            summary_text = "...\n" + summary_text[-2800:]
-        desc_parts.append(f"\n**Turn Summary:**\n{summary_text}")
-        stream_content = f"Turn Summary:\n{summary_text}"
-        if len(stream_content) > 1800:
-            stream_content = "Turn Summary:\n...\n" + stream_content[-1600:]
-    
-    # Add field conditions if any
-    field_text = _field_conditions_text(st.field)
-    if field_text:
-        desc_parts.append("\n" + field_text)
-    
-    # Get active Pokémon for title formatting
+    # Get active Pokémon for embed title/HP fields.
     p1_active = st._active(st.p1_id)
     p2_active = st._active(st.p2_id)
-    p1_display = _format_pokemon_name(p1_active)
-    p2_display = _format_pokemon_name(p2_active)
-    
-    # Build description text
-    description_text = "\n".join(desc_parts) if desc_parts else "Battle in progress..."
-    
+    p1_display = _format_pokemon_name(p1_active) if p1_active else "Pokémon"
+    p2_display = _format_pokemon_name(p2_active) if p2_active else "Pokémon"
+
     embed = discord.Embed(
-        title=f"📺 Battle Stream: **{p1_display}** vs **{p2_display}**",
-        description=description_text,
-        color=discord.Color.purple()
+        title=f"⚔️ Turn {turn_label} Summary",
+        description=summary_text if summary_text else "Battle in progress...",
+        color=discord.Color.blurple(),
     )
+
+    if p1_active is not None:
+        embed.add_field(
+            name=f"Your {p1_display}",
+            value=f"{_hp_bar(int(getattr(p1_active, 'hp', 0)), int(getattr(p1_active, 'max_hp', 1)))}\n"
+                  f"**{int(getattr(p1_active, 'hp', 0))}/{int(getattr(p1_active, 'max_hp', 1))} HP**",
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Your Pokémon", value="—", inline=False)
+
+    if p2_active is not None:
+        embed.add_field(
+            name=f"Opponent's {p2_display}",
+            value=f"{_hp_bar(int(getattr(p2_active, 'hp', 0)), int(getattr(p2_active, 'max_hp', 1)))}\n"
+                  f"**{int(getattr(p2_active, 'hp', 0))}/{int(getattr(p2_active, 'max_hp', 1))} HP**",
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Opponent's Pokémon", value="—", inline=False)
+
+    # Add field conditions if any (same card style as turn summary embeds).
+    field_text = _field_conditions_text(st.field)
+    if field_text:
+        embed.add_field(name="🌍 Field Conditions", value=field_text, inline=False)
     
     # Handle gif_file - it might be:
     # - (discord.File, Path)  (preferred; caller rendered already)
@@ -7688,8 +7689,6 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
         # Keep per-turn stream history: send one message each turn with
         # both image and turn-by-turn summary text (legacy behavior).
         send_kwargs: Dict[str, Any] = {"embed": embed}
-        if stream_content:
-            send_kwargs["content"] = stream_content
         if file is not None:
             send_kwargs["file"] = file
             try:
@@ -9239,7 +9238,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                     turn_no = int(getattr(st, "turn", 0) or 0)
                 except Exception:
                     turn_no = 0
-                summary_payload = turn_summary_text if (turn_no >= 2 and turn_summary_text) else None
+                summary_payload = turn_summary_text if turn_summary_text else None
                 # Render GIF for stream (shows current battle state with HP hidden)
                 render_result = await _render_gif_for_panel(st, st.p1_id, hide_hp_text=True)
                 msg = await _send_stream_panel(stream_channel, st, summary_payload, render_result)
