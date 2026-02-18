@@ -7580,6 +7580,12 @@ async def _render_gif_for_panel(st: BattleState, for_user_id: int, hide_hp_text:
 
 async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn_summary: Optional[str] = None, gif_file: Optional[Any] = None):
     """Send or update the stream panel (P1 view, no buttons)"""
+    def _safe_int(v: Any, default: int) -> int:
+        try:
+            return int(v)
+        except Exception:
+            return int(default)
+
     turn_no = 0
     try:
         turn_no = int(getattr(st, "turn", 0) or 0)
@@ -7602,6 +7608,8 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
             summary_text = ""
     if len(summary_text) > 3000:
         summary_text = "...\n" + summary_text[-2800:]
+    if not summary_text:
+        summary_text = "No significant actions were recorded this turn."
 
     # Get active Pokémon for embed title/HP fields.
     p1_active = st._active(st.p1_id)
@@ -7616,20 +7624,24 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
     )
 
     if p1_active is not None:
+        p1_hp = max(0, _safe_int(getattr(p1_active, "hp", 0), 0))
+        p1_max = max(1, _safe_int(getattr(p1_active, "max_hp", 1), 1))
         embed.add_field(
             name=f"Your {p1_display}",
-            value=f"{_hp_bar(int(getattr(p1_active, 'hp', 0)), int(getattr(p1_active, 'max_hp', 1)))}\n"
-                  f"**{int(getattr(p1_active, 'hp', 0))}/{int(getattr(p1_active, 'max_hp', 1))} HP**",
+            value=f"{_hp_bar(p1_hp, p1_max)}\n"
+                  f"**{p1_hp}/{p1_max} HP**",
             inline=False,
         )
     else:
         embed.add_field(name="Your Pokémon", value="—", inline=False)
 
     if p2_active is not None:
+        p2_hp = max(0, _safe_int(getattr(p2_active, "hp", 0), 0))
+        p2_max = max(1, _safe_int(getattr(p2_active, "max_hp", 1), 1))
         embed.add_field(
             name=f"Opponent's {p2_display}",
-            value=f"{_hp_bar(int(getattr(p2_active, 'hp', 0)), int(getattr(p2_active, 'max_hp', 1)))}\n"
-                  f"**{int(getattr(p2_active, 'hp', 0))}/{int(getattr(p2_active, 'max_hp', 1))} HP**",
+            value=f"{_hp_bar(p2_hp, p2_max)}\n"
+                  f"**{p2_hp}/{p2_max} HP**",
             inline=False,
         )
     else:
@@ -9020,6 +9032,21 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
 
     species_display_map = _build_species_display_map(st)
     formatted_turn_log = [_format_log_line(line, species_display_map) for line in turn_log]
+    if not formatted_turn_log:
+        try:
+            last_log = [
+                _format_log_line(line, species_display_map)
+                for line in (getattr(st, "_last_turn_log", []) or [])
+                if str(line).strip()
+            ]
+            formatted_turn_log = last_log if last_log else ["No significant actions this turn."]
+        except Exception:
+            formatted_turn_log = ["No significant actions this turn."]
+    formatted_turn_text = "\n".join(str(x) for x in formatted_turn_log if str(x).strip()).strip()
+    if len(formatted_turn_text) > 3500:
+        formatted_turn_text = "...\n" + formatted_turn_text[-3400:]
+    if not formatted_turn_text:
+        formatted_turn_text = "No significant actions this turn."
     
     # Add current Pokemon HP status
     p1_mon = st._active(st.p1_id)
@@ -9057,7 +9084,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
         turn_title = f"⚔️ Turn {st.turn - 1} Summary"
     turn_embed = discord.Embed(
         title=turn_title,
-        description="\n".join(formatted_turn_log),
+        description=formatted_turn_text,
         color=discord.Color.blue()
     )
     
@@ -9118,7 +9145,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
     # Build P2's turn summary with sprite (prepare in parallel)
     turn_embed2 = discord.Embed(
         title=turn_title,
-        description="\n".join(formatted_turn_log),
+        description=formatted_turn_text,
         color=discord.Color.red()
     )
     
@@ -9233,6 +9260,8 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                         for line in (getattr(st, "_last_turn_log", []) or [])
                         if str(line).strip()
                     ]
+                if not summary_lines:
+                    summary_lines = ["No significant actions this turn."]
                 turn_summary_text = "\n".join(summary_lines).strip()
                 try:
                     turn_no = int(getattr(st, "turn", 0) or 0)
