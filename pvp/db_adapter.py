@@ -13,6 +13,17 @@ try:
 except ImportError:
     db_cache = None
 
+_POKEDEX_FORMS_TABLE_AVAILABLE: Optional[bool] = None
+
+
+def _is_missing_pokedex_forms_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return (
+        ("no such table" in msg and "pokedex_forms" in msg)
+        or ("undefined table" in msg and "pokedex_forms" in msg)
+        or ("relation" in msg and "pokedex_forms" in msg and "does not exist" in msg)
+    )
+
 
 def _open():
     """Get a connection from the pool. Use with get_connection() context manager when possible."""
@@ -584,18 +595,11 @@ def get_form_overrides(species_name: str, form_key: str) -> Optional[Dict[str, A
                             "types": _parse_form_field(r.get("types"), []),
                             "abilities": _parse_form_field(r.get("abilities"), []),
                         }
+    global _POKEDEX_FORMS_TABLE_AVAILABLE
+    if _POKEDEX_FORMS_TABLE_AVAILABLE is False:
+        return None
     with get_connection() as con:
-        r = con.execute(
-            """
-            SELECT stats, types, abilities
-            FROM pokedex_forms
-            WHERE LOWER(species_name)=LOWER(?) AND LOWER(form_key)=LOWER(?)
-            LIMIT 1
-            """,
-            (species_name, form_key),
-        ).fetchone()
-        if not r and not form_key.lower().startswith(f"{species_name.lower()}-"):
-            prefixed_form = f"{species_name}-{form_key}"
+        try:
             r = con.execute(
                 """
                 SELECT stats, types, abilities
@@ -603,8 +607,24 @@ def get_form_overrides(species_name: str, form_key: str) -> Optional[Dict[str, A
                 WHERE LOWER(species_name)=LOWER(?) AND LOWER(form_key)=LOWER(?)
                 LIMIT 1
                 """,
-                (species_name, prefixed_form),
+                (species_name, form_key),
             ).fetchone()
+            if not r and not form_key.lower().startswith(f"{species_name.lower()}-"):
+                prefixed_form = f"{species_name}-{form_key}"
+                r = con.execute(
+                    """
+                    SELECT stats, types, abilities
+                    FROM pokedex_forms
+                    WHERE LOWER(species_name)=LOWER(?) AND LOWER(form_key)=LOWER(?)
+                    LIMIT 1
+                    """,
+                    (species_name, prefixed_form),
+                ).fetchone()
+        except Exception as e:
+            if _is_missing_pokedex_forms_error(e):
+                _POKEDEX_FORMS_TABLE_AVAILABLE = False
+                return None
+            raise
         if not r:
             return None
         row = dict(r) if hasattr(r, "keys") and not isinstance(r, dict) else r

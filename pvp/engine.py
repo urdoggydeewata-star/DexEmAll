@@ -8,6 +8,8 @@ import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, TYPE_CHECKING
 
+_POKEDEX_FORMS_TABLE_AVAILABLE: Optional[bool] = None
+
 
 def format_species_name(raw: Optional[str]) -> str:
     """Return a display-friendly Pokémon name (capitalized, hyphenless)."""
@@ -18705,6 +18707,7 @@ def _get_form_stats_from_db(species_name: str, form_key: str) -> Optional[Dict[s
         return None
     form_lower = form_key.lower() if form_key else ""
 
+    global _POKEDEX_FORMS_TABLE_AVAILABLE
     try:
         try:
             from lib import db_cache
@@ -18727,6 +18730,8 @@ def _get_form_stats_from_db(species_name: str, form_key: str) -> Optional[Dict[s
                         return None
                 # no matching row in cache; fall through to DB
 
+        if _POKEDEX_FORMS_TABLE_AVAILABLE is False:
+            return None
         from .db_pool import get_connection
         with get_connection() as conn:
             cursor = conn.execute(
@@ -18738,6 +18743,14 @@ def _get_form_stats_from_db(species_name: str, form_key: str) -> Optional[Dict[s
             return json.loads(row[0])
         return None
     except Exception as e:
+        msg = str(e or "").lower()
+        if (
+            ("no such table" in msg and "pokedex_forms" in msg)
+            or ("undefined table" in msg and "pokedex_forms" in msg)
+            or ("relation" in msg and "pokedex_forms" in msg and "does not exist" in msg)
+        ):
+            _POKEDEX_FORMS_TABLE_AVAILABLE = False
+            return None
         print(f"[Form Stats] Error loading form stats for {species_name}-{form_key}: {e}")
         return None
 

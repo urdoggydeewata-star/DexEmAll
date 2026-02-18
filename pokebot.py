@@ -158,6 +158,68 @@ def _patch_pvp_sprite_icon_fallback() -> None:
 
 _patch_pvp_sprite_icon_fallback()
 
+
+# Some deployments may run with a partially-migrated DB that lacks
+# pokedex_forms. Cache this probe so commands fail soft instead of repeatedly
+# throwing SQL errors (which can cascade into pool timeouts).
+_POKEDEX_FORMS_TABLE_AVAILABLE: Optional[bool] = None
+
+
+def _is_missing_table_error(exc: Exception, table_name: str) -> bool:
+    msg = str(exc or "").lower()
+    t = str(table_name or "").lower()
+    if not t:
+        return False
+    return (
+        ("no such table" in msg and t in msg)
+        or ("undefined table" in msg and t in msg)
+        or ("relation" in msg and t in msg and "does not exist" in msg)
+    )
+
+
+async def _safe_pokedex_forms_fetchone(conn: Any, sql: str, params: tuple[Any, ...] = ()) -> Any:
+    global _POKEDEX_FORMS_TABLE_AVAILABLE
+    if _POKEDEX_FORMS_TABLE_AVAILABLE is False:
+        return None
+    cur = None
+    try:
+        cur = await conn.execute(sql, params)
+        row = await cur.fetchone()
+        return row
+    except Exception as e:
+        if _is_missing_table_error(e, "pokedex_forms"):
+            _POKEDEX_FORMS_TABLE_AVAILABLE = False
+            return None
+        raise
+    finally:
+        if cur is not None:
+            try:
+                await cur.close()
+            except Exception:
+                pass
+
+
+async def _safe_pokedex_forms_fetchall(conn: Any, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
+    global _POKEDEX_FORMS_TABLE_AVAILABLE
+    if _POKEDEX_FORMS_TABLE_AVAILABLE is False:
+        return []
+    cur = None
+    try:
+        cur = await conn.execute(sql, params)
+        rows = await cur.fetchall()
+        return list(rows or [])
+    except Exception as e:
+        if _is_missing_table_error(e, "pokedex_forms"):
+            _POKEDEX_FORMS_TABLE_AVAILABLE = False
+            return []
+        raise
+    finally:
+        if cur is not None:
+            try:
+                await cur.close()
+            except Exception:
+                pass
+
 # Warm up renderer once to avoid first-GIF stall (no-op if renderer missing)
 try:
     from pvp.renderer import render_turn_gif
@@ -4477,12 +4539,11 @@ class GivePokemonFormView(discord.ui.View):
                     # If a form is selected, fetch form-specific abilities
                     if form_key:
                         try:
-                            cur = await conn.execute(
+                            form_data_row = await _safe_pokedex_forms_fetchone(
+                                conn,
                                 "SELECT abilities FROM pokedex_forms WHERE species_id = ? AND form_key = ?",
-                                (self.species_id, form_key)
+                                (self.species_id, form_key),
                             )
-                            form_data_row = await cur.fetchone()
-                            await cur.close()
 
                             if form_data_row and form_data_row.get('abilities'):
                                 # Override base species abilities with form abilities
@@ -5581,7 +5642,8 @@ class AdminGivePokemon(commands.Cog):
         # Check for available forms and show buttons if needed (exclude battle-only forms, mega/primal/origin forms)
         conn = await db.connect()
         try:
-            cur = await conn.execute(
+            form_rows = await _safe_pokedex_forms_fetchall(
+                conn,
                 """SELECT form_key, display_name, abilities FROM pokedex_forms 
                    WHERE species_id = ? 
                    AND (is_battle_only IS NOT TRUE)
@@ -5593,10 +5655,8 @@ class AdminGivePokemon(commands.Cog):
                                         'mega-venusaur', 'mega-blastoise', 'primal-groudon', 'primal-kyogre',
                                         'origin-dialga', 'origin-palkia', 'origin-giratina')
                    ORDER BY form_key""",
-                (species_id,)
+                (species_id,),
             )
-            form_rows = await cur.fetchall()
-            await cur.close()
             
             if form_rows:
                 # === SPECIAL HANDLING FOR GRENINJA ===
@@ -5627,12 +5687,11 @@ class AdminGivePokemon(commands.Cog):
                         # We need to fetch form data if it's not base
                         if selected_form_key:
                             # Fetch form-specific data
-                            cur = await conn.execute(
+                            form_data_row = await _safe_pokedex_forms_fetchone(
+                                conn,
                                 "SELECT abilities FROM pokedex_forms WHERE species_id = ? AND form_key = ?",
-                                (species_id, selected_form_key)
+                                (species_id, selected_form_key),
                             )
-                            form_data_row = await cur.fetchone()
-                            await cur.close()
                             
                             if form_data_row and form_data_row['abilities']:
                                 # Override base species abilities with form abilities
@@ -20121,12 +20180,11 @@ async def _create_pokemon_from_parsed(
                     ]
                     form_abilities = None
                     for form_key in form_keys_to_try:
-                        cur = await conn.execute(
+                        form_row = await _safe_pokedex_forms_fetchone(
+                            conn,
                             "SELECT abilities FROM pokedex_forms WHERE species_id = ? AND LOWER(form_key) = LOWER(?)",
-                            (species_id, form_key)
+                            (species_id, form_key),
                         )
-                        form_row = await cur.fetchone()
-                        await cur.close()
                         if form_row and form_row.get("abilities"):
                             form_abilities = form_row.get("abilities")
                             break
@@ -21785,12 +21843,11 @@ async def generate_pokeinfo_embed(
     if form_key:
         con = await db_connect()
         try:
-            cur = await con.execute(
+            form_row = await _safe_pokedex_forms_fetchone(
+                con,
                 "SELECT * FROM pokedex_forms WHERE species_id=? AND form_key=?",
-                (species_id, form_key)
+                (species_id, form_key),
             )
-            form_row = await cur.fetchone()
-            await cur.close()
 
             # Fallback: if not found in pokedex_forms, try mega_evolution overrides
             if not form_row:
@@ -22000,13 +22057,12 @@ class PokeInfoFormView(discord.ui.View):
             mrow = None
             prow = None
             if new_form_key:
-                cur = await con.execute(
+                form_row_raw = await _safe_pokedex_forms_fetchone(
+                    con,
                     "SELECT * FROM pokedex_forms WHERE species_id=? AND form_key=?",
-                    (self.species_id, new_form_key)
+                    (self.species_id, new_form_key),
                 )
-                form_row_raw = await cur.fetchone()
                 form_row = dict(form_row_raw) if form_row_raw else None
-                await cur.close()
 
                 # Fallback to mega_evolution overrides when not present in pokedex_forms
                 if not form_row:
@@ -22442,20 +22498,20 @@ async def pokeinfo(
         if form_row is None:
             con = await db_connect()
             try:
-                cur = await con.execute(
+                form_row = await _safe_pokedex_forms_fetchone(
+                    con,
                     "SELECT * FROM pokedex_forms WHERE species_id=? AND form_key=?",
-                    (sid, form_key))
-                form_row = await cur.fetchone()
-                await cur.close()
+                    (sid, form_key),
+                )
                 if form_row:
                     form_row = dict(form_row) if hasattr(form_row, "keys") and not isinstance(form_row, dict) else form_row
                 if not form_row and not (form_key or "").startswith(f"{sname}-"):
                     species_form_key = f"{sname}-{form_key}"
-                    cur = await con.execute(
+                    form_row = await _safe_pokedex_forms_fetchone(
+                        con,
                         "SELECT * FROM pokedex_forms WHERE species_id=? AND form_key=?",
-                        (sid, species_form_key))
-                    form_row = await cur.fetchone()
-                    await cur.close()
+                        (sid, species_form_key),
+                    )
                     if form_row:
                         form_row = dict(form_row) if hasattr(form_row, "keys") and not isinstance(form_row, dict) else form_row
                         form_key = species_form_key
@@ -22762,12 +22818,11 @@ async def pokeinfo(
     con = await db_connect()
     try:
         # Regular forms from pokedex_forms
-        cur = await con.execute(
+        form_rows = await _safe_pokedex_forms_fetchall(
+            con,
             "SELECT form_key, display_name FROM pokedex_forms WHERE species_id = ? ORDER BY form_key",
-            (_r(base_row, "id"),)
+            (_r(base_row, "id"),),
         )
-        form_rows = await cur.fetchall()
-        await cur.close()
         
         # Mega Evolution forms
         cur = await con.execute(
