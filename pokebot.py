@@ -15939,12 +15939,11 @@ def _team_hp_bar(pct: int, width: int = 10) -> str:
 
 
 TEAM_TEMPLATE_PATHS: tuple[Path, ...] = (
+    ASSETS_DIR / "ui" / "team-beta.png",
+    ASSETS_DIR / "ui" / "team-beta",
     ASSETS_DIR / "ui" / "team-template.png",
     ASSETS_DIR / "ui" / "team_panel_template.png",
     ASSETS_DIR / "team-template.png",
-    # Keep beta template as an explicit fallback only.
-    ASSETS_DIR / "ui" / "team-beta.png",
-    ASSETS_DIR / "ui" / "team-beta",
 )
 TEAM_TEMPLATE_BASE_SIZE: tuple[int, int] = (808, 537)
 TEAM_TEMPLATE_STEM_BASE_SIZES: dict[str, tuple[int, int]] = {
