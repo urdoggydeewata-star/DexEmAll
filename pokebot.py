@@ -16278,15 +16278,28 @@ async def setup(bot: commands.Bot):
     await bot.add_cog(MPokeInfo(bot))
 
 
-@bot.tree.command(name="pkinfo", description="Alias for /mypokeinfo (team Pokémon details).")
-@app_commands.describe(
-    name="Pokémon species (e.g. pikachu)",
-    slot="Team slot (1–6) if you have duplicates",
-)
-async def pkinfo_alias(interaction: Interaction, name: str, slot: Optional[int] = None):
+async def _dispatch_mypokeinfo_alias(interaction: Interaction, name: str, slot: Optional[int] = None) -> None:
     cog = bot.get_cog("MPokeInfo")
     if isinstance(cog, MPokeInfo):
-        return await cog.mpokeinfo(interaction, name, slot)
+        cmd_obj = getattr(cog, "mpokeinfo", None)
+        cb = getattr(cmd_obj, "callback", None)
+        if callable(cb):
+            try:
+                await cb(cog, interaction, name, slot)
+                return
+            except TypeError:
+                await cb(interaction, name, slot)
+                return
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                # Fall through to a user-facing error below.
+        try:
+            await cog.mpokeinfo(interaction, name, slot)
+            return
+        except Exception:
+            import traceback
+            traceback.print_exc()
     try:
         if interaction.response.is_done():
             await interaction.followup.send("❌ PK info system is not loaded yet. Try again in a moment.", ephemeral=True)
@@ -16294,6 +16307,24 @@ async def pkinfo_alias(interaction: Interaction, name: str, slot: Optional[int] 
             await interaction.response.send_message("❌ PK info system is not loaded yet. Try again in a moment.", ephemeral=True)
     except Exception:
         pass
+
+
+@bot.tree.command(name="mpokeinfo", description="Legacy alias for /mypokeinfo (team Pokémon details).")
+@app_commands.describe(
+    name="Pokémon species (e.g. pikachu)",
+    slot="Team slot (1–6) if you have duplicates",
+)
+async def mpokeinfo_alias(interaction: Interaction, name: str, slot: Optional[int] = None):
+    await _dispatch_mypokeinfo_alias(interaction, name, slot)
+
+
+@bot.tree.command(name="pkinfo", description="Alias for /mypokeinfo (team Pokémon details).")
+@app_commands.describe(
+    name="Pokémon species (e.g. pikachu)",
+    slot="Team slot (1–6) if you have duplicates",
+)
+async def pkinfo_alias(interaction: Interaction, name: str, slot: Optional[int] = None):
+    await _dispatch_mypokeinfo_alias(interaction, name, slot)
 
 
 @bot.tree.command(name="pkname", description="Set or clear a nickname for one of your team Pokémon.")
