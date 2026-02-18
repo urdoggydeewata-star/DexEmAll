@@ -17020,14 +17020,19 @@ class TeamPanelView(discord.ui.View):
     def _guard(self, itx: discord.Interaction) -> bool:
         return itx.user.id == self.author_id
 
-    def _overview_payload(self) -> tuple[discord.Embed, list[discord.File]]:
-        # Keep overview clean: image-only panel + slot buttons.
-        emb = discord.Embed(color=0x5865F2)
+    def _overview_payload(self) -> tuple[Optional[discord.Embed], list[discord.File]]:
+        # Send the overview as a direct image attachment (no embed) so Discord
+        # can display the panel larger while preserving the same buttons.
         files: list[discord.File] = []
         panel = _team_overview_panel_file(self.target_name, self.slots, current_gen=self.current_gen)
         if panel:
-            emb.set_image(url=f"attachment://{panel.filename}")
             files.append(panel)
+            return None, files
+        emb = discord.Embed(
+            title=f"{self.target_name} — Team",
+            description="Could not render the team panel right now.",
+            color=0x2F3136,
+        )
         return emb, files
 
     def _slot_payload(self, slot: int) -> tuple[discord.Embed, list[discord.File]]:
@@ -17098,16 +17103,26 @@ class TeamPanelView(discord.ui.View):
         )
         return emb, files
 
-    async def _edit_payload(self, itx: discord.Interaction, emb: discord.Embed, files: list[discord.File]):
+    async def _edit_payload(self, itx: discord.Interaction, emb: Optional[discord.Embed], files: list[discord.File]):
+        async def _apply(edit_fn, *, use_files_kw: bool):
+            kwargs: dict[str, Any] = {"view": self}
+            # Clear any prior embed when switching back to overview attachment view.
+            kwargs["embed"] = emb
+            if use_files_kw:
+                kwargs["files"] = files
+            else:
+                kwargs["attachments"] = files
+            return await edit_fn(**kwargs)
+
         try:
-            await itx.response.edit_message(embed=emb, attachments=files, view=self)
+            await _apply(itx.response.edit_message, use_files_kw=False)
         except TypeError:
-            await itx.response.edit_message(embed=emb, files=files, view=self)
+            await _apply(itx.response.edit_message, use_files_kw=True)
         except Exception:
             try:
-                await itx.edit_original_response(embed=emb, attachments=files, view=self)
+                await _apply(itx.edit_original_response, use_files_kw=False)
             except TypeError:
-                await itx.edit_original_response(embed=emb, files=files, view=self)
+                await _apply(itx.edit_original_response, use_files_kw=True)
 
     async def _on_overview(self, itx: discord.Interaction):
         if not self._guard(itx):
@@ -17296,7 +17311,10 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
 
     view = TeamPanelView(interaction.user.id, target.display_name, slots, current_gen=target_gen)
     emb, files = view._overview_payload()
-    await interaction.followup.send(embed=emb, files=files, view=view, ephemeral=True)
+    if emb is None:
+        await interaction.followup.send(files=files, view=view, ephemeral=True)
+    else:
+        await interaction.followup.send(embed=emb, files=files, view=view, ephemeral=True)
     if hatch_messages and uid == str(interaction.user.id):
         for line in hatch_messages[:3]:
             try:

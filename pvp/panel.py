@@ -7606,46 +7606,33 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
                 summary_text = "\n".join(cached_lines).strip()
         except Exception:
             summary_text = ""
-    if len(summary_text) > 3500:
-        summary_text = "...\n" + summary_text[-3400:]
+    if len(summary_text) > 3000:
+        summary_text = "...\n" + summary_text[-2800:]
     if not summary_text:
         summary_text = "No significant actions this turn."
 
-    # Get active Pokémon for embed title and masked status fields.
+    # Get active Pokémon for title formatting.
     p1_active = st._active(st.p1_id)
     p2_active = st._active(st.p2_id)
     p1_display = _format_pokemon_name(p1_active) if p1_active else "Pokémon"
     p2_display = _format_pokemon_name(p2_active) if p2_active else "Pokémon"
 
-    embed = discord.Embed(
-        title=f"⚔️ Turn {turn_label} Summary",
-        description=summary_text if summary_text else "Battle in progress...",
-        color=discord.Color.blurple(),
-    )
-
-    # Stream view must stay public-safe: do not expose HP bars or HP numbers.
-    if p1_active is not None:
-        embed.add_field(
-            name=f"Your {p1_display}",
-            value="HP hidden on stream",
-            inline=False,
-        )
-    else:
-        embed.add_field(name="Your Pokémon", value="—", inline=False)
-
-    if p2_active is not None:
-        embed.add_field(
-            name=f"Opponent's {p2_display}",
-            value="HP hidden on stream",
-            inline=False,
-        )
-    else:
-        embed.add_field(name="Opponent's Pokémon", value="—", inline=False)
-
-    # Add field conditions if any (same card style as turn summary embeds).
+    desc_parts = [
+        f"Turn {turn_label} • {getattr(st, 'fmt_label', 'Battle')} (Gen {getattr(st, 'gen', '?')})",
+        f"\n**Turn Summary:**\n{summary_text}",
+    ]
     field_text = _field_conditions_text(st.field)
     if field_text:
-        embed.add_field(name="🌍 Field Conditions", value=field_text, inline=False)
+        desc_parts.append(f"\n{field_text}")
+    description_text = "\n".join(desc_parts).strip() if desc_parts else "Battle in progress..."
+    if not description_text:
+        description_text = "Battle in progress..."
+
+    embed = discord.Embed(
+        title=f"📺 Battle Stream: **{p1_display}** vs **{p2_display}**",
+        description=description_text,
+        color=discord.Color.purple(),
+    )
     
     # Handle gif_file - it might be:
     # - (discord.File, Path)  (preferred; caller rendered already)
@@ -7712,8 +7699,8 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
         print(f"[Stream] Error sending stream: {e}")
         try:
             fallback = f"📺 Stream update • Turn {getattr(st, 'turn', '?')} • {getattr(st, 'fmt_label', 'Battle')}"
-            if turn_summary:
-                txt = str(turn_summary).strip()
+            if summary_text:
+                txt = str(summary_text).strip()
                 if len(txt) > 1200:
                     txt = "...\n" + txt[-1000:]
                 fallback += f"\n{txt}"
