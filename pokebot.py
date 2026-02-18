@@ -15946,11 +15946,6 @@ TEAM_TEMPLATE_PATHS: tuple[Path, ...] = (
     ASSETS_DIR / "team-template.png",
 )
 TEAM_TEMPLATE_BASE_SIZE: tuple[int, int] = (808, 537)
-TEAM_TEMPLATE_STEM_BASE_SIZES: dict[str, tuple[int, int]] = {
-    "team-beta": (800, 488),
-    "team-template": (808, 537),
-    "team_panel_template": (808, 537),
-}
 TEAM_TRAINER_HEADER_RECT = (42, 34, 212, 84)
 TEAM_TRAINER_ART_RECT = (42, 85, 212, 410)
 TEAM_TRAINER_FOOTER_RECT = (42, 430, 212, 491)
@@ -15994,9 +15989,7 @@ TEAM_MIN_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
 TEAM_MAX_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
 TEAM_MAX_SPRITE_FRAMES = 64
 TEAM_MAX_COMPOSITE_FRAMES = 64
-# This repo checkout may only contain icon sprites locally; allow Showdown fallback
-# so /team can render full-size animated fronts when available.
-TEAM_FETCH_SHOWDOWN_FOR_TEAM = True
+TEAM_FETCH_SHOWDOWN_FOR_TEAM = False
 TEAM_OVERVIEW_CACHE_TTL_SECONDS = 12.0
 TEAM_WARM_CACHE_INTERVAL_SECONDS = 120.0
 TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
@@ -16267,8 +16260,14 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
     form = _species_folder_name(str(row.get("form") or ""))
     shiny = bool(int(row.get("shiny") or 0))
     is_female = str(row.get("gender") or "").strip().lower() == "female"
+    resolved: Optional[Path | str] = None
 
-    # Keep /team sprite source aligned with battle renderer resolution logic.
+    def _is_animated_path(p: Path) -> bool:
+        suf = str(getattr(p, "suffix", "") or "").strip().lower()
+        return suf in {".gif", ".webp", ".apng"}
+
+    # Keep /team sprite source aligned with battle renderer resolution logic,
+    # but only accept this early path if it's animated.
     try:
         resolved = _pvp_sprites.find_sprite(
             species,
@@ -16281,13 +16280,7 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
         )
         if resolved is not None:
             rp = Path(resolved)
-            # Ignore icon fallback at this stage; prefer real front sprites/animations.
-            if (
-                rp.exists()
-                and rp.is_file()
-                and rp.stat().st_size > 0
-                and rp.name.lower() != "icon.png"
-            ):
+            if rp.exists() and rp.is_file() and rp.stat().st_size > 0 and _is_animated_path(rp):
                 return rp
     except Exception:
         pass
@@ -16336,7 +16329,16 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
             if p is not None:
                 return p
 
-    # 4) Fallback to static local sprites.
+    # 4) If battle resolver found a static file, keep it as fallback.
+    try:
+        if resolved is not None:
+            rp = Path(resolved)
+            if rp.exists() and rp.is_file() and rp.stat().st_size > 0:
+                return rp
+    except Exception:
+        pass
+
+    # 5) Fallback to static local sprites.
     static_candidates: list[str] = []
     if is_female:
         if shiny:
@@ -16369,27 +16371,10 @@ def _team_font(size: int, *, bold: bool = False):
         from PIL import ImageFont  # type: ignore
     except Exception:
         return None
-    # Use battle renderer Pokemon font path when available.
-    try:
-        from pvp.renderer import _get_pokemon_font_path as _renderer_pokemon_font_path  # type: ignore
-        path = _renderer_pokemon_font_path()
-        if path:
-            return ImageFont.truetype(str(path), int(size))
-    except Exception:
-        pass
-    # Fallback font candidates.
-    candidates: list[str] = []
-    candidates.extend([
-        "pvp/_common/fonts/Pokemon GB.ttf",
-        "pvp/_common/fonts/PokemonGb-RAeo.ttf",
-        "pvp/_common/fonts/pokemon-gb.ttf",
-        "pvp/_common/fonts/pokemongb.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ])
+    ]
     for fp in candidates:
         try:
             return ImageFont.truetype(fp, int(size))
@@ -16427,6 +16412,8 @@ def _team_load_sprite_frames(
     *,
     max_size: tuple[int, int],
     resample,
+    allow_upscale: bool = False,
+    min_size: tuple[int, int] | None = None,
 ) -> tuple[list[Any], int]:
     if path is None or Image is None:
         return [], TEAM_BATTLE_SYNC_DURATION_MS
@@ -16434,39 +16421,70 @@ def _team_load_sprite_frames(
         from PIL import ImageSequence  # type: ignore
     except Exception:
         ImageSequence = None  # type: ignore
-    frames: list[Any] = []
-    duration = TEAM_BATTLE_SYNC_DURATION_MS
-
     try:
-        with Image.open(str(path)) as img:
-            if ImageSequence is not None and bool(getattr(img, "is_animated", False)):
-                try:
-                    for i, fr in enumerate(ImageSequence.Iterator(img)):
-                        if i >= TEAM_MAX_SPRITE_FRAMES:
-                            break
-                        if i == 0:
-                            try:
-                                duration = max(40, min(220, int(fr.info.get("duration", duration))))
-                            except Exception:
-                                duration = TEAM_BATTLE_SYNC_DURATION_MS
-                        frames.append(fr.convert("RGBA"))
-                except Exception:
-                    frames = []
-            if not frames:
-                frames = [img.convert("RGBA")]
+        img = Image.open(str(path))
     except Exception:
         return [], TEAM_BATTLE_SYNC_DURATION_MS
+    duration = TEAM_BATTLE_SYNC_DURATION_MS
+    raw_frames: list[Any] = []
 
-    # Use union alpha bounds (alpha channel only) so transparent RGB data
-    # doesn't block cropping and cause tiny rendered sprites.
-    union_bbox = None
-    for fr in frames:
+    max_w = max(1, int(max_size[0] if max_size else 1))
+    max_h = max(1, int(max_size[1] if max_size else 1))
+    min_w = max(1, int(min_size[0])) if min_size else 1
+    min_h = max(1, int(min_size[1])) if min_size else 1
+
+    def _scale_sprite(src):
         try:
-            alpha = fr.getchannel("A")
-            bb = alpha.getbbox() if alpha is not None else fr.getbbox()
+            sw, sh = src.size
+        except Exception:
+            return src
+        if sw <= 0 or sh <= 0:
+            return src
+        max_scale = min(max_w / float(sw), max_h / float(sh))
+        if allow_upscale:
+            scale = max_scale
+            if min_size is not None:
+                min_scale = max(min_w / float(sw), min_h / float(sh))
+                scale = min(max_scale, max(min_scale, scale))
+        else:
+            scale = min(1.0, max_scale)
+        scale = max(0.05, float(scale))
+        nw = max(1, int(round(sw * scale)))
+        nh = max(1, int(round(sh * scale)))
+        if nw == sw and nh == sh:
+            return src
+        try:
+            return src.resize((nw, nh), resample)
+        except Exception:
+            return src
+
+    if ImageSequence is not None and bool(getattr(img, "is_animated", False)):
+        try:
+            for i, fr in enumerate(ImageSequence.Iterator(img)):
+                if i >= TEAM_MAX_SPRITE_FRAMES:
+                    break
+                raw_frames.append(fr.convert("RGBA"))
+        except Exception:
+            raw_frames = []
+    if not raw_frames:
+        try:
+            raw_frames = [img.convert("RGBA")]
+        except Exception:
+            raw_frames = []
+
+    if not raw_frames:
+        return [], duration
+
+    # Build a stable alpha bounding box across all frames so compositing is
+    # visually centered on the Pokémon itself (not transparent padding).
+    union_bbox: Optional[tuple[int, int, int, int]] = None
+    for fr in raw_frames:
+        try:
+            alpha = fr.split()[-1]
+            bb = alpha.getbbox()
         except Exception:
             bb = None
-        if not bb:
+        if bb is None:
             continue
         if union_bbox is None:
             union_bbox = bb
@@ -16478,37 +16496,20 @@ def _team_load_sprite_frames(
                 max(union_bbox[3], bb[3]),
             )
 
-    out_frames: list[Any] = []
-    target_w = max(1, int(max_size[0]))
-    target_h = max(1, int(max_size[1]))
-    for fr in frames:
+    frames: list[Any] = []
+    for fr in raw_frames:
         sprite = fr
         if union_bbox is not None:
             try:
-                sprite = sprite.crop(union_bbox)
+                cropped = fr.crop(union_bbox)
+                if cropped.size[0] > 0 and cropped.size[1] > 0:
+                    sprite = cropped
             except Exception:
-                pass
+                sprite = fr
+        sprite = _scale_sprite(sprite)
+        frames.append(sprite)
 
-        sw, sh = sprite.size
-        if sw > 0 and sh > 0:
-            # Fit large sprites down, but also scale tiny icon fallbacks up.
-            fit_scale = min(target_w / float(sw), target_h / float(sh))
-            if fit_scale != 1.0:
-                nw = max(1, int(round(sw * fit_scale)))
-                nh = max(1, int(round(sh * fit_scale)))
-                try:
-                    sprite = sprite.resize((nw, nh), resample=resample)
-                except Exception:
-                    pass
-
-        try:
-            if sprite.width > target_w or sprite.height > target_h:
-                sprite.thumbnail((target_w, target_h), resample=resample)
-        except Exception:
-            pass
-        out_frames.append(sprite)
-
-    return out_frames, duration
+    return frames, duration
 
 
 def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None], *, current_gen: Optional[int] = None) -> str:
@@ -16574,15 +16575,13 @@ def _team_overview_panel_file(
             resample = Image.NEAREST
         template = _team_template_path()
         if template is not None:
-            with Image.open(str(template)) as tpl:
-                base = tpl.convert("RGBA")
-            bw0, bh0 = TEAM_TEMPLATE_STEM_BASE_SIZES.get(template.stem.lower(), base.size)
+            base = Image.open(str(template)).convert("RGBA")
         else:
             # Fallback: generate a simple empty template if custom one isn't provided yet.
-            base = Image.new("RGBA", (800, 488), (92, 56, 106, 255))
-            bw0, bh0 = TEAM_TEMPLATE_BASE_SIZE
+            base = Image.new("RGBA", (808, 537), (92, 56, 106, 255))
 
         bw, bh = base.size
+        bw0, bh0 = TEAM_TEMPLATE_BASE_SIZE
         sx = bw / float(max(1, bw0))
         sy = bh / float(max(1, bh0))
         s = min(sx, sy)
@@ -16631,95 +16630,74 @@ def _team_overview_panel_file(
                     d.text((x + ox, y + oy), t, font=font, fill=stroke)
             d.text((x, y), t, font=font, fill=fill)
 
-        def _draw_pixel_shadow_text(
-            d,
-            xy: tuple[int, int],
-            text: str,
-            *,
-            font,
-            fill: tuple[int, int, int, int] = (242, 244, 252, 255),
-            shadow: tuple[int, int, int, int] = (0, 0, 0, 220),
-            shadow_offset: tuple[int, int] = (1, 1),
-        ) -> None:
-            t = str(text or "")
-            if not t or font is None:
-                return
-            x, y = int(xy[0]), int(xy[1])
-            sx_off, sy_off = int(shadow_offset[0]), int(shadow_offset[1])
-            try:
-                d.text((x + sx_off, y + sy_off), t, font=font, fill=shadow)
-                d.text((x, y), t, font=font, fill=fill)
-            except Exception:
-                pass
-
         slot_layout = tuple(_layout_scaled(g) for g in TEAM_SLOT_LAYOUT)
 
         draw = ImageDraw.Draw(base)
 
         # Overlay only text/sprites; never repaint template blocks.
-        trainer_title = "Elite Trainer"
         trainer_font = _team_font(max(12, int(round(26 * s))), bold=True)
-        header_left_x = int(round((TEAM_TRAINER_HEADER_RECT[0] + 8) * sx))
-        header_top_y = int(round(TEAM_TRAINER_LABEL_Y * sy))
-        header_name_y = int(round(TEAM_TRAINER_NAME_Y * sy))
-        header_max_w = max(48, int(round((TEAM_TRAINER_HEADER_RECT[2] - TEAM_TRAINER_HEADER_RECT[0] - 16) * sx)))
         name_font = _team_fit_font(
             draw,
             target_name,
-            max_width=header_max_w,
-            start_size=max(11, int(round(22 * s))),
-            min_size=max(8, int(round(11 * s))),
+            max_width=max(72, int(round(158 * sx))),
+            start_size=max(12, int(round(24 * s))),
+            min_size=max(9, int(round(11 * s))),
             bold=True,
         )
         if trainer_font:
-            title_font = _team_fit_font(
+            tw = _team_text_width(draw, "Trainer", trainer_font)
+            cx, ty = _pt(TEAM_TRAINER_NAME_CENTER_X, TEAM_TRAINER_LABEL_Y)
+            _draw_text_with_outline(
                 draw,
-                trainer_title,
-                max_width=header_max_w,
-                start_size=max(11, int(round(23 * s))),
-                min_size=max(8, int(round(11 * s))),
-                bold=True,
-            )
-            _draw_pixel_shadow_text(
-                draw,
-                (header_left_x, header_top_y),
-                trainer_title,
-                font=(title_font or trainer_font),
-                fill=(242, 244, 252, 255),
-                shadow=(0, 0, 0, 220),
+                (cx - tw // 2, ty),
+                "Trainer",
+                font=trainer_font,
+                fill=(245, 246, 252, 255),
+                stroke_px=max(1, int(round(2 * s))),
             )
         if name_font:
-            _draw_pixel_shadow_text(
+            nw = _team_text_width(draw, target_name, name_font)
+            cx, ny = _pt(TEAM_TRAINER_NAME_CENTER_X, TEAM_TRAINER_NAME_Y)
+            _draw_text_with_outline(
                 draw,
-                (header_left_x, header_name_y),
+                (cx - nw // 2, ny),
                 target_name,
                 font=name_font,
-                fill=(240, 242, 250, 255),
-                shadow=(0, 0, 0, 215),
+                fill=(228, 234, 252, 255),
+                stroke_px=max(1, int(round(2 * s))),
             )
 
-        # Footer: only overlay region value beside the template's existing label text.
+        # Footer: show player's selected generation (and matching region label).
         gen_num = max(1, int(current_gen or 1))
         region_name = _team_region_for_gen(gen_num)
-        footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 98) * sx))
-        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 44) * sy))
-        footer_w = max(28, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 104) * sx)))
+        footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 8) * sx))
+        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 6) * sy))
+        footer_w = max(64, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 14) * sx)))
         footer_font = _team_fit_font(
             draw,
-            region_name,
+            f"Current Gen : {gen_num}",
             max_width=footer_w,
-            start_size=max(8, int(round(14 * s))),
-            min_size=max(7, int(round(10 * s))),
+            start_size=max(8, int(round(17 * s))),
+            min_size=max(7, int(round(11 * s))),
             bold=False,
         )
         if footer_font is not None:
-            _draw_pixel_shadow_text(
+            _draw_text_with_outline(
                 draw,
                 (footer_x, footer_y),
-                region_name,
+                f"Current Gen : {gen_num}",
                 font=footer_font,
-                fill=(240, 242, 250, 255),
-                shadow=(0, 0, 0, 215),
+                fill=(242, 244, 252, 255),
+                stroke_px=max(1, int(round(2 * s))),
+            )
+            line_gap = max(10, int(round((getattr(footer_font, "size", 12) + 3) * 0.95)))
+            _draw_text_with_outline(
+                draw,
+                (footer_x, footer_y + line_gap),
+                f"Region : {region_name}",
+                font=footer_font,
+                fill=(232, 236, 249, 255),
+                stroke_px=max(1, int(round(2 * s))),
             )
 
         # Preload sprite frames (animated front preferred).
@@ -16732,14 +16710,25 @@ def _team_overview_panel_file(
                 sprite_data[slot] = {"frames": []}
                 continue
             path = _team_pick_sprite_path(row)
-            scale_mult = _team_species_visual_scale(row)
-            edge = max(32, int(round(108 * min(sx, sy) * scale_mult)))
-            frames, _ = _team_load_sprite_frames(path, max_size=(edge, edge), resample=resample)
+            geom = slot_layout[slot - 1]
+            slot_w, slot_h = geom["box_wh"]
+            visual_scale = _team_species_visual_scale(row)
+            max_w = max(30, min(max(30, slot_w - max(10, int(round(10 * s)))), int(round(128 * sx * visual_scale))))
+            max_h = max(30, min(max(30, slot_h - max(46, int(round(54 * s)))), int(round(124 * sy * visual_scale))))
+            sprite_max = (max_w, max_h)
+            sprite_min = (max(24, int(round(max_w * 0.72))), max(24, int(round(max_h * 0.72))))
+            frames, _ = _team_load_sprite_frames(
+                path,
+                max_size=sprite_max,
+                resample=resample,
+                allow_upscale=True,
+                min_size=sprite_min,
+            )
             sprite_data[slot] = {"frames": frames}
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
 
-        lvl_font_slot = _team_font(max(9, int(round(17 * s))), bold=True)
+        lvl_font_slot = _team_font(max(9, int(round(18 * s))), bold=False)
         text_prep: dict[int, dict[str, Any]] = {}
         probe_draw = ImageDraw.Draw(base)
         for slot in range(1, 7):
@@ -16755,39 +16744,20 @@ def _team_overview_panel_file(
             else:
                 label = _team_species_label(row)
                 lvl = f"lvl {int(row.get('level') or 1)}"
-            label_to_draw = label
             label_font = _team_fit_font(
                 probe_draw,
-                label_to_draw,
+                label,
                 max_width=max(36, int(round((slot_w - max(42, int(round(52 * s))))))),
                 start_size=max(9, int(round(19 * s))),
-                min_size=max(7, int(round(9 * s))),
+                min_size=max(7, int(round(10 * s))),
                 bold=True,
             )
             lvl_x = geom["level_right"][0]
-            lvl_w = 0
             if lvl_font_slot:
-                lvl_w = _team_text_width(probe_draw, lvl, lvl_font_slot)
-                lvl_x = int(geom["level_right"][0] - lvl_w)
-            if label_font:
-                label_w = _team_text_width(probe_draw, label_to_draw, label_font)
-                min_gap = max(10, int(round(14 * s)))
-                label_start_x = int(geom["label_xy"][0])
-                label_end_limit = int(lvl_x - min_gap)
-                if label_start_x + label_w > label_end_limit:
-                    tighter_max = max(22, label_end_limit - label_start_x)
-                    label_font = _team_fit_font(
-                        probe_draw,
-                        label_to_draw,
-                        max_width=tighter_max,
-                        start_size=max(8, int(round(16 * s))),
-                        min_size=max(6, int(round(7 * s))),
-                        bold=True,
-                    )
-                    if label_font:
-                        label_w = _team_text_width(probe_draw, label_to_draw, label_font)
+                lw = _team_text_width(probe_draw, lvl, lvl_font_slot)
+                lvl_x = int(geom["level_right"][0] - lw)
             text_prep[slot] = {
-                "label": label_to_draw,
+                "label": label,
                 "font": label_font,
                 "lvl": lvl,
                 "lvl_x": lvl_x,
@@ -16804,23 +16774,23 @@ def _team_overview_panel_file(
             if not row:
                 continue
             if slot_text.get("font") and str(slot_text.get("label") or "").strip():
-                _draw_pixel_shadow_text(
+                _draw_text_with_outline(
                     text_draw,
                     (int(slot_text.get("label_x") or geom["label_xy"][0]), geom["label_xy"][1]),
                     str(slot_text.get("label") or ""),
                     font=slot_text["font"],
-                    fill=(240, 242, 250, 255),
-                    shadow=(0, 0, 0, 220),
+                    fill=(244, 246, 253, 255),
+                    stroke_px=max(1, int(round(2 * s))),
                 )
             lvl = str(slot_text.get("lvl") or "")
             if lvl and lvl_font_slot:
-                _draw_pixel_shadow_text(
+                _draw_text_with_outline(
                     text_draw,
                     (int(slot_text.get("lvl_x") or geom["level_right"][0]), geom["level_right"][1]),
                     lvl,
                     font=lvl_font_slot,
-                    fill=(236, 240, 250, 255),
-                    shadow=(0, 0, 0, 210),
+                    fill=(236, 236, 246, 255),
+                    stroke_px=max(1, int(round(2 * s))),
                 )
 
         out_frames: list[Any] = []
