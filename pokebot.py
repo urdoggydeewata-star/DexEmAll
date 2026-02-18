@@ -15946,6 +15946,12 @@ TEAM_TEMPLATE_PATHS: tuple[Path, ...] = (
     ASSETS_DIR / "team-template.png",
 )
 TEAM_TEMPLATE_BASE_SIZE: tuple[int, int] = (808, 537)
+TEAM_TEMPLATE_STEM_BASE_SIZES: dict[str, tuple[int, int]] = {
+    "team-beta": (800, 488),
+    "textual-ui": (800, 488),
+    "team-template": (808, 537),
+    "team_panel_template": (808, 537),
+}
 TEAM_TRAINER_HEADER_RECT = (42, 34, 212, 84)
 TEAM_TRAINER_ART_RECT = (42, 85, 212, 410)
 TEAM_TRAINER_FOOTER_RECT = (42, 430, 212, 491)
@@ -15993,12 +15999,12 @@ TEAM_FETCH_SHOWDOWN_FOR_TEAM = False
 TEAM_OVERVIEW_CACHE_TTL_SECONDS = 12.0
 TEAM_WARM_CACHE_INTERVAL_SECONDS = 120.0
 TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
-    {"box_xy": (236, 93), "box_wh": (177, 197), "sprite_c": (324, 173), "label_xy": (246, 256), "level_right": (402, 256)},
-    {"box_xy": (415, 93), "box_wh": (177, 197), "sprite_c": (503, 173), "label_xy": (425, 256), "level_right": (581, 256)},
-    {"box_xy": (593, 93), "box_wh": (177, 197), "sprite_c": (681, 173), "label_xy": (603, 256), "level_right": (759, 256)},
-    {"box_xy": (236, 294), "box_wh": (177, 197), "sprite_c": (324, 374), "label_xy": (246, 457), "level_right": (402, 457)},
-    {"box_xy": (415, 294), "box_wh": (177, 197), "sprite_c": (503, 374), "label_xy": (425, 457), "level_right": (581, 457)},
-    {"box_xy": (593, 294), "box_wh": (177, 197), "sprite_c": (681, 374), "label_xy": (603, 457), "level_right": (759, 457)},
+    {"box_xy": (236, 93), "box_wh": (177, 197), "sprite_c": (324, 173), "label_xy": (242, 243), "level_right": (402, 243)},
+    {"box_xy": (415, 93), "box_wh": (177, 197), "sprite_c": (503, 173), "label_xy": (420, 243), "level_right": (581, 243)},
+    {"box_xy": (593, 93), "box_wh": (177, 197), "sprite_c": (681, 173), "label_xy": (598, 243), "level_right": (759, 243)},
+    {"box_xy": (236, 294), "box_wh": (177, 197), "sprite_c": (324, 374), "label_xy": (242, 444), "level_right": (402, 444)},
+    {"box_xy": (415, 294), "box_wh": (177, 197), "sprite_c": (503, 374), "label_xy": (420, 444), "level_right": (581, 444)},
+    {"box_xy": (593, 294), "box_wh": (177, 197), "sprite_c": (681, 374), "label_xy": (598, 444), "level_right": (759, 444)},
 )
 TEAM_EGG_STAGE_PATHS: tuple[Path, ...] = (
     ASSETS_EGG_STAGE_1_INTACT,
@@ -16371,7 +16377,22 @@ def _team_font(size: int, *, bold: bool = False):
         from PIL import ImageFont  # type: ignore
     except Exception:
         return None
+    try:
+        from pvp.renderer import _get_pokemon_font_path as _renderer_pokemon_font_path  # type: ignore
+
+        path = _renderer_pokemon_font_path()
+        if path:
+            return ImageFont.truetype(str(path), int(size))
+    except Exception:
+        pass
     candidates = [
+        "pvp/_common/fonts/Pokemon GB.ttf",
+        "pvp/_common/fonts/PokemonGb-RAeo.ttf",
+        "pvp/_common/fonts/pokemon-gb.ttf",
+        "pvp/_common/fonts/pokemongb.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     ]
@@ -16575,13 +16596,15 @@ def _team_overview_panel_file(
             resample = Image.NEAREST
         template = _team_template_path()
         if template is not None:
-            base = Image.open(str(template)).convert("RGBA")
+            with Image.open(str(template)) as tpl:
+                base = tpl.convert("RGBA")
+            bw0, bh0 = TEAM_TEMPLATE_STEM_BASE_SIZES.get(template.stem.lower(), TEAM_TEMPLATE_BASE_SIZE)
         else:
             # Fallback: generate a simple empty template if custom one isn't provided yet.
             base = Image.new("RGBA", (808, 537), (92, 56, 106, 255))
+            bw0, bh0 = TEAM_TEMPLATE_BASE_SIZE
 
         bw, bh = base.size
-        bw0, bh0 = TEAM_TEMPLATE_BASE_SIZE
         sx = bw / float(max(1, bw0))
         sy = bh / float(max(1, bh0))
         s = min(sx, sy)
@@ -16629,6 +16652,27 @@ def _team_overview_panel_file(
                         continue
                     d.text((x + ox, y + oy), t, font=font, fill=stroke)
             d.text((x, y), t, font=font, fill=fill)
+
+        def _draw_pixel_shadow_text(
+            d,
+            xy: tuple[int, int],
+            text: str,
+            *,
+            font,
+            fill: tuple[int, int, int, int] = (242, 244, 252, 255),
+            shadow: tuple[int, int, int, int] = (0, 0, 0, 220),
+            shadow_offset: tuple[int, int] = (1, 1),
+        ) -> None:
+            t = str(text or "")
+            if not t or font is None:
+                return
+            x, y = int(xy[0]), int(xy[1])
+            sx_off, sy_off = int(shadow_offset[0]), int(shadow_offset[1])
+            try:
+                d.text((x + sx_off, y + sy_off), t, font=font, fill=shadow)
+                d.text((x, y), t, font=font, fill=fill)
+            except Exception:
+                pass
 
         slot_layout = tuple(_layout_scaled(g) for g in TEAM_SLOT_LAYOUT)
 
@@ -16728,7 +16772,7 @@ def _team_overview_panel_file(
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
 
-        lvl_font_slot = _team_font(max(9, int(round(18 * s))), bold=False)
+        lvl_font_slot = _team_font(max(9, int(round(17 * s))), bold=True)
         text_prep: dict[int, dict[str, Any]] = {}
         probe_draw = ImageDraw.Draw(base)
         for slot in range(1, 7):
@@ -16749,7 +16793,7 @@ def _team_overview_panel_file(
                 label,
                 max_width=max(36, int(round((slot_w - max(42, int(round(52 * s))))))),
                 start_size=max(9, int(round(19 * s))),
-                min_size=max(7, int(round(10 * s))),
+                min_size=max(7, int(round(9 * s))),
                 bold=True,
             )
             lvl_x = geom["level_right"][0]
@@ -16774,23 +16818,23 @@ def _team_overview_panel_file(
             if not row:
                 continue
             if slot_text.get("font") and str(slot_text.get("label") or "").strip():
-                _draw_text_with_outline(
+                _draw_pixel_shadow_text(
                     text_draw,
                     (int(slot_text.get("label_x") or geom["label_xy"][0]), geom["label_xy"][1]),
                     str(slot_text.get("label") or ""),
                     font=slot_text["font"],
-                    fill=(244, 246, 253, 255),
-                    stroke_px=max(1, int(round(2 * s))),
+                    fill=(240, 242, 250, 255),
+                    shadow=(0, 0, 0, 220),
                 )
             lvl = str(slot_text.get("lvl") or "")
             if lvl and lvl_font_slot:
-                _draw_text_with_outline(
+                _draw_pixel_shadow_text(
                     text_draw,
                     (int(slot_text.get("lvl_x") or geom["level_right"][0]), geom["level_right"][1]),
                     lvl,
                     font=lvl_font_slot,
-                    fill=(236, 236, 246, 255),
-                    stroke_px=max(1, int(round(2 * s))),
+                    fill=(236, 240, 250, 255),
+                    shadow=(0, 0, 0, 210),
                 )
 
         out_frames: list[Any] = []
