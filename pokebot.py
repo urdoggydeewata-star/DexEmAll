@@ -16146,8 +16146,14 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
     form = _species_folder_name(str(row.get("form") or ""))
     shiny = bool(int(row.get("shiny") or 0))
     is_female = str(row.get("gender") or "").strip().lower() == "female"
+    resolved: Optional[Path | str] = None
 
-    # Keep /team sprite source aligned with battle renderer resolution logic.
+    def _is_animated_path(p: Path) -> bool:
+        suf = str(getattr(p, "suffix", "") or "").strip().lower()
+        return suf in {".gif", ".webp", ".apng"}
+
+    # Keep /team sprite source aligned with battle renderer resolution logic,
+    # but only accept this early path if it's animated.
     try:
         resolved = _pvp_sprites.find_sprite(
             species,
@@ -16160,7 +16166,7 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
         )
         if resolved is not None:
             rp = Path(resolved)
-            if rp.exists() and rp.is_file() and rp.stat().st_size > 0:
+            if rp.exists() and rp.is_file() and rp.stat().st_size > 0 and _is_animated_path(rp):
                 return rp
     except Exception:
         pass
@@ -16209,7 +16215,16 @@ def _team_pick_sprite_path(row: dict) -> Optional[Path]:
             if p is not None:
                 return p
 
-    # 4) Fallback to static local sprites.
+    # 4) If battle resolver found a static file, keep it as fallback.
+    try:
+        if resolved is not None:
+            rp = Path(resolved)
+            if rp.exists() and rp.is_file() and rp.stat().st_size > 0:
+                return rp
+    except Exception:
+        pass
+
+    # 5) Fallback to static local sprites.
     static_candidates: list[str] = []
     if is_female:
         if shiny:
@@ -16297,7 +16312,7 @@ def _team_load_sprite_frames(
     except Exception:
         return [], TEAM_BATTLE_SYNC_DURATION_MS
     duration = TEAM_BATTLE_SYNC_DURATION_MS
-    frames: list[Any] = []
+    raw_frames: list[Any] = []
 
     max_w = max(1, int(max_size[0] if max_size else 1))
     max_h = max(1, int(max_size[1] if max_size else 1))
@@ -16334,18 +16349,52 @@ def _team_load_sprite_frames(
             for i, fr in enumerate(ImageSequence.Iterator(img)):
                 if i >= TEAM_MAX_SPRITE_FRAMES:
                     break
-                sprite = fr.convert("RGBA")
-                sprite = _scale_sprite(sprite)
-                frames.append(sprite)
+                raw_frames.append(fr.convert("RGBA"))
         except Exception:
-            frames = []
-    if not frames:
+            raw_frames = []
+    if not raw_frames:
         try:
-            sprite = img.convert("RGBA")
-            sprite = _scale_sprite(sprite)
-            frames = [sprite]
+            raw_frames = [img.convert("RGBA")]
         except Exception:
-            frames = []
+            raw_frames = []
+
+    if not raw_frames:
+        return [], duration
+
+    # Build a stable alpha bounding box across all frames so compositing is
+    # visually centered on the Pokémon itself (not transparent padding).
+    union_bbox: Optional[tuple[int, int, int, int]] = None
+    for fr in raw_frames:
+        try:
+            alpha = fr.split()[-1]
+            bb = alpha.getbbox()
+        except Exception:
+            bb = None
+        if bb is None:
+            continue
+        if union_bbox is None:
+            union_bbox = bb
+        else:
+            union_bbox = (
+                min(union_bbox[0], bb[0]),
+                min(union_bbox[1], bb[1]),
+                max(union_bbox[2], bb[2]),
+                max(union_bbox[3], bb[3]),
+            )
+
+    frames: list[Any] = []
+    for fr in raw_frames:
+        sprite = fr
+        if union_bbox is not None:
+            try:
+                cropped = fr.crop(union_bbox)
+                if cropped.size[0] > 0 and cropped.size[1] > 0:
+                    sprite = cropped
+            except Exception:
+                sprite = fr
+        sprite = _scale_sprite(sprite)
+        frames.append(sprite)
+
     return frames, duration
 
 
