@@ -17487,8 +17487,8 @@ def _team_species_visual_scale(row: dict) -> float:
     if db_cache is None:
         species_norm = _daycare_norm_species(row.get("species"))
         if species_norm == "stakataka":
-            return 0.74
-        return 1.05
+            return 0.86
+        return 1.0
     species_raw = str(row.get("species") or "").strip().lower().replace("_", "-")
     if not species_raw:
         return 1.0
@@ -17496,7 +17496,7 @@ def _team_species_visual_scale(row: dict) -> float:
     # Wide/tall forms like Stakataka can clip into the name strip if rendered by
     # generic height scaling, so cap them with a hand-tuned value.
     if species_norm == "stakataka":
-        return 0.74
+        return 0.86
     candidates = [
         species_raw,
         species_raw.replace("-", " "),
@@ -17531,11 +17531,11 @@ def _team_species_visual_scale(row: dict) -> float:
         if height_m is not None:
             break
     if height_m is None:
-        return 1.05
+        return 1.0
     h = max(0.2, min(6.0, float(height_m)))
     denom = (math.log1p(6.0) - math.log1p(0.2)) or 1.0
     norm = (math.log1p(h) - math.log1p(0.2)) / denom
-    return max(0.84, min(1.46, 0.86 + (0.60 * norm)))
+    return max(0.78, min(1.34, 0.80 + (0.54 * norm)))
 
 
 def _team_is_egg_row(row: dict) -> bool:
@@ -17885,6 +17885,9 @@ def _team_load_sprite_frames(
     resample,
     allow_upscale: bool = False,
     min_size: tuple[int, int] | None = None,
+    frame_limit: int | None = None,
+    min_frame_duration_ms: int | None = None,
+    max_frame_duration_ms: int | None = None,
 ) -> tuple[list[Any], int]:
     if path is None or Image is None:
         return [], TEAM_BATTLE_SYNC_DURATION_MS
@@ -17898,11 +17901,15 @@ def _team_load_sprite_frames(
         return [], TEAM_BATTLE_SYNC_DURATION_MS
     duration = TEAM_BATTLE_SYNC_DURATION_MS
     raw_frames: list[Any] = []
+    duration_samples: list[int] = []
 
     max_w = max(1, int(max_size[0] if max_size else 1))
     max_h = max(1, int(max_size[1] if max_size else 1))
     min_w = max(1, int(min_size[0])) if min_size else 1
     min_h = max(1, int(min_size[1])) if min_size else 1
+    max_frames = max(1, int(frame_limit or TEAM_MAX_SPRITE_FRAMES))
+    min_dur = max(10, int(min_frame_duration_ms or TEAM_MIN_FRAME_DURATION_MS or TEAM_BATTLE_SYNC_DURATION_MS))
+    max_dur = max(min_dur, int(max_frame_duration_ms or TEAM_MAX_FRAME_DURATION_MS or TEAM_BATTLE_SYNC_DURATION_MS))
 
     def _scale_sprite(src):
         try:
@@ -17932,9 +17939,24 @@ def _team_load_sprite_frames(
     if ImageSequence is not None and bool(getattr(img, "is_animated", False)):
         try:
             for i, fr in enumerate(ImageSequence.Iterator(img)):
-                if i >= TEAM_MAX_SPRITE_FRAMES:
+                if i >= max_frames:
                     break
-                raw_frames.append(fr.convert("RGBA"))
+                try:
+                    raw_frames.append(fr.copy().convert("RGBA"))
+                except Exception:
+                    raw_frames.append(fr.convert("RGBA"))
+                try:
+                    d = int(fr.info.get("duration") or 0)
+                except Exception:
+                    d = 0
+                if d <= 0:
+                    try:
+                        d = int(img.info.get("duration") or 0)
+                    except Exception:
+                        d = 0
+                if d <= 0:
+                    d = TEAM_BATTLE_SYNC_DURATION_MS
+                duration_samples.append(max(min_dur, min(max_dur, int(d))))
         except Exception:
             raw_frames = []
     if not raw_frames:
@@ -17945,6 +17967,13 @@ def _team_load_sprite_frames(
 
     if not raw_frames:
         return [], duration
+
+    if duration_samples:
+        try:
+            duration = int(round(sum(duration_samples) / max(1, len(duration_samples))))
+            duration = max(min_dur, min(max_dur, duration))
+        except Exception:
+            duration = max(min_dur, min(max_dur, TEAM_BATTLE_SYNC_DURATION_MS))
 
     # Build a stable alpha bounding box across all frames so compositing is
     # visually centered on the Pokémon itself (not transparent padding).
@@ -18200,21 +18229,31 @@ def _team_overview_panel_file(
             geom = slot_layout[slot - 1]
             slot_w, slot_h = geom["box_wh"]
             visual_scale = _team_species_visual_scale(row)
-            max_w = max(30, min(max(30, slot_w - max(10, int(round(10 * s)))), int(round(140 * sx * visual_scale))))
-            max_h = max(30, min(max(30, slot_h - max(46, int(round(54 * s)))), int(round(140 * sy * visual_scale))))
+            max_w = max(30, min(max(30, slot_w - max(10, int(round(10 * s)))), int(round(128 * sx * visual_scale))))
+            max_h = max(30, min(max(30, slot_h - max(46, int(round(54 * s)))), int(round(124 * sy * visual_scale))))
             sprite_max = (max_w, max_h)
             sprite_min = (max(24, int(round(max_w * 0.72))), max(24, int(round(max_h * 0.72))))
+            species_norm = _daycare_norm_species(row.get("species"))
+            frame_limit = TEAM_MAX_SPRITE_FRAMES
+            min_frame_ms = TEAM_MIN_FRAME_DURATION_MS
+            if species_norm == "eevee":
+                # Eevee source animations can have longer loops; keep enough frames/time
+                # so Discord playback doesn't appear to reset mid-cycle.
+                frame_limit = max(frame_limit, 128)
+                min_frame_ms = max(min_frame_ms, 95)
             frames, _ = _team_load_sprite_frames(
                 path,
                 max_size=sprite_max,
                 resample=resample,
                 allow_upscale=True,
                 min_size=sprite_min,
+                frame_limit=frame_limit,
+                min_frame_duration_ms=min_frame_ms,
             )
             y_off = 0
             try:
                 if _daycare_norm_species(row.get("species")) == "stakataka":
-                    y_off = -max(2, int(round(8 * sy)))
+                    y_off = -max(2, int(round(12 * sy)))
             except Exception:
                 y_off = 0
             sprite_data[slot] = {"frames": frames, "y_off": y_off}
@@ -22018,6 +22057,81 @@ def form_aware_species_dirs(species: str, form_key: Optional[str]) -> list[Path]
             out.append(d); seen.add(d)
     return out
 
+
+def _discord_sprite_file(path: Path):
+    """
+    Build a Discord file for a sprite path.
+    For animated GIFs, re-encode frame-by-frame with clamped durations so
+    loop timing is stable (fixes some delta/disposal artifacts and fast resets).
+    """
+    from discord import File  # local import to avoid module-order issues
+    try:
+        if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+            return None
+    except Exception:
+        return None
+
+    if str(path.suffix or "").lower() != ".gif" or Image is None:
+        try:
+            return File(path, filename=path.name)
+        except Exception:
+            return None
+
+    try:
+        from PIL import ImageSequence  # type: ignore
+    except Exception:
+        try:
+            return File(path, filename=path.name)
+        except Exception:
+            return None
+
+    try:
+        frames: list[Any] = []
+        durations: list[int] = []
+        with Image.open(str(path)) as src:
+            if not bool(getattr(src, "is_animated", False)):
+                return File(path, filename=path.name)
+            max_frames = min(160, max(1, int(getattr(src, "n_frames", 1) or 1)))
+            for i, fr in enumerate(ImageSequence.Iterator(src)):
+                if i >= max_frames:
+                    break
+                try:
+                    frames.append(fr.copy().convert("RGBA"))
+                except Exception:
+                    frames.append(fr.convert("RGBA"))
+                try:
+                    d = int(fr.info.get("duration") or 0)
+                except Exception:
+                    d = 0
+                if d <= 0:
+                    try:
+                        d = int(src.info.get("duration") or 0)
+                    except Exception:
+                        d = 0
+                if d <= 0:
+                    d = 95
+                durations.append(max(70, min(220, d)))
+        if len(frames) <= 1:
+            return File(path, filename=path.name)
+        out = BytesIO()
+        frames[0].save(
+            out,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=durations or 95,
+            loop=0,
+            disposal=2,
+        )
+        out.seek(0)
+        return File(fp=out, filename=path.name)
+    except Exception:
+        try:
+            return File(path, filename=path.name)
+        except Exception:
+            return None
+
+
 def pokemon_sprite_attachment(
     species: str,
     *,
@@ -22029,13 +22143,14 @@ def pokemon_sprite_attachment(
     Returns (attachment_url, discord.File) or (None, None).
     Looks in form folders first (hyphen/space + fuzzy), then base species.
     """
-    from discord import File  # local import to avoid issues if module order changes
     for folder in form_aware_species_dirs(species, form_key):
         for fname in _candidate_filenames(shiny=shiny, gender=gender):
             p = folder / fname
             try:
                 if p.exists() and p.stat().st_size > 0:
-                    return f"attachment://{p.name}", File(p, filename=p.name)
+                    f = _discord_sprite_file(p)
+                    if f is not None:
+                        return f"attachment://{f.filename}", f
             except Exception:
                 pass
     return None, None
@@ -23071,9 +23186,12 @@ async def pokeinfo(
         )
         
         if sprite_path and sprite_path.exists():
-            from discord import File
-            files = [File(sprite_path, filename=sprite_path.name)]
-            emb.set_thumbnail(url=f"attachment://{sprite_path.name}")
+            f = _discord_sprite_file(Path(sprite_path))
+            if f is not None:
+                files = [f]
+                emb.set_thumbnail(url=f"attachment://{f.filename}")
+            else:
+                files = []
         else:
             # Fallback to attach_sprite_to_embed
             files = attach_sprite_to_embed(
