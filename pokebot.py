@@ -8489,6 +8489,9 @@ def _route_pick_item_from_pool(pool_key: str) -> tuple[str, str]:
 async def _roll_and_give_route_move_item_async(user_id: str) -> Optional[str]:
     """
     Roll route loot-ball encounter and grant rewards from the configured pool table.
+    A ball encounter acts as a loot container, not an extra guaranteed item:
+    - One reward is rolled from that ball's configured loot table.
+    - If that table includes a Poké Ball (or any ball), that is the reward.
     Returns the message to show or None if no drop.
     """
     if not ROUTE_MOVE_BALL_ENCOUNTER_RATES or not ROUTE_MOVE_ITEMS_BY_BALL:
@@ -8509,14 +8512,12 @@ async def _roll_and_give_route_move_item_async(user_id: str) -> Optional[str]:
         # Repeat Ball: duplicate previous standard roll rewards.
         if ball_id == "repeat_ball":
             prev = ROUTE_MOVE_LAST_STANDARD_ROLL.get(uid)
-            await _grant(ball_id, ball_name, 1)
             if prev:
-                prev_ball_id, prev_ball_name, prev_item_id, prev_item_name = prev
-                await _grant(prev_ball_id, prev_ball_name, 2)
+                _prev_ball_id, _prev_ball_name, prev_item_id, prev_item_name = prev
                 await _grant(prev_item_id, prev_item_name, 2)
                 return (
                     f"You found a **{ball_name}**! It repeated your last route ball reward: "
-                    f"**2× {prev_ball_name}** and **2× {prev_item_name}**."
+                    f"**2× {prev_item_name}**."
                 )
             fallback_item_id, fallback_item_name = _route_pick_item_from_pool("poke_ball")
             await _grant(fallback_item_id, fallback_item_name, 1)
@@ -8531,13 +8532,12 @@ async def _roll_and_give_route_move_item_async(user_id: str) -> Optional[str]:
         if not item_id:
             return None
 
-        await _grant(ball_id, ball_name, 1)
         await _grant(item_id, item_name, 1)
         ROUTE_MOVE_LAST_STANDARD_ROLL[uid] = (ball_id, ball_name, item_id, item_name)
 
         if ball_id == "timer_ball":
             return f"You found a **{ball_name}**! Standard reward: **{item_name}**."
-        return f"You found a **{ball_name}**! Inside was a **{item_name}**."
+        return f"You found a **{ball_name}**! Inside was **{item_name}**."
     except Exception as e:
         print(f"[Adventure] Route move item drop give_item failed: {e}")
         import traceback
@@ -18592,6 +18592,117 @@ def _parse_box_int(v: str | None) -> Optional[int]:
         return None
 
 
+async def _ensure_pokemon_locks_table(conn: Any | None = None) -> None:
+    own_conn = conn is None
+    if own_conn:
+        conn = await db.connect()
+    try:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pokemon_locks (
+                owner_id TEXT NOT NULL,
+                mon_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (owner_id, mon_id)
+            )
+            """
+        )
+        if own_conn:
+            await conn.commit()
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+
+async def _is_pokemon_locked(owner_id: str, mon_id: int, *, conn: Any | None = None) -> bool:
+    if not owner_id or int(mon_id or 0) <= 0:
+        return False
+    own_conn = conn is None
+    if own_conn:
+        conn = await db.connect()
+    try:
+        await _ensure_pokemon_locks_table(conn)
+        cur = await conn.execute(
+            "SELECT 1 FROM pokemon_locks WHERE owner_id=? AND mon_id=? LIMIT 1",
+            (str(owner_id), int(mon_id)),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return bool(row)
+    except Exception:
+        return False
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+
+async def _set_pokemon_locked(owner_id: str, mon_id: int, locked: bool, *, conn: Any | None = None) -> None:
+    if not owner_id or int(mon_id or 0) <= 0:
+        return
+    own_conn = conn is None
+    if own_conn:
+        conn = await db.connect()
+    try:
+        await _ensure_pokemon_locks_table(conn)
+        if bool(locked):
+            await conn.execute(
+                "INSERT INTO pokemon_locks (owner_id, mon_id) VALUES (?, ?) ON CONFLICT (owner_id, mon_id) DO NOTHING",
+                (str(owner_id), int(mon_id)),
+            )
+        else:
+            await conn.execute(
+                "DELETE FROM pokemon_locks WHERE owner_id=? AND mon_id=?",
+                (str(owner_id), int(mon_id)),
+            )
+        if own_conn:
+            await conn.commit()
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+
+async def _get_locked_pokemon_ids(owner_id: str, *, conn: Any | None = None) -> set[int]:
+    if not owner_id:
+        return set()
+    own_conn = conn is None
+    if own_conn:
+        conn = await db.connect()
+    try:
+        await _ensure_pokemon_locks_table(conn)
+        cur = await conn.execute(
+            "SELECT mon_id FROM pokemon_locks WHERE owner_id=?",
+            (str(owner_id),),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        out: set[int] = set()
+        for r in rows or []:
+            try:
+                mid = int((r["mon_id"] if hasattr(r, "keys") else r[0]) or 0)
+            except Exception:
+                mid = 0
+            if mid > 0:
+                out.add(mid)
+        return out
+    except Exception:
+        return set()
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+
 async def _box_swap_positions(owner_id: str, box_no: int, team_slot: int, box_pos: int) -> tuple[bool, str]:
     """
     Swap/move between one team slot and one box slot:
@@ -18765,8 +18876,15 @@ async def _box_release_mon(owner_id: str, box_no: int, box_pos: int) -> tuple[bo
         mon_id = int(row["id"] if hasattr(row, "keys") else row[0])
         species = str(row["species"] if hasattr(row, "keys") else row[1])
         held_item = str((row["held_item"] if hasattr(row, "keys") else row[2]) or "").strip()
+        if await _is_pokemon_locked(owner_id, mon_id, conn=conn):
+            return (
+                False,
+                f"**{species.replace('-', ' ').title()}** is locked. "
+                f"Use `/boxpklock box_no:{int(box_no)} pos:{int(box_pos)} lock:false` first.",
+            )
 
         await conn.execute("DELETE FROM pokemons WHERE owner_id=? AND id=?", (owner_id, mon_id))
+        await conn.execute("DELETE FROM pokemon_locks WHERE owner_id=? AND mon_id=?", (owner_id, mon_id))
         await _box_compact_positions_conn(conn, owner_id, int(box_no))
         await conn.commit()
     db.invalidate_pokemons_cache(owner_id)
@@ -22916,6 +23034,114 @@ class ReleaseConfirmView(discord.ui.View):
         self.stop()
         await interaction.response.edit_message(content="❌ Release cancelled.", view=None)
 
+
+@bot.tree.command(name="pklock", description="Lock or unlock a team Pokémon to prevent accidental release.")
+@app_commands.describe(
+    slot="Team slot (1-6)",
+    lock="True = lock, False = unlock. Leave empty to toggle.",
+)
+async def pklock_command(
+    interaction: discord.Interaction,
+    slot: app_commands.Range[int, 1, 6],
+    lock: Optional[bool] = None,
+):
+    await interaction.response.defer(ephemeral=True)
+    uid = str(interaction.user.id)
+    async with db.session() as conn:
+        cur = await conn.execute(
+            "SELECT id, species FROM pokemons WHERE owner_id=? AND team_slot=? LIMIT 1",
+            (uid, int(slot)),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return await interaction.followup.send(
+                f"❌ No Pokémon found in team slot **{int(slot)}**.",
+                ephemeral=True,
+            )
+        mon_id = int(row["id"] if hasattr(row, "keys") else row[0])
+        species = str(row["species"] if hasattr(row, "keys") else row[1]).replace("-", " ").title()
+        currently_locked = await _is_pokemon_locked(uid, mon_id, conn=conn)
+        target_locked = (not currently_locked) if lock is None else bool(lock)
+        if target_locked != currently_locked:
+            await _set_pokemon_locked(uid, mon_id, target_locked, conn=conn)
+            await conn.commit()
+
+    if target_locked == currently_locked:
+        state_word = "already locked" if target_locked else "already unlocked"
+        icon = "🔒" if target_locked else "🔓"
+        return await interaction.followup.send(
+            f"{icon} **{species}** is {state_word}.",
+            ephemeral=True,
+        )
+
+    if target_locked:
+        return await interaction.followup.send(
+            f"🔒 Locked **{species}** in slot **{int(slot)}**. It cannot be released until unlocked.",
+            ephemeral=True,
+        )
+    return await interaction.followup.send(
+        f"🔓 Unlocked **{species}** in slot **{int(slot)}**.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="boxpklock", description="Lock or unlock a boxed Pokémon to prevent accidental release.")
+@app_commands.describe(
+    box_no="Box number",
+    pos="Box slot position",
+    lock="True = lock, False = unlock. Leave empty to toggle.",
+)
+async def boxpklock_command(
+    interaction: discord.Interaction,
+    box_no: app_commands.Range[int, 1, 64],
+    pos: app_commands.Range[int, 1, 180],
+    lock: Optional[bool] = None,
+):
+    await interaction.response.defer(ephemeral=True)
+    uid = str(interaction.user.id)
+    ok, msg, _count, _cap = await _validate_box_and_slot(uid, int(box_no), slot=int(pos))
+    if not ok:
+        return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+
+    async with db.session() as conn:
+        cur = await conn.execute(
+            "SELECT id, species FROM pokemons WHERE owner_id=? AND team_slot IS NULL AND box_no=? AND box_pos=? LIMIT 1",
+            (uid, int(box_no), int(pos)),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return await interaction.followup.send(
+                f"❌ No boxed Pokémon found at Box **{int(box_no)}**, Slot **{int(pos)}**.",
+                ephemeral=True,
+            )
+        mon_id = int(row["id"] if hasattr(row, "keys") else row[0])
+        species = str(row["species"] if hasattr(row, "keys") else row[1]).replace("-", " ").title()
+        currently_locked = await _is_pokemon_locked(uid, mon_id, conn=conn)
+        target_locked = (not currently_locked) if lock is None else bool(lock)
+        if target_locked != currently_locked:
+            await _set_pokemon_locked(uid, mon_id, target_locked, conn=conn)
+            await conn.commit()
+
+    if target_locked == currently_locked:
+        state_word = "already locked" if target_locked else "already unlocked"
+        icon = "🔒" if target_locked else "🔓"
+        return await interaction.followup.send(
+            f"{icon} **{species}** is {state_word}.",
+            ephemeral=True,
+        )
+
+    if target_locked:
+        return await interaction.followup.send(
+            f"🔒 Locked **{species}** at Box **{int(box_no)}**, Slot **{int(pos)}**. It cannot be released until unlocked.",
+            ephemeral=True,
+        )
+    return await interaction.followup.send(
+        f"🔓 Unlocked **{species}** at Box **{int(box_no)}**, Slot **{int(pos)}**.",
+        ephemeral=True,
+    )
+
 @bot.tree.command(name="release", description="Release a Pokémon from your team")
 @app_commands.describe(slot="Team slot (1-6) to release")
 async def release_pokemon(interaction: discord.Interaction, slot: app_commands.Range[int, 1, 6]):
@@ -22943,6 +23169,13 @@ async def release_pokemon(interaction: discord.Interaction, slot: app_commands.R
             )
 
         mon = dict(row)
+        mon_id = int(mon.get("id") or 0)
+
+        if mon_id > 0 and await _is_pokemon_locked(uid, mon_id, conn=conn):
+            return await interaction.followup.send(
+                f"🔒 **{mon['species']}** in slot **{slot}** is locked. Use `/pklock slot:{int(slot)} lock:false` first.",
+                ephemeral=True,
+            )
 
         # Safety checks (only for non-admins)
         if not is_admin:
@@ -23022,6 +23255,10 @@ async def release_pokemon(interaction: discord.Interaction, slot: app_commands.R
                 "DELETE FROM pokemons WHERE owner_id = ? AND id = ?",
                 (uid, mon['id'])
             )
+            await conn.execute(
+                "DELETE FROM pokemon_locks WHERE owner_id = ? AND mon_id = ?",
+                (uid, mon['id']),
+            )
             await conn.commit()
             db.invalidate_pokemons_cache(uid)
             await _compact_team_slots(uid)
@@ -23065,6 +23302,8 @@ async def clear_team(interaction: discord.Interaction):
                 "❌ Your team is already empty!",
                 ephemeral=True
             )
+
+        locked_mon_ids = await _get_locked_pokemon_ids(uid, conn=conn)
         
         # Safety checks (only for non-admins)
         if not is_admin:
@@ -23099,11 +23338,15 @@ async def clear_team(interaction: discord.Interaction):
         # Release all Pokémon in the team (non-admin keeps one non-egg Pokémon).
         released_count = 0
         items_returned = []
+        locked_kept: list[str] = []
         keep_id: Optional[int] = None
         keep_species: Optional[str] = None
         if not is_admin:
             for mon in team_mons:
                 md = dict(mon)
+                mid = int(md.get("id") or 0)
+                if mid > 0 and mid in locked_mon_ids:
+                    continue
                 if _daycare_norm_species(md.get("species")) != "egg":
                     keep_id = int(md.get("id"))
                     keep_species = str(md.get("species") or "Pokémon")
@@ -23111,7 +23354,10 @@ async def clear_team(interaction: discord.Interaction):
         
         for mon in team_mons:
             mon_dict = dict(mon)
-            mon_id = mon_dict['id']
+            mon_id = int(mon_dict['id'])
+            if mon_id in locked_mon_ids:
+                locked_kept.append(str(mon_dict.get("species") or "Pokémon"))
+                continue
             if keep_id is not None and int(mon_id) == int(keep_id):
                 continue
             held_item = mon_dict.get('held_item')
@@ -23124,6 +23370,10 @@ async def clear_team(interaction: discord.Interaction):
             await conn.execute(
                 "DELETE FROM pokemons WHERE owner_id = ? AND id = ?",
                 (uid, mon_id)
+            )
+            await conn.execute(
+                "DELETE FROM pokemon_locks WHERE owner_id = ? AND mon_id = ?",
+                (uid, mon_id),
             )
             released_count += 1
         
@@ -23142,6 +23392,11 @@ async def clear_team(interaction: discord.Interaction):
         response_parts = [f"✅ Successfully released **{released_count}** Pokémon from your team."]
         if keep_species:
             response_parts.append(f"🛡️ Kept **{keep_species}** in your team to satisfy the minimum-team rule.")
+        if locked_kept:
+            response_parts.append(
+                f"🔒 Kept **{len(locked_kept)}** locked Pokémon. "
+                f"Use `/pklock` or `/boxpklock` to unlock before releasing."
+            )
         
         if items_returned:
             unique_items = list(set(items_returned))
