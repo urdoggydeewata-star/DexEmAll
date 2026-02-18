@@ -7578,7 +7578,13 @@ async def _render_gif_for_panel(st: BattleState, for_user_id: int, hide_hp_text:
         print(f"[Panel] _render_gif_for_panel failed: {e}")
     return None
 
-async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn_summary: Optional[str] = None, gif_file: Optional[Any] = None):
+async def _send_stream_panel(
+    channel: discord.TextChannel,
+    st: BattleState,
+    turn_summary: Optional[str] = None,
+    gif_file: Optional[Any] = None,
+    force_no_summary: bool = False,
+):
     """Send or update the stream panel (P1 view, no buttons)"""
     def _safe_int(v: Any, default: int) -> int:
         try:
@@ -7593,23 +7599,25 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
         turn_no = 0
     turn_label = max(1, turn_no - 1) if turn_no > 0 else 1
 
-    # Prefer per-turn summary payload, fallback to cached turn log.
-    summary_text = str(turn_summary or "").strip()
-    if not summary_text:
-        try:
-            cached_lines = [
-                str(line).strip()
-                for line in (getattr(st, "_last_turn_log", []) or [])
-                if str(line).strip()
-            ]
-            if cached_lines:
-                summary_text = "\n".join(cached_lines).strip()
-        except Exception:
-            summary_text = ""
-    if len(summary_text) > 3000:
-        summary_text = "...\n" + summary_text[-2800:]
-    if not summary_text:
-        summary_text = "No significant actions this turn."
+    summary_text = ""
+    if not force_no_summary:
+        # Prefer per-turn summary payload, fallback to cached turn log.
+        summary_text = str(turn_summary or "").strip()
+        if not summary_text:
+            try:
+                cached_lines = [
+                    str(line).strip()
+                    for line in (getattr(st, "_last_turn_log", []) or [])
+                    if str(line).strip()
+                ]
+                if cached_lines:
+                    summary_text = "\n".join(cached_lines).strip()
+            except Exception:
+                summary_text = ""
+        if len(summary_text) > 3000:
+            summary_text = "...\n" + summary_text[-2800:]
+        if not summary_text:
+            summary_text = "No significant actions this turn."
 
     # Get active Pokémon for title formatting.
     p1_active = st._active(st.p1_id)
@@ -7617,10 +7625,9 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
     p1_display = _format_pokemon_name(p1_active) if p1_active else "Pokémon"
     p2_display = _format_pokemon_name(p2_active) if p2_active else "Pokémon"
 
-    desc_parts = [
-        f"Turn {turn_label} • {getattr(st, 'fmt_label', 'Battle')} (Gen {getattr(st, 'gen', '?')})",
-        f"\n**Turn Summary:**\n{summary_text}",
-    ]
+    desc_parts = [f"Turn {turn_label} • {getattr(st, 'fmt_label', 'Battle')} (Gen {getattr(st, 'gen', '?')})"]
+    if not force_no_summary:
+        desc_parts.append(f"\n**Turn Summary:**\n{summary_text}")
     field_text = _field_conditions_text(st.field)
     if field_text:
         desc_parts.append(f"\n{field_text}")
@@ -7699,7 +7706,7 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
         print(f"[Stream] Error sending stream: {e}")
         try:
             fallback = f"📺 Stream update • Turn {getattr(st, 'turn', '?')} • {getattr(st, 'fmt_label', 'Battle')}"
-            if summary_text:
+            if summary_text and not force_no_summary:
                 txt = str(summary_text).strip()
                 if len(txt) > 1200:
                     txt = "...\n" + txt[-1000:]
@@ -8223,10 +8230,33 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
         # No separate "battle started" embed; we'll include pre-battle info in the first panel.
         st._battle_start_announced = True
         st._complete_init()
-        # Mark stream initialized, but avoid posting an image-only kickoff panel.
-        # Public stream updates should mirror turn summaries (text + image together).
+        # Stream kickoff: first public post should be image-only (no turn summary text).
+        # Later stream updates include per-turn summaries.
         if st.streaming_enabled and not getattr(st, "_stream_started", False):
             st._stream_started = True
+            try:
+                stream_channel = await _resolve_stream_channel(st, p1_itx, p2_itx)
+                if stream_channel is not None:
+                    render_result = None
+                    try:
+                        render_result = await _render_gif_for_panel(st, st.p1_id, hide_hp_text=True)
+                    except Exception as render_err:
+                        print(f"[Stream] Initial stream pre-render failed: {render_err}")
+                        render_result = None
+                    try:
+                        msg = await _send_stream_panel(
+                            stream_channel,
+                            st,
+                            None,
+                            render_result,
+                            force_no_summary=True,
+                        )
+                        if msg is not None:
+                            st._last_stream_message = msg
+                    except Exception as send_err:
+                        print(f"[Stream] Initial stream send failed: {send_err}")
+            except Exception as init_err:
+                print(f"[Stream] Initial stream setup failed: {init_err}")
 
     # Check if active Pokémon are fainted - FORCE MANUAL SWITCH
     p1_active_mon = st._active(st.p1_id)
@@ -9495,10 +9525,18 @@ class AcceptView(discord.ui.View):
                 self.stop()
                 return
 
-            await channel.send(
-                f"**The battle has commenced!** Only <@{self.challenger_id}> and <@{self.opponent_id if not p2_is_bot else 'AI'}> will see the panels.\n"
-                f"Format: **{fmt_label}** (Gen {gen})"
-            )
+            opponent_visibility = "AI" if p2_is_bot else f"<@{self.opponent_id}>"
+            if self.streaming_enabled:
+                await channel.send(
+                    f"**The battle has commenced!** <@{self.challenger_id}> and {opponent_visibility} will see the private panels.\n"
+                    f"📺 **Battle stream is ON** — public stream updates will be posted in this channel.\n"
+                    f"Format: **{fmt_label}** (Gen {gen})"
+                )
+            else:
+                await channel.send(
+                    f"**The battle has commenced!** Only <@{self.challenger_id}> and {opponent_visibility} will see the panels.\n"
+                    f"Format: **{fmt_label}** (Gen {gen})"
+                )
 
             p1_itx = self._last_itx.get(self.challenger_id) or itx
             p2_itx = self._last_itx.get(self.opponent_id) or (itx if not p2_is_bot else None)
