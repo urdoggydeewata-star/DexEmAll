@@ -16274,10 +16274,26 @@ def _team_font(size: int, *, bold: bool = False):
         from PIL import ImageFont  # type: ignore
     except Exception:
         return None
-    candidates = [
+    # Prefer Pokemon-style pixel fonts when available, then mono/system fallbacks.
+    candidates: list[str] = []
+    try:
+        from pvp.renderer import _get_pokemon_font_path as _renderer_pokemon_font_path  # type: ignore
+        p = _renderer_pokemon_font_path()
+        if p:
+            candidates.append(str(p))
+    except Exception:
+        pass
+    candidates.extend([
+        "pvp/_common/fonts/Pokemon GB.ttf",
+        "pvp/_common/fonts/PokemonGb-RAeo.ttf",
+        "pvp/_common/fonts/pokemon-gb.ttf",
+        "pvp/_common/fonts/pokemongb.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ]
+    ])
     for fp in candidates:
         try:
             return ImageFont.truetype(fp, int(size))
@@ -16538,25 +16554,27 @@ def _team_overview_panel_file(
         draw = ImageDraw.Draw(base)
 
         # Overlay only text/sprites; never repaint template blocks.
-        trainer_font = _team_font(max(12, int(round(26 * s))), bold=True)
+        trainer_title = "Elite Trainer"
+        trainer_font = _team_font(max(11, int(round(23 * s))), bold=True)
         name_font = _team_fit_font(
             draw,
             target_name,
             max_width=max(72, int(round(158 * sx))),
-            start_size=max(12, int(round(24 * s))),
+            start_size=max(10, int(round(19 * s))),
             min_size=max(9, int(round(11 * s))),
             bold=True,
         )
         if trainer_font:
-            tw = _team_text_width(draw, "Trainer", trainer_font)
+            tw = _team_text_width(draw, trainer_title, trainer_font)
             cx, ty = _pt(TEAM_TRAINER_NAME_CENTER_X, TEAM_TRAINER_LABEL_Y)
             _draw_text_with_outline(
                 draw,
                 (cx - tw // 2, ty),
-                "Trainer",
+                trainer_title,
                 font=trainer_font,
-                fill=(245, 246, 252, 255),
-                stroke_px=max(1, int(round(2 * s))),
+                fill=(248, 248, 252, 255),
+                stroke=(4, 4, 8, 255),
+                stroke_px=1,
             )
         if name_font:
             nw = _team_text_width(draw, target_name, name_font)
@@ -16566,41 +16584,34 @@ def _team_overview_panel_file(
                 (cx - nw // 2, ny),
                 target_name,
                 font=name_font,
-                fill=(228, 234, 252, 255),
-                stroke_px=max(1, int(round(2 * s))),
+                fill=(248, 248, 252, 255),
+                stroke=(4, 4, 8, 255),
+                stroke_px=1,
             )
 
-        # Footer: show player's selected generation (and matching region label).
+        # Footer: only overlay region value beside the template's existing label text.
         gen_num = max(1, int(current_gen or 1))
         region_name = _team_region_for_gen(gen_num)
-        footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 8) * sx))
-        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 6) * sy))
-        footer_w = max(64, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 14) * sx)))
+        footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 96) * sx))
+        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 26) * sy))
+        footer_w = max(36, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 102) * sx)))
         footer_font = _team_fit_font(
             draw,
-            f"Current Gen : {gen_num}",
+            region_name,
             max_width=footer_w,
-            start_size=max(8, int(round(17 * s))),
-            min_size=max(7, int(round(11 * s))),
+            start_size=max(8, int(round(15 * s))),
+            min_size=max(7, int(round(10 * s))),
             bold=False,
         )
         if footer_font is not None:
             _draw_text_with_outline(
                 draw,
                 (footer_x, footer_y),
-                f"Current Gen : {gen_num}",
+                region_name,
                 font=footer_font,
-                fill=(242, 244, 252, 255),
-                stroke_px=max(1, int(round(2 * s))),
-            )
-            line_gap = max(10, int(round((getattr(footer_font, "size", 12) + 3) * 0.95)))
-            _draw_text_with_outline(
-                draw,
-                (footer_x, footer_y + line_gap),
-                f"Region : {region_name}",
-                font=footer_font,
-                fill=(232, 236, 249, 255),
-                stroke_px=max(1, int(round(2 * s))),
+                fill=(248, 248, 252, 255),
+                stroke=(4, 4, 8, 255),
+                stroke_px=1,
             )
 
         # Preload sprite frames (animated front preferred).
@@ -16631,7 +16642,7 @@ def _team_overview_panel_file(
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
 
-        lvl_font_slot = _team_font(max(9, int(round(18 * s))), bold=False)
+        lvl_font_slot = _team_font(max(9, int(round(16 * s))), bold=True)
         text_prep: dict[int, dict[str, Any]] = {}
         probe_draw = ImageDraw.Draw(base)
         for slot in range(1, 7):
@@ -16682,8 +16693,9 @@ def _team_overview_panel_file(
                     (int(slot_text.get("label_x") or geom["label_xy"][0]), geom["label_xy"][1]),
                     str(slot_text.get("label") or ""),
                     font=slot_text["font"],
-                    fill=(244, 246, 253, 255),
-                    stroke_px=max(1, int(round(2 * s))),
+                    fill=(248, 248, 252, 255),
+                    stroke=(4, 4, 8, 255),
+                    stroke_px=1,
                 )
             lvl = str(slot_text.get("lvl") or "")
             if lvl and lvl_font_slot:
@@ -16692,8 +16704,9 @@ def _team_overview_panel_file(
                     (int(slot_text.get("lvl_x") or geom["level_right"][0]), geom["level_right"][1]),
                     lvl,
                     font=lvl_font_slot,
-                    fill=(236, 236, 246, 255),
-                    stroke_px=max(1, int(round(2 * s))),
+                    fill=(248, 248, 252, 255),
+                    stroke=(4, 4, 8, 255),
+                    stroke_px=1,
                 )
 
         out_frames: list[Any] = []
