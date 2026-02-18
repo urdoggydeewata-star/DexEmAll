@@ -5635,27 +5635,30 @@ def _team_embed(user_id: int, st: BattleState) -> discord.Embed:
 
 
 def _team_switch_embed(user_id: int, st: BattleState, description_override: Optional[str] = None) -> discord.Embed:
-    """Build the Swapping UI: title, your active + opponent panels (name, level, HP bar, moves), and instruction."""
+    """Build the Swapping UI with opponent moves always hidden."""
     my_active = st._active(user_id)
     opp_id = st.p2_id if user_id == st.p1_id else st.p1_id
     opp_active = st._active(opp_id)
 
-    def _mon_block(m) -> str:
+    def _mon_block(m, *, hide_moves: bool = False) -> str:
         if m is None:
             return "—"
         name = _format_pokemon_name(m)
         hp_bar = _hp_bar_simple(m.hp, m.max_hp)
-        mv = getattr(m, "moves", None) or []
-        move_labels = []
-        for move in mv:
-            norm = move.lower().replace(" ", "-").strip()
-            if norm.startswith("hidden-power"):
-                from .hidden_power import calculate_hidden_power_type
-                hp_type = calculate_hidden_power_type(m.ivs, generation=st.gen)
-                move_labels.append(f"HP [{hp_type}]")
-            else:
-                move_labels.append(move)
-        moves = "　".join([f"**{i+1}.** {move_labels[i] if i < len(move_labels) else '-'}" for i in range(4)])
+        if hide_moves:
+            moves = "**1.** ???　**2.** ???　**3.** ???　**4.** ???"
+        else:
+            mv = getattr(m, "moves", None) or []
+            move_labels = []
+            for move in mv:
+                norm = move.lower().replace(" ", "-").strip()
+                if norm.startswith("hidden-power"):
+                    from .hidden_power import calculate_hidden_power_type
+                    hp_type = calculate_hidden_power_type(m.ivs, generation=st.gen)
+                    move_labels.append(f"HP [{hp_type}]")
+                else:
+                    move_labels.append(move)
+            moves = "　".join([f"**{i+1}.** {move_labels[i] if i < len(move_labels) else '-'}" for i in range(4)])
         return f"**{name}** Lv{m.level}\n{hp_bar}\n{moves}"
 
     desc = description_override or "Click the name of the Pokémon you wish to swap to."
@@ -5664,8 +5667,8 @@ def _team_switch_embed(user_id: int, st: BattleState, description_override: Opti
         description=desc,
         color=discord.Color.dark_grey(),
     )
-    em.add_field(name="Your Pokémon", value=_mon_block(my_active), inline=True)
-    em.add_field(name="Opponent", value=_mon_block(opp_active), inline=True)
+    em.add_field(name="Your Pokémon", value=_mon_block(my_active, hide_moves=False), inline=True)
+    em.add_field(name="Opponent", value=_mon_block(opp_active, hide_moves=True), inline=True)
     return em
 
 def _already_locked_embed(turn_no: int) -> discord.Embed:
