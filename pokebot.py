@@ -273,6 +273,10 @@ def _patch_pvp_streaming_reliability() -> None:
     - Adds robust fallback if stream attachment send fails.
     - Posts a public clarification that private panels != public stream.
     """
+    # Modern streaming behavior is implemented in pvp/panel.py.
+    # Keep this runtime monkey-patch disabled to avoid double-posts or
+    # conflicting stream formats when both paths exist.
+    return
     try:
         # Modern pvp.panel already has reliable streaming with per-turn summary+image.
         # Do not override it from pokebot.py unless those helpers are missing.

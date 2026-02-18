@@ -7625,21 +7625,34 @@ async def _send_stream_panel(
     p1_display = _format_pokemon_name(p1_active) if p1_active else "Pokémon"
     p2_display = _format_pokemon_name(p2_active) if p2_active else "Pokémon"
 
-    desc_parts = [f"Turn {turn_label} • {getattr(st, 'fmt_label', 'Battle')} (Gen {getattr(st, 'gen', '?')})"]
-    if not force_no_summary:
-        desc_parts.append(f"\n**Turn Summary:**\n{summary_text}")
-    field_text = _field_conditions_text(st.field)
-    if field_text:
-        desc_parts.append(f"\n{field_text}")
-    description_text = "\n".join(desc_parts).strip() if desc_parts else "Battle in progress..."
-    if not description_text:
-        description_text = "Battle in progress..."
+    if force_no_summary:
+        embed = discord.Embed(
+            title="⚔️ Battle Stream Started",
+            description=f"Turn {turn_label} • {getattr(st, 'fmt_label', 'Battle')} (Gen {getattr(st, 'gen', '?')})",
+            color=discord.Color.purple(),
+        )
+    else:
+        embed = discord.Embed(
+            title=f"⚔️ Turn {turn_label} Summary",
+            description=summary_text if summary_text else "No significant actions this turn.",
+            color=discord.Color.blurple(),
+        )
 
-    embed = discord.Embed(
-        title=f"📺 Battle Stream: **{p1_display}** vs **{p2_display}**",
-        description=description_text,
-        color=discord.Color.purple(),
-    )
+        # Keep stream public-safe: include status rows but hide HP values/bars.
+        embed.add_field(
+            name=f"Your {p1_display}",
+            value="HP hidden on stream",
+            inline=False,
+        )
+        embed.add_field(
+            name=f"Opponent's {p2_display}",
+            value="HP hidden on stream",
+            inline=False,
+        )
+
+        field_text = _field_conditions_text(st.field)
+        if field_text:
+            embed.add_field(name="🌍 Field Conditions", value=field_text, inline=False)
     
     # Handle gif_file - it might be:
     # - (discord.File, Path)  (preferred; caller rendered already)
