@@ -7606,12 +7606,12 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
                 summary_text = "\n".join(cached_lines).strip()
         except Exception:
             summary_text = ""
-    if len(summary_text) > 3000:
-        summary_text = "...\n" + summary_text[-2800:]
+    if len(summary_text) > 3500:
+        summary_text = "...\n" + summary_text[-3400:]
     if not summary_text:
-        summary_text = "No significant actions were recorded this turn."
+        summary_text = "No significant actions this turn."
 
-    # Get active Pokémon for embed title/HP fields.
+    # Get active Pokémon for embed title and masked status fields.
     p1_active = st._active(st.p1_id)
     p2_active = st._active(st.p2_id)
     p1_display = _format_pokemon_name(p1_active) if p1_active else "Pokémon"
@@ -7623,25 +7623,20 @@ async def _send_stream_panel(channel: discord.TextChannel, st: BattleState, turn
         color=discord.Color.blurple(),
     )
 
+    # Stream view must stay public-safe: do not expose HP bars or HP numbers.
     if p1_active is not None:
-        p1_hp = max(0, _safe_int(getattr(p1_active, "hp", 0), 0))
-        p1_max = max(1, _safe_int(getattr(p1_active, "max_hp", 1), 1))
         embed.add_field(
             name=f"Your {p1_display}",
-            value=f"{_hp_bar(p1_hp, p1_max)}\n"
-                  f"**{p1_hp}/{p1_max} HP**",
+            value="HP hidden on stream",
             inline=False,
         )
     else:
         embed.add_field(name="Your Pokémon", value="—", inline=False)
 
     if p2_active is not None:
-        p2_hp = max(0, _safe_int(getattr(p2_active, "hp", 0), 0))
-        p2_max = max(1, _safe_int(getattr(p2_active, "max_hp", 1), 1))
         embed.add_field(
             name=f"Opponent's {p2_display}",
-            value=f"{_hp_bar(p2_hp, p2_max)}\n"
-                  f"**{p2_hp}/{p2_max} HP**",
+            value="HP hidden on stream",
             inline=False,
         )
     else:
