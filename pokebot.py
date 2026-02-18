@@ -7293,40 +7293,240 @@ TM_SELLER_PRICE = 500  # Coins per TM (Gen 1)
 # Seller has 25 TMs (rolled from 1–50 via script, fixed)
 TM_SELLER_ITEMS = [GEN1_TMS[i - 1] for i in (1, 3, 5, 6, 7, 9, 11, 12, 15, 17, 20, 21, 22, 23, 24, 31, 34, 35, 37, 40, 42, 44, 45, 49, 50)]
 
-# Route move item drop: roll for ball type (Poké Ball common, Great Ball uncommon, Ultra Ball rare),
-# then give that ball + one item from the tier's pool. Rarer balls = better rewards.
-ROUTE_MOVE_ITEM_DROP_CHANCE = 0.10  # Probability per move (e.g. 15%)
-# (ball_id, ball_display_name, weight) - higher weight = more common
-ROUTE_MOVE_BALL_TIERS: List[Tuple[str, str, int]] = [
-    ("pokeball", "Poké Ball", 70),    # Most common
-    ("great-ball", "Great Ball", 25),  # Uncommon
-    ("ultra-ball", "Ultra Ball", 5),  # Rarest
+# Route move loot table (updated): ball encounter weights + per-ball item pools.
+# Repeat Ball and Timer Ball use special handling in _roll_and_give_route_move_item_async.
+ROUTE_MOVE_BALL_ENCOUNTER_WEIGHTS: List[Tuple[str, str, float]] = [
+    ("poke_ball", "Poké Ball", 8.26),
+    ("great_ball", "Great Ball", 4.95),
+    ("ultra_ball", "Ultra Ball", 1.65),
+    ("master_ball", "Master Ball", 0.08),
+    ("dream_ball", "Dream Ball", 4.0),
+    ("net_ball", "Net Ball", 4.0),
+    ("dive_ball", "Dive Ball", 4.0),
+    ("dusk_ball", "Dusk Ball", 4.0),
+    ("sport_ball", "Sport Ball", 4.0),
+    ("level_ball", "Level Ball", 4.0),
+    ("moon_ball", "Moon Ball", 4.0),
+    ("friend_ball", "Friend Ball", 4.0),
+    ("love_ball", "Love Ball", 4.0),
+    ("heavy_ball", "Heavy Ball", 4.0),
+    ("fast_ball", "Fast Ball", 4.0),
+    ("premier_ball", "Premier Ball", 4.0),
+    ("repeat_ball", "Repeat Ball", 4.0),
+    ("timer_ball", "Timer Ball", 4.0),
+    # Remaining probability from shared table is treated as "no ball found".
+    ("__none__", "No Ball", 28.98),
 ]
-# Item pools per tier: (item_id, display_name). Rarer tiers have better items.
-ROUTE_MOVE_ITEMS_BY_TIER: Dict[str, List[Tuple[str, str]]] = {
-    "pokeball": [
-        ("potion", "Potion"),
-        ("antidote", "Antidote"),
-        ("paralyze-heal", "Paralyze Heal"),
-        ("awakening", "Awakening"),
-        ("burn-heal", "Burn Heal"),
-        ("ice-heal", "Ice Heal"),
+
+ROUTE_MOVE_ITEMS_BY_BALL: Dict[str, List[Tuple[str, str, float]]] = {
+    "poke_ball": [
+        ("poke_ball", "Poké Ball", 15.69),
+        ("escape_rope", "Escape Rope", 15.69),
+        ("poke_doll", "Poké Doll", 15.69),
+        ("antidote", "Antidote", 5.88),
+        ("burn_heal", "Burn Heal", 5.88),
+        ("awakening", "Awakening", 5.88),
+        ("paralyze_heal", "Paralyze Heal", 5.88),
+        ("ice_heal", "Ice Heal", 5.88),
+        ("repel", "Repel", 5.88),
+        ("oran_berry", "Oran Berry", 5.88),
+        ("tiny_mushroom", "Tiny Mushroom", 5.88),
+        ("stardust", "Stardust", 3.92),
+        ("potion", "Potion", 1.96),
     ],
-    "great-ball": [
-        ("super-potion", "Super Potion"),
-        ("pokeball", "Poké Ball"),
-        ("great-ball", "Great Ball"),
-        ("full-heal", "Full Heal"),
-        ("revive", "Revive"),
+    "great_ball": [
+        ("great_ball", "Great Ball", 9.52),
+        ("antidote", "Antidote", 9.52),
+        ("awakening", "Awakening", 9.52),
+        ("burn_heal", "Burn Heal", 9.52),
+        ("paralyze_heal", "Paralyze Heal", 9.52),
+        ("repel", "Repel", 9.52),
+        ("berry_juice", "Berry Juice", 9.52),
+        ("shoal_shell", "Shoal Shell", 4.76),
+        ("shoal_salt", "Shoal Salt", 4.76),
+        ("stardust", "Stardust", 4.76),
+        ("pearl", "Pearl", 4.76),
+        ("super_repel", "Super Repel", 4.76),
+        ("super_potion", "Super Potion", 4.76),
     ],
-    "ultra-ball": [
-        ("hyper-potion", "Hyper Potion"),
-        ("ultra-ball", "Ultra Ball"),
-        ("max-potion", "Max Potion"),
-        ("full-restore", "Full Restore"),
-        ("tm-fragment", "TM Fragment"),
+    "ultra_ball": [
+        ("ultra_ball", "Ultra Ball", 10.53),
+        ("lemonade", "Lemonade", 10.53),
+        ("sitrus_berry", "Sitrus Berry", 10.53),
+        ("moomoo_milk", "Moomoo Milk", 10.53),
+        ("full_heal", "Full Heal", 10.53),
+        ("max_repel", "Max Repel", 10.53),
+        ("hyper_potion", "Hyper Potion", 5.26),
+        ("nugget", "Nugget", 5.26),
+        ("revive", "Revive", 5.26),
+        ("elixir", "Elixir", 5.26),
+        ("leftovers", "Leftovers", 1.05),
+    ],
+    "master_ball": [
+        ("max_elixir", "Max Elixir", 23.26),
+        ("revive", "Revive", 23.26),
+        ("revival_herb", "Revival Herb", 9.30),
+        ("max_revive", "Max Revive", 9.30),
+        ("pp_max", "PP Max", 5.81),
+        ("master_ball", "Master Ball", 5.81),
+    ],
+    "dream_ball": [
+        ("dream_ball", "Dream Ball", 10.75),
+        ("super_potion", "Super Potion", 10.75),
+        ("awakening", "Awakening", 10.75),
+        ("ether", "Ether", 10.75),
+        ("stardust", "Stardust", 10.75),
+        ("pearl", "Pearl", 10.75),
+        ("twisted_spoon", "Twisted Spoon", 3.23),
+    ],
+    "net_ball": [
+        ("heal_ball", "Heal Ball", 18.18),
+        ("potion", "Potion", 18.18),
+        ("super_potion", "Super Potion", 14.55),
+        ("moomoo_milk", "Moomoo Milk", 14.55),
+        ("hyper_potion", "Hyper Potion", 5.45),
+        ("revive", "Revive", 5.45),
+        ("helix_fossil", "Helix Fossil", 2.14),
+        ("dome_fossil", "Dome Fossil", 2.14),
+    ],
+    "dive_ball": [
+        ("fresh_water", "Fresh Water", 10.64),
+        ("soda_pop", "Soda Pop", 10.64),
+        ("lemonade", "Lemonade", 10.64),
+        ("moomoo_milk", "Moomoo Milk", 10.64),
+        ("full_heal", "Full Heal", 10.64),
+        ("hyper_potion", "Hyper Potion", 5.45),
+        ("revive", "Revive", 5.45),
+        ("deep_sea_tooth", "Deep Sea Tooth", 10.64),
+        ("deep_sea_scale", "Deep Sea Scale", 10.64),
+    ],
+    "dusk_ball": [
+        ("smoke_ball", "Smoke Ball", 12.66),
+        ("ether", "Ether", 12.66),
+        ("stardust", "Stardust", 12.66),
+        ("pearl", "Pearl", 12.66),
+        ("spell_tag", "Spell Tag", 3.80),
+        ("black_glasses", "Black Glasses", 3.80),
+    ],
+    "sport_ball": [
+        ("black_belt", "Black Belt", 5.43),
+        ("bright_powder", "Bright Powder", 5.43),
+        ("mystic_water", "Mystic Water", 5.43),
+        ("miracle_seed", "Miracle Seed", 5.43),
+        ("charcoal", "Charcoal", 5.43),
+        ("spell_tag", "Spell Tag", 5.43),
+        ("never_melt_ice", "Never Melt Ice", 5.43),
+        ("soft_sand", "Soft Sand", 5.43),
+        ("metal_coat", "Metal Coat", 5.43),
+        ("sharp_beak", "Sharp Beak", 5.43),
+        ("silk_scarf", "Silk Scarf", 5.43),
+        ("poison_barb", "Poison Barb", 5.43),
+        ("twisted_spoon", "Twisted Spoon", 5.43),
+        ("dragon_fang", "Dragon Fang", 5.43),
+        ("hard_stone", "Hard Stone", 5.43),
+        ("magnet", "Magnet", 5.43),
+        ("choice_band", "Choice Band", 2.17),
+    ],
+    "level_ball": [
+        ("fire_stone", "Fire Stone", 8.85),
+        ("water_stone", "Water Stone", 8.85),
+        ("leaf_stone", "Leaf Stone", 8.85),
+        ("thunder_stone", "Thunder Stone", 8.85),
+        ("moon_stone", "Moon Stone", 8.85),
+        ("sun_stone", "Sun Stone", 8.85),
+        ("metal_coat", "Metal Coat", 8.85),
+        ("kings_rock", "King's Rock", 8.85),
+        ("up_grade", "Up-Grade", 8.85),
+        ("dragon_scale", "Dragon Scale", 8.85),
+        ("rare_candy", "Rare Candy", 2.65),
+    ],
+    "moon_ball": [
+        ("berry_juice", "Berry Juice", 8.55),
+        ("ether", "Ether", 8.55),
+        ("shoal_shell", "Shoal Shell", 8.55),
+        ("shoal_salt", "Shoal Salt", 8.55),
+        ("stardust", "Stardust", 8.55),
+        ("pearl", "Pearl", 8.55),
+        ("super_repel", "Super Repel", 8.55),
+        ("super_potion", "Super Potion", 8.55),
+        ("spell_tag", "Spell Tag", 5.98),
+    ],
+    "friend_ball": [
+        ("cheri_berry", "Cheri Berry", 4.0),
+        ("chesto_berry", "Chesto Berry", 4.0),
+        ("pecha_berry", "Pecha Berry", 4.0),
+        ("rawst_berry", "Rawst Berry", 4.0),
+        ("aspear_berry", "Aspear Berry", 4.0),
+        ("persim_berry", "Persim Berry", 4.0),
+        ("sitrus_berry", "Sitrus Berry", 4.0),
+        ("aguav_berry", "Aguav Berry", 4.0),
+        ("figy_berry", "Figy Berry", 4.0),
+        ("iapapa_berry", "Iapapa Berry", 4.0),
+        ("lum_berry", "Lum Berry", 4.0),
+        ("liechi_berry", "Liechi Berry", 4.0),
+        ("salac_berry", "Salac Berry", 4.0),
+        ("lansat_berry", "Lansat Berry", 4.0),
+        ("starf_berry", "Starf Berry", 4.0),
+        ("__bonus_berry__", "Bonus Berry", 4.0),
+    ],
+    "love_ball": [
+        ("everstone", "Everstone", 7.69),
+        ("destiny_knot", "Destiny Knot", 7.69),
+        ("oval_stone", "Oval Stone", 7.69),
+        ("lax_incense", "Lax Incense", 7.69),
+        ("sea_incense", "Sea Incense", 7.69),
+        ("heart_scale", "Heart Scale", 7.69),
+        ("power_weight", "Power Weight", 7.69),
+        ("power_bracer", "Power Bracer", 7.69),
+        ("power_belt", "Power Belt", 7.69),
+        ("power_lens", "Power Lens", 7.69),
+        ("power_band", "Power Band", 7.69),
+        ("macho_brace", "Macho Brace", 7.69),
+    ],
+    "heavy_ball": [
+        ("super_potion", "Super Potion", 10.64),
+        ("lemonade", "Lemonade", 10.64),
+        ("hard_stone", "Hard Stone", 10.64),
+        ("everstone", "Everstone", 10.64),
+        ("metal_coat", "Metal Coat", 5.32),
+        ("pp_up", "PP Up", 5.32),
+        ("dome_fossil", "Dome Fossil", 1.06),
+        ("helix_fossil", "Helix Fossil", 1.06),
+        ("old_amber", "Old Amber", 1.06),
+    ],
+    "fast_ball": [
+        ("fresh_water", "Fresh Water", 10.53),
+        ("soda_pop", "Soda Pop", 10.53),
+        ("thunder_stone", "Thunder Stone", 10.53),
+        ("pearl", "Pearl", 10.53),
+        ("stardust", "Stardust", 10.53),
+        ("magnet", "Magnet", 10.53),
+    ],
+    "premier_ball": [
+        ("tiny_mushroom", "Tiny Mushroom", 20.41),
+        ("stardust", "Stardust", 20.41),
+        ("pearl", "Pearl", 20.41),
+        ("nugget", "Nugget", 20.41),
+        ("big_pearl", "Big Pearl", 6.12),
+        ("star_piece", "Star Piece", 6.12),
+        ("big_nugget", "Big Nugget", 6.12),
     ],
 }
+ROUTE_MOVE_TIMER_POOL_KEY = "poke_ball"
+ROUTE_MOVE_LAST_STANDARD_ROLL: dict[str, tuple[str, str, str, str]] = {}
+ROUTE_MOVE_BONUS_BERRIES: List[Tuple[str, str]] = [
+    ("cheri_berry", "Cheri Berry"),
+    ("chesto_berry", "Chesto Berry"),
+    ("pecha_berry", "Pecha Berry"),
+    ("rawst_berry", "Rawst Berry"),
+    ("aspear_berry", "Aspear Berry"),
+    ("persim_berry", "Persim Berry"),
+    ("sitrus_berry", "Sitrus Berry"),
+    ("aguav_berry", "Aguav Berry"),
+    ("figy_berry", "Figy Berry"),
+    ("iapapa_berry", "Iapapa Berry"),
+    ("lum_berry", "Lum Berry"),
+]
 
 # :: market catalog moved to lib.market_catalog
 
@@ -8055,37 +8255,91 @@ RIVAL_BATTLES = {
 }
 
 
-def _weighted_choice(items: List[Tuple[str, str, int]]) -> Tuple[str, str]:
-    """Pick (ball_id, ball_display_name) from weighted list of (id, name, weight)."""
-    total = sum(w for _, _, w in items)
-    r = random.uniform(0, total)
-    for ball_id, display_name, weight in items:
+def _weighted_choice(items: Sequence[Tuple[str, str, float]]) -> Tuple[str, str]:
+    """Pick (id, display_name) from weighted tuples (id, name, weight)."""
+    if not items:
+        return ("", "")
+    total = 0.0
+    norm: list[tuple[str, str, float]] = []
+    for key, name, weight in items:
+        w = max(0.0, float(weight or 0.0))
+        if w <= 0:
+            continue
+        norm.append((str(key), str(name), w))
+        total += w
+    if total <= 0 or not norm:
+        key, name, _ = items[-1]
+        return str(key), str(name)
+    r = random.uniform(0.0, total)
+    for key, name, weight in norm:
         r -= weight
         if r <= 0:
-            return (ball_id, display_name)
-    return items[-1][0], items[-1][1]
+            return key, name
+    return norm[-1][0], norm[-1][1]
+
+
+def _route_pick_item_from_pool(pool_key: str) -> tuple[str, str]:
+    pool = ROUTE_MOVE_ITEMS_BY_BALL.get(str(pool_key or "")) or ROUTE_MOVE_ITEMS_BY_BALL.get("poke_ball") or []
+    item_id, item_name = _weighted_choice(pool)
+    if item_id == "__bonus_berry__":
+        try:
+            return random.choice(ROUTE_MOVE_BONUS_BERRIES)
+        except Exception:
+            return ("oran_berry", "Oran Berry")
+    return item_id, item_name
 
 
 async def _roll_and_give_route_move_item_async(user_id: str) -> Optional[str]:
     """
-    Roll for drop chance, then weighted ball type (Poké Ball > Great Ball > Ultra Ball).
-    Give the ball + one item from that tier's pool. Rarer balls = better rewards.
+    Roll route loot-ball encounter and grant rewards from the configured pool table.
     Returns the message to show or None if no drop.
     """
-    if not ROUTE_MOVE_BALL_TIERS or not ROUTE_MOVE_ITEMS_BY_TIER:
+    if not ROUTE_MOVE_BALL_ENCOUNTER_WEIGHTS or not ROUTE_MOVE_ITEMS_BY_BALL:
         return None
-    if random.random() >= ROUTE_MOVE_ITEM_DROP_CHANCE:
+    ball_id, ball_name = _weighted_choice(ROUTE_MOVE_BALL_ENCOUNTER_WEIGHTS)
+    if not ball_id or ball_id == "__none__":
         return None
-    ball_id, ball_name = _weighted_choice(ROUTE_MOVE_BALL_TIERS)
-    tier_pool = ROUTE_MOVE_ITEMS_BY_TIER.get(ball_id)
-    if not tier_pool:
-        return None
-    item_id, item_name = random.choice(tier_pool)
-    try:
-        await db.upsert_item_master(ball_id, name=ball_name)
-        await db.give_item(user_id, ball_id, 1)
+    uid = str(user_id)
+
+    async def _grant(item_id: str, item_name: str, qty: int = 1) -> None:
+        q = max(0, int(qty or 0))
+        if q <= 0:
+            return
         await db.upsert_item_master(item_id, name=item_name)
-        await db.give_item(user_id, item_id, 1)
+        await db.give_item(uid, item_id, q)
+
+    try:
+        # Repeat Ball: duplicate previous standard roll rewards.
+        if ball_id == "repeat_ball":
+            prev = ROUTE_MOVE_LAST_STANDARD_ROLL.get(uid)
+            await _grant(ball_id, ball_name, 1)
+            if prev:
+                prev_ball_id, prev_ball_name, prev_item_id, prev_item_name = prev
+                await _grant(prev_ball_id, prev_ball_name, 2)
+                await _grant(prev_item_id, prev_item_name, 2)
+                return (
+                    f"You found a **{ball_name}**! It repeated your last route ball reward: "
+                    f"**2× {prev_ball_name}** and **2× {prev_item_name}**."
+                )
+            fallback_item_id, fallback_item_name = _route_pick_item_from_pool("poke_ball")
+            await _grant(fallback_item_id, fallback_item_name, 1)
+            return (
+                f"You found a **{ball_name}**! No previous route reward to repeat, "
+                f"so it gave a standard drop: **{fallback_item_name}**."
+            )
+
+        # Timer Ball: uses standard pool with no modifier.
+        pool_key = ROUTE_MOVE_TIMER_POOL_KEY if ball_id == "timer_ball" else ball_id
+        item_id, item_name = _route_pick_item_from_pool(pool_key)
+        if not item_id:
+            return None
+
+        await _grant(ball_id, ball_name, 1)
+        await _grant(item_id, item_name, 1)
+        ROUTE_MOVE_LAST_STANDARD_ROLL[uid] = (ball_id, ball_name, item_id, item_name)
+
+        if ball_id == "timer_ball":
+            return f"You found a **{ball_name}**! Standard reward: **{item_name}**."
         return f"You found a **{ball_name}**! Inside was a **{item_name}**."
     except Exception as e:
         print(f"[Adventure] Route move item drop give_item failed: {e}")
@@ -11854,6 +12108,35 @@ def _market_mode_rows(mode: str) -> list[tuple[str, str, int, str]]:
     return out
 
 
+async def _market_sell_rows_for_owner(owner_id: str) -> tuple[list[tuple[str, str, int, str]], dict[str, int]]:
+    qty_by_item: dict[str, int] = {}
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT item_id, qty FROM user_items WHERE owner_id=? AND qty>0",
+                (str(owner_id),),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+        for row in rows or []:
+            item_id = str(row["item_id"] if hasattr(row, "keys") else row[0])
+            qty = int((row.get("qty") if hasattr(row, "keys") else row[1]) or 0)
+            if qty <= 0:
+                continue
+            canonical = _market_normalize_key(item_id)
+            if canonical not in MARKET_SELL_PRICES:
+                continue
+            qty_by_item[canonical] = int(qty_by_item.get(canonical, 0)) + int(qty)
+    except Exception:
+        return [], {}
+
+    out: list[tuple[str, str, int, str]] = []
+    for item_id, disp, price, category in _market_mode_rows("sell"):
+        if int(qty_by_item.get(item_id, 0)) > 0:
+            out.append((item_id, disp, price, category))
+    return out, qty_by_item
+
+
 class MarketQuantityModal(discord.ui.Modal):
     def __init__(self, author_id: int, area_id: str, mode: str, item_key: str):
         mode_name = "Buy" if str(mode).lower() == "buy" else "Sell"
@@ -11949,13 +12232,26 @@ class MarketDropdownView(discord.ui.View):
         self.mode = "buy" if str(mode).lower() == "buy" else "sell"
         self.search_query: str = ""
         self.page: int = 0
+        self._owned_qty: dict[str, int] = {}
+        self._rows_cache: list[tuple[str, str, int, str]] = (
+            _market_mode_rows(self.mode) if self.mode == "buy" else []
+        )
         self._rebuild_items()
 
     def _guard(self, itx: discord.Interaction) -> bool:
         return int(itx.user.id) == self.author_id
 
     def _all_rows(self) -> list[tuple[str, str, int, str]]:
-        return _market_mode_rows(self.mode)
+        return list(self._rows_cache)
+
+    async def _refresh_rows(self, uid: str) -> None:
+        if self.mode == "sell":
+            rows, qty_map = await _market_sell_rows_for_owner(uid)
+            self._rows_cache = rows
+            self._owned_qty = qty_map
+        else:
+            self._rows_cache = _market_mode_rows("buy")
+            self._owned_qty = {}
 
     def _filtered_rows(self) -> list[tuple[str, str, int, str]]:
         rows = self._all_rows()
@@ -11981,12 +12277,17 @@ class MarketDropdownView(discord.ui.View):
         end = start + self.ITEMS_PER_PAGE
         return rows[start:end], total, pages
 
-    async def _build_embed(self, uid: str) -> discord.Embed:
+    async def _build_embed(self, uid: str, *, refresh_rows: bool = True) -> discord.Embed:
+        if refresh_rows:
+            await self._refresh_rows(uid)
+            self._rebuild_items()
         mode_name = "Buy" if self.mode == "buy" else "Sell"
         page_rows, total, pages = self._paged_rows()
         desc = "Choose an item from the dropdown, then enter quantity."
         if self.mode == "buy":
             desc += "\nTreasure items are sell-only and do not appear here."
+        else:
+            desc += "\nOnly items currently in your bag are shown."
         if self.search_query:
             desc += f"\nSearch: **{self.search_query}**"
         emb = discord.Embed(
@@ -12000,10 +12301,14 @@ class MarketDropdownView(discord.ui.View):
                 if self.mode == "buy":
                     lines.append(f"• **{disp}** — {price:,} ({category})")
                 else:
-                    lines.append(f"• **{disp}** — Sell for {price:,} ({category})")
+                    owned_q = int(self._owned_qty.get(_item_id, 0))
+                    lines.append(f"• **{disp}** ×{owned_q:,} — Sell for {price:,} ({category})")
             emb.add_field(name="Items (current page preview)", value="\n".join(lines)[:1024], inline=False)
         else:
-            emb.add_field(name="Items", value="No items matched your search.", inline=False)
+            if self.mode == "sell":
+                emb.add_field(name="Items", value="No sellable market items found in your bag.", inline=False)
+            else:
+                emb.add_field(name="Items", value="No items matched your search.", inline=False)
         coins = await db.get_currency(uid, "coins")
         emb.set_footer(text=f"Results: {total} • Page {self.page + 1}/{pages} • Balance: {coins:,} {PKDollar_NAME}")
         return emb
@@ -12013,10 +12318,15 @@ class MarketDropdownView(discord.ui.View):
         page_rows, total, pages = self._paged_rows()
         options: list[discord.SelectOption] = []
         for item_id, disp, price, category in page_rows:
-            desc = f"{category} • {'Buy' if self.mode == 'buy' else 'Sell'} {price:,}"
+            if self.mode == "buy":
+                desc = f"{category} • Buy {price:,}"
+            else:
+                owned_q = int(self._owned_qty.get(item_id, 0))
+                desc = f"{category} • Own {owned_q:,} • Sell {price:,}"
             options.append(discord.SelectOption(label=disp[:100], value=item_id, description=desc[:100]))
         if not options:
-            options = [discord.SelectOption(label="No matching items", value="__none__", description="Try a different search.")]
+            no_items_desc = "Try a different search." if self.mode == "buy" else "Catch/find items first, then sell."
+            options = [discord.SelectOption(label="No matching items", value="__none__", description=no_items_desc[:100])]
         sel = discord.ui.Select(
             placeholder=("Select an item to buy…" if self.mode == "buy" else "Select an item to sell…"),
             min_values=1,
@@ -12069,8 +12379,9 @@ class MarketDropdownView(discord.ui.View):
                 return await itx.followup.send("Market access is only available in a Poké Mart.", ephemeral=True)
             return await itx.response.send_message("Market access is only available in a Poké Mart.", ephemeral=True)
         uid = str(itx.user.id)
+        await self._refresh_rows(uid)
         self._rebuild_items()
-        emb = await self._build_embed(uid)
+        emb = await self._build_embed(uid, refresh_rows=False)
         try:
             await itx.response.edit_message(embed=emb, view=self)
         except Exception:
