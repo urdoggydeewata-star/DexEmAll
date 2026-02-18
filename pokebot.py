@@ -16041,7 +16041,8 @@ def _team_species_visual_scale(row: dict) -> float:
     Uses cached Pokédex height when available so larger Pokémon render bigger.
     """
     if _team_is_egg_row(row):
-        return 0.92
+        # Keep eggs noticeably smaller so they don't dominate slot circles.
+        return 0.68
     if db_cache is None:
         return 1.0
     species_raw = str(row.get("species") or "").strip().lower().replace("_", "-")
@@ -16683,9 +16684,9 @@ def _team_overview_panel_file(
         name_font = _team_fit_font(
             draw,
             target_name,
-            max_width=max(72, int(round(158 * sx))),
-            start_size=max(12, int(round(24 * s))),
-            min_size=max(9, int(round(11 * s))),
+            max_width=max(60, int(round(148 * sx))),
+            start_size=max(10, int(round(20 * s))),
+            min_size=max(6, int(round(8 * s))),
             bold=True,
         )
         if trainer_font:
@@ -16715,7 +16716,7 @@ def _team_overview_panel_file(
         gen_num = max(1, int(current_gen or 1))
         region_name = _team_region_for_gen(gen_num)
         footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 96) * sx))
-        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 26) * sy))
+        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 18) * sy))
         footer_w = max(32, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 102) * sx)))
         footer_font = _team_fit_font(
             draw,
