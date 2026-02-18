@@ -2375,13 +2375,34 @@ def _max_damage_percent(
     return best_pct, best_move
 
 
-def _defensive_ability_switch_bonus(switch_mon: Mon, target_move_types: set[str]) -> float:
-    """Reward defensive/immunity abilities on switch-in."""
+def _defensive_ability_switch_bonus(
+    switch_mon: Mon,
+    target_move_types: set[str],
+    *,
+    target_mon: Optional[Mon] = None,
+    field_effects: Any = None,
+) -> float:
+    """Reward defensive abilities and type immunities on switch-in."""
     ability = normalize_ability_name(getattr(switch_mon, "ability", "") or "")
-    if not ability:
-        return 0.0
 
     bonus = 0.0
+    # Type-level matchup checks against inferred threat types.
+    for threat_type in target_move_types:
+        try:
+            mult, _ = type_multiplier(threat_type, switch_mon, field_effects=field_effects, user=target_mon or switch_mon)
+            m = float(mult)
+            if m == 0.0:
+                bonus += 7.0
+            elif m <= 0.5:
+                bonus += 2.5
+            elif m >= 2.0:
+                bonus -= 3.5
+        except Exception:
+            continue
+
+    if not ability:
+        return bonus
+
     # Hard immunities / absorptions
     if "Fire" in target_move_types and ability in {"flash-fire", "well-baked-body"}:
         bonus += 6.0
@@ -2597,14 +2618,39 @@ def choose_ai_action(
             )
 
             if best_switch_idx is not None:
+                best_switch_mon = battle_state.team_for(ai_user_id)[best_switch_idx]
                 # Discourage consecutive hard-switching unless heavily justified.
                 margin = 3.75
                 if analysis.get(last_action_key) == "switch":
                     margin += 1.5
 
                 meaningful_damage = any(dmg_cache >= target_hp * 0.25 for dmg_cache in damage_cache.values())
+                inferred_threat_types: set[str] = set()
+                last_type = getattr(target_mon, "_last_move_used_type", None)
+                if last_type:
+                    inferred_threat_types.add(str(last_type))
+                for tt in (getattr(target_mon, "types", None) or []):
+                    if tt:
+                        inferred_threat_types.add(str(tt))
+
+                immune_pivot = False
+                current_exposed_to_threat = False
+                if best_switch_mon is not None and inferred_threat_types:
+                    for ttype in inferred_threat_types:
+                        try:
+                            sw_mult, _ = type_multiplier(ttype, best_switch_mon, field_effects=field_effects, user=target_mon)
+                            cur_mult, _ = type_multiplier(ttype, ai_mon, field_effects=field_effects, user=target_mon)
+                            if float(sw_mult) == 0.0:
+                                immune_pivot = True
+                            if float(cur_mult) >= 2.0:
+                                current_exposed_to_threat = True
+                        except Exception:
+                            continue
+
                 # Under lethal pressure, allow more proactive defensive switching.
-                if under_lethal_pressure and not can_fast_ko and best_switch_score >= best_score - 1.0:
+                if immune_pivot and (current_exposed_to_threat or max_incoming_pct >= 55.0) and best_switch_score >= best_score - 2.0:
+                    do_switch = True
+                elif under_lethal_pressure and not can_fast_ko and best_switch_score >= best_score - 1.0:
                     do_switch = True
                 elif (not meaningful_damage or best_dmg_pct < 22.0) and best_switch_score >= best_score + (margin - 1.5):
                     do_switch = True
@@ -2832,7 +2878,12 @@ def _choose_best_switch_with_score(
                 pass
 
         # Defensive ability synergies
-        score += _defensive_ability_switch_bonus(switch_mon, target_move_types)
+        score += _defensive_ability_switch_bonus(
+            switch_mon,
+            target_move_types,
+            target_mon=target_mon,
+            field_effects=field_effects,
+        )
 
         # Status / post-entry survivability penalty
         status = str(getattr(switch_mon, "status", "") or "").lower()
