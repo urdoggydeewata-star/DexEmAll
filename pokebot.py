@@ -15946,6 +15946,11 @@ TEAM_TEMPLATE_PATHS: tuple[Path, ...] = (
     ASSETS_DIR / "team-template.png",
 )
 TEAM_TEMPLATE_BASE_SIZE: tuple[int, int] = (808, 537)
+TEAM_TEMPLATE_STEM_BASE_SIZES: dict[str, tuple[int, int]] = {
+    "team-beta": (800, 488),
+    "team-template": (808, 537),
+    "team_panel_template": (808, 537),
+}
 TEAM_TRAINER_HEADER_RECT = (42, 34, 212, 84)
 TEAM_TRAINER_ART_RECT = (42, 85, 212, 410)
 TEAM_TRAINER_FOOTER_RECT = (42, 430, 212, 491)
@@ -16427,32 +16432,63 @@ def _team_load_sprite_frames(
         from PIL import ImageSequence  # type: ignore
     except Exception:
         ImageSequence = None  # type: ignore
+    frames: list[Any] = []
+    duration = TEAM_BATTLE_SYNC_DURATION_MS
+
     try:
-        img = Image.open(str(path))
+        with Image.open(str(path)) as img:
+            if ImageSequence is not None and bool(getattr(img, "is_animated", False)):
+                try:
+                    for i, fr in enumerate(ImageSequence.Iterator(img)):
+                        if i >= TEAM_MAX_SPRITE_FRAMES:
+                            break
+                        if i == 0:
+                            try:
+                                duration = max(40, min(220, int(fr.info.get("duration", duration))))
+                            except Exception:
+                                duration = TEAM_BATTLE_SYNC_DURATION_MS
+                        frames.append(fr.convert("RGBA"))
+                except Exception:
+                    frames = []
+            if not frames:
+                frames = [img.convert("RGBA")]
     except Exception:
         return [], TEAM_BATTLE_SYNC_DURATION_MS
-    duration = TEAM_BATTLE_SYNC_DURATION_MS
-    frames: list[Any] = []
 
-    if ImageSequence is not None and bool(getattr(img, "is_animated", False)):
+    # Use the union alpha bounds to avoid tiny sprites from oversized transparent canvases.
+    union_bbox = None
+    for fr in frames:
         try:
-            for i, fr in enumerate(ImageSequence.Iterator(img)):
-                if i >= TEAM_MAX_SPRITE_FRAMES:
-                    break
-                sprite = fr.convert("RGBA")
-                sprite.thumbnail(max_size, resample=resample)
-                frames.append(sprite)
+            bb = fr.getbbox()
         except Exception:
-            frames = []
-    if not frames:
+            bb = None
+        if not bb:
+            continue
+        if union_bbox is None:
+            union_bbox = bb
+        else:
+            union_bbox = (
+                min(union_bbox[0], bb[0]),
+                min(union_bbox[1], bb[1]),
+                max(union_bbox[2], bb[2]),
+                max(union_bbox[3], bb[3]),
+            )
+
+    out_frames: list[Any] = []
+    for fr in frames:
+        sprite = fr
+        if union_bbox is not None:
+            try:
+                sprite = sprite.crop(union_bbox)
+            except Exception:
+                pass
         try:
-            sprite = img.convert("RGBA")
             sprite.thumbnail(max_size, resample=resample)
-            frames = [sprite]
         except Exception:
-            frames = []
+            pass
+        out_frames.append(sprite)
 
-    return frames, duration
+    return out_frames, duration
 
 
 def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None], *, current_gen: Optional[int] = None) -> str:
@@ -16518,13 +16554,15 @@ def _team_overview_panel_file(
             resample = Image.NEAREST
         template = _team_template_path()
         if template is not None:
-            base = Image.open(str(template)).convert("RGBA")
+            with Image.open(str(template)) as tpl:
+                base = tpl.convert("RGBA")
+            bw0, bh0 = TEAM_TEMPLATE_STEM_BASE_SIZES.get(template.stem.lower(), base.size)
         else:
             # Fallback: generate a simple empty template if custom one isn't provided yet.
-            base = Image.new("RGBA", (808, 537), (92, 56, 106, 255))
+            base = Image.new("RGBA", (800, 488), (92, 56, 106, 255))
+            bw0, bh0 = TEAM_TEMPLATE_BASE_SIZE
 
         bw, bh = base.size
-        bw0, bh0 = TEAM_TEMPLATE_BASE_SIZE
         sx = bw / float(max(1, bw0))
         sy = bh / float(max(1, bh0))
         s = min(sx, sy)
@@ -16674,8 +16712,9 @@ def _team_overview_panel_file(
                 sprite_data[slot] = {"frames": []}
                 continue
             path = _team_pick_sprite_path(row)
-            sprite_max = (max(32, int(round(108 * sx))), max(32, int(round(108 * sy))))
-            frames, _ = _team_load_sprite_frames(path, max_size=sprite_max, resample=resample)
+            scale_mult = _team_species_visual_scale(row)
+            edge = max(32, int(round(108 * min(sx, sy) * scale_mult)))
+            frames, _ = _team_load_sprite_frames(path, max_size=(edge, edge), resample=resample)
             sprite_data[slot] = {"frames": frames}
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
