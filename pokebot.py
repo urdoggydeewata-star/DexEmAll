@@ -6062,7 +6062,7 @@ class OakIntroView(discord.ui.View):
     def _make_yesno_view(self) -> discord.ui.View:
         view = discord.ui.View(timeout=60)
 
-        async def yes_cb(itx: discord.Interaction):
+        async def yes_cb(itx):
             if not self._guard(itx):
                 return await itx.response.send_message("This isn’t for you.", ephemeral=True)
 
@@ -6082,7 +6082,7 @@ class OakIntroView(discord.ui.View):
                 view=StarterView(self.author_id)
             )
 
-        async def no_cb(itx: discord.Interaction):
+        async def no_cb(itx):
             if not self._guard(itx):
                 return await itx.response.send_message("This isn’t for you.", ephemeral=True)
             await itx.response.edit_message(
@@ -6749,6 +6749,7 @@ ASSETS_DAYCARE_EGG = ASSETS_EGG_STAGE_1_INTACT
 
 DAYCARE_CITY_ID = "viridian-city"
 DAYCARE_AREA_ID = "pallet-daycare"
+ROUTE_22_ENABLED = False  # Set True to show Route 22 button in Viridian City
 DAYCARE_EGG_CAP = 3
 DAYCARE_INCUBATE_MAX = 6
 DAYCARE_BREED_THRESHOLD = 22.0
@@ -6803,6 +6804,15 @@ ADVENTURE_CITIES = {
         "next": "route-1",
         "rival_battle": "rival-1",
         "heal": False,
+        "sub_areas": [
+            ("pallet-pokemon-center", "Pokémon Center"),
+        ],
+    },
+    "pallet-pokemon-center": {
+        "name": "Pokémon Center",
+        "parent_city": "pallet-town",
+        "image": ASSETS_CITIES / "viridian-pokecenter.png",  # Same image as Viridian
+        "heal": True,
     },
     DAYCARE_AREA_ID: {
         "name": "Viridian Daycare",
@@ -6947,17 +6957,49 @@ ADVENTURE_ROUTES = {
     },
     "route-2": {
         "name": "Route 2",
-        "image_uncleared": ASSETS_ROUTES / "route-2-1.png",
-        "image_cleared": ASSETS_ROUTES / "route-2-1.png",
+        "image_uncleared": ASSETS_ROUTES / "route-2-panel-1.png",
+        "image_cleared": ASSETS_ROUTES / "route-2-panel-1.png",
+        "panels": [
+            ASSETS_ROUTES / "route-2-panel-1.png",
+            ASSETS_ROUTES / "route-2-panel-2.png",
+            ASSETS_ROUTES / "route-2-panel-3.png",
+        ],
+        "prev": "viridian-city",
         "next": "viridian-forest-1",
         "next_always": True,
-        # Versioned encounters: red/blue share Rattata/Pidgey; Weedle is Red-only, Caterpie is Blue-only
+        # Sign on panel 1: button appears only when on that panel
+        "panel_signs": {
+            1: {
+                "label": "Read Sign",
+                "text": "Remember to stock up on healing items when you explore long routes!",
+                "text_alt": "Come over here and kiss me on my hot mouth, I'm feeling romantical",
+                "text_chance": 0.999,
+            },
+        },
+        # 3-panel navigation like Route 1; encounters per panel
         "grass_paths": {
             1: {
                 "encounters": [
                     {"species": "rattata", "weight": 45, "min_level": 2, "max_level": 5},
                     {"species": "pidgey",  "weight": 40, "min_level": 3, "max_level": 5},
-                    # Red: Weedle; Blue/Green: Caterpie. We'll include both at 15% and let version flag choose.
+                    {"species": "weedle",   "weight": 15, "min_level": 3, "max_level": 5, "version": "red"},
+                    {"species": "caterpie", "weight": 15, "min_level": 3, "max_level": 5, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+            2: {
+                "encounters": [
+                    {"species": "rattata", "weight": 45, "min_level": 2, "max_level": 5},
+                    {"species": "pidgey",  "weight": 40, "min_level": 3, "max_level": 5},
+                    {"species": "weedle",   "weight": 15, "min_level": 3, "max_level": 5, "version": "red"},
+                    {"species": "caterpie", "weight": 15, "min_level": 3, "max_level": 5, "version": "blue"},
+                ],
+                "blocker": None,
+            },
+            3: {
+                "encounters": [
+                    {"species": "rattata", "weight": 45, "min_level": 2, "max_level": 5},
+                    {"species": "pidgey",  "weight": 40, "min_level": 3, "max_level": 5},
                     {"species": "weedle",   "weight": 15, "min_level": 3, "max_level": 5, "version": "red"},
                     {"species": "caterpie", "weight": 15, "min_level": 3, "max_level": 5, "version": "blue"},
                 ],
@@ -11235,6 +11277,8 @@ class AdventureCityView(discord.ui.View):
         routes = city.get("routes")
         if routes and isinstance(routes, (list, tuple)):
             for route_id in routes:
+                if route_id == "route-22" and not ROUTE_22_ENABLED:
+                    continue
                 route_def = ADVENTURE_ROUTES.get(route_id, {})
                 label = route_def.get("name", route_id.replace("-", " ").title())
                 next_btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary, custom_id=f"adv:next:{route_id}")
@@ -11334,10 +11378,10 @@ class AdventureCityView(discord.ui.View):
         hist = state.get("area_history", [])
         hist.append(state.get("area_id"))
         state["area_history"] = hist[-15:]
-        # Reset Route 1 navigation whenever entering it so it always starts at Panel 1/start.
-        if next_id == "route-1":
+        # Reset panel route navigation when entering so it always starts at Panel 1.
+        if next_id in _get_panel_routes():
             rp = state.get("route_panels") or {}
-            rp["route-1"] = {"panel": 1, "pos": "start"}
+            rp[next_id] = {"panel": 1, "pos": "start"}
             state["route_panels"] = rp
         state["area_id"] = next_id
         await _save_adventure_state(str(itx.user.id), state)
@@ -11963,19 +12007,33 @@ class AdventureRouteView(discord.ui.View):
             self.add_item(collect_btn)
             # Next is hidden until collected; Back still available if history exists (added below)
         else:
-            # Route 1 uses Forward/Back navigation instead of path selection
-            if self.area_id == "route-1":
-                back_btn = discord.ui.Button(label="⬇️", style=discord.ButtonStyle.secondary, custom_id="adv:r1:back")
-                back_btn.callback = self._on_back_route1
+            # Routes with panels (route-1, route-2) use Forward/Back navigation instead of path selection
+            panels = route.get("panels") or []
+            if isinstance(panels, list) and len(panels) >= 3:
+                back_btn = discord.ui.Button(label="⬇️", style=discord.ButtonStyle.secondary, custom_id=f"adv:panel:{self.area_id}:back")
+                back_btn.callback = self._on_back_panel
                 self.add_item(back_btn)
 
-                fwd_btn = discord.ui.Button(label="⬆️", style=discord.ButtonStyle.primary, custom_id="adv:r1:fwd")
-                fwd_btn.callback = self._on_forward_route1
+                fwd_btn = discord.ui.Button(label="⬆️", style=discord.ButtonStyle.primary, custom_id=f"adv:panel:{self.area_id}:fwd")
+                fwd_btn.callback = self._on_forward_panel
                 self.add_item(fwd_btn)
 
-                force_btn = discord.ui.Button(label="⚔️ Battle", style=discord.ButtonStyle.danger, custom_id="adv:r1:force")
-                force_btn.callback = self._on_force_route1
+                force_btn = discord.ui.Button(label="⚔️ Battle", style=discord.ButtonStyle.danger, custom_id=f"adv:panel:{self.area_id}:force")
+                force_btn.callback = self._on_force_panel
                 self.add_item(force_btn)
+                # Panel-specific sign/readable (e.g. Route 2 sign on panel 1)
+                panel_signs = route.get("panel_signs") or {}
+                rp = (self.state.get("route_panels") or {}).get(self.area_id) or {}
+                panel = max(1, min(int(rp.get("panel", 1)), 3))
+                sign_cfg = panel_signs.get(panel)
+                if sign_cfg and isinstance(sign_cfg, dict):
+                    sign_btn = discord.ui.Button(
+                        label=sign_cfg.get("label", "Read Sign"),
+                        style=discord.ButtonStyle.secondary,
+                        custom_id=f"adv:sign:{self.area_id}:{panel}",
+                    )
+                    sign_btn.callback = self._on_read_sign
+                    self.add_item(sign_btn)
             else:
                 for path_id in sorted((route.get("grass_paths") or {}).keys()):
                     btn = discord.ui.Button(label=str(path_id), style=discord.ButtonStyle.secondary, custom_id=f"adv:path:{path_id}")
@@ -11990,7 +12048,9 @@ class AdventureRouteView(discord.ui.View):
         # When next_show_when_path_blockers_only: show Next as soon as path blockers (not next_blocker) are defeated
         path_blockers_cleared = route.get("next_show_when_path_blockers_only") and _route_path_blockers_cleared(self.state, self.area_id)
         # Don't show Next if there's an uncollected collectible (user must collect first)
-        show_next = next_id and (cleared or next_always or path_blockers_cleared) and next_blocker_defeated and (not collectible or collected)
+        # Panel routes (route-1, route-2) use ⬆️ to advance to next area, so no Next button
+        has_panels = isinstance(route.get("panels"), list) and len(route.get("panels", [])) >= 3
+        show_next = next_id and not has_panels and (cleared or next_always or path_blockers_cleared) and next_blocker_defeated and (not collectible or collected)
         if show_next:
             next_label = "Next"
             if _is_city(next_id):
@@ -12011,7 +12071,9 @@ class AdventureRouteView(discord.ui.View):
                 btn.callback = self._on_rematch
                 self.add_item(btn)
         # Back button if history exists or route always shows back (e.g. route-22)
-        if (self.state.get("area_history") or route.get("back_always")) and self.area_id != "route-1":
+        # Panel routes (route-1, route-2) use ⬇️ for back, not this button
+        has_panels = isinstance(route.get("panels"), list) and len(route.get("panels", [])) >= 3
+        if (self.state.get("area_history") or route.get("back_always")) and not has_panels:
             back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, custom_id="adv:back")
             back_btn.callback = self._on_back
             self.add_item(back_btn)
@@ -12148,13 +12210,12 @@ class AdventureRouteView(discord.ui.View):
         state.setdefault("route_panels", {})[self.area_id] = {"panel": int(panel)}
 
     async def _r1_try_wild_encounter(self, itx: discord.Interaction, state: dict, *, force: bool = False) -> None:
-        """Roll (or force) a wild encounter using Route 1 grass encounters."""
-        await _route1_try_wild_encounter(itx, state, force=force)
+        """Roll (or force) a wild encounter using the route's grass encounters."""
+        await _route_panel_try_wild_encounter(itx, state, self.area_id, force=force)
 
 
-async def _route1_try_wild_encounter(itx: discord.Interaction, state: dict, *, force: bool = False) -> None:
-    """Roll (or force) a wild encounter on Route 1. Used by both ephemeral and persistent view."""
-    area_id = "route-1"
+async def _route_panel_try_wild_encounter(itx: discord.Interaction, state: dict, area_id: str, *, force: bool = False) -> None:
+    """Roll (or force) a wild encounter on a panel route (route-1, route-2, etc.)."""
     route = ADVENTURE_ROUTES.get(area_id, {})
     try:
         chance = float(os.environ.get("ROUTE_MOVE_ENCOUNTER_CHANCE", "0.35"))
@@ -12224,75 +12285,102 @@ async def _route1_try_wild_encounter(itx: discord.Interaction, state: dict, *, f
             pass
 
 
-def _r1_get_panel(state: dict) -> int:
-    """Get current Route 1 panel (1–3) from state."""
-    rp = (state.get("route_panels") or {}).get("route-1")
+def _panel_get_panel(state: dict, area_id: str) -> int:
+    """Get current panel (1–3) for a panel route."""
+    rp = (state.get("route_panels") or {}).get(area_id)
     if not isinstance(rp, dict):
         return 1
     return max(1, min(int(rp.get("panel", 1)), 3))
 
 
+def _panel_set_panel(state: dict, area_id: str, panel: int) -> None:
+    """Set panel in state for a panel route."""
+    state.setdefault("route_panels", {})[area_id] = {"panel": int(panel)}
+
+
+def _r1_get_panel(state: dict) -> int:
+    return _panel_get_panel(state, "route-1")
+
+
 def _r1_set_panel(state: dict, panel: int) -> None:
-    """Set Route 1 panel in state."""
-    state.setdefault("route_panels", {})["route-1"] = {"panel": int(panel)}
+    _panel_set_panel(state, "route-1", panel)
+
+
+def _get_panel_routes() -> list[str]:
+    """Return route ids that have 3+ panels."""
+    return [rid for rid, r in ADVENTURE_ROUTES.items()
+            if isinstance(r.get("panels"), list) and len(r.get("panels", [])) >= 3]
 
 
 class AdventureRoute1PersistentView(discord.ui.View):
-    """Persistent view so Route 1 arrow buttons work after bot restart or view timeout."""
+    """Persistent view so panel route (route-1, route-2, etc.) arrow buttons work after bot restart or view timeout."""
     def __init__(self):
         super().__init__(timeout=None)
-        back_btn = discord.ui.Button(label="⬇️", style=discord.ButtonStyle.secondary, custom_id="adv:r1:back")
-        back_btn.callback = self._handle_back
-        self.add_item(back_btn)
-        fwd_btn = discord.ui.Button(label="⬆️", style=discord.ButtonStyle.primary, custom_id="adv:r1:fwd")
-        fwd_btn.callback = self._handle_fwd
-        self.add_item(fwd_btn)
+        # Legacy route-1 + panel format buttons for each route
+        for area_id in _get_panel_routes():
+            for direction, label, style in [("back", "⬇️", discord.ButtonStyle.secondary), ("fwd", "⬆️", discord.ButtonStyle.primary)]:
+                cid = f"adv:panel:{area_id}:{direction}"
+                b = discord.ui.Button(label=label, style=style, custom_id=cid)
+                b.callback = self._handle_panel_move
+                self.add_item(b)
+        # Legacy adv:r1:back/fwd for old Route 1 messages
+        for cid, label, style in [("adv:r1:back", "⬇️", discord.ButtonStyle.secondary), ("adv:r1:fwd", "⬆️", discord.ButtonStyle.primary)]:
+            b = discord.ui.Button(label=label, style=style, custom_id=cid)
+            b.callback = self._handle_panel_move
+            self.add_item(b)
 
-    async def _handle_back(self, itx: discord.Interaction, button: discord.ui.Button):
-        await self._handle_route1_move(itx, "back")
+    async def _handle_panel_move(self, itx: discord.Interaction, button: discord.ui.Button):
+        cid = (button.custom_id or (itx.data or {}).get("custom_id") or "")
+        if cid.startswith("adv:r1:"):
+            area_id, direction = "route-1", ("back" if "back" in cid else "fwd")
+        elif cid.startswith("adv:panel:") and cid.count(":") >= 3:
+            parts = cid.split(":", 3)
+            area_id, direction = parts[2], parts[3].split(":")[0] if ":" in parts[3] else parts[3]
+        else:
+            await itx.response.defer(ephemeral=False, thinking=False)
+            await _send_adventure_panel(itx, await _get_adventure_state(str(itx.user.id)), edit_original=False)
+            return
+        await self._handle_route_panel_move(itx, area_id, direction)
 
-    async def _handle_fwd(self, itx: discord.Interaction, button: discord.ui.Button):
-        await self._handle_route1_move(itx, "fwd")
-
-    async def _handle_route1_move(self, itx: discord.Interaction, direction: str) -> None:
-        print(f"[Adventure] Persistent view _handle_route1_move called, direction={direction}")
+    async def _handle_route_panel_move(self, itx: discord.Interaction, area_id: str, direction: str) -> None:
         await itx.response.defer(ephemeral=False, thinking=False)
         uid = str(itx.user.id)
         state = await _get_adventure_state(uid)
-        if state.get("area_id") != "route-1":
-            print(f"[Adventure] Persistent view: user not on route-1 (area_id={state.get('area_id')}), sending panel only")
+        if state.get("area_id") != area_id:
             await _send_adventure_panel(itx, state, edit_original=False)
             return
-        route = ADVENTURE_ROUTES.get("route-1", {})
-        panel = _r1_get_panel(state)
+        route = ADVENTURE_ROUTES.get(area_id, {})
+        panels = route.get("panels") or []
+        num_panels = max(3, len(panels)) if isinstance(panels, list) else 3
+        panel = _panel_get_panel(state, area_id)
         moved_within_route = False
         if direction == "fwd":
-            if panel < 3:
-                _r1_set_panel(state, panel + 1)
+            if panel < num_panels:
+                _panel_set_panel(state, area_id, panel + 1)
                 moved_within_route = True
             else:
                 next_area = route.get("next")
                 if next_area:
                     state["area_id"] = next_area
-                state.get("route_panels", {}).pop("route-1", None)
+                state.get("route_panels", {}).pop(area_id, None)
         else:
             if panel > 1:
-                _r1_set_panel(state, panel - 1)
+                _panel_set_panel(state, area_id, panel - 1)
                 moved_within_route = True
             else:
                 state["area_id"] = route.get("prev") or "pallet-town"
-                state.get("route_panels", {}).pop("route-1", None)
+                state.get("route_panels", {}).pop(area_id, None)
         await _save_adventure_state(uid, state)
         print(f"[Adventure] Persistent view: moved_within_route={moved_within_route}, sending panel with roll_route1_item={moved_within_route}")
         if moved_within_route:
-            await _route1_try_wild_encounter(itx, state)
+            await _route_panel_try_wild_encounter(itx, state, "route-1")
             await _save_adventure_state(uid, state)
         await _send_adventure_panel(itx, state, edit_original=False, roll_route1_item=moved_within_route)
 
 
 class _AdventureRouteViewRoute1Methods:
-    """Mixin-style: methods that belong in AdventureRouteView (Route 1 arrow handlers)."""
-    async def _on_back_route1(self, itx: discord.Interaction):
+    """Mixin-style: methods for AdventureRouteView (panel route ⬆️⬇️ handlers for route-1, route-2, etc.)."""
+    async def _on_back_panel(self, itx: discord.Interaction):
         print("[Adventure] Ephemeral view _on_back_route1 (⬇️) called")
         if not self._guard(itx):
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
@@ -12321,7 +12409,7 @@ class _AdventureRouteViewRoute1Methods:
             await _save_adventure_state(str(itx.user.id), state)
         await _send_adventure_panel(itx, state, edit_original=False, roll_route1_item=moved_within_route)
 
-    async def _on_forward_route1(self, itx: discord.Interaction):
+    async def _on_forward_panel(self, itx: discord.Interaction):
         print("[Adventure] Ephemeral view _on_forward_route1 (⬆️) called")
         if not self._guard(itx):
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
@@ -12354,7 +12442,7 @@ class _AdventureRouteViewRoute1Methods:
         await _send_adventure_panel(itx, state, edit_original=False, roll_route1_item=moved_within_route)
 
 
-    async def _on_force_route1(self, itx: discord.Interaction):
+    async def _on_force_panel(self, itx: discord.Interaction):
         if not self._guard(itx):
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
         if not itx.response.is_done():
@@ -12366,7 +12454,29 @@ class _AdventureRouteViewRoute1Methods:
         await _save_adventure_state(str(itx.user.id), state)
         await _send_adventure_panel(itx, state, edit_original=False)
 
-
+    async def _on_read_sign(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id", "")
+        route = ADVENTURE_ROUTES.get(self.area_id, {})
+        panel_signs = route.get("panel_signs") or {}
+        try:
+            parts = cid.split(":")
+            if len(parts) >= 4:
+                area_id, panel = parts[2], int(parts[3])
+                sign_cfg = panel_signs.get(panel) if isinstance(panel_signs, dict) else None
+                if sign_cfg and isinstance(sign_cfg, dict):
+                    text = sign_cfg.get("text", "")
+                    text_alt = sign_cfg.get("text_alt")
+                    if text_alt is not None:
+                        chance = float(sign_cfg.get("text_chance", 0.9))
+                        text = text if random.random() < chance else text_alt
+                    if text:
+                        await itx.response.send_message(f"**Sign:**\n>>> {text}", ephemeral=True)
+                        return
+        except Exception:
+            pass
+        await itx.response.send_message("Nothing to read.", ephemeral=True)
 
     async def _on_collect(self, itx: discord.Interaction):
         if not self._guard(itx):
@@ -12760,21 +12870,13 @@ async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_o
                 img = route.get("image_cleared")
         else:
             img = route.get("image_cleared") if cleared else route.get("image_uncleared")
-        # Route 1 uses 3-panel navigation with Forward/Back; other routes use grass paths.
-
-        if area_id == "route-1":
-
-            panel = int((state.get("route_panels", {}).get(area_id, {}) or {}).get("panel", 1))
-            pos = str((state.get("route_panels", {}).get(area_id, {}) or {}).get("pos", "start"))
-
-            # Roll and give route move item here so it always runs when this panel is sent after a move
-            if roll_route1_item:
-                print(f"[Adventure] _send_adventure_panel: roll_route1_item=True for route-1, calling item drop for uid={uid}")
+        # Panel routes (route-1, route-2) use 3-panel navigation with Forward/Back
+        panels = route.get("panels") or []
+        has_panels = isinstance(panels, list) and len(panels) >= 3
+        if has_panels:
+            panel = _panel_get_panel(state, area_id)
+            if roll_route1_item and area_id in _get_panel_routes():
                 route_move_item_message = await _roll_and_give_route_move_item_async(uid)
-                print(f"[Adventure] _send_adventure_panel: item drop returned message={route_move_item_message!r}")
-
-            # Use pre-sliced panel images if available
-            panels = route.get("panels") or []
             if isinstance(panels, list) and len(panels) >= 3:
                 try:
                     img_panel = panels[max(0, min(panel - 1, len(panels) - 1))]
@@ -12782,13 +12884,11 @@ async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_o
                     img_panel = img
             else:
                 img_panel = img
-
-            desc = f"Use ⬆️/⬇️ to walk through the route. (Panel {panel}/3)\nMoving may trigger an encounter. Use ⚔️ Battle to force one."
-
+            num_panels = len(panels) if isinstance(panels, list) else 3
+            desc = f"Use ⬆️/⬇️ to walk through the route. (Panel {panel}/{num_panels})\nMoving may trigger an encounter. Use ⚔️ Battle to force one."
             emb, files = _embed_with_image(route.get("name", area_id), desc, img_panel)
             if route_move_item_message:
                 emb.add_field(name="", value=route_move_item_message, inline=False)
-
         else:
 
             desc = "Choose a grass path to encounter Pokémon."
