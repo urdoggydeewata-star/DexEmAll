@@ -16763,7 +16763,7 @@ def _team_overview_panel_file(
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
 
-        lvl_font_slot = _team_font(max(8, int(round(14 * s))), bold=False)
+        lvl_font_slot = _team_font(max(7, int(round(11 * s))), bold=False)
         text_prep: dict[int, dict[str, Any]] = {}
         probe_draw = ImageDraw.Draw(base)
         for slot in range(1, 7):
@@ -16778,7 +16778,7 @@ def _team_overview_panel_file(
                 lvl = f"{_team_egg_progress_pct(row)}%"
             else:
                 label = _team_species_label(row)
-                lvl = f"lvl {int(row.get('level') or 1)}"
+                lvl = f"Lv {int(row.get('level') or 1)}"
             label_to_draw = label
             label_font = _team_fit_font(
                 probe_draw,
@@ -16839,8 +16839,8 @@ def _team_overview_panel_file(
                     (int(slot_text.get("lvl_x") or geom["level_right"][0]), geom["level_right"][1]),
                     lvl,
                     font=lvl_font_slot,
-                    fill=(236, 240, 250, 255),
-                    shadow=(0, 0, 0, 210),
+                    fill=(244, 246, 252, 255),
+                    shadow=(0, 0, 0, 215),
                 )
 
         out_frames: list[Any] = []
