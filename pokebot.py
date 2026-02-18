@@ -16478,8 +16478,8 @@ def _team_overview_panel_file(
             text: str,
             *,
             font,
-            fill: tuple[int, int, int, int] = (230, 241, 250, 255),
-            shadow: tuple[int, int, int, int] = (10, 22, 33, 185),
+            fill: tuple[int, int, int, int] = (242, 244, 252, 255),
+            shadow: tuple[int, int, int, int] = (0, 0, 0, 220),
             shadow_offset: tuple[int, int] = (1, 1),
         ) -> None:
             t = str(text or "")
@@ -16526,8 +16526,8 @@ def _team_overview_panel_file(
                 (header_left_x, header_top_y),
                 trainer_title,
                 font=(title_font or trainer_font),
-                fill=(236, 240, 252, 255),
-                shadow=(10, 22, 33, 190),
+                fill=(242, 244, 252, 255),
+                shadow=(0, 0, 0, 220),
             )
         if name_font:
             _draw_pixel_shadow_text(
@@ -16535,22 +16535,22 @@ def _team_overview_panel_file(
                 (header_left_x, header_name_y),
                 target_name,
                 font=name_font,
-                fill=(232, 236, 249, 255),
-                shadow=(10, 22, 33, 180),
+                fill=(240, 242, 250, 255),
+                shadow=(0, 0, 0, 215),
             )
 
         # Footer: only overlay region value beside the template's existing label text.
         gen_num = max(1, int(current_gen or 1))
         region_name = _team_region_for_gen(gen_num)
-        footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 94) * sx))
-        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 24) * sy))
-        footer_w = max(36, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 102) * sx)))
+        footer_x = int(round((TEAM_TRAINER_FOOTER_RECT[0] + 102) * sx))
+        footer_y = int(round((TEAM_TRAINER_FOOTER_RECT[1] + 34) * sy))
+        footer_w = max(32, int(round((TEAM_TRAINER_FOOTER_RECT[2] - TEAM_TRAINER_FOOTER_RECT[0] - 110) * sx)))
         footer_font = _team_fit_font(
             draw,
             region_name,
             max_width=footer_w,
-            start_size=max(8, int(round(15 * s))),
-            min_size=max(7, int(round(10 * s))),
+            start_size=max(8, int(round(13 * s))),
+            min_size=max(7, int(round(9 * s))),
             bold=False,
         )
         if footer_font is not None:
@@ -16559,8 +16559,8 @@ def _team_overview_panel_file(
                 (footer_x, footer_y),
                 region_name,
                 font=footer_font,
-                fill=(230, 241, 250, 255),
-                shadow=(10, 22, 33, 175),
+                fill=(240, 242, 250, 255),
+                shadow=(0, 0, 0, 215),
             )
 
         # Preload sprite frames (animated front preferred).
@@ -16579,7 +16579,7 @@ def _team_overview_panel_file(
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
 
-        lvl_font_slot = _team_font(max(9, int(round(16 * s))), bold=True)
+        lvl_font_slot = _team_font(max(8, int(round(15 * s))), bold=False)
         text_prep: dict[int, dict[str, Any]] = {}
         probe_draw = ImageDraw.Draw(base)
         for slot in range(1, 7):
@@ -16600,9 +16600,9 @@ def _team_overview_panel_file(
                 probe_draw,
                 label_to_draw,
                 max_width=max(36, int(round((slot_w - max(42, int(round(52 * s))))))),
-                start_size=max(9, int(round(19 * s))),
-                min_size=max(7, int(round(10 * s))),
-                bold=True,
+                start_size=max(9, int(round(18 * s))),
+                min_size=max(7, int(round(9 * s))),
+                bold=False,
             )
             lvl_x = geom["level_right"][0]
             lvl_w = 0
@@ -16620,9 +16620,9 @@ def _team_overview_panel_file(
                         probe_draw,
                         label_to_draw,
                         max_width=tighter_max,
-                        start_size=max(8, int(round(16 * s))),
+                        start_size=max(8, int(round(15 * s))),
                         min_size=max(7, int(round(9 * s))),
-                        bold=True,
+                        bold=False,
                     )
                     if label_font:
                         label_w = _team_text_width(probe_draw, label_to_draw, label_font)
@@ -16653,8 +16653,8 @@ def _team_overview_panel_file(
                     (int(slot_text.get("label_x") or geom["label_xy"][0]), geom["label_xy"][1]),
                     str(slot_text.get("label") or ""),
                     font=slot_text["font"],
-                    fill=(230, 241, 250, 255),
-                    shadow=(10, 22, 33, 185),
+                    fill=(240, 242, 250, 255),
+                    shadow=(0, 0, 0, 220),
                 )
             lvl = str(slot_text.get("lvl") or "")
             if lvl and lvl_font_slot:
@@ -16663,8 +16663,8 @@ def _team_overview_panel_file(
                     (int(slot_text.get("lvl_x") or geom["level_right"][0]), geom["level_right"][1]),
                     lvl,
                     font=lvl_font_slot,
-                    fill=(206, 224, 240, 255),
-                    shadow=(10, 22, 33, 170),
+                    fill=(236, 240, 250, 255),
+                    shadow=(0, 0, 0, 210),
                 )
 
         out_frames: list[Any] = []
