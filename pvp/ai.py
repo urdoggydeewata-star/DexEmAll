@@ -126,6 +126,16 @@ def _is_move_useless(
     if move_lower in ["toxic"]:
         if target.status in ["psn", "tox"]:
             return True
+
+    # Context-required moves that fail if condition is unmet.
+    if move_lower in {"dream-eater", "nightmare"}:
+        # Both require target to be asleep.
+        if str(getattr(target, "status", "") or "").lower() != "slp":
+            return True
+    if move_lower in {"snore", "sleep-talk"}:
+        # User must be asleep.
+        if str(getattr(user, "status", "") or "").lower() != "slp":
+            return True
     
     # Trick Room already active
     if move_lower == "trick-room":

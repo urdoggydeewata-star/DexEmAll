@@ -234,6 +234,27 @@ def _ai_move_is_zero_effect_damaging(
         return False
 
 
+def _ai_move_fails_basic_condition(
+    st: "BattleState",
+    ai_user_id: int,
+    move_name: str,
+) -> bool:
+    """Fast context checks for moves that fail without prerequisites."""
+    mv = _norm_move_key(move_name)
+    try:
+        ai_mon = st._active(ai_user_id)
+        target_mon = st._opp_active(ai_user_id)
+    except Exception:
+        ai_mon = None
+        target_mon = None
+
+    if mv in {"dream-eater", "nightmare"}:
+        return str(getattr(target_mon, "status", "") or "").lower() != "slp"
+    if mv in {"snore", "sleep-talk"}:
+        return str(getattr(ai_mon, "status", "") or "").lower() != "slp"
+    return False
+
+
 def _choose_quick_fallback_move(st: "BattleState", ai_user_id: int, field_effects: Any) -> Dict[str, Any]:
     """
     Fast deterministic fallback move picker for AI timeout/error cases.
@@ -268,6 +289,8 @@ def _choose_quick_fallback_move(st: "BattleState", ai_user_id: int, field_effect
         move_key = _norm_move_key(mv)
         category = str(md.get("category") or md.get("damage_class") or "status").lower()
         score = (power * 1.15) + (priority * 38.0) + max(0.0, min(100.0, accuracy)) * 0.12
+        if _ai_move_fails_basic_condition(st, ai_user_id, mv):
+            score -= 240.0
         if category == "status" and power <= 0:
             score -= 8.0
         if move_key in recovery_moves and ai_hp_pct <= 0.42:
@@ -376,10 +399,16 @@ def _normalize_ai_choice(st: "BattleState", ai_user_id: int, raw_choice: Any, fi
                 not _ai_move_is_zero_effect_damaging(st, ai_user_id, lm, field_effects)
                 for lm in legal_moves
             )
+            has_condition_valid_option = any(
+                not _ai_move_fails_basic_condition(st, ai_user_id, lm)
+                for lm in legal_moves
+            )
             for lm in legal_moves:
                 if _norm_move_key(lm) == wanted:
                     # Reject "no effect" damaging move picks when a valid alternative exists.
                     if has_non_zero_effect_option and _ai_move_is_zero_effect_damaging(st, ai_user_id, lm, field_effects):
+                        break
+                    if has_condition_valid_option and _ai_move_fails_basic_condition(st, ai_user_id, lm):
                         break
                     return {"kind": "move", "value": lm}
 
@@ -9589,6 +9618,19 @@ class AcceptView(discord.ui.View):
             gen = self.generation if self.generation is not None else 9
             p1_is_bot = getattr(self, "p1_is_bot", False)
             p2_is_bot = getattr(self, "p2_is_bot", False)
+
+            # Recovery guard: if stream button state desynced after message edits/restarts,
+            # infer it from the challenge status text.
+            if not self.streaming_enabled and self.challenge_message and getattr(self.challenge_message, "embeds", None):
+                try:
+                    emb0 = self.challenge_message.embeds[0]
+                    status_text = ""
+                    if emb0 and len(getattr(emb0, "fields", [])) > 2:
+                        status_text = str(emb0.fields[2].value or "")
+                    if "battle will be streamed" in status_text.lower() or "📺" in status_text:
+                        self.streaming_enabled = True
+                except Exception:
+                    pass
 
             if p2_is_bot:
                 from .ai import generate_bot_team
