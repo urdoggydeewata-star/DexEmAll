@@ -706,14 +706,15 @@ BETA_CLAIM_CUSTOM_ID = str(_OWNER_SETTINGS.beta_claim_custom_id)
 # Access code gate: users must run /code <code> before using the bot (set BOT_ACCESS_CODE in .env)
 BOT_ACCESS_CODE: str = (os.getenv("BOT_ACCESS_CODE") or "").strip()
 
-_ACCESS_VERIFY_CACHE_TTL_SECONDS = 1800.0
+_ACCESS_VERIFY_CACHE_TTL_SECONDS = 21600.0
 _ACCESS_VERIFY_CACHE: dict[int, tuple[bool, float]] = {}
 _USER_GEN_CACHE_TTL_SECONDS = 300.0
 _USER_GEN_CACHE: dict[str, tuple[int, float]] = {}
 _ADMIN_CHECK_CACHE_TTL_SECONDS = 120.0
 _ADMIN_CHECK_CACHE: dict[str, tuple[bool, float]] = {}
-_REQUIRED_ROLE_CACHE_TTL_SECONDS = 1800.0
+_REQUIRED_ROLE_CACHE_TTL_SECONDS = 21600.0
 _REQUIRED_ROLE_CACHE: dict[int, tuple[bool, float]] = {}
+_REQUIRED_ROLE_FETCH_INFLIGHT: dict[int, asyncio.Task[bool]] = {}
 _ROLE_GATE_EXEMPT_CACHE_TTL_SECONDS = 1800.0
 _ROLE_GATE_EXEMPT_CACHE: dict[int, tuple[bool, float]] = {}
 _ROLE_GATE_EXEMPT_TABLE_READY = False
@@ -984,7 +985,12 @@ def _is_verify_button_interaction(interaction: discord.Interaction) -> bool:
         return False
 
 
-async def _has_required_os_role(user_id: int | str, *, force_refresh: bool = False) -> bool:
+async def _has_required_os_role(
+    user_id: int | str,
+    *,
+    force_refresh: bool = False,
+    interaction: Optional[discord.Interaction] = None,
+) -> bool:
     try:
         uid = int(user_id)
     except Exception:
@@ -993,19 +999,54 @@ async def _has_required_os_role(user_id: int | str, *, force_refresh: bool = Fal
         cached = _get_cached_required_role(uid)
         if cached is not None:
             return bool(cached)
-    guild = bot.get_guild(VERIFY_GUILD_ID)
-    if guild is None:
-        _set_cached_required_role(uid, False)
-        return False
-    member = guild.get_member(uid)
-    if member is None:
+
+    # Fast path for slash interactions inside the verification guild:
+    # use the interaction member payload directly (no API fetch).
+    if interaction is not None:
         try:
-            member = await guild.fetch_member(uid)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            member = None
+            if int(getattr(interaction, "guild_id", 0) or 0) == VERIFY_GUILD_ID:
+                member = interaction.user
+                roles = getattr(member, "roles", None)
+                if roles is not None:
+                    has_role = any(int(r.id) == VERIFY_ROLE_ID for r in roles)
+                    _set_cached_required_role(uid, bool(has_role))
+                    return bool(has_role)
         except Exception:
-            member = None
-    has_role = bool(member and any(int(r.id) == VERIFY_ROLE_ID for r in getattr(member, "roles", [])))
+            pass
+
+    async def _resolve_required_role() -> bool:
+        guild = bot.get_guild(VERIFY_GUILD_ID)
+        if guild is None:
+            return False
+        member = guild.get_member(uid)
+        if member is None:
+            try:
+                member = await guild.fetch_member(uid)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                member = None
+            except Exception:
+                member = None
+        return bool(member and any(int(r.id) == VERIFY_ROLE_ID for r in getattr(member, "roles", [])))
+
+    # Coalesce concurrent role fetches for the same user.
+    inflight = _REQUIRED_ROLE_FETCH_INFLIGHT.get(uid)
+    if inflight is not None:
+        try:
+            has_role = bool(await inflight)
+            _set_cached_required_role(uid, has_role)
+            return has_role
+        except Exception:
+            pass
+
+    task: asyncio.Task[bool] = asyncio.create_task(_resolve_required_role())
+    _REQUIRED_ROLE_FETCH_INFLIGHT[uid] = task
+    try:
+        has_role = bool(await task)
+    except Exception:
+        has_role = False
+    finally:
+        if _REQUIRED_ROLE_FETCH_INFLIGHT.get(uid) is task:
+            _REQUIRED_ROLE_FETCH_INFLIGHT.pop(uid, None)
     _set_cached_required_role(uid, has_role)
     return has_role
 
@@ -1031,7 +1072,7 @@ async def _check_required_role_interaction(
         return True
     # Fast path: most users should pass via required role check; avoid DB lookup
     # for role-gate exemptions unless role check fails.
-    if await _has_required_os_role(interaction.user.id):
+    if await _has_required_os_role(interaction.user.id, interaction=interaction):
         return True
     if await _is_role_gate_exempt(interaction.user.id):
         return True
