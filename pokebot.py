@@ -15679,35 +15679,77 @@ class MPokeInfo(commands.Cog):
         panel_static = base.copy()
         draw = ImageDraw.Draw(panel_static)
         font_stats = self._mpokeinfo_font(max(8, int(round(11 * scale))), bold=True)
+        right_box_left = _pt(266, 0)[0]
+        right_box_w = max(26, int(round(108 * sx)))
+
+        def _draw_centered_in_box(
+            text: str,
+            font,
+            *,
+            left: int,
+            y: int,
+            width: int,
+            fill: tuple[int, int, int, int] = (236, 244, 248, 255),
+            shadow: tuple[int, int, int, int] = (0, 0, 0, 220),
+        ) -> str:
+            txt = _clip_text(text, font, max(8, int(width)))
+            if not txt or font is None:
+                return txt
+            tw = self._mpokeinfo_text_width(draw_probe, txt, font)
+            tx = int(left + max(0, ((int(width) - tw) // 2)))
+            self._mpokeinfo_draw_shadow_text(draw, (tx, int(y)), txt, font=font, fill=fill, shadow=shadow)
+            return txt
 
         # --- top row / summary ---
         ot_name = str(getattr(interaction.user, "display_name", None) or interaction.user.name or "Trainer").strip()
         ot_name = re.sub(r"\s+", " ", ot_name)
+        ot_box_left, ot_box_y = _pt(82, 15)
+        ot_box_w = max(34, int(round(98 * sx)))
         ot_font = self._mpokeinfo_fit_font(
             draw_probe,
             ot_name,
-            max_width=max(42, int(round(104 * sx))),
+            max_width=ot_box_w,
             start_size=max(8, int(round(10 * scale))),
-            min_size=max(7, int(round(8 * scale))),
+            min_size=max(6, int(round(7 * scale))),
             bold=True,
         )
-        ot_text = _clip_text(f"OT {ot_name}", ot_font, max(42, int(round(104 * sx))))
-        self._mpokeinfo_draw_shadow_text(draw, _pt(82, 15), ot_text, font=ot_font)
+        _draw_centered_in_box(ot_name, ot_font, left=ot_box_left, y=ot_box_y, width=ot_box_w)
 
-        gsym = "♂" if gender == "male" else "♀" if gender == "female" else "∅" if gender == "genderless" else "?"
-        lv_line = f"| lv {int(level)}{gsym}"
+        lv_line = f"{int(level)}"
+        lv_box_left, lv_box_y = _pt(202, 15)
+        lv_box_w = max(22, int(round(56 * sx)))
         lv_font = self._mpokeinfo_fit_font(
             draw_probe,
             lv_line,
-            max_width=max(24, int(round(56 * sx))),
+            max_width=lv_box_w,
             start_size=max(8, int(round(10 * scale))),
             min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        lv_line = _clip_text(lv_line, lv_font, max(24, int(round(56 * sx))))
-        lv_right = _pt(258, 15)[0]
-        lv_w = self._mpokeinfo_text_width(draw_probe, lv_line, lv_font)
-        self._mpokeinfo_draw_shadow_text(draw, (lv_right - lv_w, _pt(258, 15)[1]), lv_line, font=lv_font)
+        _draw_centered_in_box(lv_line, lv_font, left=lv_box_left, y=lv_box_y, width=lv_box_w)
+
+        gender_key = str(gender or "").strip().lower()
+        gender_symbol = {"male": "♂", "female": "♀", "genderless": "∅"}.get(gender_key)
+        if gender_symbol:
+            try:
+                from PIL import ImageFont  # type: ignore
+                gender_font = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                    max(8, int(round(10 * scale))),
+                )
+            except Exception:
+                gender_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
+            gfill = (112, 190, 255, 255) if gender_key == "male" else (255, 156, 214, 255) if gender_key == "female" else (214, 214, 226, 255)
+            gw = self._mpokeinfo_text_width(draw_probe, gender_symbol, gender_font)
+            gx = int(lv_box_left + lv_box_w - gw - max(1, int(round(1 * sx))))
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                (gx, lv_box_y),
+                gender_symbol,
+                font=gender_font,
+                fill=gfill,
+                shadow=(12, 12, 12, 220),
+            )
 
         primary_type = str(types[0] if types else "Normal").upper()
         badge_left, badge_top = _pt(198, 31)
@@ -15747,27 +15789,23 @@ class MPokeInfo(commands.Cog):
         nature_font = self._mpokeinfo_fit_font(
             draw_probe,
             nature_text,
-            max_width=max(26, int(round(108 * sx))),
+            max_width=right_box_w,
             start_size=max(8, int(round(10 * scale))),
             min_size=max(7, int(round(8 * scale))),
             bold=False,
         )
-        nature_text = _clip_text(nature_text, nature_font, max(26, int(round(108 * sx))))
-        self._mpokeinfo_draw_shadow_text(draw, _pt(266, 34), nature_text, font=nature_font)
+        _draw_centered_in_box(nature_text, nature_font, left=right_box_left, y=_pt(0, 34)[1], width=right_box_w)
 
-        exp_text = "MAX EXP" if exp_to_next_val is None else f"{int(exp_to_next_val):,} EXP"
+        exp_text = "MAX" if exp_to_next_val is None else f"{int(exp_to_next_val):,}"
         exp_font = self._mpokeinfo_fit_font(
             draw_probe,
             exp_text,
-            max_width=max(26, int(round(108 * sx))),
+            max_width=right_box_w,
             start_size=max(8, int(round(10 * scale))),
             min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        exp_text = _clip_text(exp_text, exp_font, max(26, int(round(108 * sx))))
-        exp_w = self._mpokeinfo_text_width(draw_probe, exp_text, exp_font)
-        exp_right = _pt(372, 65)[0]
-        self._mpokeinfo_draw_shadow_text(draw, (exp_right - exp_w, _pt(372, 65)[1]), exp_text, font=exp_font)
+        _draw_centered_in_box(exp_text, exp_font, left=right_box_left, y=_pt(0, 65)[1], width=right_box_w)
 
         fr_pct = max(0, min(100, int(round((max(0, int(friendship_value)) / 255.0) * 100.0))))
         fr_text = f"{fr_pct}%"
@@ -15791,17 +15829,22 @@ class MPokeInfo(commands.Cog):
         pokemon_font = self._mpokeinfo_fit_font(
             draw_probe,
             species_display,
-            max_width=max(24, int(round(108 * sx))),
+            max_width=right_box_w,
             start_size=max(8, int(round(10 * scale))),
             min_size=max(7, int(round(8 * scale))),
             bold=False,
         )
-        species_display = _clip_text(species_display, pokemon_font, max(24, int(round(108 * sx))))
-        self._mpokeinfo_draw_shadow_text(draw, _pt(266, 126), species_display, font=pokemon_font)
+        species_display = _draw_centered_in_box(
+            species_display,
+            pokemon_font,
+            left=right_box_left,
+            y=_pt(0, 126)[1],
+            width=right_box_w,
+        )
 
         # --- main sprite region ---
         nickname = str(mon.get("nickname") or species_display).strip() or species_display
-        nick_xy = _pt(86, 132)
+        nick_box_left, nick_box_y = _pt(86, 132)
         nick_max_w = max(28, int(round(136 * sx)))
         if bool(is_locked):
             lock_font = self._mpokeinfo_font(max(7, int(round(9 * scale))), bold=True)
@@ -15813,8 +15856,8 @@ class MPokeInfo(commands.Cog):
                 fill=(255, 214, 126, 255),
                 shadow=(84, 54, 10, 220),
             )
-            nick_xy = _pt(92, 132)
-            nick_max_w = max(24, int(round(130 * sx)))
+            nick_box_left = int(nick_box_left + max(7, int(round(8 * sx))))
+            nick_max_w = max(22, int(nick_max_w - max(7, int(round(8 * sx)))))
         nick_font = self._mpokeinfo_fit_font(
             draw_probe,
             nickname,
@@ -15823,8 +15866,13 @@ class MPokeInfo(commands.Cog):
             min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        nickname = _clip_text(nickname, nick_font, nick_max_w)
-        self._mpokeinfo_draw_shadow_text(draw, nick_xy, nickname, font=nick_font)
+        _draw_centered_in_box(
+            nickname,
+            nick_font,
+            left=nick_box_left,
+            y=nick_box_y,
+            width=nick_max_w,
+        )
 
         if shiny:
             shiny_font = self._mpokeinfo_font(max(8, int(round(12 * scale))), bold=True)
@@ -15853,18 +15901,22 @@ class MPokeInfo(commands.Cog):
         if not moves_clean:
             moves_clean = ["—"]
         move_start_x, move_start_y = _pt(86, 162)
-        move_line_h = max(12, int(round(18 * sy)))
+        move_box_w = max(24, int(round(138 * sx)))
+        move_box_bottom = _pt(0, 222)[1]
+        move_count = max(1, min(4, len(moves_clean)))
+        usable_h = max(12, move_box_bottom - move_start_y)
+        move_line_h = max(10, usable_h // move_count)
         for idx, mv in enumerate(moves_clean[:4]):
             y = int(move_start_y + (idx * move_line_h))
             mv_font = self._mpokeinfo_fit_font(
                 draw_probe,
                 mv,
-                max_width=max(24, int(round(138 * sx))),
-                start_size=max(8, int(round(10 * scale))),
-                min_size=max(7, int(round(8 * scale))),
+                max_width=move_box_w,
+                start_size=max(8, int(round(9 * scale))),
+                min_size=max(7, int(round(7 * scale))),
                 bold=False,
             )
-            mv = _clip_text(mv, mv_font, max(24, int(round(138 * sx))))
+            mv = _clip_text(mv, mv_font, move_box_w)
             self._mpokeinfo_draw_shadow_text(draw, (move_start_x, y), mv, font=mv_font, fill=(240, 245, 250, 255))
 
         ability_text = str(mon.get("ability") or "Unknown").replace("-", " ").replace("_", " ").title() or "Unknown"
@@ -16327,6 +16379,11 @@ async def _dispatch_pokeinfo_alias(
     cb = getattr(cmd_obj, "callback", None)
     if callable(cb):
         try:
+            await cb(interaction, name_or_id, bool(shiny), gender, gen)
+            return
+        except TypeError:
+            pass
+        try:
             await cb(
                 interaction,
                 name_or_id=name_or_id,
@@ -16342,6 +16399,11 @@ async def _dispatch_pokeinfo_alias(
     # Last fallback: call the command object directly if available.
     try:
         if callable(cmd_obj):
+            try:
+                await cmd_obj(interaction, name_or_id, bool(shiny), gender, gen)
+                return
+            except TypeError:
+                pass
             await cmd_obj(
                 interaction,
                 name_or_id=name_or_id,
@@ -16374,7 +16436,9 @@ async def mpokeinfo_alias(interaction: Interaction, name: str, slot: Optional[in
 
 @bot.tree.command(name="pkinfo", description="Alias for /pokeinfo (Pokédex species info).")
 @app_commands.describe(
-    name_or_id="Name or National Dex number (e.g., bulbasaur or 1). Names like 'alolan raichu' are okay.",
+    name_or_id="Primary query (name or National Dex number).",
+    name="Legacy query field (also accepts name or National Dex number).",
+    slot="Legacy slot field from old /pkinfo payloads (ignored).",
     shiny="Show shiny sprite (default: off)",
     gender="Force sprite gender (optional)",
     gen="Also show how many moves are legal in this generation (1–9)",
@@ -16387,12 +16451,25 @@ async def mpokeinfo_alias(interaction: Interaction, name: str, slot: Optional[in
 )
 async def pkinfo_alias(
     interaction: Interaction,
-    name_or_id: str,
+    name_or_id: Optional[str] = None,
+    name: Optional[str] = None,
+    slot: Optional[int] = None,
     shiny: bool = False,
     gender: Optional[str] = None,
     gen: Optional[int] = None,
 ):
-    await _dispatch_pokeinfo_alias(interaction, name_or_id, shiny=shiny, gender=gender, gen=gen)
+    _ = slot  # legacy option retained for backward compatibility with old payloads
+    query = str(name_or_id or name or "").strip()
+    if not query:
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("❌ Please provide a Pokémon name or Dex number.", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ Please provide a Pokémon name or Dex number.", ephemeral=True)
+        except Exception:
+            pass
+        return
+    await _dispatch_pokeinfo_alias(interaction, query, shiny=shiny, gender=gender, gen=gen)
 
 
 @bot.tree.command(name="pkname", description="Set or clear a nickname for one of your team Pokémon.")
