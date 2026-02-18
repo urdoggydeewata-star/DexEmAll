@@ -296,11 +296,19 @@ def _patch_pvp_streaming_reliability() -> None:
                 except Exception:
                     turn_no = 0
                 summary_text = str(turn_summary or "").strip()
-                # Match requested stream UX:
-                # - Turn 1: image only (no summary text)
-                # - Later turns: include summary (moves + damage)
-                if turn_no <= 1:
-                    summary_text = ""
+                if not summary_text:
+                    try:
+                        cached_lines = [
+                            str(line).strip()
+                            for line in (getattr(st, "_last_turn_log", []) or [])
+                            if str(line).strip()
+                        ]
+                        if cached_lines:
+                            summary_text = "\n".join(cached_lines).strip()
+                    except Exception:
+                        summary_text = ""
+                if not summary_text:
+                    summary_text = "No significant actions this turn."
 
                 stream_key = None
                 try:
@@ -437,25 +445,9 @@ def _patch_pvp_streaming_reliability() -> None:
                             st.stream_channel = ch
                             st.stream_channel_id = getattr(ch, "id", None)
 
-                    # Kick off a first public stream post as soon as battle starts.
+                    # Do not emit an image-only kickoff post; stream updates should
+                    # mirror turn summaries (text + image together).
                     if bool(getattr(st, "streaming_enabled", False)) and not bool(getattr(st, "_stream_started", False)):
-                        ch = getattr(st, "stream_channel", None)
-                        if ch is not None and hasattr(ch, "send"):
-                            render_result = None
-                            render_fn = getattr(_pvp_panel, "_render_gif_for_panel", None)
-                            if callable(render_fn):
-                                try:
-                                    render_result = await render_fn(st, st.p1_id, hide_hp_text=True)
-                                except Exception as e:
-                                    print(f"[StreamPatch] initial render failed: {e}")
-                            send_fn = getattr(_pvp_panel, "_send_stream_panel", None)
-                            if callable(send_fn):
-                                try:
-                                    msg = await send_fn(ch, st, None, render_result)
-                                    if msg is not None:
-                                        st._last_stream_message = msg
-                                except Exception as e:
-                                    print(f"[StreamPatch] initial stream send failed: {e}")
                         st._stream_started = True
                 except Exception:
                     pass
@@ -476,20 +468,14 @@ def _patch_pvp_streaming_reliability() -> None:
                             st.stream_channel = ch
                             st.stream_channel_id = getattr(ch, "id", None)
                             summary_lines = list(getattr(st, "_last_turn_log", []) or [])
-                            try:
-                                turn_no = int(getattr(st, "turn", 0) or 0)
-                            except Exception:
-                                turn_no = 0
-                            send_initial = (turn_no <= 1 and not bool(getattr(st, "_stream_initial_sent", False)))
-                            send_summary = (turn_no >= 2 and bool(summary_lines))
-                            if not (send_initial or send_summary):
+                            summary_lines = [str(line).strip() for line in summary_lines if str(line).strip()]
+                            if not summary_lines:
                                 return result
-                            summary_text = "\n".join(summary_lines).strip() if send_summary else None
+                            summary_text = "\n".join(summary_lines).strip()
                             send_fn = getattr(_pvp_panel, "_send_stream_panel", None)
                             if callable(send_fn):
-                                await send_fn(ch, st, summary_text, gif_file if send_initial else None)
-                                if send_initial:
-                                    st._stream_initial_sent = True
+                                # Let stream panel render its own public-safe image.
+                                await send_fn(ch, st, summary_text, None)
                 except Exception as e:
                     print(f"[StreamPatch] _send_player_panel stream mirror failed: {e}")
                 return result
