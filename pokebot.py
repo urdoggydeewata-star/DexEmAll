@@ -4345,6 +4345,34 @@ def _normalize_ball_item_id(ball_name: Optional[str]) -> str:
         "pokeball": "poke_ball",
         "pok_ball": "poke_ball",
         "poke_ball": "poke_ball",
+        "greatball": "great_ball",
+        "ultraball": "ultra_ball",
+        "masterball": "master_ball",
+        "safariball": "safari_ball",
+        "repeatball": "repeat_ball",
+        "timerball": "timer_ball",
+        "quickball": "quick_ball",
+        "duskball": "dusk_ball",
+        "netball": "net_ball",
+        "nestball": "nest_ball",
+        "heavyball": "heavy_ball",
+        "loveball": "love_ball",
+        "levelball": "level_ball",
+        "lureball": "lure_ball",
+        "moonball": "moon_ball",
+        "fastball": "fast_ball",
+        "friendball": "friend_ball",
+        "friendshipball": "friend_ball",
+        "friendship_ball": "friend_ball",
+        "healball": "heal_ball",
+        "luxuryball": "luxury_ball",
+        "premierball": "premier_ball",
+        "beastball": "beast_ball",
+        "diveball": "dive_ball",
+        "cherishball": "cherish_ball",
+        "sportball": "sport_ball",
+        "dreamball": "dream_ball",
+        "parkball": "park_ball",
     }
     return aliases.get(norm, norm)
 
@@ -15424,7 +15452,7 @@ class MPokeInfo(commands.Cog):
     @staticmethod
     def _gender_icon_local(g: Optional[str]) -> str:
         g = (g or "").lower()
-        return "♂️" if g == "male" else "♀️" if g == "female" else "∅" if g == "genderless" else ""
+        return "♂️" if g in {"male", "m", "♂"} else "♀️" if g in {"female", "f", "♀"} else "∅" if g in {"genderless", "none", "unknown"} else ""
 
     def _pick_sprite_file(self, species: str, gender: Optional[str], shiny: bool, form: Optional[str] = None) -> Optional[discord.File]:
         """
@@ -15565,30 +15593,105 @@ class MPokeInfo(commands.Cog):
 
     # --------------------- types / stats helpers ---------------------
     async def _extract_types(self, species: str, mon: dict, dex: Optional[dict]) -> List[str]:
-        def _norm_list(x) -> list[str]:
-            li = self._as_list(x)
-            out = []
-            for t in li:
-                if t is None:
+        def _extract_token(v: Any) -> Optional[str]:
+            if v is None:
+                return None
+            if isinstance(v, Mapping):
+                if isinstance(v.get("type"), Mapping):
+                    tn = str(v.get("type", {}).get("name") or "").strip()
+                    if tn:
+                        return tn
+                for k in ("name", "type_name", "type", "value"):
+                    vv = v.get(k)
+                    if isinstance(vv, Mapping):
+                        nn = str(vv.get("name") or "").strip()
+                        if nn:
+                            return nn
+                    elif vv not in (None, ""):
+                        s = str(vv).strip()
+                        if s:
+                            return s
+                return None
+            s = str(v).strip()
+            if not s:
+                return None
+            if s.startswith("{") and s.endswith("}"):
+                try:
+                    parsed = json.loads(s)
+                    return _extract_token(parsed)
+                except Exception:
+                    m = re.search(r"""['"]name['"]\s*:\s*['"]([^'"]+)['"]""", s)
+                    if m:
+                        return str(m.group(1) or "").strip()
+                    return None
+            s = s.strip("[](){}")
+            if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
+                s = s[1:-1].strip()
+            if s.lower().startswith("type="):
+                s = s.split("=", 1)[1].strip()
+            return s
+
+        def _norm_list(x: Any) -> list[str]:
+            if x is None:
+                return []
+            if isinstance(x, Mapping):
+                nested_types = x.get("types")
+                if nested_types is not None:
+                    return _norm_list(nested_types)
+                pairs = [
+                    x.get("type1") or x.get("type_1"),
+                    x.get("type2") or x.get("type_2"),
+                    x.get("primary_type"),
+                    x.get("secondary_type"),
+                ]
+                if any(pairs):
+                    return _norm_list(pairs)
+                tok = _extract_token(x)
+                return [tok] if tok else []
+            if isinstance(x, (list, tuple, set)):
+                seq = list(x)
+            elif isinstance(x, str):
+                try:
+                    parsed = json.loads(x)
+                    if parsed is not None and parsed is not x:
+                        return _norm_list(parsed)
+                except Exception:
+                    pass
+                seq = [p.strip() for p in re.split(r"[,/|]", x) if p.strip()]
+            else:
+                seq = [x]
+            out: list[str] = []
+            seen: set[str] = set()
+            for t in seq:
+                tok = _extract_token(t)
+                if tok is None:
                     continue
-                s = str(t).strip()
-                if s and s.lower() != "none":
-                    out.append(s)
+                key = tok.strip().lower().replace("_", "-")
+                if not key or key in {"none", "unknown"}:
+                    continue
+                if key not in seen:
+                    seen.add(key)
+                    out.append(key)
             return out
 
         # 1) Prefer dex (pokedex / ensure_species) as source of truth for fixed info
         d = self._as_mapping(dex) if dex else {}
         for cand in (
-            d.get("types"), d.get("typing"), d.get("type"),
+            d.get("types"),
+            d.get("typing"),
             [d.get("type1") or d.get("type_1"), d.get("type2") or d.get("type_2")] if (d.get("type1") or d.get("type_1") or d.get("type2") or d.get("type_2")) else None,
             [d.get("primary_type"), d.get("secondary_type")] if (d.get("primary_type") or d.get("secondary_type")) else None,
             (d.get("species") or {}).get("types") if isinstance(d.get("species"), dict) else None,
+            mon.get("types") if isinstance(mon, Mapping) else None,
+            [mon.get("type1"), mon.get("type2"), mon.get("primary_type"), mon.get("secondary_type")] if isinstance(mon, Mapping) else None,
+            d.get("type"),
+            mon.get("type") if isinstance(mon, Mapping) else None,
         ):
             if cand is None:
                 continue
             li = _norm_list(cand)
             if li:
-                return [s.title() for s in li]
+                return [s.replace("_", " ").replace("-", " ").title() for s in li]
 
         # 2) If dex was None or missing types, fetch from pokedex table by species
         try:
@@ -15598,7 +15701,7 @@ class MPokeInfo(commands.Cog):
                 if pokedex_row:
                     tlist = _norm_list(pokedex_row.get("types"))
                     if tlist:
-                        return [s.title() for s in tlist]
+                        return [s.replace("_", " ").replace("-", " ").title() for s in tlist]
                 # Direct query fallback (pokedex has types JSONB only)
                 conn = await db_mod.connect()
                 try:
@@ -15611,7 +15714,7 @@ class MPokeInfo(commands.Cog):
                     if row and row.get("types"):
                         tlist = _norm_list(row.get("types"))
                         if tlist:
-                            return [s.title() for s in tlist]
+                            return [s.replace("_", " ").replace("-", " ").title() for s in tlist]
                 finally:
                     await conn.close()
         except Exception:
@@ -15638,7 +15741,8 @@ class MPokeInfo(commands.Cog):
             except Exception:
                 return None
 
-        is_female = (str(gender).lower() == "female")
+        g_norm = str(gender or "").strip().lower()
+        is_female = g_norm in {"female", "f", "♀"}
         cand: List[str] = []
         if is_female:
             if shiny: cand += ["female-animated-shiny-front.gif", "female-shiny-front.png"]
@@ -15649,6 +15753,13 @@ class MPokeInfo(commands.Cog):
         for fname in cand:
             fp = exists(fname)
             if fp:
+                if str(fp.suffix or "").lower() == ".gif":
+                    try:
+                        with Image.open(str(fp)) as g:
+                            if not bool(getattr(g, "is_animated", False)) or int(getattr(g, "n_frames", 1) or 1) <= 1:
+                                continue
+                    except Exception:
+                        continue
                 return discord.File(fp, filename=fp.name)
         return None
 
@@ -15747,7 +15858,8 @@ class MPokeInfo(commands.Cog):
                 folder_candidates.append(self.sprites_base / f"{base_species}-{form_norm}")
         folder_candidates.append(self.sprites_base / base_species)
 
-        is_female = (str(gender).lower() == "female")
+        g_norm = str(gender or "").strip().lower()
+        is_female = g_norm in {"female", "f", "♀"}
         filenames: List[str] = []
         if is_female:
             if shiny:
@@ -15767,6 +15879,13 @@ class MPokeInfo(commands.Cog):
                 p = folder / fname
                 try:
                     if p.exists() and p.is_file() and p.stat().st_size > 0:
+                        if str(p.suffix or "").lower() == ".gif":
+                            try:
+                                with Image.open(str(p)) as g:
+                                    if not bool(getattr(g, "is_animated", False)) or int(getattr(g, "n_frames", 1) or 1) <= 1:
+                                        continue
+                            except Exception:
+                                continue
                         return p
                 except Exception:
                     continue
@@ -15804,8 +15923,10 @@ class MPokeInfo(commands.Cog):
         candidates: list[str] = []
         for c in (
             canonical,
+            canonical + "_ball" if canonical and not canonical.endswith("_ball") else "",
             canonical.replace("_", "-"),
             canonical.replace("_", " "),
+            canonical.replace("_ball", "") if canonical.endswith("_ball") else "",
             "poke_ball" if canonical in {"pokeball", "poke_ball", "pok_ball"} else "",
         ):
             c2 = str(c or "").strip().lower()
@@ -15815,7 +15936,7 @@ class MPokeInfo(commands.Cog):
             p = MPokeInfo._held_item_icon_path(c)
             if p is not None:
                 return p
-        return None
+        return MPokeInfo._held_item_icon_path("poke_ball")
 
     @staticmethod
     def _mpokeinfo_type_badge_path(type_name: Optional[str]) -> Optional[Path]:
@@ -15914,6 +16035,9 @@ class MPokeInfo(commands.Cog):
         # Load sprite frames first so we can emit animated GIF output when possible.
         sprite_frames: list[Any] = []
         sprite_duration_ms = 95
+        sprite_frame_durations: list[int] = []
+        species_norm_for_anim = _daycare_norm_species(species)
+        sprite_frame_limit = 120 if species_norm_for_anim == "eevee" else 24
         sprite_path = self._pick_sprite_path(species, gender, shiny, current_form)
         if sprite_path is not None:
             try:
@@ -15926,9 +16050,28 @@ class MPokeInfo(commands.Cog):
                         except Exception:
                             sprite_duration_ms = 95
                         for i, fr in enumerate(ImageSequence.Iterator(src)):
-                            if i >= 24:
+                            if i >= int(sprite_frame_limit):
                                 break
-                            sprite_frames.append(fr.convert("RGBA"))
+                            try:
+                                sprite_frames.append(fr.copy().convert("RGBA"))
+                            except Exception:
+                                sprite_frames.append(fr.convert("RGBA"))
+                            try:
+                                fd = int(fr.info.get("duration") or 0)
+                            except Exception:
+                                fd = 0
+                            if fd <= 0:
+                                try:
+                                    fd = int(src.info.get("duration") or 0)
+                                except Exception:
+                                    fd = 0
+                            if fd <= 0:
+                                fd = sprite_duration_ms
+                            if species_norm_for_anim == "eevee":
+                                fd = max(90, min(260, int(fd)))
+                            else:
+                                fd = max(55, min(180, int(fd)))
+                            sprite_frame_durations.append(int(fd))
                     else:
                         sprite_frames = [src.convert("RGBA")]
             except Exception:
@@ -16047,7 +16190,11 @@ class MPokeInfo(commands.Cog):
         lv_box_w = max(22, int(round(56 * sx)))
         lv_box_h = max(10, int(round(13 * sy)))
         gender_key = str(gender or "").strip().lower()
-        gender_symbol = {"male": "♂", "female": "♀", "genderless": "∅"}.get(gender_key)
+        gender_symbol = {
+            "male": "♂", "m": "♂", "♂": "♂",
+            "female": "♀", "f": "♀", "♀": "♀",
+            "genderless": "∅", "none": "∅", "unknown": "∅",
+        }.get(gender_key)
         lv_font = self._mpokeinfo_fit_font(
             draw_probe,
             lv_line,
@@ -16088,7 +16235,7 @@ class MPokeInfo(commands.Cog):
         gap = max(1, int(round(2 * sx))) if gender_symbol else 0
         group_w = int(lv_w + (gap + gw if gender_symbol else 0))
         group_x = int(lv_box_left + max(0, ((lv_box_w - group_w) // 2)))
-        lv_nudge_x = max(1, int(round(2 * sx)))
+        lv_nudge_x = max(4, int(round(8 * sx)))
         lv_y = int(lv_box_y + max(0, ((lv_box_h - lv_h) // 2) - 1))
         self._mpokeinfo_draw_shadow_text(
             draw,
@@ -16099,7 +16246,8 @@ class MPokeInfo(commands.Cog):
             shadow=(0, 0, 0, 220),
         )
         if gender_symbol and gender_font is not None:
-            gx = int(group_x + lv_nudge_x + lv_w + gap)
+            gender_nudge_x = max(2, int(round(4 * sx)))
+            gx = int(group_x + lv_nudge_x + lv_w + gap + gender_nudge_x)
             gender_nudge_y = -max(1, int(round(1 * sy)))
             gy = int(lv_box_y + max(0, ((lv_box_h - gh) // 2) - 1 + gender_nudge_y))
             self._mpokeinfo_draw_shadow_text(
@@ -16326,8 +16474,17 @@ class MPokeInfo(commands.Cog):
             try:
                 with Image.open(str(ball_icon)) as src:
                     icon = src.convert("RGBA")
-                icon.thumbnail((max(10, int(round(18 * sx))), max(10, int(round(18 * sy)))), resample=resample)
-                panel_static.alpha_composite(icon, dest=_pt(88, 40))
+                try:
+                    bb = icon.split()[-1].getbbox()
+                    if bb is not None:
+                        cropped = icon.crop(bb)
+                        if cropped.size[0] > 0 and cropped.size[1] > 0:
+                            icon = cropped
+                except Exception:
+                    pass
+                icon.thumbnail((max(12, int(round(22 * sx))), max(12, int(round(22 * sy)))), resample=resample)
+                ix, iy = _pt(86, 38)
+                panel_static.alpha_composite(icon, dest=(int(ix), int(iy)))
             except Exception:
                 pass
 
@@ -16475,13 +16632,18 @@ class MPokeInfo(commands.Cog):
                     out_frames.append(fr)
                 if out_frames:
                     out = BytesIO()
+                    durations_to_save: Any
+                    if sprite_frame_durations and len(sprite_frame_durations) >= len(out_frames):
+                        durations_to_save = sprite_frame_durations[:len(out_frames)]
+                    else:
+                        durations_to_save = int(max(55, min(220, sprite_duration_ms)))
                     try:
                         out_frames[0].save(
                             out,
                             format="GIF",
                             save_all=True,
                             append_images=out_frames[1:],
-                            duration=int(max(55, min(180, sprite_duration_ms))),
+                            duration=durations_to_save,
                             loop=0,
                             disposal=2,
                         )
@@ -16611,7 +16773,11 @@ class MPokeInfo(commands.Cog):
         ot_text = self._format_ot(self.bot, str(mon.get("owner_id") or mon.get("user_id") or ""))
         gender_icon_fn = globals().get("_gender_icon", None)
         gender_icon = gender_icon_fn(gender) if callable(gender_icon_fn) else self._gender_icon_local(gender)
-        gender_display = "Male ♂" if gender == "male" else "Female ♀" if gender == "female" else (gender_icon or "—")
+        gender_display = (
+            "Male ♂" if gender in {"male", "m", "♂"} else
+            "Female ♀" if gender in {"female", "f", "♀"} else
+            (gender_icon or "—")
+        )
 
         fr = mon.get("friendship", mon.get("happiness", 0))
         try:
@@ -21977,7 +22143,8 @@ def _species_folder_name(species: str) -> str:
 
 def _candidate_filenames(shiny: bool = False, gender: Optional[str] = None) -> List[str]:
     # Same exact priority as your bot
-    female = (str(gender or "").strip().lower() == "female")
+    g = str(gender or "").strip().lower()
+    female = g in {"female", "f", "♀"}
     cand: List[str] = []
     if female:
         if shiny:
@@ -22082,17 +22249,14 @@ def _discord_sprite_file(path: Path):
     try:
         from PIL import ImageSequence  # type: ignore
     except Exception:
-        try:
-            return File(path, filename=path.name)
-        except Exception:
-            return None
+        return None
 
     try:
         frames: list[Any] = []
         durations: list[int] = []
         with Image.open(str(path)) as src:
             if not bool(getattr(src, "is_animated", False)):
-                return File(path, filename=path.name)
+                return None
             max_frames = min(160, max(1, int(getattr(src, "n_frames", 1) or 1)))
             for i, fr in enumerate(ImageSequence.Iterator(src)):
                 if i >= max_frames:
@@ -22114,7 +22278,7 @@ def _discord_sprite_file(path: Path):
                     d = 95
                 durations.append(max(70, min(220, d)))
         if len(frames) <= 1:
-            return File(path, filename=path.name)
+            return None
         out = BytesIO()
         frames[0].save(
             out,
@@ -22128,10 +22292,7 @@ def _discord_sprite_file(path: Path):
         out.seek(0)
         return File(fp=out, filename=path.name)
     except Exception:
-        try:
-            return File(path, filename=path.name)
-        except Exception:
-            return None
+        return None
 
 
 def pokemon_sprite_attachment(
