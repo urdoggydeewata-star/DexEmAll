@@ -7317,6 +7317,9 @@ ROUTE_MOVE_BALL_ENCOUNTER_WEIGHTS: List[Tuple[str, str, float]] = [
     # Remaining probability from shared table is treated as "no ball found".
     ("__none__", "No Ball", 28.98),
 ]
+# Global dampener for route loot-ball frequency.
+# Table weights are still used when a roll happens.
+ROUTE_MOVE_BALL_GLOBAL_ROLL_CHANCE = 0.20
 
 ROUTE_MOVE_ITEMS_BY_BALL: Dict[str, List[Tuple[str, str, float]]] = {
     "poke_ball": [
@@ -8295,6 +8298,8 @@ async def _roll_and_give_route_move_item_async(user_id: str) -> Optional[str]:
     Returns the message to show or None if no drop.
     """
     if not ROUTE_MOVE_BALL_ENCOUNTER_WEIGHTS or not ROUTE_MOVE_ITEMS_BY_BALL:
+        return None
+    if random.random() > float(ROUTE_MOVE_BALL_GLOBAL_ROLL_CHANCE):
         return None
     ball_id, ball_name = _weighted_choice(ROUTE_MOVE_BALL_ENCOUNTER_WEIGHTS)
     if not ball_id or ball_id == "__none__":
