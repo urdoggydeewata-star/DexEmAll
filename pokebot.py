@@ -11745,6 +11745,7 @@ async def _start_pve_battle(
     trainer_quote: Optional[str] = None,
     area_id: Optional[str] = None,
     route_display_name: Optional[str] = None,
+    resend_adventure_panel: bool = True,
 ) -> Optional[bool]:
     from pvp.manager import get_manager
     from pvp.panel import BattleState, _turn_loop
@@ -12130,14 +12131,24 @@ async def _start_pve_battle(
                     await _save_adventure_state(str(itx.user.id), state)
                     await _heal_party(str(itx.user.id))
                     try:
-                        await _send_adventure_panel(itx, state, edit_original=False)
+                        await _send_adventure_panel(
+                            itx,
+                            state,
+                            edit_original=False,
+                            force_new_message=True,
+                        )
                     except Exception:
                         pass
         # After any adventure/rival battle, send the adventure panel so the user always returns to the map
-        if fmt_label == "Adventure" or fmt_label == "Rival":
+        if resend_adventure_panel and (fmt_label == "Adventure" or fmt_label == "Rival"):
             try:
                 state = await _get_adventure_state(str(itx.user.id))
-                await _send_adventure_panel(itx, state, edit_original=False)
+                await _send_adventure_panel(
+                    itx,
+                    state,
+                    edit_original=False,
+                    force_new_message=True,
+                )
             except Exception:
                 pass
 
@@ -12185,6 +12196,7 @@ async def _run_rival_battle(itx: discord.Interaction, area_id: str, state: dict)
         fmt_label="Rival",
         area_id=area_id,
         route_display_name=route_display_name,
+        resend_adventure_panel=False,
     )
     if won is None:
         return False
@@ -12211,7 +12223,7 @@ async def _run_rival_battle(itx: discord.Interaction, area_id: str, state: dict)
             title = "Rival Wins!"
             result_emb = _adventure_help_embed(title, "\n".join(lines))
             await itx.followup.send(embed=result_emb, ephemeral=False)
-    await _send_adventure_panel(itx, state, edit_original=False)
+    await _send_adventure_panel(itx, state, edit_original=False, force_new_message=True)
     return won
 
 
@@ -13607,10 +13619,12 @@ class AdventureRouteView(discord.ui.View):
                             team.append(mon)
                     if not team:
                         return await itx.followup.send("Trainer team failed to load.", ephemeral=False)
-                    won = await _start_pve_battle(itx, team, trainer_name)
+                    won = await _start_pve_battle(itx, team, trainer_name, resend_adventure_panel=False)
                     if won is None:
                         return await itx.followup.send("Couldn't start the battle. Please try again.", ephemeral=False)
                     if not won:
+                        state = await _get_adventure_state(str(itx.user.id))
+                        await _send_adventure_panel(itx, state, edit_original=False, force_new_message=True)
                         return
                     state.setdefault("defeated_trainers", {})[next_trainer_id] = int(time.time())
                     if _route_is_cleared(state, current_area) and current_area not in state.get("cleared_routes", []):
@@ -13618,7 +13632,7 @@ class AdventureRouteView(discord.ui.View):
                     await _save_adventure_state(str(itx.user.id), state)
                     state = await _get_adventure_state(str(itx.user.id))
                     # Stay on current area and re-send panel so user can click Next again to advance
-                    await _send_adventure_panel(itx, state, edit_original=True)
+                    await _send_adventure_panel(itx, state, edit_original=False, force_new_message=True)
                     return
             _adv_history_push(state, state.get("area_id"))
             state["area_id"] = next_id
@@ -13727,7 +13741,13 @@ async def _route_panel_try_wild_encounter(itx: discord.Interaction, state: dict,
         return
 
     route_display = route.get("name", area_id)
-    won = await _start_pve_battle(itx, [wild_mon], f"Wild {species.title()}", area_id=area_id, route_display_name=route_display)
+    won = await _start_pve_battle(
+        itx,
+        [wild_mon],
+        f"Wild {species.title()}",
+        area_id=area_id,
+        route_display_name=route_display,
+    )
     if won is _PVE_ALREADY_IN_BATTLE:
         return
     if won is None:
@@ -14037,16 +14057,19 @@ class _AdventureRouteViewRoute1Methods:
                         team.append(mon)
                 if not team:
                     return await itx.followup.send("Trainer team failed to load.", ephemeral=False)
-                won = await _start_pve_battle(itx, team, trainer_name)
+                won = await _start_pve_battle(itx, team, trainer_name, resend_adventure_panel=False)
                 if won is None:
                     return await itx.followup.send("Couldn't start the battle. Please try again.", ephemeral=False)
                 if not won:
-                    return await itx.followup.send("❌ You lost the battle.", ephemeral=False)
+                    await itx.followup.send("❌ You lost the battle.", ephemeral=False)
+                    state = await _get_adventure_state(str(itx.user.id))
+                    await _send_adventure_panel(itx, state, edit_original=False, force_new_message=True)
+                    return
                 state.setdefault("defeated_trainers", {})[blocker] = int(time.time())
                 if _route_is_cleared(state, self.area_id) and self.area_id not in state.get("cleared_routes", []):
                     state.setdefault("cleared_routes", []).append(self.area_id)
                 await _save_adventure_state(str(itx.user.id), state)
-                await _send_adventure_panel(itx, state, edit_original=True)
+                await _send_adventure_panel(itx, state, edit_original=False, force_new_message=True)
                 return
 
             # Encounter
@@ -14093,7 +14116,14 @@ class _AdventureRouteViewRoute1Methods:
                 return await itx.followup.send("Encounter failed to load.", ephemeral=False)
 
             route_display = route.get("name", self.area_id)
-            won = await _start_pve_battle(itx, [wild_mon], f"Wild {species.title()}", area_id=self.area_id, route_display_name=route_display)
+            won = await _start_pve_battle(
+                itx,
+                [wild_mon],
+                f"Wild {species.title()}",
+                area_id=self.area_id,
+                route_display_name=route_display,
+                resend_adventure_panel=False,
+            )
             if won is _PVE_ALREADY_IN_BATTLE:
                 return  # "You're already in a battle." was already sent; don't send a second message
             if won is None:
@@ -14107,7 +14137,7 @@ class _AdventureRouteViewRoute1Methods:
                 except Exception:
                     pass
             await _save_adventure_state(str(itx.user.id), state)
-            await _send_adventure_panel(itx, state, edit_original=True)
+            await _send_adventure_panel(itx, state, edit_original=False, force_new_message=True)
         except Exception as e:
             import traceback
             tb = traceback.format_exc()
@@ -14149,7 +14179,12 @@ class _AdventureRouteViewRoute1Methods:
                     team.append(mon)
             if not team:
                 return await itx.followup.send("Trainer team failed to load.", ephemeral=False)
-            won = await _start_pve_battle(itx, team, trainer.get("name", "Trainer"))
+            won = await _start_pve_battle(
+                itx,
+                team,
+                trainer.get("name", "Trainer"),
+                resend_adventure_panel=False,
+            )
             if won is None:
                 return await itx.followup.send("Couldn't start the battle. Please try again.", ephemeral=False)
             if won:
@@ -14159,7 +14194,7 @@ class _AdventureRouteViewRoute1Methods:
             else:
                 await itx.followup.send("❌ Rematch lost.", ephemeral=False)
             state = await _get_adventure_state(str(itx.user.id))
-            await _send_adventure_panel(itx, state, edit_original=True)
+            await _send_adventure_panel(itx, state, edit_original=False, force_new_message=True)
         finally:
             self._handled = False
 
@@ -14204,9 +14239,21 @@ async def _cancel_previous_panel_for_user(bot: discord.Client, uid: str) -> None
     except Exception:
         pass
 
-async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_original: bool, route_move_item_message: Optional[str] = None, roll_route1_item: bool = False) -> None:
+async def _send_adventure_panel(
+    itx: discord.Interaction,
+    state: dict,
+    *,
+    edit_original: bool,
+    route_move_item_message: Optional[str] = None,
+    roll_route1_item: bool = False,
+    force_new_message: bool = False,
+) -> None:
     # If this is a button-press (component interaction), edit the clicked message.
-    is_component = getattr(itx, 'type', None) == discord.InteractionType.component and getattr(itx, 'message', None) is not None
+    is_component = (
+        not force_new_message
+        and getattr(itx, 'type', None) == discord.InteractionType.component
+        and getattr(itx, 'message', None) is not None
+    )
     msg = None
 
     async def _edit_with_files(edit_fn):
@@ -14391,7 +14438,7 @@ async def _send_adventure_panel(itx: discord.Interaction, state: dict, *, edit_o
                 msg = await _edit_with_files(itx.edit_original_response)
             except Exception:
                 msg = await _edit_with_files(itx.message.edit)
-    elif edit_original:
+    elif edit_original and not force_new_message:
         msg = await _edit_with_files(itx.edit_original_response)
     else:
         # Fresh slash command without editing original; send a normal (non-ephemeral) message
