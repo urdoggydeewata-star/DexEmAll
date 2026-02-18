@@ -16772,7 +16772,7 @@ def _team_overview_panel_file(
             if len(frames) > 1:
                 cycle_lengths.append(len(frames))
 
-        lvl_font_slot = _team_font(max(9, int(round(17 * s))), bold=True)
+        lvl_font_slot = _team_font(max(7, int(round(12 * s))), bold=True)
         text_prep: dict[int, dict[str, Any]] = {}
         probe_draw = ImageDraw.Draw(base)
         for slot in range(1, 7):
@@ -16788,20 +16788,35 @@ def _team_overview_panel_file(
             else:
                 label = _team_species_label(row)
                 lvl = f"lvl {int(row.get('level') or 1)}"
+            label_to_draw = label
             label_font = _team_fit_font(
                 probe_draw,
-                label,
+                label_to_draw,
                 max_width=max(36, int(round((slot_w - max(42, int(round(52 * s))))))),
-                start_size=max(9, int(round(19 * s))),
-                min_size=max(7, int(round(9 * s))),
+                start_size=max(8, int(round(14 * s))),
+                min_size=max(6, int(round(9 * s))),
                 bold=True,
             )
             lvl_x = geom["level_right"][0]
+            lvl_w = 0
             if lvl_font_slot:
-                lw = _team_text_width(probe_draw, lvl, lvl_font_slot)
-                lvl_x = int(geom["level_right"][0] - lw)
+                lvl_w = _team_text_width(probe_draw, lvl, lvl_font_slot)
+                lvl_x = int(geom["level_right"][0] - lvl_w)
+            if label_font:
+                label_start_x = int(geom["label_xy"][0])
+                min_gap = max(8, int(round(10 * s)))
+                label_end_limit = int(lvl_x - min_gap)
+                label_max_w = max(20, label_end_limit - label_start_x)
+                label_font = _team_fit_font(
+                    probe_draw,
+                    label_to_draw,
+                    max_width=label_max_w,
+                    start_size=max(8, int(round(13 * s))),
+                    min_size=max(6, int(round(8 * s))),
+                    bold=True,
+                )
             text_prep[slot] = {
-                "label": label,
+                "label": label_to_draw,
                 "font": label_font,
                 "lvl": lvl,
                 "lvl_x": lvl_x,
