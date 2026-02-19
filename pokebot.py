@@ -7980,7 +7980,7 @@ ADVENTURE_ROUTES = {
             ASSETS_ROUTES / "route-2-panel-3.png",
         ],
         "prev": "viridian-city",
-        "next": "viridian-forest-1",
+        "next": "Viridian-Forest",
         "next_always": True,
         # Sign on panel 1: button appears only when on that panel
         "panel_signs": {
@@ -8023,162 +8023,73 @@ ADVENTURE_ROUTES = {
         },
         "trainers": {},
     },
-    "viridian-forest-1": {
+    "Viridian-Forest": {   # <-- ADD HERE (new line)
         "name": "Viridian Forest",
-        "image_uncleared": ASSETS_ROUTES / "viridian-forest-1.png",
-        "image_cleared": ASSETS_ROUTES / "viridian-forest-1.png",
-        "next": "viridian-forest-2",
-        "next_always": True,
-        "grass_paths": {},
-        "trainers": {},
-    },
-    "viridian-forest-2": {
-        "name": "Viridian Forest",
-        "image_uncleared": ASSETS_ROUTES / "viridian-forest-2.png",
-        "image_cleared": ASSETS_ROUTES / "viridian-forest-2.png",
-        "next": "viridian-forest-3-pokeball",
-        "next_blocker": "trainer-vf2-2",
-        "next_show_when_path_blockers_only": True,
-        "next_trainer": "trainer-vf2-2",
-        "grass_paths": {
-            1: {
-                "encounters": [
-                    {"species": "weedle", "weight": 40, "min_level": 3, "max_level": 5},
-                    {"species": "caterpie", "weight": 40, "min_level": 3, "max_level": 5},
-                    {"species": "pidgey", "weight": 20, "min_level": 3, "max_level": 5},
-                ],
-                "blocker": "trainer-vf2-1",
-            },
-        },
-        "trainers": {
-            "trainer-vf2-1": {
-                "name": "Bug Catcher Rick",
-                "blocker_quote": "You can't pass without battling me first!",
-                "team": [
-                    {"species": "weedle", "level": 6, "moves": ["Poison Sting", "String Shot"], "stats": {"hp": 20, "atk": 9, "defn": 7, "spa": 7, "spd": 7, "spe": 7}},
-                    {"species": "caterpie", "level": 6, "moves": ["Tackle", "String Shot"], "stats": {"hp": 21, "atk": 8, "defn": 8, "spa": 7, "spd": 7, "spe": 7}},
-                ],
-            },
-            "trainer-vf2-2": {
-                "name": "Bug Catcher Doug",
-                "rematch": False,
-                "blocker_quote": "Beat me if you want to go further!",
-                "team": [
-                    {"species": "weedle", "level": 7, "moves": ["Poison Sting", "String Shot"], "stats": {"hp": 22, "atk": 9, "defn": 9, "spa": 7, "spd": 7, "spe": 7}},
-                    {"species": "kakuna", "level": 7, "moves": ["Harden"], "stats": {"hp": 23, "atk": 8, "defn": 12, "spa": 7, "spd": 8, "spe": 8}},
-                    {"species": "weedle", "level": 7, "moves": ["Poison Sting", "String Shot"], "stats": {"hp": 22, "atk": 9, "defn": 9, "spa": 7, "spd": 7, "spe": 6}},
-                ],
-            },
-        },
-    },
-    "viridian-forest-3-pokeball": {
-        "name": "Viridian Forest",
-        "image_uncleared": ASSETS_ROUTES / "viridian-forest-3-pokeball.png",
-        "image_cleared": ASSETS_ROUTES / "viridian-forest-3-pokeball.png",
-        "next": "viridian-forest-3",
-        "next_always": True,
-        "collectible_button": {"label": "Pokéball", "state_key": "viridian_forest_pokeball_collected", "next_area": "viridian-forest-3", "item": "pokeball", "qty": 1},
-        "grass_paths": {},
-        "trainers": {},
-    },
-    "viridian-forest-3": {
-        "name": "Viridian Forest",
-        "image_uncleared": ASSETS_ROUTES / "viridian-forest-3.png",
-        "image_cleared": ASSETS_ROUTES / "viridian-forest-3.png",
-        "next": "viridian-forest-4",
-        "grass_paths": {
-            1: {
-                "encounters": [
-                    {"species": "weedle", "weight": 40, "min_level": 3, "max_level": 5},
-                    {"species": "caterpie", "weight": 40, "min_level": 3, "max_level": 5},
-                    {"species": "pidgey", "weight": 20, "min_level": 3, "max_level": 5},
-                ],
-                "blocker": None,
-            },
-            2: {
-                "encounters": [
-                    {"species": "weedle", "weight": 40, "min_level": 3, "max_level": 5},
-                    {"species": "caterpie", "weight": 40, "min_level": 3, "max_level": 5},
-                    {"species": "pidgey", "weight": 20, "min_level": 3, "max_level": 5},
-                ],
-                "blocker": "trainer-vf3-1",
-            },
-            3: {
-                "encounters": [
-                    {"species": "weedle", "weight": 40, "min_level": 3, "max_level": 5},
-                    {"species": "caterpie", "weight": 40, "min_level": 3, "max_level": 5},
-                    {"species": "pidgey", "weight": 20, "min_level": 3, "max_level": 5},
-                ],
-                "blocker": "trainer-vf3-2",
-            },
-        },
-        "trainers": {
-            "trainer-vf3-1": {
-                "name": "Bug Catcher Anthony",
-                "rematch": False,
-                "blocker_quote": "Between path 1 and 2 — you'll have to battle me!",
-                "team": [
-                    {"species": "caterpie", "level": 7, "moves": ["Tackle", "String Shot"], "stats": {"hp": 23, "atk": 8, "defn": 9, "spa": 7, "spd": 7, "spe": 7}},
-                    {"species": "caterpie", "level": 8, "moves": ["Tackle", "String Shot"], "stats": {"hp": 25, "atk": 9, "defn": 10, "spa": 8, "spd": 7, "spe": 7}},
-                ],
-            },
-            "trainer-vf3-2": {
-                "name": "Bug Catcher Charlie",
-                "rematch": False,
-                "blocker_quote": "Between path 2 and 3 — no passing!",
-                "team": [
-                    {"species": "metapod", "level": 7, "moves": ["Harden"], "stats": {"hp": 24, "atk": 6, "defn": 12, "spa": 8, "spd": 8, "spe": 8}},
-                    {"species": "caterpie", "level": 7, "moves": ["Tackle", "String Shot"], "stats": {"hp": 23, "atk": 9, "defn": 9, "spa": 6, "spd": 7, "spe": 7}},
-                    {"species": "metapod", "level": 7, "moves": ["Harden"], "stats": {"hp": 24, "atk": 7, "defn": 13, "spa": 8, "spd": 8, "spe": 8}},
-                ],
-            },
-        },
-    },
-    "viridian-forest-4": {
-        "name": "Viridian Forest",
-        "image_uncleared": ASSETS_ROUTES / "viridian-forest-4.png",
-        "image_cleared": ASSETS_ROUTES / "viridian-forest-4.png",
+        "layout": "maze",
+        "entry_node": "2-1",
+        "exit_node": "3-1",
         "next": "route-2-2",
-        "next_blocker": "trainer-vf4-2",
-        "next_show_when_path_blockers_only": True,
-        "next_trainer": "trainer-vf4-2",
-        "grass_paths": {
-            1: {
-                "encounters": [
-                    {"species": "weedle", "weight": 40, "min_level": 3, "max_level": 5},
-                    {"species": "caterpie", "weight": 40, "min_level": 3, "max_level": 5},
-                    {"species": "pidgey", "weight": 20, "min_level": 3, "max_level": 5},
+        "prev": "route-2",
+        "nodes": {
+            "2-1": {
+                "image": ASSETS_ROUTES / "viridian-forest-2-1.png",
+                "exits": [
+                    {"id": "north", "label": "⬆️ North", "target": "2-2"},
+                    {"id": "east", "label": "➡️ East", "target": "3-1"},
+                    {"id": "west", "label": "⬅️ West", "target": "1-1"},
                 ],
-                "blocker": None,
+                "encounters": [
+                    {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "kakuna", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "metapod", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "pikachu", "weight": 10, "min_level": 3, "max_level": 5},
+                ],
             },
-            2: {
-                "encounters": [
-                    {"species": "weedle", "weight": 40, "min_level": 3, "max_level": 5},
-                    {"species": "caterpie", "weight": 40, "min_level": 3, "max_level": 5},
-                    {"species": "pidgey", "weight": 20, "min_level": 3, "max_level": 5},
+            "1-1": {
+                "image": ASSETS_ROUTES / "viridian-forest-1-1.png",
+                "exits": [
+                    {"id": "south", "label": "➡️ East", "target": "2-1"},
+                    {"id": "north", "label": "⬆️ North", "target": "2-2"},
                 ],
-                "blocker": "trainer-vf4-1",
+                "encounters": [
+                    {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "kakuna", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "metapod", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "pikachu", "weight": 10, "min_level": 3, "max_level": 5},
+                ],
+            },
+            "1-2": {
+                "image": ASSETS_ROUTES / "viridian-forest-1-2.png",
+                "exits": [
+                    {"id": "south", "label": "➡️ East", "target": "2-2"},
+                    {"id": "north", "label": "⬇️ South", "target": "2-2"},
+                ],
+                "encounters": [
+                    {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "kakuna", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "metapod", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "ralts", "weight": 10, "min_level": 2, "max_level": 4},
+                ],
+            },
+            "2-2": {
+                "image": ASSETS_ROUTES / "viridian-forest-2-2.png",
+                "exits": [
+                    {"id": "south", "label": "⬅️ West", "target": "1-2"},
+                    {"id": "north", "label": "⬇️ South", "target": "2-1"},
+                ],
+                "encounters": [
+                    {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "kakuna", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "metapod", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "pikachu", "weight": 10, "min_level": 2, "max_level": 4},
+                ],
             },
         },
-        "trainers": {
-            "trainer-vf4-1": {
-                "name": "Bug Catcher",
-                "rematch": False,
-                "blocker_quote": "Two trainers guard the exit — I'm the first!",
-                "team": [
-                    {"species": "weedle", "level": 7, "moves": ["Poison Sting", "String Shot"], "stats": {"hp": 22, "atk": 9, "defn": 9, "spa": 7, "spd": 7, "spe": 7}},
-                    {"species": "caterpie", "level": 7, "moves": ["Tackle", "String Shot"], "stats": {"hp": 23, "atk": 8, "defn": 9, "spa": 7, "spd": 7, "spe": 7}},
-                ],
-            },
-            "trainer-vf4-2": {
-                "name": "Bug Catcher Sammy",
-                "rematch": False,
-                "blocker_quote": "I'm the second — beat me to reach Route 2!",
-                "team": [
-                    {"species": "weedle", "level": 9, "moves": ["Poison Sting", "String Shot"], "stats": {"hp": 26, "atk": 11, "defn": 10, "spa": 8, "spd": 8, "spe": 8}},
-                ],
-            },
-        },
+        "trainers": {},
     },
     "route-2-2": {
         "name": "Route 2",
@@ -13813,38 +13724,63 @@ class AdventureRouteView(discord.ui.View):
             self.add_item(collect_btn)
             # Next is hidden until collected; Back still available if history exists (added below)
         else:
-            # Routes with panels (route-1, route-2) use Forward/Back navigation instead of path selection
-            panels = route.get("panels") or []
-            if isinstance(panels, list) and len(panels) >= 3:
-                back_btn = discord.ui.Button(label="⬇️", style=discord.ButtonStyle.secondary, custom_id=f"adv:panel:{self.area_id}:back")
-                back_btn.callback = self._on_back_panel
-                self.add_item(back_btn)
-
-                fwd_btn = discord.ui.Button(label="⬆️", style=discord.ButtonStyle.primary, custom_id=f"adv:panel:{self.area_id}:fwd")
-                fwd_btn.callback = self._on_forward_panel
-                self.add_item(fwd_btn)
-
-                force_btn = discord.ui.Button(label="⚔️ Battle", style=discord.ButtonStyle.danger, custom_id=f"adv:panel:{self.area_id}:force")
-                force_btn.callback = self._on_force_panel
+            # Maze routes use directional exit buttons per node
+            if route.get("layout") == "maze":
+                nodes = route.get("nodes") or {}
+                node_id = _maze_get_node(self.state, self.area_id, route)
+                entry_node = route.get("entry_node") or "start"
+                prev_area = route.get("prev")
+                if node_id == entry_node and prev_area and (self.state.get("area_history") or route.get("back_always")):
+                    back_btn = discord.ui.Button(label="⬅️ Back", style=discord.ButtonStyle.secondary, custom_id=f"adv:maze:{self.area_id}:back")
+                    back_btn.callback = self._on_maze_back
+                    self.add_item(back_btn)
+                node_cfg = nodes.get(node_id)
+                if node_cfg:
+                    for exit_cfg in (node_cfg.get("exits") or []):
+                        if isinstance(exit_cfg, dict) and exit_cfg.get("id") and exit_cfg.get("target"):
+                            btn = discord.ui.Button(
+                                label=exit_cfg.get("label", exit_cfg["id"]),
+                                style=discord.ButtonStyle.secondary,
+                                custom_id=f"adv:maze:{self.area_id}:{exit_cfg['id']}",
+                            )
+                            btn.callback = self._on_maze_exit
+                            self.add_item(btn)
+                force_btn = discord.ui.Button(label="⚔️ Battle", style=discord.ButtonStyle.danger, custom_id=f"adv:maze:{self.area_id}:force")
+                force_btn.callback = self._on_maze_force
                 self.add_item(force_btn)
-                # Panel-specific sign/readable (e.g. Route 2 sign on panel 1)
-                panel_signs = route.get("panel_signs") or {}
-                rp = (self.state.get("route_panels") or {}).get(self.area_id) or {}
-                panel = max(1, min(int(rp.get("panel", 1)), 3))
-                sign_cfg = panel_signs.get(panel)
-                if sign_cfg and isinstance(sign_cfg, dict):
-                    sign_btn = discord.ui.Button(
-                        label=sign_cfg.get("label", "Read Sign"),
-                        style=discord.ButtonStyle.secondary,
-                        custom_id=f"adv:sign:{self.area_id}:{panel}",
-                    )
-                    sign_btn.callback = self._on_read_sign
-                    self.add_item(sign_btn)
+            # Routes with panels (route-1, route-2) use Forward/Back navigation instead of path selection
             else:
-                for path_id in sorted((route.get("grass_paths") or {}).keys()):
-                    btn = discord.ui.Button(label=str(path_id), style=discord.ButtonStyle.secondary, custom_id=f"adv:path:{path_id}")
-                    btn.callback = self._on_path
-                    self.add_item(btn)
+                panels = route.get("panels") or []
+                if isinstance(panels, list) and len(panels) >= 3:
+                    back_btn = discord.ui.Button(label="⬇️", style=discord.ButtonStyle.secondary, custom_id=f"adv:panel:{self.area_id}:back")
+                    back_btn.callback = self._on_back_panel
+                    self.add_item(back_btn)
+
+                    fwd_btn = discord.ui.Button(label="⬆️", style=discord.ButtonStyle.primary, custom_id=f"adv:panel:{self.area_id}:fwd")
+                    fwd_btn.callback = self._on_forward_panel
+                    self.add_item(fwd_btn)
+
+                    force_btn = discord.ui.Button(label="⚔️ Battle", style=discord.ButtonStyle.danger, custom_id=f"adv:panel:{self.area_id}:force")
+                    force_btn.callback = self._on_force_panel
+                    self.add_item(force_btn)
+                    # Panel-specific sign/readable (e.g. Route 2 sign on panel 1)
+                    panel_signs = route.get("panel_signs") or {}
+                    rp = (self.state.get("route_panels") or {}).get(self.area_id) or {}
+                    panel = max(1, min(int(rp.get("panel", 1)), 3))
+                    sign_cfg = panel_signs.get(panel)
+                    if sign_cfg and isinstance(sign_cfg, dict):
+                        sign_btn = discord.ui.Button(
+                            label=sign_cfg.get("label", "Read Sign"),
+                            style=discord.ButtonStyle.secondary,
+                            custom_id=f"adv:sign:{self.area_id}:{panel}",
+                        )
+                        sign_btn.callback = self._on_read_sign
+                        self.add_item(sign_btn)
+                else:
+                    for path_id in sorted((route.get("grass_paths") or {}).keys()):
+                        btn = discord.ui.Button(label=str(path_id), style=discord.ButtonStyle.secondary, custom_id=f"adv:path:{path_id}")
+                        btn.callback = self._on_path
+                        self.add_item(btn)
 
         next_id = route.get("next")
         cleared = self.area_id in self.state.get("cleared_routes", [])
@@ -13854,9 +13790,10 @@ class AdventureRouteView(discord.ui.View):
         # When next_show_when_path_blockers_only: show Next as soon as path blockers (not next_blocker) are defeated
         path_blockers_cleared = route.get("next_show_when_path_blockers_only") and _route_path_blockers_cleared(self.state, self.area_id)
         # Don't show Next if there's an uncollected collectible (user must collect first)
-        # Panel routes (route-1, route-2) use ⬆️ to advance to next area, so no Next button
+        # Panel/maze routes use arrows/exits to navigate, so no Next button
         has_panels = isinstance(route.get("panels"), list) and len(route.get("panels", [])) >= 3
-        show_next = next_id and not has_panels and (cleared or next_always or path_blockers_cleared) and next_blocker_defeated and (not collectible or collected)
+        has_maze = route.get("layout") == "maze"
+        show_next = next_id and not has_panels and not has_maze and (cleared or next_always or path_blockers_cleared) and next_blocker_defeated and (not collectible or collected)
         if show_next:
             next_label = "Next"
             if _is_city(next_id):
@@ -13877,9 +13814,8 @@ class AdventureRouteView(discord.ui.View):
                 btn.callback = self._on_rematch
                 self.add_item(btn)
         # Back button if history exists or route always shows back (e.g. route-22)
-        # Panel routes (route-1, route-2) use ⬇️ for back, not this button
-        has_panels = isinstance(route.get("panels"), list) and len(route.get("panels", [])) >= 3
-        if (self.state.get("area_history") or route.get("back_always")) and not has_panels:
+        # Panel/maze routes use their own navigation, not this button
+        if (self.state.get("area_history") or route.get("back_always")) and not has_panels and not has_maze:
             back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, custom_id="adv:back")
             back_btn.callback = self._on_back
             self.add_item(back_btn)
@@ -13933,7 +13869,7 @@ class AdventureRouteView(discord.ui.View):
                     if not cleared and not _route_is_cleared(state, current_area) and not path_blockers_ok:
                         await itx.followup.send("Clear this route first before moving on.", ephemeral=False)
                         return
-            # If route has next_trainer (e.g. viridian-forest-2): second trainer is only triggerable by clicking Next, not by blocking a path
+            # If route has next_trainer: second trainer is only triggerable by clicking Next, not by blocking a path
             next_trainer_id = route_def.get("next_trainer")
             if next_trainer_id and next_trainer_id not in state.get("defeated_trainers", {}):
                 trainer = (route_def.get("trainers") or {}).get(next_trainer_id)
@@ -14094,6 +14030,70 @@ async def _route_panel_try_wild_encounter(itx: discord.Interaction, state: dict,
             pass
 
 
+async def _route_maze_try_wild_encounter(itx: discord.Interaction, state: dict, area_id: str, target_node_id: Optional[str], *, force: bool = False) -> None:
+    """Roll (or force) a wild encounter on a maze route. Uses target node if moving, else current node."""
+    route = ADVENTURE_ROUTES.get(area_id, {})
+    if route.get("layout") != "maze":
+        return
+    nodes = route.get("nodes") or {}
+    node_id = target_node_id or _maze_get_node(state, area_id, route)
+    node_cfg = nodes.get(node_id, {})
+    encounters = node_cfg.get("encounters") or []
+    if not encounters:
+        return
+    try:
+        chance = float(os.environ.get("ROUTE_MOVE_ENCOUNTER_CHANCE", "0.35"))
+    except Exception:
+        chance = 0.35
+    if not force and random.random() > chance:
+        return
+    enc_specs = []
+    weights = []
+    version = "red"
+    for e in encounters:
+        if isinstance(e, str):
+            enc_specs.append({"species": e, "min_level": 3, "max_level": 3})
+            weights.append(1)
+        elif isinstance(e, dict):
+            ver = e.get("version")
+            if ver and ver.lower() not in str(version).lower():
+                continue
+            enc_specs.append({
+                "species": e.get("species"),
+                "min_level": int(e.get("min_level", 3)),
+                "max_level": int(e.get("max_level", e.get("min_level", 3))),
+            })
+            weights.append(int(e.get("weight", 1)))
+    if not enc_specs:
+        return
+    choice = random.choices(enc_specs, weights=weights, k=1)[0]
+    species = choice["species"]
+    state.setdefault("repeat_seen", [])
+    if species and species.lower() not in [s.lower() for s in state["repeat_seen"]]:
+        state["repeat_seen"].append(species)
+        state["dex_seen"] = state.get("dex_seen", 0) + 1
+    try:
+        asyncio.create_task(pokedex_mark_seen(str(itx.user.id), species, caught=False))
+    except Exception:
+        pass
+    lvl = random.randint(choice["min_level"], choice["max_level"])
+    wild_mon = await _build_mon_from_species(species, level=lvl)
+    if not wild_mon:
+        return
+    route_display = route.get("name", area_id)
+    won = await _start_pve_battle(itx, [wild_mon], f"Wild {species.title()}", area_id=area_id, route_display_name=route_display)
+    if won is _PVE_ALREADY_IN_BATTLE:
+        return
+    if won is None:
+        return await itx.followup.send("Couldn't start the encounter battle. Please try again.", ephemeral=False)
+    if won:
+        _add_discovered(state, area_id, species)
+        try:
+            asyncio.create_task(pokedex_mark_seen(str(itx.user.id), species, caught=True))
+        except Exception:
+            pass
+
+
 def _panel_get_panel(state: dict, area_id: str) -> int:
     """Get current panel (1–3) for a panel route."""
     rp = (state.get("route_panels") or {}).get(area_id)
@@ -14121,6 +14121,39 @@ def _get_panel_routes() -> list[str]:
             if isinstance(r.get("panels"), list) and len(r.get("panels", [])) >= 3]
 
 
+def _get_maze_routes() -> list[str]:
+    """Return route ids that use maze layout."""
+    return [rid for rid, r in ADVENTURE_ROUTES.items()
+            if r.get("layout") == "maze" and isinstance(r.get("nodes"), dict)]
+
+
+def _maze_get_node(state: dict, area_id: str, route: dict) -> str:
+    """Get current maze node id; init to entry_node if not set."""
+    rp = (state.get("route_panels") or {}).get(area_id)
+    if isinstance(rp, dict) and rp.get("node"):
+        node_id = str(rp["node"])
+        if node_id in (route.get("nodes") or {}):
+            return node_id
+    entry = route.get("entry_node") or "start"
+    state.setdefault("route_panels", {})[area_id] = {"node": entry}
+    return entry
+
+
+def _maze_set_node(state: dict, area_id: str, node_id: str) -> None:
+    """Set current maze node."""
+    state.setdefault("route_panels", {})[area_id] = {"node": str(node_id)}
+
+
+def _get_maze_exit_ids(route: dict) -> set:
+    """Return all unique exit ids used in a maze route's nodes."""
+    out = set()
+    for node_cfg in (route.get("nodes") or {}).values():
+        for ex in (node_cfg.get("exits") or []):
+            if isinstance(ex, dict) and ex.get("id"):
+                out.add(ex["id"])
+    return out
+
+
 class AdventureRoute1PersistentView(discord.ui.View):
     """Persistent view so panel route (route-1, route-2, etc.) arrow buttons work after bot restart or view timeout."""
     def __init__(self):
@@ -14132,11 +14165,88 @@ class AdventureRoute1PersistentView(discord.ui.View):
                 b = discord.ui.Button(label=label, style=style, custom_id=cid)
                 b.callback = self._handle_panel_move
                 self.add_item(b)
+        # Maze routes: exit buttons, force, back
+        for area_id in _get_maze_routes():
+            route = ADVENTURE_ROUTES.get(area_id, {})
+            exit_ids = _get_maze_exit_ids(route)
+            for eid in sorted(exit_ids):
+                cid = f"adv:maze:{area_id}:{eid}"
+                b = discord.ui.Button(label=eid.title(), style=discord.ButtonStyle.secondary, custom_id=cid)
+                b.callback = self._handle_maze
+                self.add_item(b)
+            bf = discord.ui.Button(label="⚔️ Battle", style=discord.ButtonStyle.danger, custom_id=f"adv:maze:{area_id}:force")
+            bf.callback = self._handle_maze
+            self.add_item(bf)
+            bb = discord.ui.Button(label="⬅️ Back", style=discord.ButtonStyle.secondary, custom_id=f"adv:maze:{area_id}:back")
+            bb.callback = self._handle_maze
+            self.add_item(bb)
         # Legacy adv:r1:back/fwd for old Route 1 messages
         for cid, label, style in [("adv:r1:back", "⬇️", discord.ButtonStyle.secondary), ("adv:r1:fwd", "⬆️", discord.ButtonStyle.primary)]:
             b = discord.ui.Button(label=label, style=style, custom_id=cid)
             b.callback = self._handle_panel_move
             self.add_item(b)
+
+    async def _handle_maze(self, itx: discord.Interaction, button: discord.ui.Button):
+        cid = (button.custom_id or (itx.data or {}).get("custom_id") or "")
+        if not cid.startswith("adv:maze:") or cid.count(":") < 3:
+            await itx.response.defer(ephemeral=False, thinking=False)
+            await _send_adventure_panel(itx, await _get_adventure_state(str(itx.user.id)), edit_original=False)
+            return
+        parts = cid.split(":", 3)
+        area_id, action = parts[2], parts[3]
+        await itx.response.defer(ephemeral=False, thinking=False)
+        uid = str(itx.user.id)
+        state = await _get_adventure_state(uid)
+        if state.get("area_id") != area_id:
+            await _send_adventure_panel(itx, state, edit_original=False)
+            return
+        route = ADVENTURE_ROUTES.get(area_id, {})
+        if route.get("layout") != "maze":
+            await _send_adventure_panel(itx, state, edit_original=False)
+            return
+        if action == "force":
+            await _route_maze_try_wild_encounter(itx, state, area_id, None, force=True)
+            await _save_adventure_state(uid, state)
+            await _send_adventure_panel(itx, state, edit_original=False)
+            return
+        if action == "back":
+            prev_area = route.get("prev")
+            if prev_area:
+                _adv_history_push(state, area_id)
+                state["area_id"] = prev_area
+                state.get("route_panels", {}).pop(area_id, None)
+            await _save_adventure_state(uid, state)
+            await _send_adventure_panel(itx, state, edit_original=False)
+            return
+        # Exit: north, south, east, west, etc.
+        nodes = route.get("nodes") or {}
+        node_id = _maze_get_node(state, area_id, route)
+        node_cfg = nodes.get(node_id, {})
+        exits_list = node_cfg.get("exits") or []
+        target = None
+        for ex in exits_list:
+            if isinstance(ex, dict) and ex.get("id") == action:
+                target = ex.get("target")
+                break
+        if not target:
+            await _send_adventure_panel(itx, state, edit_original=False)
+            return
+        exit_node = route.get("exit_node")
+        moved_within_route = True
+        if target == exit_node:
+            next_area = route.get("next")
+            if next_area:
+                _adv_history_push(state, area_id)
+                state["area_id"] = next_area
+            state.get("route_panels", {}).pop(area_id, None)
+            moved_within_route = False
+        else:
+            _maze_set_node(state, area_id, target)
+        await _save_adventure_state(uid, state)
+        if moved_within_route:
+            await _route_maze_try_wild_encounter(itx, state, area_id, target, force=False)
+            await _save_adventure_state(uid, state)
+        await _send_adventure_panel(itx, state, edit_original=False)
 
     async def _handle_panel_move(self, itx: discord.Interaction, button: discord.ui.Button):
         cid = (button.custom_id or (itx.data or {}).get("custom_id") or "")
@@ -14170,7 +14280,7 @@ class AdventureRoute1PersistentView(discord.ui.View):
             else:
                 next_area = route.get("next")
                 if next_area:
-                    _adv_history_push(state, "route-1")
+                    _adv_history_push(state, area_id)
                     state["area_id"] = next_area
                 state.get("route_panels", {}).pop(area_id, None)
         else:
@@ -14183,7 +14293,7 @@ class AdventureRoute1PersistentView(discord.ui.View):
         await _save_adventure_state(uid, state)
         print(f"[Adventure] Persistent view: moved_within_route={moved_within_route}, sending panel with roll_route1_item={moved_within_route}")
         if moved_within_route:
-            await _route_panel_try_wild_encounter(itx, state, "route-1")
+            await _route_panel_try_wild_encounter(itx, state, area_id)
             await _save_adventure_state(uid, state)
         await _send_adventure_panel(itx, state, edit_original=False, roll_route1_item=moved_within_route)
 
@@ -14262,6 +14372,73 @@ class _AdventureRouteViewRoute1Methods:
         state = await _get_adventure_state(str(itx.user.id))
         # Force encounter
         await self._r1_try_wild_encounter(itx, state, force=True)
+        await _save_adventure_state(str(itx.user.id), state)
+        await _send_adventure_panel(itx, state, edit_original=False)
+
+    async def _on_maze_back(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not itx.response.is_done():
+            await itx.response.defer(ephemeral=False, thinking=False)
+        state = await _get_adventure_state(str(itx.user.id))
+        route = ADVENTURE_ROUTES.get(self.area_id, {})
+        prev_area = route.get("prev")
+        if prev_area:
+            _adv_history_push(state, self.area_id)
+            state["area_id"] = prev_area
+            state.get("route_panels", {}).pop(self.area_id, None)
+        await _save_adventure_state(str(itx.user.id), state)
+        await _send_adventure_panel(itx, state, edit_original=False)
+
+    async def _on_maze_exit(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not itx.response.is_done():
+            await itx.response.defer(ephemeral=False, thinking=False)
+        cid = (itx.data or {}).get("custom_id", "")
+        parts = cid.split(":") if cid else []
+        if len(parts) < 4:
+            return await itx.followup.send("Invalid maze exit.", ephemeral=True)
+        area_id, exit_id = parts[2], parts[3]
+        state = await _get_adventure_state(str(itx.user.id))
+        route = ADVENTURE_ROUTES.get(area_id, {})
+        if route.get("layout") != "maze":
+            return await itx.followup.send("Not a maze route.", ephemeral=True)
+        nodes = route.get("nodes") or {}
+        node_id = _maze_get_node(state, area_id, route)
+        node_cfg = nodes.get(node_id, {})
+        exits_list = node_cfg.get("exits") or []
+        target = None
+        for ex in exits_list:
+            if isinstance(ex, dict) and ex.get("id") == exit_id:
+                target = ex.get("target")
+                break
+        if not target:
+            return await itx.followup.send("That exit isn't available from here.", ephemeral=True)
+        exit_node = route.get("exit_node")
+        moved_within_route = True
+        if target == exit_node:
+            next_area = route.get("next")
+            if next_area:
+                _adv_history_push(state, area_id)
+                state["area_id"] = next_area
+            state.get("route_panels", {}).pop(area_id, None)
+            moved_within_route = False
+        else:
+            _maze_set_node(state, area_id, target)
+        await _save_adventure_state(str(itx.user.id), state)
+        if moved_within_route:
+            await _route_maze_try_wild_encounter(itx, state, area_id, target, force=False)
+            await _save_adventure_state(str(itx.user.id), state)
+        await _send_adventure_panel(itx, state, edit_original=False)
+
+    async def _on_maze_force(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not itx.response.is_done():
+            await itx.response.defer(ephemeral=False, thinking=False)
+        state = await _get_adventure_state(str(itx.user.id))
+        await _route_maze_try_wild_encounter(itx, state, self.area_id, None, force=True)
         await _save_adventure_state(str(itx.user.id), state)
         await _send_adventure_panel(itx, state, edit_original=False)
 
@@ -14708,16 +14885,21 @@ async def _send_adventure_panel(
         # Route panel navigation state (used for Route 1 3-panel navigation)
         route_panels = state.setdefault("route_panels", {})
         rp = route_panels.get(area_id)
-        if not isinstance(rp, dict):
+        is_maze = route.get("layout") == "maze"
+        if is_maze:
+            _maze_get_node(state, area_id, route)  # ensure node is initialized
+            rp = route_panels.get(area_id) or {}
+        elif not isinstance(rp, dict):
             rp = {"panel": 1, "pos": "start"}
             route_panels[area_id] = rp
-        try:
-            rp["panel"] = max(1, min(int(rp.get("panel", 1)), 3))
-        except Exception:
-            rp["panel"] = 1
-        rp["pos"] = rp.get("pos", "start")
-        if rp["pos"] not in ("start", "end"):
-            rp["pos"] = "start"
+        if not is_maze:
+            try:
+                rp["panel"] = max(1, min(int(rp.get("panel", 1)), 3))
+            except Exception:
+                rp["panel"] = 1
+            rp["pos"] = rp.get("pos", "start")
+            if rp["pos"] not in ("start", "end"):
+                rp["pos"] = "start"
         # Route 22: four-stage images (rival not arrived → rival arrived → uncleared → cleared)
         if area_id == "route-22":
             rival_id = route.get("rival_battle")
@@ -14729,32 +14911,42 @@ async def _send_adventure_panel(
                 img = route.get("image_cleared")
         else:
             img = route.get("image_cleared") if cleared else route.get("image_uncleared")
-        # Panel routes (route-1, route-2) use 3-panel navigation with Forward/Back
-        panels = route.get("panels") or []
-        has_panels = isinstance(panels, list) and len(panels) >= 3
-        if has_panels:
-            panel = _panel_get_panel(state, area_id)
-            if roll_route1_item and area_id in _get_panel_routes():
-                route_move_item_message = await _roll_and_give_route_move_item_async(uid)
-            if isinstance(panels, list) and len(panels) >= 3:
-                try:
-                    img_panel = panels[max(0, min(panel - 1, len(panels) - 1))]
-                except Exception:
-                    img_panel = img
-            else:
-                img_panel = img
-            num_panels = len(panels) if isinstance(panels, list) else 3
-            desc = f"Use ⬆️/⬇️ to walk through the route. (Panel {panel}/{num_panels})\nMoving may trigger an encounter. Use ⚔️ Battle to force one."
-            emb, files = _embed_with_image(route.get("name", area_id), desc, img_panel)
-            if route_move_item_message:
-                emb.add_field(name="", value=route_move_item_message, inline=False)
-        else:
-
-            desc = "Choose a grass path to encounter Pokémon."
-
+        # Maze routes use per-node images and exit buttons
+        if is_maze:
+            nodes = route.get("nodes") or {}
+            node_id = _maze_get_node(state, area_id, route)
+            node_cfg = nodes.get(node_id, {})
+            maze_img = node_cfg.get("image") if isinstance(node_cfg, dict) else None
+            img = maze_img if maze_img and Path(str(maze_img)).exists() else img
+            desc = "Use the arrows to explore the forest. Moving may trigger an encounter. Use ⚔️ Battle to force one."
             emb, files = _embed_with_image(route.get("name", area_id), desc, img)
             if route_move_item_message:
                 emb.add_field(name="", value=route_move_item_message, inline=False)
+        # Panel routes (route-1, route-2) use 3-panel navigation with Forward/Back
+        else:
+            panels = route.get("panels") or []
+            has_panels = isinstance(panels, list) and len(panels) >= 3
+            if has_panels:
+                panel = _panel_get_panel(state, area_id)
+                if roll_route1_item and area_id in _get_panel_routes():
+                    route_move_item_message = await _roll_and_give_route_move_item_async(uid)
+                if isinstance(panels, list) and len(panels) >= 3:
+                    try:
+                        img_panel = panels[max(0, min(panel - 1, len(panels) - 1))]
+                    except Exception:
+                        img_panel = img
+                else:
+                    img_panel = img
+                num_panels = len(panels) if isinstance(panels, list) else 3
+                desc = f"Use ⬆️/⬇️ to walk through the route. (Panel {panel}/{num_panels})\nMoving may trigger an encounter. Use ⚔️ Battle to force one."
+                emb, files = _embed_with_image(route.get("name", area_id), desc, img_panel)
+                if route_move_item_message:
+                    emb.add_field(name="", value=route_move_item_message, inline=False)
+            else:
+                desc = "Choose a grass path to encounter Pokémon."
+                emb, files = _embed_with_image(route.get("name", area_id), desc, img)
+                if route_move_item_message:
+                    emb.add_field(name="", value=route_move_item_message, inline=False)
         view = AdventureRouteView(itx.user.id, area_id, state)
 
     if is_component:
