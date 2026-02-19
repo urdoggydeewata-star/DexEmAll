@@ -25010,6 +25010,104 @@ async def _periodic_pool_stats_logging():
     except ImportError:
         print("[DB Pool Stats] get_pool_stats not available")
 
+async def _periodic_auto_pull_updates():
+    """
+    Periodically fetch/pull updates from the current git branch.
+    Intended for hosts where you want continuous auto-update checks while running.
+    """
+    import asyncio
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent
+    if not (repo_root / ".git").exists():
+        print("[AutoPull] No .git directory found; auto-pull disabled.")
+        return
+
+    def _env_enabled(name: str, default: str = "1") -> bool:
+        return str(os.getenv(name, default)).strip().lower() not in {"0", "false", "no", "off"}
+
+    try:
+        interval = int(float(os.getenv("AUTO_PULL_INTERVAL_SEC", "120")))
+    except Exception:
+        interval = 120
+    interval = max(30, interval)
+    restart_after_pull = _env_enabled("AUTO_PULL_RESTART", "1")
+
+    async def _run_git(args: list[str], *, timeout: float = 30.0) -> tuple[int, str, str]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                *args,
+                cwd=str(repo_root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as e:
+            return (1, "", str(e))
+        try:
+            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                await proc.communicate()
+            except Exception:
+                pass
+            return (124, "", f"timeout after {timeout:.1f}s")
+        out = (out_b.decode("utf-8", errors="ignore") if out_b else "").strip()
+        err = (err_b.decode("utf-8", errors="ignore") if err_b else "").strip()
+        return (int(proc.returncode or 0), out, err)
+
+    rc, branch_name, err = await _run_git(["rev-parse", "--abbrev-ref", "HEAD"], timeout=20.0)
+    if rc != 0 or not branch_name or branch_name == "HEAD":
+        print(f"[AutoPull] Could not determine active branch ({err or 'unknown error'}); disabled.")
+        return
+
+    print(
+        f"[AutoPull] Watching origin/{branch_name} every {interval}s "
+        f"(restart={'on' if restart_after_pull else 'off'})."
+    )
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            # Skip pulls if working tree is dirty to avoid merge conflicts at runtime.
+            rc, dirty, _ = await _run_git(["status", "--porcelain"], timeout=20.0)
+            if rc == 0 and dirty:
+                print("[AutoPull] Working tree dirty; skipping this check.")
+                continue
+
+            rc, _, err = await _run_git(["fetch", "origin", branch_name, "--quiet"], timeout=60.0)
+            if rc != 0:
+                print(f"[AutoPull] Fetch failed: {err or 'unknown error'}")
+                continue
+
+            rc_l, local_sha, _ = await _run_git(["rev-parse", "HEAD"], timeout=20.0)
+            rc_r, remote_sha, err_r = await _run_git(["rev-parse", f"origin/{branch_name}"], timeout=20.0)
+            if rc_l != 0 or rc_r != 0:
+                print(f"[AutoPull] SHA resolve failed: {err_r or 'unknown error'}")
+                continue
+            if local_sha == remote_sha:
+                continue
+
+            rc, out, err = await _run_git(["pull", "--ff-only", "origin", branch_name], timeout=90.0)
+            if rc != 0:
+                print(f"[AutoPull] Pull failed: {err or out or 'unknown error'}")
+                continue
+
+            print(f"[AutoPull] Updated from origin/{branch_name}: {out or 'fast-forward complete'}")
+            if restart_after_pull:
+                print("[AutoPull] Restarting process to apply pulled updates...")
+                try:
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+                os.execv(sys.executable, [sys.executable, *sys.argv])
+        except Exception as e:
+            print(f"[AutoPull] Loop error: {e}")
+
 @bot.event
 async def on_ready():
     # Prevent double-run on reconnects
@@ -25112,6 +25210,17 @@ async def on_ready():
         bot._pool_stats_task_started = True
         bot.loop.create_task(_periodic_pool_stats_logging())
         print("[DB Pool] Periodic pool stats logging started")
+
+    # 7) Start periodic git auto-pull checks (enabled by default).
+    #    Env controls:
+    #      AUTO_PULL_LOOP=0        -> disable
+    #      AUTO_PULL_INTERVAL_SEC  -> check interval (min 30s, default 120s)
+    #      AUTO_PULL_RESTART=0     -> don't restart automatically after pull
+    auto_pull_enabled = str(os.getenv("AUTO_PULL_LOOP", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    if auto_pull_enabled and not hasattr(bot, "_auto_pull_task_started"):
+        bot._auto_pull_task_started = True
+        bot.loop.create_task(_periodic_auto_pull_updates())
+        print("[AutoPull] Periodic auto-pull task started")
 
 @bot.event
 async def on_message(message: discord.Message):
