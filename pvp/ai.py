@@ -43,6 +43,41 @@ def _coerce_int(value: Any, default: int = 0) -> int:
         return int(default)
 
 
+_engine_get_move = get_move
+
+
+def get_move(move_name: str) -> Dict[str, Any]:
+    """Sanitized move lookup for AI scoring (guards None numeric fields)."""
+    try:
+        raw = _engine_get_move(move_name) or {}
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        try:
+            raw = dict(raw)
+        except Exception:
+            raw = {}
+    out: Dict[str, Any] = dict(raw)
+    out["power"] = _coerce_int(out.get("power"), 0)
+    out["priority"] = _coerce_int(out.get("priority"), 0)
+    out["pp"] = max(0, _coerce_int(out.get("pp"), 0))
+    try:
+        acc_raw = out.get("accuracy")
+        if acc_raw in (None, "", "none"):
+            out["accuracy"] = 100.0
+        else:
+            out["accuracy"] = float(acc_raw)
+    except Exception:
+        out["accuracy"] = 100.0
+    cat = str(out.get("category") or out.get("damage_class") or "status").strip().lower()
+    if not cat:
+        cat = "status"
+    out["category"] = cat
+    if not out.get("damage_class"):
+        out["damage_class"] = cat
+    return out
+
+
 def _sanitize_mon_numeric_state(mon: Any) -> Any:
     """
     Defensive normalization for runtime battle mons.

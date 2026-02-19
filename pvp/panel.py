@@ -535,6 +535,38 @@ def _max_pp(move_name: str, generation: Optional[int] = None) -> int:
 def _norm_pp_move_key(move_name: Any) -> str:
     return str(move_name or "").strip().lower().replace(" ", "-").replace("_", "-")
 
+
+def _pp_global_max_for_move(move_name: str, generation: Optional[int] = None) -> int:
+    try:
+        return max(1, int(_max_pp(move_name, generation=generation)))
+    except Exception:
+        try:
+            return max(1, int(_base_pp(move_name, generation=generation)))
+        except Exception:
+            return 20
+
+
+def _pp_parse_list(raw: Any, *, count: int, defaults: List[int], lo: int, hi: int) -> List[int]:
+    vals = raw
+    if isinstance(vals, str):
+        try:
+            vals = json.loads(vals) if vals else []
+        except Exception:
+            vals = []
+    if not isinstance(vals, (list, tuple)):
+        vals = []
+    out: List[int] = []
+    for i in range(int(count)):
+        default_i = int(defaults[i]) if i < len(defaults) else int(defaults[-1] if defaults else lo)
+        v = vals[i] if i < len(vals) else default_i
+        try:
+            n = int(v)
+        except Exception:
+            n = default_i
+        out.append(max(int(lo), min(int(hi), int(n))))
+    return out
+
+
 def _check_dmax_gear_sync(user_id_str: str, battle_gen: int = 8) -> bool:
     """
     Synchronously check if user has Dynamax Band equipped AND it's active for the battle generation.
@@ -8342,7 +8374,16 @@ async def _load_pp_state_for_user(st: BattleState, uid: int) -> None:
             db_id = getattr(mon, "_db_id", None)
             if not db_id:
                 continue
-            cur = await conn.execute("SELECT moves, moves_pp FROM pokemons WHERE id=? LIMIT 1", (int(db_id),))
+            try:
+                cur = await conn.execute(
+                    "SELECT moves, moves_pp, moves_pp_min, moves_pp_max FROM pokemons WHERE id=? LIMIT 1",
+                    (int(db_id),),
+                )
+            except Exception:
+                cur = await conn.execute(
+                    "SELECT moves, moves_pp FROM pokemons WHERE id=? LIMIT 1",
+                    (int(db_id),),
+                )
             row = await cur.fetchone()
             await cur.close()
             if not row:
@@ -8351,34 +8392,28 @@ async def _load_pp_state_for_user(st: BattleState, uid: int) -> None:
                 moves = json.loads(row["moves"]) if row.get("moves") else []
             except Exception:
                 moves = []
-            try:
-                raw_pp = row.get("moves_pp")
-                if isinstance(raw_pp, list):
-                    pps = raw_pp
-                elif raw_pp:
-                    pps = json.loads(raw_pp)
-                else:
-                    pps = None
-            except Exception:
-                pps = None
+            raw_pp = row.get("moves_pp")
+            raw_pp_min = row.get("moves_pp_min")
+            raw_pp_max = row.get("moves_pp_max")
             st._ensure_pp_loaded(uid, mon)
             key = st._get_mon_key(uid, mon)
             if key not in st._pp:
                 st._pp[key] = {}
             store = st._pp[key]
-            if moves and isinstance(pps, list) and len(pps) == len(moves):
-                for mv, left in zip(moves, pps):
-                    try:
-                        base_pp = int(_base_pp(mv, generation=st.gen))
-                    except Exception:
-                        base_pp = 20
-                    try:
-                        left_i = int(left)
-                    except Exception:
-                        left_i = base_pp
-                    left_i = max(0, min(left_i, max(1, int(base_pp))))
-                    store[mv] = left_i
-                    store[_norm_pp_move_key(mv)] = left_i
+            if moves:
+                move_keys = [_norm_pp_move_key(mv) for mv in moves]
+                base_caps = [max(1, int(_base_pp(mv, generation=st.gen))) for mv in move_keys]
+                global_caps = [_pp_global_max_for_move(mv, generation=st.gen) for mv in move_keys]
+                max_caps = _pp_parse_list(raw_pp_max, count=len(move_keys), defaults=base_caps, lo=1, hi=999)
+                min_caps = _pp_parse_list(raw_pp_min, count=len(move_keys), defaults=[0] * len(move_keys), lo=0, hi=999)
+                pps = _pp_parse_list(raw_pp, count=len(move_keys), defaults=max_caps, lo=0, hi=999)
+                for i in range(len(move_keys)):
+                    max_caps[i] = max(base_caps[i], min(max_caps[i], global_caps[i]))
+                    min_caps[i] = max(0, min(min_caps[i], max_caps[i]))
+                    pps[i] = max(min_caps[i], min(pps[i], max_caps[i]))
+                for mv, left_i in zip(moves, pps):
+                    store[mv] = int(left_i)
+                    store[_norm_pp_move_key(mv)] = int(left_i)
 
 
 async def _save_pp_state_for_user(st: BattleState, uid: int) -> None:
@@ -8400,26 +8435,55 @@ async def _save_pp_state_for_user(st: BattleState, uid: int) -> None:
                 except Exception:
                     continue
             move_list = (mon.moves or [])[:4]
+            row_d: Dict[str, Any] = {}
+            try:
+                cur = await conn.execute(
+                    "SELECT moves_pp_min, moves_pp_max FROM pokemons WHERE id=? LIMIT 1",
+                    (int(db_id),),
+                )
+                bounds_row = await cur.fetchone()
+                await cur.close()
+                if bounds_row:
+                    row_d = dict(bounds_row) if hasattr(bounds_row, "keys") else {}
+            except Exception:
+                row_d = {}
+            move_keys = [_norm_pp_move_key(mv) for mv in move_list]
+            base_caps = [max(1, int(_base_pp(mv, generation=st.gen))) for mv in move_keys]
+            global_caps = [_pp_global_max_for_move(mv, generation=st.gen) for mv in move_keys]
+            max_caps = _pp_parse_list(row_d.get("moves_pp_max"), count=len(move_keys), defaults=base_caps, lo=1, hi=999)
+            min_caps = _pp_parse_list(row_d.get("moves_pp_min"), count=len(move_keys), defaults=[0] * len(move_keys), lo=0, hi=999)
+            for i in range(len(move_keys)):
+                max_caps[i] = max(base_caps[i], min(max_caps[i], global_caps[i]))
+                min_caps[i] = max(0, min(min_caps[i], max_caps[i]))
             moves_pp: List[int] = []
-            for mv in move_list:
-                try:
-                    base_pp = int(_base_pp(mv, generation=st.gen))
-                except Exception:
-                    base_pp = 20
+            for i, mv in enumerate(move_list):
+                cap_i = max_caps[i] if i < len(max_caps) else _pp_global_max_for_move(mv, generation=st.gen)
+                min_i = min_caps[i] if i < len(min_caps) else 0
                 left = pp_store.get(mv)
                 if left is None:
                     left = pp_store.get(_norm_pp_move_key(mv))
                 if left is None:
                     left = norm_pp_store.get(_norm_pp_move_key(mv))
                 try:
-                    left_i = int(left) if left is not None else int(base_pp)
+                    left_i = int(left) if left is not None else int(cap_i)
                 except Exception:
-                    left_i = int(base_pp)
-                moves_pp.append(max(0, min(left_i, max(1, int(base_pp)))))
-            await conn.execute(
-                "UPDATE pokemons SET moves_pp=? WHERE id=?",
-                (json.dumps(moves_pp, ensure_ascii=False), int(db_id)),
-            )
+                    left_i = int(cap_i)
+                moves_pp.append(max(int(min_i), min(int(left_i), int(cap_i))))
+            try:
+                await conn.execute(
+                    "UPDATE pokemons SET moves_pp=?, moves_pp_min=?, moves_pp_max=? WHERE id=?",
+                    (
+                        json.dumps(moves_pp, ensure_ascii=False),
+                        json.dumps(min_caps, ensure_ascii=False),
+                        json.dumps(max_caps, ensure_ascii=False),
+                        int(db_id),
+                    ),
+                )
+            except Exception:
+                await conn.execute(
+                    "UPDATE pokemons SET moves_pp=? WHERE id=?",
+                    (json.dumps(moves_pp, ensure_ascii=False), int(db_id)),
+                )
         await conn.commit()
     try:
         _lib_db.invalidate_pokemons_cache(str(uid))

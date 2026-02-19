@@ -25,6 +25,8 @@ _session_conn: contextvars.ContextVar[Optional[asyncpg.Connection]] = contextvar
     "pg_session_conn",
     default=None,
 )
+_task_conn_map: dict[asyncio.Task, asyncpg.Connection] = {}
+_task_conn_lock = asyncio.Lock()
 
 # Expose Row alias for compatibility
 Row = asyncpg.Record
@@ -89,6 +91,67 @@ async def _acquire_with_retry(
     if last_exc is not None:
         raise last_exc
     raise TimeoutError("Pool acquire failed unexpectedly")
+
+
+def _auto_task_session_enabled() -> bool:
+    return os.getenv("DB_AUTO_TASK_SESSION", "1").lower() not in ("0", "false", "no")
+
+
+async def _release_task_conn(conn: asyncpg.Connection) -> None:
+    try:
+        if conn.is_in_transaction():
+            await conn.execute("ROLLBACK")
+    except Exception:
+        pass
+    try:
+        pool = await _get_pool()
+        await pool.release(conn)
+    except Exception:
+        pass
+
+
+async def ensure_task_session(*, timeout: Optional[float] = None) -> Optional[asyncpg.Connection]:
+    """
+    Ensure one pooled connection is reused for the current asyncio Task.
+    This dramatically reduces acquire churn for command handlers that issue
+    many sequential queries without explicit db.session().
+    """
+    if not _auto_task_session_enabled():
+        return None
+    if _session_conn.get() is not None:
+        # Explicit db.session() already controls connection reuse.
+        return _session_conn.get()
+    task = asyncio.current_task()
+    if task is None:
+        return None
+    existing = _task_conn_map.get(task)
+    if existing is not None:
+        return existing
+    pool = await _get_pool()
+    conn = await _acquire_with_retry(pool, timeout=timeout)
+    async with _task_conn_lock:
+        existing2 = _task_conn_map.get(task)
+        if existing2 is not None:
+            await pool.release(conn)
+            return existing2
+        _task_conn_map[task] = conn
+
+        def _on_task_done(done_task: asyncio.Task) -> None:
+            task_conn = _task_conn_map.pop(done_task, None)
+            if task_conn is None:
+                return
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_release_task_conn(task_conn))
+            except Exception:
+                # Best effort; if loop is unavailable, pool reset will handle it.
+                pass
+
+        try:
+            task.add_done_callback(_on_task_done)
+        except Exception:
+            pass
+        return conn
 
 
 def _convert_qmarks_to_dollars(sql: str) -> str:
@@ -288,6 +351,11 @@ class Connection:
         if self._pinned is not None:
             return await _execute_with_conn(self._pinned, sql, params)
 
+        # Reuse per-task connection when auto task session is enabled.
+        task_conn = await ensure_task_session()
+        if task_conn is not None:
+            return await _execute_with_conn(task_conn, sql, params)
+
         # Otherwise, borrow a pool connection for this query
         pool = await _get_pool()
         conn = await _acquire_with_retry(pool)
@@ -324,6 +392,11 @@ class Connection:
             for stmt in statements:
                 await _execute_with_conn(self._pinned, stmt, ())
             return
+        task_conn = await ensure_task_session()
+        if task_conn is not None:
+            for stmt in statements:
+                await _execute_with_conn(task_conn, stmt, ())
+            return
         pool = await _get_pool()
         conn = await _acquire_with_retry(pool)
         try:
@@ -340,6 +413,11 @@ class Connection:
         # Release pinned connection if present
         if self._pinned is not None:
             try:
+                try:
+                    if self._pinned.is_in_transaction():
+                        await self._pinned.execute("ROLLBACK")
+                except Exception:
+                    pass
                 await self._pool.release(self._pinned)
             finally:
                 self._pinned = None
@@ -361,6 +439,11 @@ async def connect(_: str | None = None, timeout: float | None = None) -> Connect
     if sticky:
         conn = await _acquire_with_retry(pool, timeout=timeout)
         return Connection(pool, pinned=conn)
+    if _auto_task_session_enabled():
+        try:
+            await ensure_task_session(timeout=timeout)
+        except Exception:
+            pass
     return Connection(pool)
 
 
@@ -374,6 +457,16 @@ async def session() -> Connection:
         return
 
     pool = await _get_pool()
+    task = asyncio.current_task()
+    if _auto_task_session_enabled() and task is not None:
+        task_conn = _task_conn_map.get(task)
+        if task_conn is not None:
+            token = _session_conn.set(task_conn)
+            try:
+                yield Connection(pool)
+            finally:
+                _session_conn.reset(token)
+            return
     try:
         conn = await _acquire_with_retry(pool)
     except Exception as exc:
@@ -388,4 +481,9 @@ async def session() -> Connection:
         yield Connection(pool)
     finally:
         _session_conn.reset(token)
+        try:
+            if conn.is_in_transaction():
+                await conn.execute("ROLLBACK")
+        except Exception:
+            pass
         await pool.release(conn)

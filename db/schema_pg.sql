@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS pokemons (
   held_item     TEXT,
   moves         JSONB NOT NULL,
   moves_pp      JSONB,
+  moves_pp_min  JSONB,
+  moves_pp_max  JSONB,
   tera_type     TEXT,
   team_slot     INTEGER,
   box_no        INTEGER,
@@ -66,6 +68,8 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS user_gender TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS beta_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS hp_now INTEGER;
 ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS moves_pp JSONB;
+ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS moves_pp_min JSONB;
+ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS moves_pp_max JSONB;
 ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS is_hidden_ability INTEGER;
 ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS exp INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS exp_group TEXT NOT NULL DEFAULT 'medium_fast';

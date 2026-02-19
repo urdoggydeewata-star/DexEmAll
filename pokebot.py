@@ -37,7 +37,7 @@ from discord.ext import commands
 from discord import app_commands, ui, Interaction, Embed
 
 from pvp.engine import build_mon
-from pvp.panel import _base_pp
+from pvp.panel import _base_pp, _max_pp
 import pvp.panel as _pvp_panel
 if TYPE_CHECKING:
     from pvp.engine import Mon
@@ -1860,6 +1860,8 @@ async def _ensure_pg_pokemons_columns(conn) -> None:
     try:
         await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS hp_now INTEGER")
         await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS moves_pp JSONB")
+        await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS moves_pp_min JSONB")
+        await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS moves_pp_max JSONB")
         await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS shiny INTEGER NOT NULL DEFAULT 0")
         await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS is_hidden_ability INTEGER NOT NULL DEFAULT 0")
         _PG_POKEMONS_COLS_OK = True
@@ -1869,7 +1871,14 @@ async def _ensure_pg_pokemons_columns(conn) -> None:
 
 async def _pg_pokemons_column_flags(conn) -> dict:
     """Return existence flags for optional PG columns on pokemons."""
-    flags = {"hp_now": True, "moves_pp": True, "shiny": True, "is_hidden_ability": True}
+    flags = {
+        "hp_now": True,
+        "moves_pp": True,
+        "moves_pp_min": False,
+        "moves_pp_max": False,
+        "shiny": True,
+        "is_hidden_ability": True,
+    }
     if not getattr(db, "DB_IS_POSTGRES", False):
         return flags
     try:
@@ -1880,6 +1889,14 @@ async def _pg_pokemons_column_flags(conn) -> dict:
         flags["moves_pp"] = await db._column_exists(conn, "pokemons", "moves_pp")
     except Exception:
         flags["moves_pp"] = False
+    try:
+        flags["moves_pp_min"] = await db._column_exists(conn, "pokemons", "moves_pp_min")
+    except Exception:
+        flags["moves_pp_min"] = False
+    try:
+        flags["moves_pp_max"] = await db._column_exists(conn, "pokemons", "moves_pp_max")
+    except Exception:
+        flags["moves_pp_max"] = False
     try:
         flags["shiny"] = await db._column_exists(conn, "pokemons", "shiny")
     except Exception:
@@ -6873,10 +6890,23 @@ async def _set_pokemon_moves(owner_id: str, mon_id: int, moves: list[str]) -> No
             except Exception:
                 pp_val = None
             base_pps.append(int(pp_val) if pp_val is not None else 20)
-        await conn.execute(
-            "UPDATE pokemons SET moves=?, moves_pp=? WHERE owner_id=? AND id=?",
-            (json.dumps(moves[:4], ensure_ascii=False), json.dumps(base_pps, ensure_ascii=False), owner_id, mon_id),
-        )
+        try:
+            await conn.execute(
+                "UPDATE pokemons SET moves=?, moves_pp=?, moves_pp_min=?, moves_pp_max=? WHERE owner_id=? AND id=?",
+                (
+                    json.dumps(moves[:4], ensure_ascii=False),
+                    json.dumps(base_pps, ensure_ascii=False),
+                    json.dumps([0] * len(base_pps), ensure_ascii=False),
+                    json.dumps(base_pps, ensure_ascii=False),
+                    owner_id,
+                    mon_id,
+                ),
+            )
+        except Exception:
+            await conn.execute(
+                "UPDATE pokemons SET moves=?, moves_pp=? WHERE owner_id=? AND id=?",
+                (json.dumps(moves[:4], ensure_ascii=False), json.dumps(base_pps, ensure_ascii=False), owner_id, mon_id),
+            )
         await conn.commit()
         db.invalidate_pokemons_cache(owner_id)
     finally:
@@ -7424,10 +7454,24 @@ class StarterView(discord.ui.View):
                                         moves = ["Tackle"]
                                         pps = [20]
                                     if col_flags.get("moves_pp"):
-                                        await conn.execute(
-                                            "UPDATE pokemons SET moves=?, moves_pp=? WHERE owner_id=? AND id=?",
-                                            (json.dumps(moves, ensure_ascii=False), json.dumps(pps or [20] * len(moves), ensure_ascii=False), uid, pid),
-                                        )
+                                        pp_vals = pps or [20] * len(moves)
+                                        if col_flags.get("moves_pp_min") and col_flags.get("moves_pp_max"):
+                                            await conn.execute(
+                                                "UPDATE pokemons SET moves=?, moves_pp=?, moves_pp_min=?, moves_pp_max=? WHERE owner_id=? AND id=?",
+                                                (
+                                                    json.dumps(moves, ensure_ascii=False),
+                                                    json.dumps(pp_vals, ensure_ascii=False),
+                                                    json.dumps([0] * len(pp_vals), ensure_ascii=False),
+                                                    json.dumps(pp_vals, ensure_ascii=False),
+                                                    uid,
+                                                    pid,
+                                                ),
+                                            )
+                                        else:
+                                            await conn.execute(
+                                                "UPDATE pokemons SET moves=?, moves_pp=? WHERE owner_id=? AND id=?",
+                                                (json.dumps(moves, ensure_ascii=False), json.dumps(pp_vals, ensure_ascii=False), uid, pid),
+                                            )
                                     else:
                                         await conn.execute(
                                             "UPDATE pokemons SET moves=? WHERE owner_id=? AND id=?",
@@ -11180,7 +11224,16 @@ async def _load_pp_from_db(st: "BattleState", uid: int) -> None:
                     db_id = getattr(mon, "_db_id", None)
                     if not db_id:
                         continue
-                    cur = await conn.execute("SELECT moves, moves_pp FROM pokemons WHERE id=? LIMIT 1", (int(db_id),))
+                    try:
+                        cur = await conn.execute(
+                            "SELECT moves, moves_pp, moves_pp_min, moves_pp_max FROM pokemons WHERE id=? LIMIT 1",
+                            (int(db_id),),
+                        )
+                    except Exception:
+                        cur = await conn.execute(
+                            "SELECT moves, moves_pp FROM pokemons WHERE id=? LIMIT 1",
+                            (int(db_id),),
+                        )
                     row = await cur.fetchone(); await cur.close()
                     if not row:
                         continue
@@ -11188,16 +11241,9 @@ async def _load_pp_from_db(st: "BattleState", uid: int) -> None:
                         moves = json.loads(row["moves"]) if row.get("moves") else []
                     except Exception:
                         moves = []
-                    try:
-                        raw_pps = row.get("moves_pp")
-                        if isinstance(raw_pps, list):
-                            pps = raw_pps
-                        elif raw_pps:
-                            pps = json.loads(raw_pps)
-                        else:
-                            pps = None
-                    except Exception:
-                        pps = None
+                    raw_pps = row.get("moves_pp")
+                    raw_pp_min = row.get("moves_pp_min")
+                    raw_pp_max = row.get("moves_pp_max")
                     st._ensure_pp_loaded(uid, mon)
                     if hasattr(st, "_get_mon_key"):
                         key = st._get_mon_key(uid, mon)
@@ -11205,21 +11251,21 @@ async def _load_pp_from_db(st: "BattleState", uid: int) -> None:
                         key = (uid, idx)
                     if key not in st._pp:
                         st._pp[key] = {}
-                    if moves and isinstance(pps, list) and len(pps) == len(moves):
-                        for m, left in zip(moves, pps):
+                    if moves:
+                        move_ids = [str(m).strip().replace("_", "-").replace(" ", "-").lower() for m in moves]
+                        base_caps = [_pp_move_base(mid, st.gen) for mid in move_ids]
+                        global_caps = [_pp_move_global_max(mid, st.gen) for mid in move_ids]
+                        max_caps = _pp_parse_int_list(raw_pp_max, count=len(move_ids), defaults=base_caps, lo=1, hi=999)
+                        min_caps = _pp_parse_int_list(raw_pp_min, count=len(move_ids), defaults=[0] * len(move_ids), lo=0, hi=999)
+                        pps = _pp_parse_int_list(raw_pps, count=len(move_ids), defaults=max_caps, lo=0, hi=999)
+                        for i in range(len(move_ids)):
+                            max_caps[i] = max(base_caps[i], min(max_caps[i], global_caps[i]))
+                            min_caps[i] = max(0, min(min_caps[i], max_caps[i]))
+                            pps[i] = max(min_caps[i], min(pps[i], max_caps[i]))
+                        for m, left_i in zip(moves, pps):
+                            st._pp[key][m] = int(left_i)
                             try:
-                                base_pp = int(_base_pp(m, generation=st.gen))
-                            except Exception:
-                                base_pp = 20
-                            try:
-                                left_i = int(left)
-                            except Exception:
-                                left_i = base_pp
-                            # Clamp stale inflated rows (e.g. legacy 64/56) to legal base PP.
-                            left_i = max(0, min(left_i, max(1, base_pp)))
-                            st._pp[key][m] = left_i
-                            try:
-                                st._pp[key][_norm_move_name(str(m))] = left_i
+                                st._pp[key][_norm_move_name(str(m))] = int(left_i)
                             except Exception:
                                 pass
             break
@@ -11249,24 +11295,54 @@ async def _save_party_state_from_battle(st: "BattleState", uid: int) -> None:
                     norm_pp_store[_norm_move_name(str(k))] = int(v)
                 except Exception:
                     continue
+            row_d: dict[str, Any] = {}
+            try:
+                cur = await conn.execute(
+                    "SELECT moves_pp_min, moves_pp_max FROM pokemons WHERE id=? LIMIT 1",
+                    (int(db_id),),
+                )
+                bounds_row = await cur.fetchone()
+                await cur.close()
+                if bounds_row:
+                    row_d = dict(bounds_row) if hasattr(bounds_row, "keys") else {}
+            except Exception:
+                row_d = {}
+            move_ids = [str(m).strip().replace("_", "-").replace(" ", "-").lower() for m in move_list]
+            base_caps = [_pp_move_base(mid, st.gen) for mid in move_ids]
+            global_caps = [_pp_move_global_max(mid, st.gen) for mid in move_ids]
+            max_caps = _pp_parse_int_list(row_d.get("moves_pp_max"), count=len(move_ids), defaults=base_caps, lo=1, hi=999)
+            min_caps = _pp_parse_int_list(row_d.get("moves_pp_min"), count=len(move_ids), defaults=[0] * len(move_ids), lo=0, hi=999)
+            for i in range(len(move_ids)):
+                max_caps[i] = max(base_caps[i], min(max_caps[i], global_caps[i]))
+                min_caps[i] = max(0, min(min_caps[i], max_caps[i]))
             moves_pp: list[int] = []
-            for m in move_list:
-                try:
-                    base_pp = int(_base_pp(m, generation=st.gen))
-                except Exception:
-                    base_pp = 20
+            for i, m in enumerate(move_list):
+                cap_i = max_caps[i] if i < len(max_caps) else _pp_move_global_max(str(m), st.gen)
+                min_i = min_caps[i] if i < len(min_caps) else 0
                 left = pp_store.get(m)
                 if left is None:
                     left = norm_pp_store.get(_norm_move_name(str(m)))
                 try:
-                    left_i = int(left) if left is not None else int(base_pp)
+                    left_i = int(left) if left is not None else int(cap_i)
                 except Exception:
-                    left_i = int(base_pp)
-                moves_pp.append(max(0, min(left_i, max(1, int(base_pp)))))
-            await conn.execute(
-                "UPDATE pokemons SET hp_now=?, moves_pp=? WHERE id=?",
-                (int(mon.hp), json.dumps(moves_pp, ensure_ascii=False), int(db_id)),
-            )
+                    left_i = int(cap_i)
+                moves_pp.append(max(int(min_i), min(int(left_i), int(cap_i))))
+            try:
+                await conn.execute(
+                    "UPDATE pokemons SET hp_now=?, moves_pp=?, moves_pp_min=?, moves_pp_max=? WHERE id=?",
+                    (
+                        int(mon.hp),
+                        json.dumps(moves_pp, ensure_ascii=False),
+                        json.dumps(min_caps, ensure_ascii=False),
+                        json.dumps(max_caps, ensure_ascii=False),
+                        int(db_id),
+                    ),
+                )
+            except Exception:
+                await conn.execute(
+                    "UPDATE pokemons SET hp_now=?, moves_pp=? WHERE id=?",
+                    (int(mon.hp), json.dumps(moves_pp, ensure_ascii=False), int(db_id)),
+                )
         await conn.commit()
         db.invalidate_pokemons_cache(str(uid))
 
@@ -11805,26 +11881,53 @@ async def _apply_evolution(owner_id: str, mon_db_id: int, evolved_species_name: 
                 pass
             base_pps.append(pp_val)
         hp_val = int(final_stats.get("hp", 1))
-        await conn.execute(
-            """UPDATE pokemons SET species = ?, level = ?, hp = ?, hp_now = ?, atk = ?, def = ?, spa = ?, spd = ?, spe = ?, ability = ?, moves = ?, moves_pp = ?, form = ? WHERE owner_id = ? AND id = ?""",
-            (
-                evolved_display_name,
-                level,
-                hp_val,
-                hp_val,
-                int(final_stats.get("attack", 0)),
-                int(final_stats.get("defense", 0)),
-                int(final_stats.get("special_attack", 0)),
-                int(final_stats.get("special_defense", 0)),
-                int(final_stats.get("speed", 0)),
-                new_ability or None,
-                json.dumps(move_list, ensure_ascii=False),
-                json.dumps(base_pps, ensure_ascii=False),
-                None,
-                owner_id,
-                mon_db_id,
-            ),
-        )
+        try:
+            await conn.execute(
+                """UPDATE pokemons
+                   SET species = ?, level = ?, hp = ?, hp_now = ?, atk = ?, def = ?, spa = ?, spd = ?, spe = ?,
+                       ability = ?, moves = ?, moves_pp = ?, moves_pp_min = ?, moves_pp_max = ?, form = ?
+                   WHERE owner_id = ? AND id = ?""",
+                (
+                    evolved_display_name,
+                    level,
+                    hp_val,
+                    hp_val,
+                    int(final_stats.get("attack", 0)),
+                    int(final_stats.get("defense", 0)),
+                    int(final_stats.get("special_attack", 0)),
+                    int(final_stats.get("special_defense", 0)),
+                    int(final_stats.get("speed", 0)),
+                    new_ability or None,
+                    json.dumps(move_list, ensure_ascii=False),
+                    json.dumps(base_pps, ensure_ascii=False),
+                    json.dumps([0] * len(base_pps), ensure_ascii=False),
+                    json.dumps(base_pps, ensure_ascii=False),
+                    None,
+                    owner_id,
+                    mon_db_id,
+                ),
+            )
+        except Exception:
+            await conn.execute(
+                """UPDATE pokemons SET species = ?, level = ?, hp = ?, hp_now = ?, atk = ?, def = ?, spa = ?, spd = ?, spe = ?, ability = ?, moves = ?, moves_pp = ?, form = ? WHERE owner_id = ? AND id = ?""",
+                (
+                    evolved_display_name,
+                    level,
+                    hp_val,
+                    hp_val,
+                    int(final_stats.get("attack", 0)),
+                    int(final_stats.get("defense", 0)),
+                    int(final_stats.get("special_attack", 0)),
+                    int(final_stats.get("special_defense", 0)),
+                    int(final_stats.get("speed", 0)),
+                    new_ability or None,
+                    json.dumps(move_list, ensure_ascii=False),
+                    json.dumps(base_pps, ensure_ascii=False),
+                    None,
+                    owner_id,
+                    mon_db_id,
+                ),
+            )
         await conn.commit()
         db.invalidate_pokemons_cache(owner_id)
         return True
@@ -11858,8 +11961,16 @@ async def _add_caught_wild_to_team(
         ivs_long = _mon_to_long_stats(getattr(mon, "ivs", {}) or {})
         evs_long = _mon_to_long_stats(getattr(mon, "evs", {}) or {})
         level = int(getattr(mon, "level", 5))
-        nature = (getattr(mon, "nature", None) or "hardy").strip() or "hardy"
-        ability = _norm_ability_id(getattr(mon, "ability", None))
+        nature = (
+            getattr(mon, "nature", None)
+            or getattr(mon, "nature_name", None)
+            or "hardy"
+        )
+        nature = str(nature or "hardy").strip().lower() or "hardy"
+        ability = _norm_ability_id(
+            getattr(mon, "_original_ability", None)
+            or getattr(mon, "ability", None)
+        )
         gender = (getattr(mon, "gender", None) or "").strip() or None
         species = (getattr(mon, "species", None) or "").strip()
         if not species:
@@ -11877,7 +11988,11 @@ async def _add_caught_wild_to_team(
             if entry is None:
                 entry = await ensure_species_and_learnsets(species)
             regs, hides, valid = _ability_set_from_entry(entry)
-            if valid and ability not in valid:
+            if not ability and regs:
+                ability = regs[0]
+            elif not ability and hides:
+                ability = hides[0]
+            elif ability and valid and ability not in valid:
                 ability = regs[0] if regs else hides[0]
         except Exception:
             pass
@@ -12243,10 +12358,17 @@ async def _heal_party(user_id: str) -> int:
     healed = 0
     user_gen = await _user_selected_gen(user_id)
     async with db.session() as conn:
-        cur = await conn.execute(
-            "SELECT id, species, level, nature, ivs, evs, hp, moves FROM pokemons WHERE owner_id=? AND team_slot IS NOT NULL ORDER BY team_slot",
-            (user_id,),
-        )
+        try:
+            cur = await conn.execute(
+                "SELECT id, species, level, nature, ivs, evs, hp, moves, moves_pp_min, moves_pp_max FROM pokemons WHERE owner_id=? AND team_slot IS NOT NULL ORDER BY team_slot",
+                (user_id,),
+            )
+        except Exception:
+            cur = await conn.execute(
+                "SELECT id, species, level, nature, ivs, evs, hp, moves "
+                "FROM pokemons WHERE owner_id=? AND team_slot IS NOT NULL ORDER BY team_slot",
+                (user_id,),
+            )
         rows = await cur.fetchall()
         await cur.close()
         cached_base_stats: Dict[str, dict] = {}
@@ -12349,11 +12471,34 @@ async def _heal_party(user_id: str) -> int:
                 moves = json.loads(row["moves"]) if row.get("moves") else []
             except Exception:
                 moves = []
-            max_pp = [_base_pp(m, generation=user_gen) for m in moves[:4]] if moves else []
-            await conn.execute(
-                "UPDATE pokemons SET hp=?, hp_now=?, moves_pp=? WHERE id=?",
-                (hp_max, hp_max, json.dumps(max_pp, ensure_ascii=False), int(row["id"])),
-            )
+            base_caps = [_pp_move_base(str(m), user_gen) for m in moves[:4]] if moves else []
+            global_caps = [_pp_move_global_max(str(m), user_gen) for m in moves[:4]] if moves else []
+            stored_max = _pp_parse_int_list(
+                row.get("moves_pp_max"),
+                count=len(base_caps),
+                defaults=base_caps,
+                lo=1,
+                hi=999,
+            ) if base_caps else []
+            for i in range(len(stored_max)):
+                stored_max[i] = max(base_caps[i], min(stored_max[i], global_caps[i]))
+            try:
+                await conn.execute(
+                    "UPDATE pokemons SET hp=?, hp_now=?, moves_pp=?, moves_pp_min=?, moves_pp_max=? WHERE id=?",
+                    (
+                        hp_max,
+                        hp_max,
+                        json.dumps(stored_max, ensure_ascii=False),
+                        json.dumps([0] * len(stored_max), ensure_ascii=False),
+                        json.dumps(stored_max, ensure_ascii=False),
+                        int(row["id"]),
+                    ),
+                )
+            except Exception:
+                await conn.execute(
+                    "UPDATE pokemons SET hp=?, hp_now=?, moves_pp=? WHERE id=?",
+                    (hp_max, hp_max, json.dumps(stored_max, ensure_ascii=False), int(row["id"])),
+                )
             healed += 1
         await conn.commit()
         db.invalidate_pokemons_cache(user_id)
@@ -17912,7 +18057,7 @@ class MPokeInfo(commands.Cog):
             (f"{_ival('legendaries_killed')}", 402, left_under_leg_x, left_under_leg_w),
         ]
         for value, y, row_left, row_w in top_rows:
-            _draw_row_value(value, left=row_left, top=_pt(0, y)[1], width=row_w)
+            _draw_row_value(value, left=row_left, top=_pt(0, y)[1], width=row_w, y_extra=max(1, int(round(1 * sy))))
 
         right_rows = [
             (f"{_ival('raids_won')}", 240, right_under_rw_x, right_under_rw_w),
@@ -17921,12 +18066,12 @@ class MPokeInfo(commands.Cog):
             (f"{_ival('battles_lost')}", 402, right_under_bl_x, right_under_bl_w),
         ]
         for value, y, row_left, row_w in right_rows:
-            _draw_row_value(value, left=row_left, top=_pt(0, y)[1], width=row_w)
+            _draw_row_value(value, left=row_left, top=_pt(0, y)[1], width=row_w, y_extra=max(1, int(round(1 * sy))))
 
         ot_name = str(getattr(interaction.user, "display_name", None) or "Trainer").strip()
         # Match front-panel header geometry (scaled into this panel's coordinate system).
         # Front-equivalent top-row geometry adapted to this panel's scale grid.
-        ot_box_left, ot_box_y = _pt(236, 21)
+        ot_box_left, ot_box_y = _pt(244, 21)
         ot_box_w = max(24, int(round(142 * sx)))
         ot_box_h = max(10, int(round(20 * sy)))
         _draw_center_value(
@@ -17956,19 +18101,24 @@ class MPokeInfo(commands.Cog):
         )
         species_display = _clip_text(species_display, name_font, max(20, int(round(220 * sx))))
         if species_display and name_font is not None:
-            self._mpokeinfo_draw_shadow_text(
-                draw,
-                _pt(332, 216),
+            name_x, name_y = _pt(322, 206)
+            name_w = max(20, int(round(236 * sx)))
+            name_h = max(10, int(round(24 * sy)))
+            _draw_center_value(
                 species_display,
-                font=name_font,
-                fill=theme_fill,
-                shadow=theme_shadow,
+                name_x,
+                name_y,
+                name_w,
+                name_h,
+                start_size=max(10, int(round(18 * scale))),
+                min_size=max(8, int(round(10 * scale))),
+                bold=True,
             )
 
         g_key = str(gender or "").strip().lower()
         g_sym = {"male": "♂", "m": "♂", "♀": "♀", "female": "♀", "f": "♀"}.get(g_key, "")
         lv_text = f"{int(level)}"
-        lv_box_left, lv_box_y = _pt(470, 20)
+        lv_box_left, lv_box_y = _pt(478, 20)
         lv_box_w = max(18, int(round(126 * sx)))
         lv_box_h = max(10, int(round(20 * sy)))
         lv_font = self._mpokeinfo_fit_font(
@@ -18039,7 +18189,7 @@ class MPokeInfo(commands.Cog):
         type_tokens = [str(t or "").strip().lower() for t in list(types or []) if str(t or "").strip()]
         if not type_tokens:
             type_tokens = ["normal"]
-        type_left, type_top = _pt(510, 56)
+        type_left, type_top = _pt(518, 56)
         type_w = max(24, int(round(122 * sx)))
         type_h = max(12, int(round(26 * sy)))
         type_gap = max(1, int(round(4 * sy)))
@@ -19107,6 +19257,48 @@ def _norm_move_token(s: str | None) -> str:
     return str(s or "").strip().lower().replace("_", "-").replace(" ", "-")
 
 
+def _pp_move_base(move_id: str, generation: int) -> int:
+    try:
+        return max(1, int(_base_pp(move_id, generation=generation)))
+    except Exception:
+        return 20
+
+
+def _pp_move_global_max(move_id: str, generation: int) -> int:
+    try:
+        return max(1, int(_max_pp(move_id, generation=generation)))
+    except Exception:
+        return max(1, _pp_move_base(move_id, generation))
+
+
+def _pp_parse_int_list(
+    raw: Any,
+    *,
+    count: int,
+    defaults: list[int],
+    lo: int,
+    hi: int,
+) -> list[int]:
+    vals = raw
+    if isinstance(vals, str):
+        try:
+            vals = json.loads(vals) if vals else []
+        except Exception:
+            vals = []
+    if not isinstance(vals, (list, tuple)):
+        vals = []
+    out: list[int] = []
+    for i in range(int(count)):
+        default_i = int(defaults[i]) if i < len(defaults) else int(defaults[-1] if defaults else lo)
+        v = vals[i] if i < len(vals) else default_i
+        try:
+            n = int(v)
+        except Exception:
+            n = default_i
+        out.append(max(int(lo), min(int(hi), int(n))))
+    return out
+
+
 def _canonical_pp_item_id(item_query: str | None) -> str:
     token = item_id_from_user(str(item_query or ""))
     compact = token.replace("_", "")
@@ -19340,10 +19532,16 @@ async def useppitem_cmd(
 
     async with DB_WRITE_LOCK:
         async with db.session() as conn:
-            cur = await conn.execute(
-                "SELECT id, species, moves, moves_pp FROM pokemons WHERE owner_id=? AND id=? LIMIT 1",
-                (uid, mon_id),
-            )
+            try:
+                cur = await conn.execute(
+                    "SELECT id, species, moves, moves_pp, moves_pp_min, moves_pp_max FROM pokemons WHERE owner_id=? AND id=? LIMIT 1",
+                    (uid, mon_id),
+                )
+            except Exception:
+                cur = await conn.execute(
+                    "SELECT id, species, moves, moves_pp FROM pokemons WHERE owner_id=? AND id=? LIMIT 1",
+                    (uid, mon_id),
+                )
             row = await cur.fetchone()
             await cur.close()
             if not row:
@@ -19368,32 +19566,40 @@ async def useppitem_cmd(
             move_names = [m.replace("-", " ").title() for m in move_ids]
 
             base_pps: list[int] = []
+            global_max_pps: list[int] = []
             for mv in move_ids:
-                try:
-                    base_pps.append(max(1, int(_base_pp(mv, generation=user_gen))))
-                except Exception:
-                    base_pps.append(20)
+                base_pps.append(_pp_move_base(mv, user_gen))
+                global_max_pps.append(_pp_move_global_max(mv, user_gen))
 
-            raw_pps = row_d.get("moves_pp")
-            parsed_pps: list[Any]
-            if isinstance(raw_pps, str):
-                try:
-                    parsed_pps = json.loads(raw_pps) if raw_pps else []
-                except Exception:
-                    parsed_pps = []
-            elif isinstance(raw_pps, list):
-                parsed_pps = list(raw_pps)
-            else:
-                parsed_pps = []
+            stored_max_pps = _pp_parse_int_list(
+                row_d.get("moves_pp_max"),
+                count=len(move_ids),
+                defaults=base_pps,
+                lo=1,
+                hi=999,
+            )
+            for i in range(len(stored_max_pps)):
+                stored_max_pps[i] = max(base_pps[i], min(stored_max_pps[i], global_max_pps[i]))
 
-            cur_pps: list[int] = []
-            for i, cap in enumerate(base_pps):
-                raw_val = parsed_pps[i] if i < len(parsed_pps) else cap
-                try:
-                    pp_i = int(raw_val)
-                except Exception:
-                    pp_i = cap
-                cur_pps.append(max(0, min(pp_i, cap)))
+            stored_min_pps = _pp_parse_int_list(
+                row_d.get("moves_pp_min"),
+                count=len(move_ids),
+                defaults=[0] * len(move_ids),
+                lo=0,
+                hi=999,
+            )
+            for i in range(len(stored_min_pps)):
+                stored_min_pps[i] = max(0, min(stored_min_pps[i], stored_max_pps[i]))
+
+            cur_pps = _pp_parse_int_list(
+                row_d.get("moves_pp"),
+                count=len(move_ids),
+                defaults=stored_max_pps,
+                lo=0,
+                hi=999,
+            )
+            for i in range(len(cur_pps)):
+                cur_pps[i] = max(stored_min_pps[i], min(cur_pps[i], stored_max_pps[i]))
 
             target_indices: list[int]
             if single_move_item:
@@ -19418,26 +19624,38 @@ async def useppitem_cmd(
             changed_lines: list[str] = []
             for i in target_indices:
                 before = cur_pps[i]
-                cap = base_pps[i]
+                cap_before = stored_max_pps[i]
+                base_cap = base_pps[i]
+                global_cap = global_max_pps[i]
+                min_cap = stored_min_pps[i]
+                cap_after = cap_before
                 after = before
                 if canonical in {"ether", "elixir"}:
-                    after = min(cap, before + 10)
-                elif canonical in {"max_ether", "max_elixir", "pp_max"}:
-                    after = cap
+                    after = min(cap_before, before + 10)
+                elif canonical in {"max_ether", "max_elixir"}:
+                    after = cap_before
                 elif canonical == "pp_up":
-                    # Treat PP Up as a PP-restoring item in this bot flow.
-                    restore = max(1, int(cap // 5))
-                    after = min(cap, before + restore)
-                if after > before:
+                    # Increase move PP cap by one PP-Up step, then grant that gain immediately.
+                    pp_up_step = max(1, int(base_cap // 5))
+                    cap_after = min(global_cap, cap_before + pp_up_step)
+                    cap_gain = max(0, cap_after - cap_before)
+                    after = min(cap_after, before + cap_gain)
+                elif canonical == "pp_max":
+                    cap_after = int(global_cap)
+                    after = int(cap_after)
+                after = max(min_cap, min(after, cap_after))
+                if cap_after != cap_before:
+                    stored_max_pps[i] = cap_after
+                if after > before or cap_after != cap_before:
                     changed = True
                     cur_pps[i] = after
-                    changed_lines.append(f"• **{move_names[i]}**: {before}/{cap} → {after}/{cap}")
+                    changed_lines.append(f"• **{move_names[i]}**: {before}/{cap_before} → {after}/{cap_after}")
 
             if not changed:
-                if canonical == "pp_up" and target_indices:
+                if canonical in {"pp_up", "pp_max"} and target_indices:
                     i = target_indices[0]
                     return await inter.followup.send(
-                        f"ℹ️ **{move_names[i]}** is already at max PP (**{before_pps[i]}/{base_pps[i]}**). "
+                        f"ℹ️ **{move_names[i]}** is already at max PP (**{before_pps[i]}/{stored_max_pps[i]}**). "
                         f"**{pretty_item(canonical)}** was not consumed.",
                         ephemeral=True,
                     )
@@ -19446,10 +19664,22 @@ async def useppitem_cmd(
                     ephemeral=True,
                 )
 
-            await conn.execute(
-                "UPDATE pokemons SET moves_pp=? WHERE owner_id=? AND id=?",
-                (json.dumps(cur_pps, ensure_ascii=False), uid, int(row_d.get("id") or mon_id)),
-            )
+            try:
+                await conn.execute(
+                    "UPDATE pokemons SET moves_pp=?, moves_pp_min=?, moves_pp_max=? WHERE owner_id=? AND id=?",
+                    (
+                        json.dumps(cur_pps, ensure_ascii=False),
+                        json.dumps(stored_min_pps, ensure_ascii=False),
+                        json.dumps(stored_max_pps, ensure_ascii=False),
+                        uid,
+                        int(row_d.get("id") or mon_id),
+                    ),
+                )
+            except Exception:
+                await conn.execute(
+                    "UPDATE pokemons SET moves_pp=? WHERE owner_id=? AND id=?",
+                    (json.dumps(cur_pps, ensure_ascii=False), uid, int(row_d.get("id") or mon_id)),
+                )
             await conn.execute(
                 "UPDATE user_items SET qty = GREATEST(0, qty - 1) WHERE owner_id=? AND item_id=? AND qty>=1",
                 (uid, bag_item_id),
@@ -19733,6 +19963,16 @@ def _team_parse_moves_pp(raw: Any) -> list[int]:
         except Exception:
             out.append(0)
     return out
+
+
+def _team_pp_cap_for_move(move_id: str, generation: int, stored_max: Any = None) -> int:
+    base_cap = _pp_move_base(move_id, generation)
+    global_cap = _pp_move_global_max(move_id, generation)
+    try:
+        stored = int(stored_max)
+    except Exception:
+        stored = base_cap
+    return max(base_cap, min(stored, global_cap))
 
 
 def _team_hp_values(row: dict) -> tuple[int, int, int]:
@@ -20412,6 +20652,7 @@ def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None], *,
             "hp_now": int(row.get("hp_now") or 0),
             "hp_max": int(row.get("hp") or 0),
             "locked": int(bool(row.get("is_locked"))),
+            "registered": int(bool(row.get("is_registered"))),
         }
         if species_norm == "egg":
             item["egg_progress"] = round(float(row.get("_egg_progress") or 0.0), 3)
@@ -20749,13 +20990,21 @@ def _team_overview_panel_file(
                         stroke_px=1,
                     )
             if slot_text.get("font") and str(slot_text.get("label") or "").strip():
+                label_fill = (240, 242, 250, 255)
+                label_shadow = (0, 0, 0, 220)
+                if bool(row.get("is_registered")):
+                    label_fill = (255, 116, 116, 255)
+                    label_shadow = (92, 20, 20, 220)
+                elif bool(row.get("shiny")):
+                    label_fill = (255, 224, 118, 255)
+                    label_shadow = (98, 74, 24, 220)
                 _draw_pixel_shadow_text(
                     text_draw,
                     (int(slot_text.get("label_x") or geom["label_xy"][0]), geom["label_xy"][1]),
                     str(slot_text.get("label") or ""),
                     font=slot_text["font"],
-                    fill=(240, 242, 250, 255),
-                    shadow=(0, 0, 0, 220),
+                    fill=label_fill,
+                    shadow=label_shadow,
                 )
             lvl = str(slot_text.get("lvl") or "")
             if lvl and lvl_font_slot:
@@ -20941,13 +21190,15 @@ class TeamPanelView(discord.ui.View):
         move_ids = _team_parse_move_ids(row.get("moves"))
         moves = _team_parse_moves(row.get("moves"))
         pps = _team_parse_moves_pp(row.get("moves_pp"))
+        max_pps_stored = _team_parse_moves_pp(row.get("moves_pp_max"))
         move_lines: list[str] = []
         for i, move_name in enumerate(moves):
             move_id = move_ids[i] if i < len(move_ids) else move_name.replace(" ", "-").lower()
-            try:
-                max_pp = int(_base_pp(move_id, generation=self.current_gen))
-            except Exception:
-                max_pp = 20
+            max_pp = _team_pp_cap_for_move(
+                move_id,
+                self.current_gen,
+                max_pps_stored[i] if i < len(max_pps_stored) else None,
+            )
             cur_pp = pps[i] if i < len(pps) else None
             if cur_pp is not None:
                 try:
@@ -21057,7 +21308,8 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
                             "id": p.get("id"), "species": p.get("species"), "level": p.get("level"),
                             "gender": p.get("gender"), "shiny": p.get("shiny"), "team_slot": p.get("team_slot"),
                             "held_item": p.get("held_item"), "item_emoji": item_emoji,
-                            "hp": p.get("hp"), "hp_now": p.get("hp_now"), "moves": p.get("moves"), "moves_pp": p.get("moves_pp"),
+                            "hp": p.get("hp"), "hp_now": p.get("hp_now"), "moves": p.get("moves"),
+                            "moves_pp": p.get("moves_pp"), "moves_pp_max": p.get("moves_pp_max"),
                             "nature": p.get("nature"), "ability": p.get("ability"), "friendship": p.get("friendship"),
                             "form": p.get("form"),
                         })
@@ -21065,9 +21317,11 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
             pass
     if rows is None:
         async with db.session() as conn:
+            col_flags = await _pg_pokemons_column_flags(conn)
+            pp_max_sel = "p.moves_pp_max AS moves_pp_max," if col_flags.get("moves_pp_max", False) else "NULL AS moves_pp_max,"
             cur = await conn.execute("""
             SELECT p.id, p.species, p.level, p.gender, p.shiny, p.team_slot, p.held_item, i.emoji AS item_emoji,
-                   p.hp, p.hp_now, p.moves, p.moves_pp, p.nature, p.ability, p.friendship, p.form
+                   p.hp, p.hp_now, p.moves, p.moves_pp, """ + pp_max_sel + """ p.nature, p.ability, p.friendship, p.form
             FROM pokemons p
             LEFT JOIN items i ON i.id = p.held_item
             WHERE p.owner_id = ? AND p.team_slot BETWEEN 1 AND 6
@@ -21091,24 +21345,26 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
             pass
 
     nickname_map: dict[int, str] = {}
-    try:
-        row_ids: list[int] = []
-        for r in rows or []:
-            try:
-                rid = int((r.get("id") if hasattr(r, "keys") else r[0]) or 0)
-            except Exception:
-                rid = 0
-            if rid > 0:
-                row_ids.append(rid)
-        if row_ids:
-            nickname_map = await _get_pokemon_nickname_map(uid, row_ids)
-    except Exception:
-        nickname_map = {}
     locked_ids: set[int] = set()
-    try:
-        locked_ids = await _get_locked_pokemon_ids(uid)
-    except Exception:
-        locked_ids = set()
+    registered_ids: set[int] = set()
+    row_ids: list[int] = []
+    for r in rows or []:
+        try:
+            rid = int((r.get("id") if hasattr(r, "keys") else r[0]) or 0)
+        except Exception:
+            rid = 0
+        if rid > 0:
+            row_ids.append(rid)
+    if row_ids:
+        try:
+            async with db.session() as conn:
+                nickname_map = await _get_pokemon_nickname_map(uid, row_ids, conn=conn)
+                locked_ids = await _get_locked_pokemon_ids(uid, conn=conn)
+                registered_ids = await _get_registered_pokemon_ids(uid, row_ids, conn=conn)
+        except Exception:
+            nickname_map = {}
+            locked_ids = set()
+            registered_ids = set()
 
     # Map slots
     slots: dict[int, dict | None] = {i: None for i in range(1, 7)}
@@ -21121,10 +21377,11 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
             "hp_now": r[9] if len(r) > 9 else None,
             "moves": r[10] if len(r) > 10 else None,
             "moves_pp": r[11] if len(r) > 11 else None,
-            "nature": r[12] if len(r) > 12 else None,
-            "ability": r[13] if len(r) > 13 else None,
-            "friendship": r[14] if len(r) > 14 else None,
-            "form": r[15] if len(r) > 15 else None,
+            "moves_pp_max": r[12] if len(r) > 12 else None,
+            "nature": r[13] if len(r) > 13 else None,
+            "ability": r[14] if len(r) > 14 else None,
+            "friendship": r[15] if len(r) > 15 else None,
+            "form": r[16] if len(r) > 16 else None,
         }
         try:
             rid = int(row.get("id") or 0)
@@ -21133,6 +21390,7 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
         if rid > 0 and rid in nickname_map:
             row["nickname"] = nickname_map[rid]
         row["is_locked"] = bool(rid > 0 and rid in locked_ids)
+        row["is_registered"] = bool(rid > 0 and rid in registered_ids)
         try:
             slot_i = int(row["team_slot"])
             if 1 <= slot_i <= 6:
@@ -22093,6 +22351,56 @@ async def _get_locked_pokemon_ids(owner_id: str, *, conn: Any | None = None) -> 
         cur = await conn.execute(
             "SELECT mon_id FROM pokemon_locks WHERE owner_id=?",
             (str(owner_id),),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        out: set[int] = set()
+        for r in rows or []:
+            try:
+                mid = int((r["mon_id"] if hasattr(r, "keys") else r[0]) or 0)
+            except Exception:
+                mid = 0
+            if mid > 0:
+                out.add(mid)
+        return out
+    except Exception:
+        return set()
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+
+async def _get_registered_pokemon_ids(owner_id: str, mon_ids: Sequence[int], *, conn: Any | None = None) -> set[int]:
+    if not owner_id:
+        return set()
+    ids_clean: list[int] = []
+    seen: set[int] = set()
+    for mid in mon_ids or []:
+        try:
+            i = int(mid or 0)
+        except Exception:
+            continue
+        if i <= 0 or i in seen:
+            continue
+        seen.add(i)
+        ids_clean.append(i)
+    if not ids_clean:
+        return set()
+    own_conn = conn is None
+    if own_conn:
+        conn = await db.connect()
+    try:
+        try:
+            await register_stats.ensure_schema(conn)
+        except Exception:
+            pass
+        placeholders = ", ".join("?" for _ in ids_clean)
+        cur = await conn.execute(
+            f"SELECT mon_id FROM registered_mons WHERE owner_id=? AND mon_id IN ({placeholders})",
+            (str(owner_id), *ids_clean),
         )
         rows = await cur.fetchall()
         await cur.close()

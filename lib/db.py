@@ -19,6 +19,11 @@ if _env.exists():
     except ImportError:
         pass
 
+# Performance-oriented defaults (can be overridden by real env vars).
+os.environ.setdefault("DB_AUTO_TASK_SESSION", "1")
+os.environ.setdefault("DB_POOL_ACQUIRE_TIMEOUT", "12")
+os.environ.setdefault("DB_POOL_ACQUIRE_RETRIES", "2")
+
 # Import caching module
 try:
     from . import db_cache
@@ -302,6 +307,10 @@ async def init_schema() -> None:
                     await conn.execute("ALTER TABLE pokemons ADD COLUMN hp_now INTEGER")
                 if not await _column_exists(conn, "pokemons", "moves_pp"):
                     await conn.execute("ALTER TABLE pokemons ADD COLUMN moves_pp JSONB")
+                if not await _column_exists(conn, "pokemons", "moves_pp_min"):
+                    await conn.execute("ALTER TABLE pokemons ADD COLUMN moves_pp_min JSONB")
+                if not await _column_exists(conn, "pokemons", "moves_pp_max"):
+                    await conn.execute("ALTER TABLE pokemons ADD COLUMN moves_pp_max JSONB")
                 if not await _column_exists(conn, "pokemons", "shiny"):
                     await conn.execute("ALTER TABLE pokemons ADD COLUMN shiny INTEGER NOT NULL DEFAULT 0")
                 if not await _column_exists(conn, "pokemons", "is_hidden_ability"):
@@ -832,15 +841,39 @@ async def set_pokemon_moves(owner_id: str, mon_id: int, moves: Sequence[str] | S
                 pass
 
         has_moves_pp = True
+        has_moves_pp_min = True
+        has_moves_pp_max = True
         try:
             has_moves_pp = await _column_exists(conn, "pokemons", "moves_pp")
         except Exception:
             has_moves_pp = False
+        try:
+            has_moves_pp_min = await _column_exists(conn, "pokemons", "moves_pp_min")
+        except Exception:
+            has_moves_pp_min = False
+        try:
+            has_moves_pp_max = await _column_exists(conn, "pokemons", "moves_pp_max")
+        except Exception:
+            has_moves_pp_max = False
+        min_pps = [0 for _ in base_pps]
         if has_moves_pp:
-            await conn.execute(
-                "UPDATE pokemons SET moves=?, moves_pp=? WHERE owner_id=? AND id=?",
-                (json.dumps(moves, ensure_ascii=False), json.dumps(base_pps, ensure_ascii=False), owner_id, mon_id),
-            )
+            if has_moves_pp_min and has_moves_pp_max:
+                await conn.execute(
+                    "UPDATE pokemons SET moves=?, moves_pp=?, moves_pp_min=?, moves_pp_max=? WHERE owner_id=? AND id=?",
+                    (
+                        json.dumps(moves, ensure_ascii=False),
+                        json.dumps(base_pps, ensure_ascii=False),
+                        json.dumps(min_pps, ensure_ascii=False),
+                        json.dumps(base_pps, ensure_ascii=False),
+                        owner_id,
+                        mon_id,
+                    ),
+                )
+            else:
+                await conn.execute(
+                    "UPDATE pokemons SET moves=?, moves_pp=? WHERE owner_id=? AND id=?",
+                    (json.dumps(moves, ensure_ascii=False), json.dumps(base_pps, ensure_ascii=False), owner_id, mon_id),
+                )
         else:
             await conn.execute(
                 "UPDATE pokemons SET moves=? WHERE owner_id=? AND id=?",
