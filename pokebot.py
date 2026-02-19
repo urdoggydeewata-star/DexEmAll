@@ -36,7 +36,6 @@ import discord
 from discord.ext import commands
 from discord import app_commands, ui, Interaction, Embed
 
-from db_async import connect as db_connect
 from pvp.engine import build_mon
 from pvp.panel import _base_pp
 import pvp.panel as _pvp_panel
@@ -75,6 +74,11 @@ import lib.rules as _rules
 from lib import evolution_mechanics as evo_mech
 from lib import breeding_mechanics as breeding_mech
 import pvp.sprites as _pvp_sprites
+
+# Always use the shared lib.db pooled backend for command queries.
+# The legacy db_async module can resolve to a local sqlite backend on some hosts,
+# which causes missing-table errors and broken alias commands under load.
+db_connect = db.connect
 try:
     from tools.cache_everything import warm_cache, STATIC_TABLES
 except ImportError:
@@ -4312,13 +4316,40 @@ def _roll_gender_from_ratio(gender_ratio: dict) -> str:
 
 async def _get_base_friendship(species_name: str) -> int:
     """Read base friendship from pokedex; fallback to base_happiness → 50."""
-    conn = await db.connect()
+    species_key = str(species_name or "").strip().lower()
+    if db_cache and species_key:
+        cache_keys = {
+            species_key,
+            species_key.replace(" ", "-"),
+            species_key.replace("-", " "),
+            species_key.replace("_", "-"),
+            species_key.replace("-", "_"),
+        }
+        for ck in cache_keys:
+            entry = db_cache.get_cached_pokedex(ck)
+            if not entry:
+                continue
+            bf = entry.get("base_friendship")
+            if bf is None:
+                bf = entry.get("base_happiness")
+            try:
+                return int(bf) if bf is not None else 50
+            except Exception:
+                return 50
+
     try:
-        cur = await conn.execute(
+        conn = await db.connect()
+    except (asyncio.TimeoutError, TimeoutError):
+        return 50
+    except Exception:
+        return 50
+    try:
+        row = await _safe_optional_fetchone(
+            conn,
             "SELECT base_friendship, base_happiness FROM pokedex WHERE LOWER(name)=LOWER(?)",
-            (species_name.lower(),)
+            (species_key,),
+            tables=("pokedex",),
         )
-        row = await cur.fetchone(); await cur.close()
         if not row:
             return 50
         bf = row["base_friendship"]
@@ -17646,6 +17677,7 @@ async def setup(bot: commands.Bot):
 
 async def _dispatch_mypokeinfo_alias(interaction: Interaction, name: str, slot: Optional[int] = None) -> None:
     cog = bot.get_cog("MPokeInfo")
+    last_error: Optional[Exception] = None
     if isinstance(cog, MPokeInfo):
         cmd_obj = getattr(cog, "mpokeinfo", None)
         cb = getattr(cmd_obj, "callback", None)
@@ -17653,24 +17685,39 @@ async def _dispatch_mypokeinfo_alias(interaction: Interaction, name: str, slot: 
             try:
                 await cb(cog, interaction, name, slot)
                 return
-            except TypeError:
-                await cb(interaction, name, slot)
-                return
-            except Exception:
-                import traceback
-                traceback.print_exc()
-                # Fall through to a user-facing error below.
-        try:
-            await cog.mpokeinfo(interaction, name, slot)
-            return
-        except Exception:
-            import traceback
-            traceback.print_exc()
+            except TypeError as e:
+                # Retry positional-style callback invocation only when the
+                # TypeError looks like a signature mismatch.
+                msg = str(e).lower()
+                sig_mismatch = (
+                    "positional argument" in msg
+                    or "unexpected keyword" in msg
+                    or "required positional argument" in msg
+                    or ("takes" in msg and "given" in msg)
+                )
+                if sig_mismatch:
+                    try:
+                        await cb(interaction, name, slot)
+                        return
+                    except Exception as e2:
+                        last_error = e2
+                else:
+                    last_error = e
+            except Exception as e:
+                last_error = e
+    if last_error is not None:
+        print(f"[mypokeinfo alias] dispatch failed: {last_error!r}")
+    timeout_hit = isinstance(last_error, (asyncio.TimeoutError, TimeoutError))
+    msg = (
+        "⏳ Database is busy right now. Please try `/mypokeinfo` again in a few seconds."
+        if timeout_hit
+        else "❌ PK info system is not loaded yet. Try again in a moment."
+    )
     try:
         if interaction.response.is_done():
-            await interaction.followup.send("❌ PK info system is not loaded yet. Try again in a moment.", ephemeral=True)
+            await interaction.followup.send(msg, ephemeral=True)
         else:
-            await interaction.response.send_message("❌ PK info system is not loaded yet. Try again in a moment.", ephemeral=True)
+            await interaction.response.send_message(msg, ephemeral=True)
     except Exception:
         pass
 
@@ -17682,6 +17729,15 @@ async def _dispatch_pokeinfo_alias(
     gender: Optional[str] = None,
     gen: Optional[int] = None,
 ) -> None:
+    def _typeerror_is_signature_mismatch(exc: TypeError) -> bool:
+        m = str(exc or "").lower()
+        return (
+            "positional argument" in m
+            or "unexpected keyword" in m
+            or "required positional argument" in m
+            or ("takes" in m and "given" in m)
+        )
+
     cmd_obj = None
     try:
         cmd_obj = bot.tree.get_command("pokeinfo")
@@ -17710,50 +17766,60 @@ async def _dispatch_pokeinfo_alias(
                 gen=gen,
             )
             return
-        except TypeError:
+        except TypeError as e:
             # Fallback for callback styles that require positional args.
-            try:
-                await cb(interaction, name_or_id, bool(shiny), gender, gen)
-                return
-            except Exception as e:
+            if _typeerror_is_signature_mismatch(e):
+                try:
+                    await cb(interaction, name_or_id, bool(shiny), gender, gen)
+                    return
+                except Exception as e2:
+                    last_error = e2
+            else:
                 last_error = e
-        except Exception:
-            import traceback
-            traceback.print_exc()
-            last_error = Exception("pokeinfo_callback_failed")
+        except Exception as e:
+            last_error = e
 
-    # Last fallback: call the command object directly if available.
-    try:
-        if callable(cmd_obj):
-            try:
-                await cmd_obj(
-                    interaction,
-                    name_or_id=name_or_id,
-                    shiny=bool(shiny),
-                    gender=gender,
-                    gen=gen,
-                )
-                return
-            except TypeError:
-                await cmd_obj(interaction, name_or_id, bool(shiny), gender, gen)
-                return
-    except Exception:
-        import traceback
-        traceback.print_exc()
-        last_error = Exception("pokeinfo_command_invoke_failed")
-
-    try:
-        if last_error is not None:
+    if last_error is not None:
+        low = str(last_error).lower()
+        if isinstance(last_error, (asyncio.TimeoutError, TimeoutError)):
+            msg = "⏳ Pokédex is busy right now. Please try `/pkinfo` again in a few seconds."
+        elif (
+            "no such table" in low
+            or "does not exist" in low
+            or "undefined table" in low
+            or "relation" in low and "does not exist" in low
+        ):
+            msg = "⚠️ Pokédex data is still loading. Please try `/pkinfo` again in a few seconds."
+        else:
             msg = "❌ Pokédex lookup failed. Please try again."
+        try:
             if interaction.response.is_done():
                 await interaction.followup.send(msg, ephemeral=True)
             else:
                 await interaction.response.send_message(msg, ephemeral=True)
-        else:
+        except Exception:
+            pass
+        print(f"[pkinfo alias] dispatch failed: {last_error!r}")
+        return
+
+    if cmd_obj is None:
+        try:
+            msg = "❌ Pokédex info command is not loaded yet. Try again in a moment."
             if interaction.response.is_done():
-                await interaction.followup.send("❌ Pokédex info command is not loaded yet. Try again in a moment.", ephemeral=True)
+                await interaction.followup.send(msg, ephemeral=True)
             else:
-                await interaction.response.send_message("❌ Pokédex info command is not loaded yet. Try again in a moment.", ephemeral=True)
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+        return
+
+    # Command object exists but had no callable callback.
+    try:
+        msg = "❌ Pokédex info command is not loaded yet. Try again in a moment."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
     except Exception:
         pass
 
@@ -22833,19 +22899,33 @@ async def fuzzy_species_row(con, name: str):
     Returns (row, suggestions_or_empty_list) where row may be None.
     """
     q = (name or "").strip().lower()
-    cur = await con.execute("SELECT * FROM pokedex WHERE LOWER(name)=?", (q,))
-    row = await cur.fetchone(); await cur.close()
+    row = await _safe_optional_fetchone(
+        con,
+        "SELECT * FROM pokedex WHERE LOWER(name)=?",
+        (q,),
+        tables=("pokedex",),
+    )
     if row:
         return row, []
 
-    cur = await con.execute("SELECT id, name FROM pokedex")
-    all_rows = await cur.fetchall(); await cur.close()
+    all_rows = await _safe_optional_fetchall(
+        con,
+        "SELECT id, name FROM pokedex",
+        (),
+        tables=("pokedex",),
+    )
+    if not all_rows:
+        return None, []
     choices = [r["name"] for r in all_rows]
     best, ratio, suggestions = _fuzzy_best(q, choices)  # <-- your corrector
     if not best or ratio < 0.82:
         return None, suggestions
-    cur = await con.execute("SELECT * FROM pokedex WHERE LOWER(name)=?", (best.lower(),))
-    row = await cur.fetchone(); await cur.close()
+    row = await _safe_optional_fetchone(
+        con,
+        "SELECT * FROM pokedex WHERE LOWER(name)=?",
+        (best.lower(),),
+        tables=("pokedex",),
+    )
     return row, [] if row else suggestions
 
 # ---------- Sprite helpers (form-aware + fuzzy folder) ----------
@@ -23702,7 +23782,19 @@ async def pokeinfo(
         form_key = parsed_form  # Only use parsed form from name, no explicit parameter
         base_row = None
         if db_cache:
-            base_row = db_cache.get_cached_pokedex(species_guess)
+            guess = str(species_guess or "").strip()
+            cache_keys = {
+                guess,
+                guess.lower(),
+                guess.replace(" ", "-"),
+                guess.replace("-", " "),
+                guess.replace("_", "-"),
+                guess.replace("-", "_"),
+            }
+            for ck in cache_keys:
+                base_row = db_cache.get_cached_pokedex(ck)
+                if base_row:
+                    break
         if base_row is None:
             con = await db_connect()
             try:

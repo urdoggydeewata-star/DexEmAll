@@ -48,6 +48,41 @@ def _get_float(name: str, default: float) -> float:
         return default
 
 
+def _is_transient_acquire_error(exc: Exception) -> bool:
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    msg = str(exc or "").lower()
+    return (
+        "too many connections" in msg
+        or "connection pool exhausted" in msg
+        or ("cancelled" in msg and "acquire" in msg)
+    )
+
+
+async def _acquire_with_retry(
+    pool: asyncpg.pool.Pool,
+    *,
+    timeout: Optional[float] = None,
+) -> asyncpg.Connection:
+    acquire_timeout = float(timeout if timeout is not None else _get_float("DB_POOL_ACQUIRE_TIMEOUT", 20.0))
+    retries = max(0, _get_int("DB_POOL_ACQUIRE_RETRIES", 2))
+    base_backoff = max(0.01, _get_float("DB_POOL_ACQUIRE_BACKOFF", 0.06))
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            return await pool.acquire(timeout=acquire_timeout)
+        except Exception as exc:
+            if not _is_transient_acquire_error(exc):
+                raise
+            last_exc = exc
+            if attempt >= retries:
+                raise
+            await asyncio.sleep(base_backoff * (2 ** attempt))
+    if last_exc is not None:
+        raise last_exc
+    raise TimeoutError("Pool acquire failed unexpectedly")
+
+
 def _convert_qmarks_to_dollars(sql: str) -> str:
     """Replace ? placeholders with $1, $2, ... while respecting quoted strings."""
     out = []
@@ -143,9 +178,10 @@ async def _get_pool() -> asyncpg.pool.Pool:
                 min_size, max_size = max_size, min_size
 
             if is_managed_pool:
-                # pgbouncer/managed pool: keep prepared statements off and default to tiny pool.
+                # pgbouncer/managed pool: keep prepared statements off; allow
+                # DB_POOL_MAX/DB_POOL_SIZE to scale concurrency.
                 min_size = _get_int("DB_POOL_MIN", 1)
-                max_size = _get_int("DB_POOL_MAX", 5)
+                max_size = _get_int("DB_POOL_MAX", _get_int("DB_POOL_SIZE", 20))
                 pool_kwargs = {
                     "dsn": dsn,
                     "min_size": min_size,
@@ -245,8 +281,7 @@ class Connection:
 
         # Otherwise, borrow a pool connection for this query
         pool = await _get_pool()
-        acquire_timeout = _get_float("DB_POOL_ACQUIRE_TIMEOUT", 10.0)
-        conn = await pool.acquire(timeout=acquire_timeout)
+        conn = await _acquire_with_retry(pool)
         try:
             return await _execute_with_conn(conn, sql, params)
         finally:
@@ -281,10 +316,12 @@ class Connection:
                 await _execute_with_conn(self._pinned, stmt, ())
             return
         pool = await _get_pool()
-        acquire_timeout = _get_float("DB_POOL_ACQUIRE_TIMEOUT", 10.0)
-        async with pool.acquire(timeout=acquire_timeout) as conn:
+        conn = await _acquire_with_retry(pool)
+        try:
             for stmt in statements:
                 await _execute_with_conn(conn, stmt, ())
+        finally:
+            await pool.release(conn)
 
     async def commit(self) -> None:
         # Using autocommit via pool connections
@@ -310,9 +347,8 @@ class Connection:
 async def connect(_: str | None = None, timeout: float | None = None) -> Connection:
     pool = await _get_pool()
     sticky = os.getenv("DB_STICKY_CONN", "1").lower() not in ("0", "false", "no")
-    acquire_timeout = _get_float("DB_POOL_ACQUIRE_TIMEOUT", 10.0)
     if sticky:
-        conn = await pool.acquire(timeout=acquire_timeout)
+        conn = await _acquire_with_retry(pool, timeout=timeout)
         return Connection(pool, pinned=conn)
     return Connection(pool)
 
@@ -327,8 +363,7 @@ async def session() -> Connection:
         return
 
     pool = await _get_pool()
-    acquire_timeout = _get_float("DB_POOL_ACQUIRE_TIMEOUT", 10.0)
-    conn = await pool.acquire(timeout=acquire_timeout)
+    conn = await _acquire_with_retry(pool)
     token = _session_conn.set(conn)
     try:
         yield Connection(pool)
