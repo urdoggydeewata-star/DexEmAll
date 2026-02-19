@@ -16526,8 +16526,8 @@ class MPokeInfo(commands.Cog):
         if not type_tokens:
             type_tokens = ["Normal"]
         badge_left, badge_top = _pt(198, 31)
-        badge_w = max(22, int(round(58 * sx)))
-        badge_h = max(10, int(round(12 * sy)))
+        badge_w = max(20, int(round(54 * sx)))
+        badge_h = max(10, int(round(11 * sy)))
         badge_gap = max(1, int(round(2 * sy)))
         for i, tok in enumerate(type_tokens[:2]):
             row_y = int(badge_top + (i * (badge_h + badge_gap)))
@@ -16724,8 +16724,8 @@ class MPokeInfo(commands.Cog):
                 _pt(132, 67),
                 "★",
                 font=side_star_font,
-                fill=(255, 230, 130, 255),
-                shadow=(78, 42, 10, 220),
+                fill=(255, 110, 132, 255),
+                shadow=(88, 20, 26, 220),
             )
 
         ball_raw = str(mon.get("pokeball") or "poke_ball").strip().lower()
@@ -17209,9 +17209,9 @@ class MPokeInfo(commands.Cog):
         type_tokens = [str(t or "").strip().lower() for t in list(types or []) if str(t or "").strip()]
         if not type_tokens:
             type_tokens = ["normal"]
-        type_left, type_top = _pt(316, 33)
-        type_w = max(24, int(round(94 * sx)))
-        type_h = max(12, int(round(27 * sy)))
+        type_left, type_top = _pt(308, 31)
+        type_w = max(28, int(round(126 * sx)))
+        type_h = max(14, int(round(34 * sy)))
         type_gap = max(1, int(round(4 * sy)))
         for i, tok in enumerate(type_tokens[:2]):
             row_y = int(type_top + (i * (type_h + type_gap)))
@@ -17268,8 +17268,8 @@ class MPokeInfo(commands.Cog):
                 _pt(538, 61),
                 "★",
                 font=star_font,
-                fill=(255, 230, 130, 255),
-                shadow=(78, 42, 10, 220),
+                fill=(255, 110, 132, 255),
+                shadow=(88, 20, 26, 220),
             )
             self._mpokeinfo_draw_shadow_text(
                 draw,
