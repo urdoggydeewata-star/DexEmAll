@@ -11086,7 +11086,10 @@ async def _load_pp_from_db(st: "BattleState", uid: int) -> None:
                     except Exception:
                         pps = None
                     st._ensure_pp_loaded(uid, mon)
-                    key = (uid, idx)
+                    if hasattr(st, "_get_mon_key"):
+                        key = st._get_mon_key(uid, mon)
+                    else:
+                        key = (uid, idx)
                     if key not in st._pp:
                         st._pp[key] = {}
                     if moves and isinstance(pps, list) and len(pps) == len(moves):
@@ -11102,6 +11105,10 @@ async def _load_pp_from_db(st: "BattleState", uid: int) -> None:
                             # Clamp stale inflated rows (e.g. legacy 64/56) to legal base PP.
                             left_i = max(0, min(left_i, max(1, base_pp)))
                             st._pp[key][m] = left_i
+                            try:
+                                st._pp[key][_norm_move_name(str(m))] = left_i
+                            except Exception:
+                                pass
             break
         except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
             if attempt == 0:
@@ -11117,7 +11124,10 @@ async def _save_party_state_from_battle(st: "BattleState", uid: int) -> None:
             db_id = getattr(mon, "_db_id", None)
             if not db_id:
                 continue
-            key = (uid, idx)
+            if hasattr(st, "_get_mon_key"):
+                key = st._get_mon_key(uid, mon)
+            else:
+                key = (uid, idx)
             pp_store = st._pp.get(key, {})
             move_list = (mon.moves or [])[:4]
             norm_pp_store: dict[str, int] = {}

@@ -42,6 +42,10 @@ try:
 except ImportError:
     _lib_db_cache = None
 try:
+    from lib import db as _lib_db
+except Exception:
+    _lib_db = None
+try:
     from lib import register_stats as _register_stats  # type: ignore
 except Exception:
     _register_stats = None
@@ -527,6 +531,10 @@ def _max_pp(move_name: str, generation: Optional[int] = None) -> int:
     # Max PP = base PP * 1.6 (3 PP Ups = 20% each = 60% total)
     return int(base * 1.6)
 
+
+def _norm_pp_move_key(move_name: Any) -> str:
+    return str(move_name or "").strip().lower().replace(" ", "-").replace("_", "-")
+
 def _check_dmax_gear_sync(user_id_str: str, battle_gen: int = 8) -> bool:
     """
     Synchronously check if user has Dynamax Band equipped AND it's active for the battle generation.
@@ -786,6 +794,12 @@ class BattleState:
         self.p2_is_bot = p2_is_bot
         self.p1_team: List[Mon] = p1_party[:6]
         self.p2_team: List[Mon] = p2_party[:6]
+        for idx, mon in enumerate(self.p1_team):
+            if mon is not None:
+                setattr(mon, "_battle_slot", idx)
+        for idx, mon in enumerate(self.p2_team):
+            if mon is not None:
+                setattr(mon, "_battle_slot", idx)
         self.p1_active = 0
         self.p2_active = 0
         self.turn = 1
@@ -1122,11 +1136,18 @@ class BattleState:
             mon = self._active(uid)
         
         team = self.team_for(uid)
-        try:
-            team_index = team.index(mon)
-        except ValueError:
-            # Fallback: use active index if mon not found
-            team_index = self.p1_active if uid == self.p1_id else self.p2_active
+        slot = getattr(mon, "_battle_slot", None)
+        if isinstance(slot, int) and 0 <= slot < len(team):
+            team_index = int(slot)
+        else:
+            team_index = -1
+            for i, cand in enumerate(team):
+                if cand is mon:
+                    team_index = i
+                    break
+            if team_index < 0:
+                # Fallback: use active index if mon not found
+                team_index = self.p1_active if uid == self.p1_id else self.p2_active
         
         return (uid, team_index)
     
@@ -1148,14 +1169,20 @@ class BattleState:
         is_transformed = getattr(mon, '_transformed', False) or getattr(mon, '_imposter_transformed', False)
         
         for m in moves:
-            if m not in store:
+            norm_m = _norm_pp_move_key(m)
+            if m not in store and norm_m not in store:
                 if is_transformed:
                     # Transformed Pokemon get 5 PP per move (or max if less than 5)
                     base_pp = _base_pp(m, generation=self.gen)
-                    store[m] = min(5, base_pp) if base_pp < 5 else 5
+                    loaded_pp = min(5, base_pp) if base_pp < 5 else 5
                 else:
                     # Normal Pokemon start with their base PP (database value). DB overrides (moves_pp) may replace this.
-                    store[m] = _base_pp(m, generation=self.gen)
+                    loaded_pp = _base_pp(m, generation=self.gen)
+                store[m] = loaded_pp
+                store[norm_m] = loaded_pp
+            elif m not in store and norm_m in store:
+                # Keep canonical move-name key populated for direct lookups/UI rendering.
+                store[m] = int(store.get(norm_m, _base_pp(m, generation=self.gen)))
 
     def _pp_left(self, uid: int, move_name: str, mon: Optional[Mon] = None) -> int:
         """Get remaining PP for a move. If mon is None, uses active Pokemon."""
@@ -1165,7 +1192,20 @@ class BattleState:
                 return 999
         self._ensure_pp_loaded(uid, mon)
         key = self._get_mon_key(uid, mon)
-        return int(self._pp.get(key, {}).get(move_name, _max_pp(move_name, generation=self.gen)))
+        store = self._pp.get(key, {}) or {}
+        left = store.get(move_name)
+        if left is None:
+            norm_name = _norm_pp_move_key(move_name)
+            left = store.get(norm_name)
+            if left is None:
+                for raw_key, raw_val in store.items():
+                    if _norm_pp_move_key(raw_key) == norm_name:
+                        left = raw_val
+                        break
+        try:
+            return int(left) if left is not None else int(_max_pp(move_name, generation=self.gen))
+        except Exception:
+            return int(_max_pp(move_name, generation=self.gen))
 
     def _spend_pp(self, uid: int, move_name: str, target: Any = None, move_data: Any = None, mon: Optional[Mon] = None) -> None:
         """
@@ -1190,7 +1230,19 @@ class BattleState:
         
         self._ensure_pp_loaded(uid, mon)
         key = self._get_mon_key(uid, mon)
-        left = self._pp.get(key, {}).get(move_name, _max_pp(move_name, generation=self.gen))
+        if key not in self._pp:
+            self._pp[key] = {}
+        store = self._pp[key]
+        norm_name = _norm_pp_move_key(move_name)
+        resolved_key = move_name if move_name in store else (norm_name if norm_name in store else move_name)
+        if resolved_key == move_name and move_name not in store:
+            for raw_key in store.keys():
+                if _norm_pp_move_key(raw_key) == norm_name:
+                    resolved_key = raw_key
+                    break
+        left = store.get(resolved_key)
+        if left is None:
+            left = _max_pp(move_name, generation=self.gen)
         
         # Calculate PP cost (1 normally, 2+ if Pressure is active)
         pp_cost = 1
@@ -1277,18 +1329,20 @@ class BattleState:
                 pp_cost = 1 + pressure_count
         
         # Spend PP (can't go below 0)
-        if key not in self._pp:
-            self._pp[key] = {}
-        self._pp[key][move_name] = max(0, left - pp_cost)
+        new_left = max(0, int(left) - int(pp_cost))
+        store[resolved_key] = new_left
+        store[norm_name] = new_left
+        if move_name not in store:
+            store[move_name] = new_left
     
     def _initialize_max_pp(self) -> None:
         """Initialize all moves with max PP for PVP battles."""
         for uid in [self.p1_id, self.p2_id]:
             team = self.team_for(uid)
-            for team_index, mon in enumerate(team):
+            for mon in team:
                 if mon:
                     # Ensure key is a tuple (user_id, team_index)
-                    key = (int(uid), int(team_index))
+                    key = self._get_mon_key(int(uid), mon)
                     if key not in self._pp:
                         self._pp[key] = {}
                     # Ensure moves is a list of strings
@@ -1302,7 +1356,9 @@ class BattleState:
                     for move in moves:
                         move_str = str(move) if move else "Tackle"
                         # Use base PP as starting pool; it will be overridden by stored moves_pp if available.
-                        self._pp[key][move_str] = _base_pp(move_str, generation=self.gen)
+                        start_pp = _base_pp(move_str, generation=self.gen)
+                        self._pp[key][move_str] = start_pp
+                        self._pp[key][_norm_pp_move_key(move_str)] = start_pp
     
     def _cache_all_moves(self) -> None:
         """Pre-cache all move data for all Pokémon in the battle. Uses db_cache when available, then DB."""
@@ -8225,6 +8281,111 @@ async def _send_player_panel(itx: discord.Interaction, st: BattleState, for_user
             except Exception:
                 pass
 
+
+async def _load_pp_state_for_user(st: BattleState, uid: int) -> None:
+    """Hydrate in-battle PP from DB moves_pp for a single user."""
+    if _lib_db is None or int(uid) <= 0:
+        return
+    team = st.team_for(uid)
+    async with _lib_db.session() as conn:
+        for mon in team:
+            db_id = getattr(mon, "_db_id", None)
+            if not db_id:
+                continue
+            cur = await conn.execute("SELECT moves, moves_pp FROM pokemons WHERE id=? LIMIT 1", (int(db_id),))
+            row = await cur.fetchone()
+            await cur.close()
+            if not row:
+                continue
+            try:
+                moves = json.loads(row["moves"]) if row.get("moves") else []
+            except Exception:
+                moves = []
+            try:
+                raw_pp = row.get("moves_pp")
+                if isinstance(raw_pp, list):
+                    pps = raw_pp
+                elif raw_pp:
+                    pps = json.loads(raw_pp)
+                else:
+                    pps = None
+            except Exception:
+                pps = None
+            st._ensure_pp_loaded(uid, mon)
+            key = st._get_mon_key(uid, mon)
+            if key not in st._pp:
+                st._pp[key] = {}
+            store = st._pp[key]
+            if moves and isinstance(pps, list) and len(pps) == len(moves):
+                for mv, left in zip(moves, pps):
+                    try:
+                        base_pp = int(_base_pp(mv, generation=st.gen))
+                    except Exception:
+                        base_pp = 20
+                    try:
+                        left_i = int(left)
+                    except Exception:
+                        left_i = base_pp
+                    left_i = max(0, min(left_i, max(1, int(base_pp))))
+                    store[mv] = left_i
+                    store[_norm_pp_move_key(mv)] = left_i
+
+
+async def _save_pp_state_for_user(st: BattleState, uid: int) -> None:
+    """Persist in-battle PP back to DB moves_pp for a single user."""
+    if _lib_db is None or int(uid) <= 0:
+        return
+    team = st.team_for(uid)
+    async with _lib_db.session() as conn:
+        for mon in team:
+            db_id = getattr(mon, "_db_id", None)
+            if not db_id:
+                continue
+            key = st._get_mon_key(uid, mon)
+            pp_store = st._pp.get(key, {}) or {}
+            norm_pp_store: Dict[str, int] = {}
+            for raw_key, raw_val in pp_store.items():
+                try:
+                    norm_pp_store[_norm_pp_move_key(raw_key)] = int(raw_val)
+                except Exception:
+                    continue
+            move_list = (mon.moves or [])[:4]
+            moves_pp: List[int] = []
+            for mv in move_list:
+                try:
+                    base_pp = int(_base_pp(mv, generation=st.gen))
+                except Exception:
+                    base_pp = 20
+                left = pp_store.get(mv)
+                if left is None:
+                    left = pp_store.get(_norm_pp_move_key(mv))
+                if left is None:
+                    left = norm_pp_store.get(_norm_pp_move_key(mv))
+                try:
+                    left_i = int(left) if left is not None else int(base_pp)
+                except Exception:
+                    left_i = int(base_pp)
+                moves_pp.append(max(0, min(left_i, max(1, int(base_pp)))))
+            await conn.execute(
+                "UPDATE pokemons SET moves_pp=? WHERE id=?",
+                (json.dumps(moves_pp, ensure_ascii=False), int(db_id)),
+            )
+        await conn.commit()
+    try:
+        _lib_db.invalidate_pokemons_cache(str(uid))
+    except Exception:
+        pass
+
+
+async def _load_pp_state_for_battle(st: BattleState) -> None:
+    for uid in (st.p1_id, st.p2_id):
+        await _load_pp_state_for_user(st, uid)
+
+
+async def _save_pp_state_for_battle(st: BattleState) -> None:
+    for uid in (st.p1_id, st.p2_id):
+        await _save_pp_state_for_user(st, uid)
+
 async def _finish(st: BattleState, p1_itx: discord.Interaction, p2_itx: discord.Interaction, *, room_id: Optional[int]):
     # Clean up all battle GIF files for this battle
     try:
@@ -8250,7 +8411,15 @@ async def _finish(st: BattleState, p1_itx: discord.Interaction, p2_itx: discord.
 
     # For Adventure format send a single consolidated end panel (Myuu-style)
     fmt = getattr(st, "fmt_label", "") or ""
-    if fmt.lower().startswith("adventure") or fmt.lower() == "rival":
+    is_adventure_like = fmt.lower().startswith("adventure") or fmt.lower() == "rival"
+    # Persist move PP at battle end for non-Adventure battles.
+    # Adventure/Rival persistence is handled by pokebot's PvE wrapper.
+    if not is_adventure_like:
+        try:
+            await _save_pp_state_for_battle(st)
+        except Exception:
+            pass
+    if is_adventure_like:
         # Adventure wild + trainer/rival: single combined embed sent from pokebot (battle ended + outcome + EXP/level-ups + money)
         pass
     else:
@@ -8452,6 +8621,19 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
     TURN_TIMER = 150.0  # 150 seconds = 2.5 minutes per turn
     
     st.unlock_both()
+    fmt_key = (getattr(st, "fmt_label", "") or "").strip().lower()
+    is_adventure_like = fmt_key.startswith("adventure") or fmt_key == "rival"
+    # Ensure PP is loaded from stored moves_pp in battle modes that don't
+    # already preload/snapshot PP via the Adventure wrapper.
+    if not is_adventure_like and not bool(getattr(st, "_pp_persist_loaded", False)):
+        try:
+            await _load_pp_state_for_battle(st)
+        except Exception:
+            pass
+        try:
+            st._pp_persist_loaded = True
+        except Exception:
+            pass
     
     if not getattr(st, '_battle_start_announced', False):
         # No separate "battle started" embed; we'll include pre-battle info in the first panel.
