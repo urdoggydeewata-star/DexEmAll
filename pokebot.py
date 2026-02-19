@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 
 import lib
 from lib import db
+from lib import register_stats
 from lib.owner_settings import load_owner_settings
 from lib.market_catalog import (
     MARKET_DISPLAY_NAMES,
@@ -10006,6 +10007,7 @@ async def _daycare_tick(owner_id: str, state: dict, *, command_credit: float = 0
                 changed = True
         else:
             produced = False
+            produced_count = 0
             while (now - last_egg_at) >= interval and len(eggs) < DAYCARE_EGG_CAP:
                 if parents[0] is None or parents[1] is None:
                     break
@@ -10013,6 +10015,7 @@ async def _daycare_tick(owner_id: str, state: dict, *, command_credit: float = 0
                 if not egg:
                     break
                 eggs.append(egg)
+                produced_count += 1
                 last_egg_at += interval
                 produced = True
                 changed = True
@@ -10024,9 +10027,18 @@ async def _daycare_tick(owner_id: str, state: dict, *, command_credit: float = 0
                     bonus = await _daycare_create_egg(parents[0], parents[1], pair_info)
                     if bonus:
                         eggs.append(bonus)
+                        produced_count += 1
                         changed = True
             if produced:
                 rec["last_egg_at"] = last_egg_at
+                try:
+                    parent_ids = [
+                        int(parents[0].get("id") or 0) if parents and parents[0] else 0,
+                        int(parents[1].get("id") or 0) if parents and parents[1] else 0,
+                    ]
+                    await register_stats.increment_eggs_bred(owner_id, parent_ids, count=max(1, int(produced_count or 1)))
+                except Exception:
+                    pass
 
         # Keep legacy field clean after migrating to real-time cadence.
         try:
@@ -11811,6 +11823,10 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
                     ev_summary.append((mon, ev_gains))
         await conn.commit()
         db.invalidate_pokemons_cache(str(winner_id))
+        try:
+            await register_stats.add_exp_from_summary(str(winner_id), exp_summary)
+        except Exception:
+            pass
         return (level_ups, exp_summary, ev_summary)
 
 
@@ -16667,6 +16683,484 @@ class MPokeInfo(commands.Cog):
         out.seek(0)
         filename = f"mpokeinfo_{int(mon.get('id') or 0)}.png"
         return discord.File(fp=out, filename=filename)
+
+    @staticmethod
+    def _register_panel_base_path() -> Optional[Path]:
+        candidates = [
+            ASSETS_DIR / "ui" / "register-base.png",
+            ASSETS_DIR / "ui" / "register_base.png",
+            ASSETS_DIR / "ui" / "register-template.png",
+            ASSETS_DIR / "ui" / "register_template.png",
+            ASSETS_DIR / "ui" / "register.png",
+        ]
+        for p in candidates:
+            try:
+                if p.exists() and p.is_file() and p.stat().st_size > 0:
+                    return p
+            except Exception:
+                continue
+        return None
+
+    async def _render_register_panel(
+        self,
+        interaction: Interaction,
+        mon: dict,
+        *,
+        profile: dict,
+        species: str,
+        level: int,
+        shiny: bool,
+        gender: str,
+        current_form: Optional[str],
+        types: List[str],
+    ) -> Optional[discord.File]:
+        if Image is None:
+            return None
+        try:
+            from PIL import Image as PILImage, ImageDraw, ImageSequence  # type: ignore
+        except Exception:
+            return None
+
+        template = self._register_panel_base_path()
+        if template is None:
+            return None
+        try:
+            base = PILImage.open(str(template)).convert("RGBA")
+        except Exception:
+            return None
+
+        W, H = base.size
+        sx = max(0.1, float(W) / 800.0)
+        sy = max(0.1, float(H) / 488.0)
+        scale = min(sx, sy)
+        draw_probe = ImageDraw.Draw(base)
+
+        def _pt(x: float, y: float) -> tuple[int, int]:
+            return (int(round(x * sx)), int(round(y * sy)))
+
+        def _clip_text(text: str, font, max_width: int) -> str:
+            t = str(text or "")
+            if not t or font is None:
+                return ""
+            if self._mpokeinfo_text_width(draw_probe, t, font) <= int(max_width):
+                return t
+            suffix = "..."
+            if self._mpokeinfo_text_width(draw_probe, suffix, font) > int(max_width):
+                return ""
+            lo, hi = 0, len(t)
+            best = suffix
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                cand = f"{t[:mid].rstrip()}{suffix}"
+                if self._mpokeinfo_text_width(draw_probe, cand, font) <= int(max_width):
+                    best = cand
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            return best
+
+        panel_static = base.copy()
+        draw = ImageDraw.Draw(panel_static)
+        label_font = self._mpokeinfo_font(max(8, int(round(17 * scale))), bold=True)
+        value_font_base_size = max(8, int(round(18 * scale)))
+
+        def _draw_center_value(text: str, left: int, top: int, width: int, height: int) -> None:
+            txt = str(text or "—")
+            font = self._mpokeinfo_fit_font(
+                draw_probe,
+                txt,
+                max_width=max(10, int(width - max(6, int(round(8 * sx))))),
+                start_size=value_font_base_size,
+                min_size=max(8, int(round(11 * scale))),
+                bold=True,
+            )
+            txt = _clip_text(txt, font, max(10, int(width - max(6, int(round(8 * sx)))))
+            )
+            if not txt or font is None:
+                return
+            tw = self._mpokeinfo_text_width(draw_probe, txt, font)
+            try:
+                tb = draw_probe.textbbox((0, 0), txt, font=font)
+                th = max(1, int(tb[3] - tb[1]))
+            except Exception:
+                th = max(8, int(round(12 * scale)))
+            tx = int(left + max(0, (int(width) - tw) // 2))
+            ty = int(top + max(0, (int(height) - th) // 2 - 1))
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                (tx, ty),
+                txt,
+                font=font,
+                fill=(242, 246, 250, 255),
+                shadow=(0, 0, 0, 220),
+            )
+
+        def _draw_label(text: str, left: int, top: int, width: int) -> None:
+            if label_font is None:
+                return
+            txt = _clip_text(text, label_font, max(12, int(width - max(6, int(round(8 * sx))))))
+            if not txt:
+                return
+            tw = self._mpokeinfo_text_width(draw_probe, txt, label_font)
+            tx = int(left + max(0, (int(width) - tw) // 2))
+            ty = int(top + max(0, int(round(1 * sy))))
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                (tx, ty),
+                txt,
+                font=label_font,
+                fill=(238, 238, 246, 255),
+                shadow=(24, 12, 35, 220),
+            )
+
+        def _draw_row(label: str, value: str, *, left: int, top: int, width: int) -> None:
+            label_h = max(10, int(round(22 * sy)))
+            value_h = max(10, int(round(22 * sy)))
+            _draw_label(label, left, top, width)
+            _draw_center_value(value, left, top + label_h, width, value_h)
+
+        def _ival(key: str) -> int:
+            try:
+                return int(profile.get(key, 0) or 0)
+            except Exception:
+                return 0
+
+        most_used_move = register_stats.display_move_name(profile.get("most_used_move"))
+        move_count = _ival("most_used_move_count")
+        if move_count > 0 and most_used_move != "—":
+            most_used_move = f"{most_used_move} ×{move_count}"
+
+        left_x = _pt(16, 0)[0]
+        left_w = max(50, int(round(294 * sx)))
+        right_x = _pt(320, 0)[0]
+        right_w = max(40, int(round(236 * sx)))
+        top_rows = [
+            ("Most Used Move", most_used_move, 12),
+            ("Times Traded", f"{_ival('times_traded')}", 74),
+            ("Eggs Bred", f"{_ival('eggs_bred')}", 128),
+            ("Total Routes", f"{_ival('total_routes')}", 182),
+            ("Total Exp Gained", f"{_ival('total_exp_gained')} EXP", 236),
+            ("Pokemon Beat", f"{_ival('pokemon_beat')}", 290),
+            ("Shinies Killed", f"{_ival('shinies_killed')}", 344),
+            ("Legendaries Killed", f"{_ival('legendaries_killed')}", 398),
+        ]
+        for label, value, y in top_rows:
+            _draw_row(label, value, left=left_x, top=_pt(0, y)[1], width=left_w)
+
+        right_rows = [
+            ("Raids Won", f"{_ival('raids_won')}", 236),
+            ("Raids Lost", f"{_ival('raids_lost')}", 290),
+            ("Battles Won", f"{_ival('battles_won')}", 344),
+            ("Battles Lost", f"{_ival('battles_lost')}", 398),
+        ]
+        for label, value, y in right_rows:
+            _draw_row(label, value, left=right_x, top=_pt(0, y)[1], width=right_w)
+
+        ot_name = interaction.user.display_name if getattr(interaction, "user", None) else "Trainer"
+        ot_text = f"OT {ot_name}"
+        ot_font = self._mpokeinfo_fit_font(
+            draw_probe,
+            ot_text,
+            max_width=max(20, int(round(214 * sx))),
+            start_size=max(9, int(round(17 * scale))),
+            min_size=max(8, int(round(10 * scale))),
+            bold=True,
+        )
+        ot_text = _clip_text(ot_text, ot_font, max(20, int(round(214 * sx))))
+        if ot_text and ot_font is not None:
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                _pt(322, 8),
+                ot_text,
+                font=ot_font,
+                fill=(242, 246, 250, 255),
+                shadow=(0, 0, 0, 220),
+            )
+
+        species_display = str(mon.get("nickname") or species or "Pokémon").replace("-", " ").replace("_", " ").title()
+        name_font = self._mpokeinfo_fit_font(
+            draw_probe,
+            species_display,
+            max_width=max(20, int(round(220 * sx))),
+            start_size=max(10, int(round(18 * scale))),
+            min_size=max(8, int(round(10 * scale))),
+            bold=True,
+        )
+        species_display = _clip_text(species_display, name_font, max(20, int(round(220 * sx))))
+        if species_display and name_font is not None:
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                _pt(332, 216),
+                species_display,
+                font=name_font,
+                fill=(242, 246, 250, 255),
+                shadow=(0, 0, 0, 220),
+            )
+
+        g_key = str(gender or "").strip().lower()
+        g_sym = {"male": "♂", "m": "♂", "♀": "♀", "female": "♀", "f": "♀"}.get(g_key, "")
+        lv_text = f"Lv {int(level)}{g_sym}"
+        lv_font = self._mpokeinfo_fit_font(
+            draw_probe,
+            lv_text,
+            max_width=max(20, int(round(86 * sx))),
+            start_size=max(9, int(round(16 * scale))),
+            min_size=max(7, int(round(10 * scale))),
+            bold=True,
+        )
+        lv_text = _clip_text(lv_text, lv_font, max(20, int(round(86 * sx))))
+        if lv_text and lv_font is not None:
+            tw = self._mpokeinfo_text_width(draw_probe, lv_text, lv_font)
+            tx = int(_pt(548, 8)[0] - tw)
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                (tx, _pt(0, 8)[1]),
+                lv_text,
+                font=lv_font,
+                fill=(246, 232, 255, 255),
+                shadow=(24, 12, 35, 220),
+            )
+
+        ribbons = _ival("ribbons")
+        ribbons_label_font = self._mpokeinfo_fit_font(
+            draw_probe, "Ribbons", max_width=max(12, int(round(132 * sx))), start_size=max(8, int(round(16 * scale))), min_size=max(8, int(round(10 * scale))), bold=True
+        )
+        if ribbons_label_font is not None:
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                _pt(584, 42),
+                "Ribbons",
+                font=ribbons_label_font,
+                fill=(242, 246, 250, 255),
+                shadow=(0, 0, 0, 220),
+            )
+        ribbon_text = f"🏅 {ribbons}" if ribbons > 0 else "None"
+        ribbon_font = self._mpokeinfo_fit_font(
+            draw_probe, ribbon_text, max_width=max(12, int(round(118 * sx))), start_size=max(8, int(round(15 * scale))), min_size=max(8, int(round(10 * scale))), bold=True
+        )
+        if ribbon_font is not None:
+            _draw_center_value(ribbon_text, _pt(568, 0)[0], _pt(0, 96)[1], max(16, int(round(132 * sx))), max(10, int(round(24 * sy))))
+
+        primary_type = str(types[0] if types else "Normal").strip().lower()
+        badge = self._mpokeinfo_type_badge_path(primary_type)
+        if badge is not None:
+            try:
+                with PILImage.open(str(badge)) as src:
+                    t_icon = src.convert("RGBA")
+                t_icon.thumbnail((max(18, int(round(54 * sx))), max(10, int(round(19 * sy)))), resample=PILImage.Resampling.LANCZOS)
+                panel_static.alpha_composite(t_icon, dest=_pt(330, 40))
+            except Exception:
+                pass
+        else:
+            t_txt = primary_type.replace("-", " ").title()
+            t_font = self._mpokeinfo_fit_font(
+                draw_probe, t_txt, max_width=max(12, int(round(86 * sx))), start_size=max(8, int(round(14 * scale))), min_size=max(7, int(round(10 * scale))), bold=True
+            )
+            if t_font is not None:
+                self._mpokeinfo_draw_shadow_text(draw, _pt(332, 44), t_txt, font=t_font, fill=(240, 244, 248, 255), shadow=(0, 0, 0, 220))
+
+        if shiny:
+            def _spark(cx: int, cy: int, size: int = 3) -> None:
+                core = (255, 242, 166, 255)
+                glow = (255, 172, 64, 230)
+                for d in range(-size, size + 1):
+                    draw.point((cx + d, cy), fill=core)
+                    draw.point((cx, cy + d), fill=core)
+                for d in range(-max(1, size - 1), max(1, size - 1) + 1):
+                    draw.point((cx + d, cy + d), fill=glow)
+                    draw.point((cx + d, cy - d), fill=glow)
+
+            _spark(*_pt(545, 62), size=max(2, int(round(2 * scale))))
+
+        sprite_frames: list[Any] = []
+        durations: list[int] = []
+        sprite_path = self._pick_sprite_path(species, gender, shiny, current_form)
+        if sprite_path is not None:
+            try:
+                with PILImage.open(str(sprite_path)) as src:
+                    is_anim = bool(getattr(src, "is_animated", False))
+                    if is_anim:
+                        frame_cap = 120 if _daycare_norm_species(species) == "eevee" else 48
+                        for i, fr in enumerate(ImageSequence.Iterator(src)):
+                            if i >= frame_cap:
+                                break
+                            try:
+                                sprite_frames.append(fr.copy().convert("RGBA"))
+                            except Exception:
+                                sprite_frames.append(fr.convert("RGBA"))
+                            try:
+                                d = int(fr.info.get("duration") or src.info.get("duration") or 95)
+                            except Exception:
+                                d = 95
+                            d = max(85, min(260, d)) if _daycare_norm_species(species) == "eevee" else max(55, min(180, d))
+                            durations.append(int(d))
+                    else:
+                        sprite_frames = [src.convert("RGBA")]
+            except Exception:
+                sprite_frames = []
+                durations = []
+
+        if sprite_frames:
+            union_bbox = None
+            for fr in sprite_frames:
+                try:
+                    bb = fr.split()[-1].getbbox()
+                except Exception:
+                    bb = None
+                if bb is None:
+                    continue
+                if union_bbox is None:
+                    union_bbox = bb
+                else:
+                    union_bbox = (
+                        min(union_bbox[0], bb[0]),
+                        min(union_bbox[1], bb[1]),
+                        max(union_bbox[2], bb[2]),
+                        max(union_bbox[3], bb[3]),
+                    )
+            fitted: list[Any] = []
+            for fr in sprite_frames:
+                sp = fr
+                if union_bbox is not None:
+                    try:
+                        crop = fr.crop(union_bbox)
+                        if crop.size[0] > 0 and crop.size[1] > 0:
+                            sp = crop
+                    except Exception:
+                        pass
+                try:
+                    sp.thumbnail((max(20, int(round(210 * sx))), max(20, int(round(180 * sy)))), resample=PILImage.Resampling.LANCZOS)
+                except Exception:
+                    pass
+                fitted.append(sp)
+            sprite_frames = fitted
+
+        sprite_cx, sprite_cy = _pt(438, 141)
+        if sprite_frames and len(sprite_frames) > 1:
+            out_frames: list[Any] = []
+            for sp in sprite_frames:
+                fr = panel_static.copy()
+                try:
+                    fr.alpha_composite(sp, dest=(int(sprite_cx - (sp.width // 2)), int(sprite_cy - (sp.height // 2))))
+                except Exception:
+                    pass
+                out_frames.append(fr)
+            if out_frames:
+                out = BytesIO()
+                try:
+                    out_frames[0].save(
+                        out,
+                        format="GIF",
+                        save_all=True,
+                        append_images=out_frames[1:],
+                        duration=durations[:len(out_frames)] if durations else 95,
+                        loop=0,
+                        disposal=2,
+                    )
+                except Exception:
+                    return None
+                out.seek(0)
+                return discord.File(fp=out, filename=f"register_{int(mon.get('id') or 0)}.gif")
+
+        if sprite_frames:
+            try:
+                sp = sprite_frames[0]
+                panel_static.alpha_composite(sp, dest=(int(sprite_cx - (sp.width // 2)), int(sprite_cy - (sp.height // 2))))
+            except Exception:
+                pass
+
+        out = BytesIO()
+        try:
+            panel_static.save(out, format="PNG")
+        except Exception:
+            return None
+        out.seek(0)
+        return discord.File(fp=out, filename=f"register_{int(mon.get('id') or 0)}.png")
+
+    @app_commands.command(name="register", description="Register a Pokémon for tracking (costs 500,000 PKC).")
+    @app_commands.describe(
+        name="Pokémon species from your team (e.g. pikachu)",
+        slot="Team slot (1–6) if you have duplicates",
+    )
+    async def register(self, interaction: Interaction, name: str, slot: Optional[int] = None):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=False)
+
+        uid = str(interaction.user.id)
+        async with db.session() as conn:
+            mon = await resolve_team_mon(interaction, name, slot, conn=conn)  # noqa: F405
+            if not mon:
+                return
+            full = await db.get_pokemon(uid, int(mon["id"]), conn=conn)
+            if not full:
+                await interaction.followup.send("Could not load Pokémon data.", ephemeral=True)
+                return
+            mon = full
+            species = str(mon.get("species") or "unknown")
+            try:
+                dex = await ensure_species_and_learnsets(species)
+            except Exception:
+                dex = None
+
+        mon_id = int(mon.get("id") or 0)
+        if mon_id <= 0:
+            return await interaction.followup.send("Could not resolve Pokémon ID for registration.", ephemeral=True)
+
+        reg = await register_stats.register_mon(
+            uid,
+            mon_id,
+            species,
+            cost=register_stats.REGISTER_COST_PKC,
+        )
+        if not bool(reg.get("ok")):
+            if str(reg.get("reason")) == "insufficient_funds":
+                bal = int(reg.get("balance") or 0)
+                cost = int(register_stats.REGISTER_COST_PKC)
+                return await interaction.followup.send(
+                    f"❌ You need **{cost:,} {PKDollar_NAME}** to register this Pokémon, but you only have **{bal:,}**.",
+                    ephemeral=True,
+                )
+            return await interaction.followup.send("❌ Could not register this Pokémon right now.", ephemeral=True)
+
+        profile = reg.get("profile") if isinstance(reg.get("profile"), dict) else None
+        if profile is None:
+            profile = await register_stats.get_profile(uid, mon_id)
+        profile = profile or {}
+
+        level = int(mon.get("level") or 1)
+        shiny = bool(mon.get("shiny"))
+        gender = str(mon.get("gender") or "").lower()
+        current_form = mon.get("form")
+        if not current_form and dex:
+            current_form = dex.get("form_name")
+        types = await self._extract_types(species, mon, dex)
+
+        panel_file = await self._render_register_panel(
+            interaction,
+            mon,
+            profile=profile,
+            species=species,
+            level=level,
+            shiny=shiny,
+            gender=gender,
+            current_form=current_form,
+            types=types,
+        )
+
+        if bool(reg.get("created")):
+            charged = int(reg.get("cost_charged") or register_stats.REGISTER_COST_PKC)
+            remaining = int(reg.get("balance") or 0)
+            msg = (
+                f"✅ Registered **{species.replace('-', ' ').title()}** for stat tracking "
+                f"(-{charged:,} {PKDollar_NAME}). Remaining balance: **{remaining:,}**."
+            )
+        else:
+            msg = f"ℹ️ **{species.replace('-', ' ').title()}** is already registered. Showing current tracker card."
+
+        if panel_file is not None:
+            await interaction.followup.send(content=msg, file=panel_file, ephemeral=False)
+        else:
+            await interaction.followup.send(content=msg, ephemeral=False)
 
     # --------------------- command ---------------------
     @app_commands.command(name="mypokeinfo", description="Show details for a Pokémon on your team.")

@@ -676,6 +676,28 @@ def _is_damaging_move(move_name: str) -> bool:
 def _record_last_move(mon: Mon, move_name: str, battle_state: Any = None) -> None:
     """Track the last move name (and its base type) used by a Pokémon."""
     mon.last_move_used = move_name
+    # Buffer move-usage counters for /register profiles; flush at battle end.
+    try:
+        if battle_state is not None:
+            owner_raw = getattr(mon, "_owner_id", None)
+            mon_id_raw = getattr(mon, "_db_id", None)
+            owner_id = str(owner_raw or "")
+            mon_id = int(mon_id_raw or 0)
+            if owner_id and mon_id > 0:
+                mv_key = str(move_name or "").strip().lower().replace("_", "-").replace(" ", "-")
+                if mv_key and mv_key != "recharge":
+                    usage_buf = getattr(battle_state, "_registered_move_usage", None)
+                    if not isinstance(usage_buf, dict):
+                        usage_buf = {}
+                        setattr(battle_state, "_registered_move_usage", usage_buf)
+                    key = (owner_id, mon_id)
+                    bucket = usage_buf.get(key)
+                    if not isinstance(bucket, dict):
+                        bucket = {}
+                        usage_buf[key] = bucket
+                    bucket[mv_key] = int(bucket.get(mv_key, 0) or 0) + 1
+    except Exception:
+        pass
     try:
         mv = _get_move_with_cache(move_name, battle_state=battle_state, generation=battle_state.gen if battle_state else None)
         if mv:
@@ -684,6 +706,40 @@ def _record_last_move(mon: Mon, move_name: str, battle_state: Any = None) -> Non
             mon._last_move_used_type = "Normal" if move_name.lower().replace(" ", "-") == "struggle" else None
     except Exception:
         mon._last_move_used_type = "Normal" if move_name.lower().replace(" ", "-") == "struggle" else None
+
+
+def _record_registered_ko(atk: Mon, dfn: Mon, battle_state: Any = None) -> None:
+    """Buffer KO counters for /register profiles; flushed once in _finish."""
+    try:
+        if battle_state is None:
+            return
+        owner_raw = getattr(atk, "_owner_id", None)
+        mon_id_raw = getattr(atk, "_db_id", None)
+        owner_id = str(owner_raw or "")
+        mon_id = int(mon_id_raw or 0)
+        if not owner_id or mon_id <= 0:
+            return
+        ko_buf = getattr(battle_state, "_registered_ko_stats", None)
+        if not isinstance(ko_buf, dict):
+            ko_buf = {}
+            setattr(battle_state, "_registered_ko_stats", ko_buf)
+        key = (owner_id, mon_id)
+        rec = ko_buf.get(key)
+        if not isinstance(rec, dict):
+            rec = {"pokemon_beat": 0, "shinies_killed": 0, "species_kos": {}}
+            ko_buf[key] = rec
+        rec["pokemon_beat"] = int(rec.get("pokemon_beat", 0) or 0) + 1
+        if bool(getattr(dfn, "shiny", False)):
+            rec["shinies_killed"] = int(rec.get("shinies_killed", 0) or 0) + 1
+        species_kos = rec.get("species_kos")
+        if not isinstance(species_kos, dict):
+            species_kos = {}
+            rec["species_kos"] = species_kos
+        defeated_species = str(getattr(dfn, "species", "") or "").strip().lower().replace("_", "-")
+        if defeated_species:
+            species_kos[defeated_species] = int(species_kos.get(defeated_species, 0) or 0) + 1
+    except Exception:
+        pass
 
 def _has_choice_item(mon: Mon) -> bool:
     """Detect choice item on the active Pokémon (Band/Specs/Scarf)."""
@@ -734,6 +790,9 @@ class BattleState:
         # Track participants for EXP split
         self.p1_participants: set = set()
         self.p2_participants: set = set()
+        # /register tracking buffers (flushed once at battle end).
+        self._registered_move_usage: Dict[Tuple[str, int], Dict[str, int]] = {}
+        self._registered_ko_stats: Dict[Tuple[str, int], Dict[str, Any]] = {}
         # Track money bonuses from Pay Day etc. and Happy Hour flags
         self.money_pool: Dict[int, int] = {self.p1_id: 0, self.p2_id: 0}
         self.happy_hour_used: Dict[int, bool] = {self.p1_id: False, self.p2_id: False}
@@ -3013,6 +3072,7 @@ class BattleState:
             from .engine import break_jaw_lock, release_octolock
             break_jaw_lock(dfn)
             release_octolock(dfn)
+            _record_registered_ko(atk, dfn, battle_state=self)
             log.append(f"**{dfn.species}** fainted!")
             self._reconcile_special_weather(immediate_log=log)
             defender_uid = self.p2_id if uid == self.p1_id else self.p1_id
@@ -5149,6 +5209,7 @@ class BattleState:
             if dfn.hp <= 0:
                 from .engine import release_octolock
                 release_octolock(dfn)
+                _record_registered_ko(atk, dfn, battle_state=self)
                 log.append(f"**{dfn.species}** fainted!")
                 self._reconcile_special_weather(immediate_log=log)
                 
@@ -8138,6 +8199,13 @@ async def _finish(st: BattleState, p1_itx: discord.Interaction, p2_itx: discord.
                 await itx.followup.send(embed=embed, ephemeral=ephemeral)
         except Exception:
             pass  # Silently ignore errors for bot interactions
+
+    # Flush per-battle /register tracking buffers.
+    try:
+        from lib import register_stats as _register_stats  # type: ignore
+        await _register_stats.flush_battle_state(st)
+    except Exception:
+        pass
 
     # For Adventure format send a single consolidated end panel (Myuu-style)
     fmt = getattr(st, "fmt_label", "") or ""
