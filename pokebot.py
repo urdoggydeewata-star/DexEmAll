@@ -16962,7 +16962,6 @@ class MPokeInfo(commands.Cog):
 
         panel_static = base.copy()
         draw = ImageDraw.Draw(panel_static)
-        label_font = self._mpokeinfo_font(max(8, int(round(17 * scale))), bold=True)
         value_font_base_size = max(8, int(round(18 * scale)))
 
         def _draw_center_value(text: str, left: int, top: int, width: int, height: int) -> None:
@@ -16996,28 +16995,10 @@ class MPokeInfo(commands.Cog):
                 shadow=(0, 0, 0, 220),
             )
 
-        def _draw_label(text: str, left: int, top: int, width: int) -> None:
-            if label_font is None:
-                return
-            txt = _clip_text(text, label_font, max(12, int(width - max(6, int(round(8 * sx))))))
-            if not txt:
-                return
-            tw = self._mpokeinfo_text_width(draw_probe, txt, label_font)
-            tx = int(left + max(0, (int(width) - tw) // 2))
-            ty = int(top + max(0, int(round(1 * sy))))
-            self._mpokeinfo_draw_shadow_text(
-                draw,
-                (tx, ty),
-                txt,
-                font=label_font,
-                fill=(238, 238, 246, 255),
-                shadow=(24, 12, 35, 220),
-            )
-
-        def _draw_row(label: str, value: str, *, left: int, top: int, width: int) -> None:
+        # Template already includes static labels; draw only dynamic values.
+        def _draw_row_value(value: str, *, left: int, top: int, width: int) -> None:
             label_h = max(10, int(round(22 * sy)))
             value_h = max(10, int(round(22 * sy)))
-            _draw_label(label, left, top, width)
             _draw_center_value(value, left, top + label_h, width, value_h)
 
         def _ival(key: str) -> int:
@@ -17036,29 +17017,29 @@ class MPokeInfo(commands.Cog):
         right_x = _pt(320, 0)[0]
         right_w = max(40, int(round(236 * sx)))
         top_rows = [
-            ("Most Used Move", most_used_move, 12),
-            ("Times Traded", f"{_ival('times_traded')}", 74),
-            ("Eggs Bred", f"{_ival('eggs_bred')}", 128),
-            ("Total Routes", f"{_ival('total_routes')}", 182),
-            ("Total Exp Gained", f"{_ival('total_exp_gained')} EXP", 236),
-            ("Pokemon Beat", f"{_ival('pokemon_beat')}", 290),
-            ("Shinies Killed", f"{_ival('shinies_killed')}", 344),
-            ("Legendaries Killed", f"{_ival('legendaries_killed')}", 398),
+            (most_used_move, 12),
+            (f"{_ival('times_traded')}", 74),
+            (f"{_ival('eggs_bred')}", 128),
+            (f"{_ival('total_routes')}", 182),
+            (f"{_ival('total_exp_gained')}", 236),
+            (f"{_ival('pokemon_beat')}", 290),
+            (f"{_ival('shinies_killed')}", 344),
+            (f"{_ival('legendaries_killed')}", 398),
         ]
-        for label, value, y in top_rows:
-            _draw_row(label, value, left=left_x, top=_pt(0, y)[1], width=left_w)
+        for value, y in top_rows:
+            _draw_row_value(value, left=left_x, top=_pt(0, y)[1], width=left_w)
 
         right_rows = [
-            ("Raids Won", f"{_ival('raids_won')}", 236),
-            ("Raids Lost", f"{_ival('raids_lost')}", 290),
-            ("Battles Won", f"{_ival('battles_won')}", 344),
-            ("Battles Lost", f"{_ival('battles_lost')}", 398),
+            (f"{_ival('raids_won')}", 236),
+            (f"{_ival('raids_lost')}", 290),
+            (f"{_ival('battles_won')}", 344),
+            (f"{_ival('battles_lost')}", 398),
         ]
-        for label, value, y in right_rows:
-            _draw_row(label, value, left=right_x, top=_pt(0, y)[1], width=right_w)
+        for value, y in right_rows:
+            _draw_row_value(value, left=right_x, top=_pt(0, y)[1], width=right_w)
 
         ot_name = interaction.user.display_name if getattr(interaction, "user", None) else "Trainer"
-        ot_text = f"OT {ot_name}"
+        ot_text = f"{ot_name}"
         ot_font = self._mpokeinfo_fit_font(
             draw_probe,
             ot_text,
@@ -17100,7 +17081,7 @@ class MPokeInfo(commands.Cog):
 
         g_key = str(gender or "").strip().lower()
         g_sym = {"male": "♂", "m": "♂", "♀": "♀", "female": "♀", "f": "♀"}.get(g_key, "")
-        lv_text = f"Lv {int(level)}{g_sym}"
+        lv_text = f"{int(level)}{g_sym}"
         lv_font = self._mpokeinfo_fit_font(
             draw_probe,
             lv_text,
@@ -17123,19 +17104,7 @@ class MPokeInfo(commands.Cog):
             )
 
         ribbons = _ival("ribbons")
-        ribbons_label_font = self._mpokeinfo_fit_font(
-            draw_probe, "Ribbons", max_width=max(12, int(round(132 * sx))), start_size=max(8, int(round(16 * scale))), min_size=max(8, int(round(10 * scale))), bold=True
-        )
-        if ribbons_label_font is not None:
-            self._mpokeinfo_draw_shadow_text(
-                draw,
-                _pt(584, 42),
-                "Ribbons",
-                font=ribbons_label_font,
-                fill=(242, 246, 250, 255),
-                shadow=(0, 0, 0, 220),
-            )
-        ribbon_text = f"🏅 {ribbons}" if ribbons > 0 else "None"
+        ribbon_text = f"{ribbons}" if ribbons > 0 else "0"
         ribbon_font = self._mpokeinfo_fit_font(
             draw_probe, ribbon_text, max_width=max(12, int(round(118 * sx))), start_size=max(8, int(round(15 * scale))), min_size=max(8, int(round(10 * scale))), bold=True
         )
