@@ -8027,7 +8027,7 @@ ADVENTURE_ROUTES = {
         "name": "Viridian Forest",
         "layout": "maze",
         "entry_node": "2-1",
-        "exit_node": "3-1",
+        "exit_node": "1-3",
         "next": "route-2-2",
         "prev": "route-2",
         "nodes": {
@@ -8063,8 +8063,8 @@ ADVENTURE_ROUTES = {
             "1-2": {
                 "image": ASSETS_ROUTES / "viridian-forest-1-2.png",
                 "exits": [
-                    {"id": "south", "label": "➡️ East", "target": "2-2"},
-                    {"id": "north", "label": "⬇️ South", "target": "2-2"},
+                    {"id": "east", "label": "➡️ East", "target": "2-2"},
+                    {"id": "south", "label": "⬇️ South", "target": "1-1"},
                 ],
                 "encounters": [
                     {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
@@ -8077,8 +8077,119 @@ ADVENTURE_ROUTES = {
             "2-2": {
                 "image": ASSETS_ROUTES / "viridian-forest-2-2.png",
                 "exits": [
-                    {"id": "south", "label": "⬅️ West", "target": "1-2"},
-                    {"id": "north", "label": "⬇️ South", "target": "2-1"},
+                    {"id": "west", "label": "⬅️ West", "target": "1-2"},
+                    {"id": "south", "label": "⬇️ South", "target": "2-1"},
+                ],
+                "encounters": [
+                    {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "kakuna", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "metapod", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "pikachu", "weight": 10, "min_level": 2, "max_level": 4},
+                ],
+            },
+            "3-1": {
+                "image": ASSETS_ROUTES / "viridian-forest-3-1.png",
+                "exits": [
+                    {"id": "west", "label": "⬅️ West", "target": "2-1"},
+                    {"id": "north", "label": "⬆️ North", "target": "3-2"},
+                ],
+                "encounters": [
+                    {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "kakuna", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "metapod", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "pikachu", "weight": 10, "min_level": 2, "max_level": 4},
+                ],
+            },
+            "3-2": {
+                "image": ASSETS_ROUTES / "viridian-forest-3-2.png",
+                "exits": [
+                    {"id": "south", "label": "⬇️ South", "target": "3-1"},
+                    {"id": "north", "label": "⬆️ North", "target": "3-3"},
+                ],
+                "encounters": [
+                    {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "kakuna", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "metapod", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "pikachu", "weight": 10, "min_level": 2, "max_level": 4},
+                ],
+            },
+            "3-3": {
+                "image": ASSETS_ROUTES / "viridian-forest-3-3.png",
+                "exits": [
+                    {"id": "west", "label": "⬅️ West", "target": "2-3"},
+                    {"id": "south", "label": "⬇️ South", "target": "3-2"},
+                ],
+                "encounters": [
+                    {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "kakuna", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "metapod", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "pikachu", "weight": 10, "min_level": 2, "max_level": 4},
+                ],
+            },
+            "2-3": {
+                "image": ASSETS_ROUTES / "viridian-forest-2-3.png",
+                "exits": [
+                    {"id": "west", "label": "⬅️ West", "target": "2.5-3"},
+                    {"id": "east", "label": "➡️ East", "target": "3-3"},
+                ],
+                "encounters": [
+                    {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "kakuna", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "metapod", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "pikachu", "weight": 10, "min_level": 2, "max_level": 4},
+                ],
+            },
+            "2.5-3": {
+                "image": ASSETS_ROUTES / "viridian-forest-2.5-3.png",
+                "exits": [
+                    {"id": "west", "label": "⬅️ West", "target": "1.5-3"},
+                    {"id": "east", "label": "➡️ East", "target": "2-3"},
+                ],
+                "encounters": [
+                    {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "kakuna", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "metapod", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "pikachu", "weight": 10, "min_level": 2, "max_level": 4},
+                ],
+            },
+            "1.5-3": {
+                "image": ASSETS_ROUTES / "viridian-forest-1.5-3.png",
+                "exits": [
+                    {"id": "south", "label": "⬇️ South", "target": "1-2.5"},
+                    {"id": "east", "label": "➡️ East", "target": "2.5-3"},
+                ],
+                "encounters": [
+                    {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "kakuna", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "metapod", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "pikachu", "weight": 10, "min_level": 2, "max_level": 4},
+                ],
+            },
+            "1-2.5": {
+                "image": ASSETS_ROUTES / "viridian-forest-1-2.5.png",
+                "exits": [
+                    {"id": "northwest", "label": "↖️ Northwest", "target": "1-3"},
+                    {"id": "northeast", "label": "↗️ Northeast", "target": "1.5-3"},
+                ],
+                "encounters": [
+                    {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
+                    {"species": "kakuna", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "metapod", "weight": 15, "min_level": 5, "max_level": 6},
+                    {"species": "pikachu", "weight": 10, "min_level": 2, "max_level": 4},
+                ],
+            },
+            "1-3": {
+                "image": ASSETS_ROUTES / "viridian-forest-1-3.png",
+                "exits": [
+                    {"id": "exit", "label": "🚪 Exit to Route 2", "target": "1-3"},
                 ],
                 "encounters": [
                     {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
@@ -8563,6 +8674,7 @@ ADVENTURE_ROUTES = {
         "trainers": {},
     },
 }
+
 
 RIVAL_BATTLES = {
     "rival-1": {
