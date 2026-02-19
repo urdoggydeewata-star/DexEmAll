@@ -8730,7 +8730,9 @@ def on_switch_in(mon: Mon, opponent: Mon, field_effects: Any = None) -> List[str
                     mon._trace_activated_this_switch = True
                     
                     ability_display = opponent.ability.replace("-", " ").title()
-                    messages.append(f"{mon.species} traced {opponent.species}'s {ability_display}!")
+                    tracer_name = format_species_name(mon.species)
+                    target_name = format_species_name(opponent.species)
+                    messages.append(f"{tracer_name} traced {target_name}'s {ability_display}!")
                     
                     # Some abilities have on-switch effects that should trigger
                     # (e.g., Intimidate, Download, etc.)
@@ -9032,7 +9034,9 @@ def on_switch_in(mon: Mon, opponent: Mon, field_effects: Any = None) -> List[str
             if opponent_ability not in uncopyable:
                 mon.ability = opponent.ability
                 ability_name = opponent.ability.replace("-", " ").title()
-                messages.append(f"**{mon.species} traced {opponent.species}'s {ability_name}!**")
+                tracer_name = format_species_name(mon.species)
+                target_name = format_species_name(opponent.species)
+                messages.append(f"{tracer_name} traced {target_name}'s {ability_name}!")
         
         # Imposter: Transform into opponent (silently for surprise factor)
         # Gen 5: Copies stat stages

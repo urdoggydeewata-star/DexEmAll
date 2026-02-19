@@ -11121,7 +11121,13 @@ def _gender_ratio_from_entry(entry: dict) -> dict:
     return gender_ratio
 
 
-async def _build_mon_from_species(species: str, level: int, moves: Optional[list[str]] = None) -> Optional["Mon"]:
+async def _build_mon_from_species(
+    species: str,
+    level: int,
+    moves: Optional[list[str]] = None,
+    *,
+    sync_nature: Optional[str] = None,
+) -> Optional["Mon"]:
     # Prefer cache (db_cache) then ensure_species_and_learnsets (DB / API)
     entry = None
     if db_cache is not None:
@@ -11181,6 +11187,11 @@ async def _build_mon_from_species(species: str, level: int, moves: Optional[list
         capture_rate = int(float(entry.get("capture_rate") or 45))
     except Exception:
         capture_rate = 45
+    rolled_nature = str(rolled.get("nature") or "hardy").strip().lower() or "hardy"
+    sync_nature_norm = str(sync_nature or "").strip().lower()
+    if sync_nature_norm:
+        rolled_nature = sync_nature_norm
+
     dto = {
         "species": entry.get("name") or species,
         "types": types_tuple,
@@ -11205,7 +11216,7 @@ async def _build_mon_from_species(species: str, level: int, moves: Optional[list
         "moves": [m.title() if isinstance(m, str) else str(m) for m in move_list][:4],
         "ability": rolled.get("ability"),
         "gender": rolled.get("gender"),
-        "nature": rolled.get("nature"),
+        "nature": rolled_nature,
         "is_shiny": await shiny_roll(_wild_shiny_denominator()),
         "hp_now": int(rolled["stats"]["hp"]),
         "weight_kg": float(entry.get("weight_kg") or 100.0),
@@ -11213,6 +11224,51 @@ async def _build_mon_from_species(species: str, level: int, moves: Optional[list
         "capture_rate": capture_rate,
     }
     return build_mon(dto, set_level=level, heal=True)
+
+
+async def _wild_synchronize_nature(owner_id: str) -> Optional[str]:
+    """
+    50% chance for wild encounters to copy the nature of the user's lead
+    when that lead has Synchronize.
+    """
+    if not owner_id:
+        return None
+    try:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                """
+                SELECT team_slot, ability, nature, hp_now, hp
+                FROM pokemons
+                WHERE owner_id=? AND team_slot BETWEEN 1 AND 6
+                ORDER BY team_slot ASC
+                """,
+                (str(owner_id),),
+            )
+            rows = [dict(r) for r in await cur.fetchall()]
+            await cur.close()
+    except Exception:
+        return None
+    if not rows:
+        return None
+    lead = None
+    for r in rows:
+        try:
+            hp_max = int(r.get("hp") or 0)
+            hp_now = int(r.get("hp_now") if r.get("hp_now") is not None else hp_max)
+        except Exception:
+            hp_now = 0
+        if hp_now > 0:
+            lead = r
+            break
+    if lead is None:
+        lead = rows[0]
+    ability = str(lead.get("ability") or "").strip().lower().replace("_", "-").replace(" ", "-")
+    if ability != "synchronize":
+        return None
+    if random.random() >= 0.5:
+        return None
+    nature = str(lead.get("nature") or "").strip().lower()
+    return nature or None
 
 async def _load_pp_from_db(st: "BattleState", uid: int) -> None:
     team = st.team_for(uid)
@@ -14563,7 +14619,8 @@ async def _route_panel_try_wild_encounter(itx: discord.Interaction, state: dict,
         pass
 
     lvl = random.randint(choice["min_level"], choice["max_level"])
-    wild_mon = await _build_mon_from_species(species, level=lvl)
+    sync_nature = await _wild_synchronize_nature(str(itx.user.id))
+    wild_mon = await _build_mon_from_species(species, level=lvl, sync_nature=sync_nature)
     if not wild_mon:
         return
 
@@ -14634,7 +14691,8 @@ async def _route_maze_try_wild_encounter(itx: discord.Interaction, state: dict, 
     except Exception:
         pass
     lvl = random.randint(choice["min_level"], choice["max_level"])
-    wild_mon = await _build_mon_from_species(species, level=lvl)
+    sync_nature = await _wild_synchronize_nature(str(itx.user.id))
+    wild_mon = await _build_mon_from_species(species, level=lvl, sync_nature=sync_nature)
     if not wild_mon:
         return
     route_display = route.get("name", area_id)
@@ -15178,7 +15236,8 @@ class _AdventureRouteViewRoute1Methods:
             except Exception:
                 pass
             lvl = random.randint(choice["min_level"], choice["max_level"])
-            wild_mon = await _build_mon_from_species(species, level=lvl)
+            sync_nature = await _wild_synchronize_nature(str(itx.user.id))
+            wild_mon = await _build_mon_from_species(species, level=lvl, sync_nature=sync_nature)
             if not wild_mon:
                 await _save_adventure_state(str(itx.user.id), state)
                 return await itx.followup.send("Encounter failed to load.", ephemeral=False)
@@ -15613,7 +15672,8 @@ async def route_cmd(interaction: discord.Interaction, number: int):
     if not discovered:
         return await interaction.followup.send("You haven't discovered any Pokémon on that route yet.", ephemeral=True)
     species = random.choice(discovered)
-    wild_mon = await _build_mon_from_species(species, level=3)
+    sync_nature = await _wild_synchronize_nature(uid)
+    wild_mon = await _build_mon_from_species(species, level=3, sync_nature=sync_nature)
     if not wild_mon:
         return await interaction.followup.send("Encounter failed to load.", ephemeral=True)
     won = await _start_pve_battle(interaction, [wild_mon], f"Wild {species.title()}")
@@ -18386,7 +18446,7 @@ class MPokeInfo(commands.Cog):
         out.seek(0)
         return discord.File(fp=out, filename=f"register_{int(mon.get('id') or 0)}.png")
 
-    @app_commands.command(name="expshare", description="Buy Exp. Share for your team (20,000 PKC).")
+    # /expshare retired: Exp. Share is now obtained via market pricing.
     async def expshare(self, interaction: Interaction):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=False)
@@ -22465,11 +22525,6 @@ async def _box_swap_positions(owner_id: str, box_no: int, team_slot: int, box_po
 
             if team_sp != "egg" and box_sp == "egg" and int(team_non_egg_count) <= 1:
                 return False, "You must keep at least one non-egg Pokémon in your team."
-            if box_sp != "egg":
-                dup = await _team_has_species(owner_id, box_sp, exclude_mon_id=team_id, conn=conn)
-                if dup:
-                    return False, f"Team already has **{box_species.replace('-', ' ').title()}**. Duplicates are not allowed."
-
             await conn.execute(
                 "UPDATE pokemons SET team_slot=NULL, box_no=?, box_pos=? WHERE owner_id=? AND id=?",
                 (int(box_no), int(box_pos), owner_id, team_id),
@@ -22515,10 +22570,6 @@ async def _box_swap_positions(owner_id: str, box_no: int, team_slot: int, box_po
         box_sp = _daycare_norm_species(box_species)
         if box_sp == "egg" and int(team_non_egg_count) <= 0:
             return False, "You must keep at least one non-egg Pokémon in your team."
-        if box_sp != "egg":
-            dup = await _team_has_species(owner_id, box_sp, conn=conn)
-            if dup:
-                return False, f"Team already has **{box_species.replace('-', ' ').title()}**. Duplicates are not allowed."
         await conn.execute(
             "UPDATE pokemons SET team_slot=?, box_no=NULL, box_pos=NULL WHERE owner_id=? AND id=?",
             (int(team_slot), owner_id, box_id),
@@ -26838,6 +26889,83 @@ async def _move_id_from_name(move: str) -> tuple[int | None, str | None]:
         except Exception:
             pass
 
+
+def _learnset_gen_bounds_for_user_gen(user_gen: int) -> tuple[int, int]:
+    """
+    Map user-selected game gen to learnset generation window.
+    Kanto/FRLG mode (gen 1) uses Gen 1-3 level-up learnsets.
+    """
+    try:
+        g = int(user_gen or 1)
+    except Exception:
+        g = 1
+    g = max(1, min(9, g))
+    cap = 3 if g == 1 else g
+    return (1, max(1, min(9, cap)))
+
+
+async def _levelup_moves_for_species(species_id: int, gen_min: int, gen_max: int) -> list[dict[str, Any]]:
+    try:
+        sid = int(species_id)
+        gmin = int(gen_min)
+        gmax = int(gen_max)
+    except Exception:
+        return []
+    if sid <= 0:
+        return []
+    if gmin > gmax:
+        gmin, gmax = gmax, gmin
+    async with db.session() as conn:
+        cur = await conn.execute(
+            """
+            SELECT
+                m.name AS move_name,
+                MIN(COALESCE(l.level_learned, 1)) AS unlock_level
+            FROM learnsets l
+            JOIN moves m ON m.id = l.move_id
+            WHERE l.species_id = ?
+              AND l.generation BETWEEN ? AND ?
+              AND LOWER(REPLACE(TRIM(COALESCE(l.method, '')), '_', '-')) = 'level-up'
+            GROUP BY m.name
+            ORDER BY unlock_level ASC, m.name ASC
+            """,
+            (sid, gmin, gmax),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+    out: list[dict[str, Any]] = []
+    for r in rows or []:
+        d = dict(r) if hasattr(r, "keys") else {}
+        move_name = str(d.get("move_name") or "").strip()
+        if not move_name:
+            continue
+        try:
+            unlock = int(d.get("unlock_level") or 1)
+        except Exception:
+            unlock = 1
+        out.append({"move_name": move_name, "unlock_level": max(1, unlock)})
+    return out
+
+
+def _split_levelup_rows(rows: list[dict[str, Any]], level: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    now_rows: list[dict[str, Any]] = []
+    locked_rows: list[dict[str, Any]] = []
+    try:
+        lvl = int(level)
+    except Exception:
+        lvl = 1
+    for r in rows or []:
+        try:
+            unlock = int(r.get("unlock_level") or 1)
+        except Exception:
+            unlock = 1
+        if unlock <= lvl:
+            now_rows.append(r)
+        else:
+            locked_rows.append(r)
+    return now_rows, locked_rows
+
+
 class OverrideMoveView(discord.ui.View):
     def __init__(self, owner_id: str, mon_id: int, old_moves: list[str], new_move: str, *, timeout: float = 60.0):
         super().__init__(timeout=timeout)
@@ -26874,80 +27002,149 @@ class OverrideMoveView(discord.ui.View):
         return cb
 
 # ---------------- /learn command ----------------
-@bot.tree.command(name="learn", description="Teach a level-up move from your highest unlocked generation.")
+@bot.tree.command(name="learn", description="Teach a legal level-up move for your current generation rules.")
 @app_commands.describe(
     mon="Team slot (1-6) OR Pokémon name on your team",
-    move="Move name (level-up move, must be legal for your highest unlocked gen)",
+    move="Move name (must be a currently learnable level-up move)",
 )
 async def learn_cmd(interaction: discord.Interaction, mon: str, move: str):
     uid = str(interaction.user.id)
-    await interaction.response.defer(ephemeral=False)
+    await interaction.response.defer(ephemeral=True)
 
-    # Resolve team Pokémon by slot or name
     mon_id, mon_row, err = await _resolve_team_mon_by_name_or_slot(uid, mon)
     if err:
         return await interaction.followup.send(f"❌ {err}", ephemeral=True)
-    species_name = mon_row["species"]
-    level        = int(mon_row["level"])
+    species_name = str(mon_row["species"])
+    level = int(mon_row["level"])
 
-    # Get species_id
     species_id = await _species_id_from_name(species_name)
     if not species_id:
         return await interaction.followup.send("❌ Could not resolve species in Pokédex.", ephemeral=True)
 
-    # Fuzzy match move - no legality restrictions, just check if move exists
-    conn = await db.connect()
     try:
-        # Allow any move to be taught as long as it exists
-        canon_move, confidence, suggestions = await FuzzyMatcher.fuzzy_move(conn, move)
-        
-        if not canon_move or confidence < 0.70:
-            sugg_text = f"\n\n**Did you mean:** {', '.join(suggestions[:5])}" if suggestions else ""
-            return await interaction.followup.send(
-                f"❌ Move **{move}** not found.{sugg_text}",
-                ephemeral=True
-            )
-        
-        # Get move ID from the matched canonical move name
-        cur = await conn.execute("SELECT id FROM moves WHERE LOWER(name) = LOWER(?)", (canon_move,))
-        move_row = await cur.fetchone()
-        await cur.close()
-        
-        if not move_row:
-            return await interaction.followup.send(f"❌ Move **{canon_move}** not found in database.", ephemeral=True)
-        
-        move_id = move_row['id']
-    finally:
-        try:
-            await conn.close()
-        except Exception:
-            pass
+        user_gen = int(await _user_selected_gen(uid))
+    except Exception:
+        user_gen = 1
+    gen_min, gen_max = _learnset_gen_bounds_for_user_gen(user_gen)
 
-    # Current moves
-    current = await _get_current_moves(uid, mon_id)
-    nm = _norm_move_name(canon_move)
-    if nm in [m.lower() for m in current]:
+    rows = await _levelup_moves_for_species(int(species_id), gen_min, gen_max)
+    if not rows:
         return await interaction.followup.send(
-            f"ℹ️ **{species_name}** already knows **{canon_move.replace('-', ' ').title()}**.",
-            ephemeral=True
+            f"❌ No level-up learnset data found for **{species_name.replace('-', ' ').title()}** "
+            f"(Gen window: **{gen_min}-{gen_max}**).",
+            ephemeral=True,
+        )
+    now_rows, _locked_rows = _split_levelup_rows(rows, level)
+    if not now_rows:
+        return await interaction.followup.send(
+            f"❌ **{species_name.replace('-', ' ').title()}** has no level-up moves available at **Lv.{int(level)}** "
+            f"for Gen window **{gen_min}-{gen_max}**.",
+            ephemeral=True,
         )
 
-    # Teach (append if < 4; else ask which to forget)
+    legal_names = [str(r.get("move_name") or "") for r in now_rows if str(r.get("move_name") or "").strip()]
+    best_move, confidence, suggestions = FuzzyMatcher.fuzzy_match(move, legal_names, threshold=0.70)
+    if not best_move or confidence < 0.70:
+        sugg_text = f"\n\n**Available now examples:** {', '.join(legal_names[:8])}" if legal_names else ""
+        if suggestions:
+            sugg_text += f"\n**Did you mean:** {', '.join(suggestions[:5])}"
+        return await interaction.followup.send(
+            f"❌ **{move}** is not a currently learnable level-up move for **{species_name.replace('-', ' ').title()}**.{sugg_text}",
+            ephemeral=True,
+        )
+
+    current = await _get_current_moves(uid, mon_id)
+    current_norm = {_norm_move_name(m) for m in current}
+    nm = _norm_move_name(best_move)
+    if nm in current_norm:
+        return await interaction.followup.send(
+            f"ℹ️ **{species_name.replace('-', ' ').title()}** already knows **{str(best_move).replace('-', ' ').title()}**.",
+            ephemeral=True,
+        )
+
     if len(current) < 4:
         new_list = current + [nm]
         await _save_moves(uid, mon_id, new_list)
         return await interaction.followup.send(
-            f"✅ **{species_name}** learned **{canon_move.replace('-', ' ').title()}**!",
-            ephemeral=True
+            f"✅ **{species_name.replace('-', ' ').title()}** learned **{str(best_move).replace('-', ' ').title()}**!",
+            ephemeral=True,
         )
 
-    # Need to forget one — show 4 buttons
     view = OverrideMoveView(uid, mon_id, current[:4], nm)
     await interaction.followup.send(
-        f"Your **{species_name}** already knows 4 moves. Choose one to forget:",
+        f"Your **{species_name.replace('-', ' ').title()}** already knows 4 moves. Choose one to forget:",
         view=view,
-        ephemeral=True
+        ephemeral=True,
     )
+
+
+@bot.tree.command(name="move", description="Show level-up moves this Pokémon can learn now and later.")
+@app_commands.describe(mon="Team slot (1-6) OR Pokémon name on your team")
+async def move_cmd(interaction: discord.Interaction, mon: str):
+    uid = str(interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
+
+    mon_id, mon_row, err = await _resolve_team_mon_by_name_or_slot(uid, mon)
+    if err:
+        return await interaction.followup.send(f"❌ {err}", ephemeral=True)
+    species_name = str(mon_row["species"])
+    level = int(mon_row["level"])
+
+    species_id = await _species_id_from_name(species_name)
+    if not species_id:
+        return await interaction.followup.send("❌ Could not resolve species in Pokédex.", ephemeral=True)
+
+    try:
+        user_gen = int(await _user_selected_gen(uid))
+    except Exception:
+        user_gen = 1
+    gen_min, gen_max = _learnset_gen_bounds_for_user_gen(user_gen)
+
+    rows = await _levelup_moves_for_species(int(species_id), gen_min, gen_max)
+    if not rows:
+        return await interaction.followup.send(
+            f"❌ No level-up learnset data found for **{species_name.replace('-', ' ').title()}** "
+            f"(Gen window: **{gen_min}-{gen_max}**).",
+            ephemeral=True,
+        )
+
+    current = await _get_current_moves(uid, mon_id)
+    current_norm = {_norm_move_name(m) for m in current}
+    now_rows, locked_rows = _split_levelup_rows(rows, level)
+
+    def _line(row: dict[str, Any]) -> str:
+        mv = str(row.get("move_name") or "").strip()
+        try:
+            unlock = int(row.get("unlock_level") or 1)
+        except Exception:
+            unlock = 1
+        mv_norm = _norm_move_name(mv)
+        known_prefix = "✅ " if mv_norm in current_norm else ""
+        return f"{known_prefix}Lv.{int(unlock):>2} • {mv.replace('-', ' ').title()}"
+
+    now_lines = [_line(r) for r in now_rows][:20]
+    lock_lines = [_line(r) for r in locked_rows][:20]
+
+    emb = discord.Embed(
+        title=f"{species_name.replace('-', ' ').title()} — Move Learnset",
+        description=(
+            f"Current level: **{int(level)}**\n"
+            f"Generation rules: **Gen {int(user_gen)}** (level-up window **{gen_min}-{gen_max}**)"
+        ),
+        color=0x5865F2,
+    )
+    emb.add_field(
+        name=f"Learnable now ({len(now_rows)})",
+        value="\n".join(now_lines) if now_lines else "—",
+        inline=False,
+    )
+    emb.add_field(
+        name=f"Locked until later ({len(locked_rows)})",
+        value="\n".join(lock_lines) if lock_lines else "—",
+        inline=False,
+    )
+    emb.set_footer(text="✅ = move already known")
+    await interaction.followup.send(embed=emb, ephemeral=True)
 # =========================
 #  /release command
 # =========================

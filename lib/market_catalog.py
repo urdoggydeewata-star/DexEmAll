@@ -67,7 +67,7 @@ MARKET_PRICE_CATALOG: Dict[str, List[Tuple[str, str, int]]] = {
         ("scope_lens", "Scope Lens", 100),
         ("focus_band", "Focus Band", 100),
         ("choice_band", "Choice Band", 100),
-        ("exp_share", "Exp. Share", 1500),
+        ("exp_share", "Exp. Share", 20000),
         ("amulet_coin", "Amulet Coin", 100),
         ("everstone", "Everstone", 100),
         ("lucky_egg", "Lucky Egg", 5000),
