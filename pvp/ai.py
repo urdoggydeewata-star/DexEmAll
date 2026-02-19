@@ -27,6 +27,72 @@ from .generation import get_generation as get_gen
 _battle_analysis: Dict[int, Dict[str, Any]] = {}
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return int(default)
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        s = str(value).strip()
+        if not s:
+            return int(default)
+        return int(float(s))
+    except Exception:
+        return int(default)
+
+
+def _sanitize_mon_numeric_state(mon: Any) -> Any:
+    """
+    Defensive normalization for runtime battle mons.
+    Some battle states can carry None in hp/max_hp/stats, which breaks
+    AI comparisons like `> 0` during choice generation.
+    """
+    if mon is None:
+        return None
+    hp_raw = getattr(mon, "hp", 0)
+    max_hp_raw = getattr(mon, "max_hp", None)
+    hp = max(0, _coerce_int(hp_raw, 0))
+    max_hp = _coerce_int(max_hp_raw, hp if hp > 0 else 1)
+    if max_hp <= 0:
+        max_hp = max(1, hp if hp > 0 else 1)
+    if hp > max_hp:
+        hp = max_hp
+    try:
+        setattr(mon, "hp", int(hp))
+    except Exception:
+        pass
+    try:
+        setattr(mon, "max_hp", int(max_hp))
+    except Exception:
+        pass
+
+    stats = getattr(mon, "stats", None)
+    if not isinstance(stats, dict):
+        try:
+            stats = dict(stats) if stats is not None else {}
+        except Exception:
+            stats = {}
+    stats["spe"] = _coerce_int(stats.get("spe", 0), 0)
+    try:
+        setattr(mon, "stats", stats)
+    except Exception:
+        pass
+    return mon
+
+
+def _hp_ratio(mon: Any, default: float = 1.0) -> float:
+    m = _sanitize_mon_numeric_state(mon)
+    if m is None:
+        return float(default)
+    hp = _coerce_int(getattr(m, "hp", 0), 0)
+    max_hp = _coerce_int(getattr(m, "max_hp", 1), 1)
+    if max_hp <= 0:
+        return float(default)
+    return float(hp) / float(max_hp)
+
+
 def calculate_move_score(
     user: Mon,
     target: Mon,
@@ -2470,17 +2536,36 @@ def choose_ai_action(
         return {"kind": "move", "value": "Tackle"}
 
     # If we have no active mon data, default to random move
-    ai_mon = battle_state._active(ai_user_id)
-    target_mon = battle_state._opp_active(ai_user_id)
+    ai_mon = _sanitize_mon_numeric_state(battle_state._active(ai_user_id))
+    target_mon = _sanitize_mon_numeric_state(battle_state._opp_active(ai_user_id))
     if not ai_mon or not target_mon:
         fallback = battle_state.moves_for(ai_user_id) or ["Tackle"]
         return {"kind": "move", "value": str(random.choice(fallback))}
 
+    # Normalize whole teams so downstream heuristics never compare None to ints.
+    try:
+        for m in (battle_state.team_for(ai_user_id) or []):
+            _sanitize_mon_numeric_state(m)
+        p1 = getattr(battle_state, "p1_id", None)
+        p2 = getattr(battle_state, "p2_id", None)
+        opp_id = p2 if ai_user_id == p1 else p1
+        if opp_id is not None:
+            for m in (battle_state.team_for(int(opp_id)) or []):
+                _sanitize_mon_numeric_state(m)
+    except Exception:
+        pass
+
     user_side, target_side = _get_sides_for_user(ai_user_id, battle_state)
-    ai_speed = int(speed_value(ai_mon, user_side, field_effects))
-    target_speed = int(speed_value(target_mon, target_side, field_effects))
-    ai_hp_pct = ai_mon.hp / ai_mon.max_hp if ai_mon.max_hp > 0 else 1.0
-    target_hp = max(1, int(target_mon.hp or 1))
+    try:
+        ai_speed = _coerce_int(speed_value(ai_mon, user_side, field_effects), 0)
+    except Exception:
+        ai_speed = 0
+    try:
+        target_speed = _coerce_int(speed_value(target_mon, target_side, field_effects), 0)
+    except Exception:
+        target_speed = 0
+    ai_hp_pct = _hp_ratio(ai_mon, default=1.0)
+    target_hp = max(1, _coerce_int(getattr(target_mon, "hp", 1), 1))
 
     # Track previous AI action to avoid repetitive hard-switch loops.
     analysis = _battle_analysis.setdefault(id(battle_state), {})
@@ -2628,7 +2713,7 @@ def choose_ai_action(
             )
 
             if best_switch_idx is not None:
-                best_switch_mon = battle_state.team_for(ai_user_id)[best_switch_idx]
+                best_switch_mon = _sanitize_mon_numeric_state(battle_state.team_for(ai_user_id)[best_switch_idx])
                 # Discourage consecutive hard-switching unless heavily justified.
                 margin = 3.75
                 if analysis.get(last_action_key) == "switch":
@@ -2790,6 +2875,8 @@ def _choose_best_switch_with_score(
     last_move_type: Optional[str] = None,
 ) -> Tuple[Optional[int], float]:
     """Return (best_switch_index, switch_score)."""
+    current_mon = _sanitize_mon_numeric_state(current_mon)
+    target_mon = _sanitize_mon_numeric_state(target_mon)
     if not switch_options:
         return None, -999.0
 
@@ -2819,11 +2906,11 @@ def _choose_best_switch_with_score(
         target_move_types = {str(t) for t in (getattr(target_mon, "types", None) or []) if t}
 
     for switch_idx in switch_options:
-        switch_mon = battle_state.team_for(switching_user_id)[switch_idx]
-        if not switch_mon or switch_mon.hp <= 0:
+        switch_mon = _sanitize_mon_numeric_state(battle_state.team_for(switching_user_id)[switch_idx])
+        if not switch_mon or _coerce_int(getattr(switch_mon, "hp", 0), 0) <= 0:
             continue
 
-        switch_hp_pct = switch_mon.hp / switch_mon.max_hp if switch_mon.max_hp > 0 else 0.0
+        switch_hp_pct = _hp_ratio(switch_mon, default=0.0)
         if switch_hp_pct <= 0:
             continue
 
@@ -2868,8 +2955,14 @@ def _choose_best_switch_with_score(
             score -= 8.0
 
         # Speed edge matters for revenge kills and tempo
-        switch_speed = int(speed_value(switch_mon, user_side, field_effects))
-        target_speed = int(speed_value(target_mon, target_side, field_effects))
+        try:
+            switch_speed = _coerce_int(speed_value(switch_mon, user_side, field_effects), 0)
+        except Exception:
+            switch_speed = 0
+        try:
+            target_speed = _coerce_int(speed_value(target_mon, target_side, field_effects), 0)
+        except Exception:
+            target_speed = 0
         if switch_speed > target_speed:
             score += 2.5
 
@@ -2944,8 +3037,8 @@ def _score_switch(
     Score switching. Returns score (positive = good to switch, negative = bad).
     Based on Run and Bun switch AI logic.
     """
-    ai_mon = battle_state._active(ai_user_id)
-    target_mon = battle_state._opp_active(ai_user_id)
+    ai_mon = _sanitize_mon_numeric_state(battle_state._active(ai_user_id))
+    target_mon = _sanitize_mon_numeric_state(battle_state._opp_active(ai_user_id))
     
     # Check conditions for switching
     # 1. AI must only be able to use ineffective moves (score <= -5)
@@ -2958,15 +3051,15 @@ def _score_switch(
     if not switch_options:
         return -20.0  # No switch options
     
-    target_speed = getattr(target_mon, 'stats', {}).get('spe', 0) or 0
+    target_speed = _coerce_int(getattr(target_mon, 'stats', {}).get('spe', 0), 0)
     
     viable_switch = False
     for switch_idx in switch_options:
-        switch_mon = battle_state.team_for(ai_user_id)[switch_idx]
-        if not switch_mon or switch_mon.hp <= 0:
+        switch_mon = _sanitize_mon_numeric_state(battle_state.team_for(ai_user_id)[switch_idx])
+        if not switch_mon or _coerce_int(getattr(switch_mon, "hp", 0), 0) <= 0:
             continue
         
-        switch_speed = getattr(switch_mon, 'stats', {}).get('spe', 0) or 0
+        switch_speed = _coerce_int(getattr(switch_mon, 'stats', {}).get('spe', 0), 0)
         
         # Check if faster and not OHKO'd
         if switch_speed > target_speed:
@@ -2976,7 +3069,7 @@ def _score_switch(
                 for t_move in target_moves[:4]:
                     try:
                         t_dmg, _, _ = damage(target_mon, switch_mon, t_move, field_effects, None, None)
-                        if t_dmg >= switch_mon.hp:
+                        if _coerce_int(t_dmg, 0) >= _coerce_int(getattr(switch_mon, "hp", 0), 0):
                             can_ohko = True
                             break
                     except Exception:
@@ -2996,7 +3089,7 @@ def _score_switch(
                 for t_move in target_moves[:4]:
                     try:
                         t_dmg, _, _ = damage(target_mon, switch_mon, t_move, field_effects, None, None)
-                        if t_dmg >= switch_mon.max_hp / 2:
+                        if _coerce_int(t_dmg, 0) >= (_coerce_int(getattr(switch_mon, "max_hp", 1), 1) / 2):
                             can_2hko = True
                             break
                     except Exception:
@@ -3009,7 +3102,7 @@ def _score_switch(
                 pass
     
     # 3. AI mon must not be below 50% health
-    hp_percent = ai_mon.hp / ai_mon.max_hp if ai_mon.max_hp > 0 else 1.0
+    hp_percent = _hp_ratio(ai_mon, default=1.0)
     if hp_percent < 0.5:
         return -20.0  # Don't switch if already low
     
