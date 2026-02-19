@@ -17715,11 +17715,11 @@ class MPokeInfo(commands.Cog):
             )
 
         # Template already includes static labels; draw only dynamic values.
-        def _draw_row_value(value: str, *, left: int, top: int, width: int) -> None:
+        def _draw_row_value(value: str, *, left: int, top: int, width: int, y_extra: int = 0) -> None:
             label_h = max(8, int(round(18 * sy)))
             value_h = max(10, int(round(34 * sy)))
             value_nudge = max(2, int(round(4 * sy)))
-            _draw_center_value(value, left, top + label_h, width, value_h, y_nudge=value_nudge, x_nudge=0)
+            _draw_center_value(value, left, top + label_h, width, value_h, y_nudge=value_nudge + int(y_extra), x_nudge=0)
 
         def _ival(key: str) -> int:
             try:
@@ -17735,7 +17735,7 @@ class MPokeInfo(commands.Cog):
         left_x = _pt(44, 0)[0]
         left_w = max(40, int(round(278 * sx)))
         # Under-sprite rows use slightly narrower, shifted boxes on the template.
-        left_under_exp_x = _pt(86, 0)[0]
+        left_under_exp_x = _pt(84, 0)[0]
         left_under_exp_w = max(32, int(round(240 * sx)))
         left_under_pb_x = _pt(54, 0)[0]
         left_under_pb_w = max(32, int(round(262 * sx)))
@@ -17758,19 +17758,19 @@ class MPokeInfo(commands.Cog):
             (f"{_ival('times_traded')}", 74, left_x, left_w),
             (f"{_ival('eggs_bred')}", 128, left_x, left_w),
             (f"{_ival('total_routes')}", 182, left_x, left_w),
-            (f"{_ival('total_exp_gained')}", 236, left_under_exp_x, left_under_exp_w),
-            (f"{_ival('pokemon_beat')}", 290, left_under_pb_x, left_under_pb_w),
-            (f"{_ival('shinies_killed')}", 344, left_under_shiny_x, left_under_shiny_w),
-            (f"{_ival('legendaries_killed')}", 398, left_under_leg_x, left_under_leg_w),
+            (f"{_ival('total_exp_gained')}", 240, left_under_exp_x, left_under_exp_w),
+            (f"{_ival('pokemon_beat')}", 294, left_under_pb_x, left_under_pb_w),
+            (f"{_ival('shinies_killed')}", 348, left_under_shiny_x, left_under_shiny_w),
+            (f"{_ival('legendaries_killed')}", 402, left_under_leg_x, left_under_leg_w),
         ]
         for value, y, row_left, row_w in top_rows:
             _draw_row_value(value, left=row_left, top=_pt(0, y)[1], width=row_w)
 
         right_rows = [
-            (f"{_ival('raids_won')}", 236, right_under_rw_x, right_under_rw_w),
-            (f"{_ival('raids_lost')}", 290, right_under_rl_x, right_under_rl_w),
-            (f"{_ival('battles_won')}", 344, right_under_bw_x, right_under_bw_w),
-            (f"{_ival('battles_lost')}", 398, right_under_bl_x, right_under_bl_w),
+            (f"{_ival('raids_won')}", 240, right_under_rw_x, right_under_rw_w),
+            (f"{_ival('raids_lost')}", 294, right_under_rl_x, right_under_rl_w),
+            (f"{_ival('battles_won')}", 348, right_under_bw_x, right_under_bw_w),
+            (f"{_ival('battles_lost')}", 402, right_under_bl_x, right_under_bl_w),
         ]
         for value, y, row_left, row_w in right_rows:
             _draw_row_value(value, left=row_left, top=_pt(0, y)[1], width=row_w)
@@ -17778,7 +17778,7 @@ class MPokeInfo(commands.Cog):
         ot_name = str(getattr(interaction.user, "display_name", None) or "Trainer").strip()
         # Match front-panel header geometry (scaled into this panel's coordinate system).
         # Front-equivalent top-row geometry adapted to this panel's scale grid.
-        ot_box_left, ot_box_y = _pt(214, 21)
+        ot_box_left, ot_box_y = _pt(236, 21)
         ot_box_w = max(24, int(round(142 * sx)))
         ot_box_h = max(10, int(round(20 * sy)))
         _draw_center_value(
@@ -17820,7 +17820,7 @@ class MPokeInfo(commands.Cog):
         g_key = str(gender or "").strip().lower()
         g_sym = {"male": "♂", "m": "♂", "♀": "♀", "female": "♀", "f": "♀"}.get(g_key, "")
         lv_text = f"{int(level)}"
-        lv_box_left, lv_box_y = _pt(444, 20)
+        lv_box_left, lv_box_y = _pt(470, 20)
         lv_box_w = max(18, int(round(126 * sx)))
         lv_box_h = max(10, int(round(20 * sy)))
         lv_font = self._mpokeinfo_fit_font(
@@ -17892,7 +17892,7 @@ class MPokeInfo(commands.Cog):
         type_tokens = [str(t or "").strip().lower() for t in list(types or []) if str(t or "").strip()]
         if not type_tokens:
             type_tokens = ["normal"]
-        type_left, type_top = _pt(488, 56)
+        type_left, type_top = _pt(510, 56)
         type_w = max(24, int(round(122 * sx)))
         type_h = max(12, int(round(26 * sy)))
         type_gap = max(1, int(round(4 * sy)))
@@ -18942,6 +18942,62 @@ def pretty_item(item_id: str | None) -> str:
         return "None"
     return item_id.replace("_", " ").title()
 
+
+_PP_ITEM_ALIASES: dict[str, tuple[str, ...]] = {
+    "ether": ("ether",),
+    "max_ether": ("max_ether", "max-ether", "maxether"),
+    "elixir": ("elixir",),
+    "max_elixir": ("max_elixir", "max-elixir", "maxelixir"),
+    "pp_up": ("pp_up", "pp-up", "ppup"),
+    "pp_max": ("pp_max", "pp-max", "ppmax"),
+}
+
+
+def _norm_move_token(s: str | None) -> str:
+    return str(s or "").strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def _canonical_pp_item_id(item_query: str | None) -> str:
+    token = item_id_from_user(str(item_query or ""))
+    compact = token.replace("_", "")
+    for canon, aliases in _PP_ITEM_ALIASES.items():
+        for alias in aliases:
+            a = alias.lower().replace("-", "_").strip()
+            if token == a or compact == a.replace("_", ""):
+                return canon
+    return ""
+
+
+async def _resolve_pp_item_in_bag_conn(conn, owner_id: str, canonical_item_id: str) -> tuple[str, int]:
+    aliases = _PP_ITEM_ALIASES.get(str(canonical_item_id or "").strip(), ())
+    if not aliases:
+        return "", 0
+    lowered = [a.lower().replace("-", "_").strip() for a in aliases if a]
+    lowered = list(dict.fromkeys([a for a in lowered if a]))
+    if not lowered:
+        return "", 0
+    placeholders = ", ".join("?" for _ in lowered)
+    cur = await conn.execute(
+        f"SELECT item_id, qty FROM user_items WHERE owner_id=? AND LOWER(REPLACE(item_id, '-', '_')) IN ({placeholders})",
+        (str(owner_id), *lowered),
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    best_item_id = ""
+    best_qty = 0
+    for row in rows or []:
+        d = dict(row) if hasattr(row, "keys") else {}
+        iid = str(d.get("item_id") or "").strip()
+        try:
+            qty = int(d.get("qty") or 0)
+        except Exception:
+            qty = 0
+        if qty > best_qty and iid:
+            best_item_id = iid
+            best_qty = qty
+    return best_item_id, best_qty
+
+
 # Helpers: ISO parsing and cooldown/daily-cap checks using event_log
 def _now_utc(): return dt.datetime.now(dt.timezone.utc)
 def _parse_iso_z(s: str): return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -19087,6 +19143,182 @@ async def walk_cmd(inter: discord.Interaction, name: str, slot: int | None = Non
         f"👟 You walked with **{mon['species'].title()}**{auto}. Friendship set to **0**.",
         ephemeral=True
     )
+
+
+@bot.tree.command(name="useppitem", description="Use Ether/Elixir/PP items on a team Pokémon.")
+@app_commands.describe(
+    name="Pokémon name in your team (e.g. pikachu)",
+    item="PP item (Ether, Max Ether, Elixir, Max Elixir, PP Up, PP Max)",
+    move="Move name (required for Ether, Max Ether, PP Up, PP Max)",
+    slot="If duplicates, which team slot (1–6)",
+)
+async def useppitem_cmd(
+    inter: discord.Interaction,
+    name: str,
+    item: str,
+    move: str | None = None,
+    slot: int | None = None,
+):
+    await inter.response.defer(ephemeral=True, thinking=False)
+    mon = await resolve_team_mon(inter, name, slot)
+    if not mon:
+        return
+
+    uid = str(inter.user.id)
+    mon_id = int(mon.get("id") or 0)
+    if mon_id <= 0:
+        return await inter.followup.send("❌ Could not resolve that Pokémon.", ephemeral=True)
+
+    canonical = _canonical_pp_item_id(item)
+    if not canonical:
+        return await inter.followup.send(
+            "❌ Unsupported PP item. Use: **Ether**, **Max Ether**, **Elixir**, **Max Elixir**, **PP Up**, or **PP Max**.",
+            ephemeral=True,
+        )
+
+    single_move_item = canonical in {"ether", "max_ether", "pp_up", "pp_max"}
+    if single_move_item and not str(move or "").strip():
+        return await inter.followup.send(
+            "❌ That item needs a target move. Example: `/useppitem name:pikachu item:pp up move:thunderbolt`",
+            ephemeral=True,
+        )
+
+    try:
+        user_gen = int(await _user_selected_gen(uid))
+    except Exception:
+        user_gen = 1
+
+    async with DB_WRITE_LOCK:
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT id, species, moves, moves_pp FROM pokemons WHERE owner_id=? AND id=? LIMIT 1",
+                (uid, mon_id),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+            if not row:
+                return await inter.followup.send("❌ Pokémon not found in your team.", ephemeral=True)
+            row_d = dict(row) if hasattr(row, "keys") else {}
+
+            bag_item_id, bag_qty = await _resolve_pp_item_in_bag_conn(conn, uid, canonical)
+            if bag_qty <= 0 or not bag_item_id:
+                pretty = pretty_item(canonical)
+                return await inter.followup.send(f"❌ You don’t have **{pretty}** in your bag.", ephemeral=True)
+
+            try:
+                moves_raw = row_d.get("moves")
+                moves = json.loads(moves_raw) if isinstance(moves_raw, str) else moves_raw
+            except Exception:
+                moves = []
+            if not isinstance(moves, list) or not moves:
+                return await inter.followup.send("❌ This Pokémon has no usable move data.", ephemeral=True)
+            move_ids = [str(m).strip().replace("_", "-").replace(" ", "-").lower() for m in moves[:4] if str(m).strip()]
+            if not move_ids:
+                return await inter.followup.send("❌ This Pokémon has no usable move data.", ephemeral=True)
+            move_names = [m.replace("-", " ").title() for m in move_ids]
+
+            base_pps: list[int] = []
+            for mv in move_ids:
+                try:
+                    base_pps.append(max(1, int(_base_pp(mv, generation=user_gen))))
+                except Exception:
+                    base_pps.append(20)
+
+            raw_pps = row_d.get("moves_pp")
+            parsed_pps: list[Any]
+            if isinstance(raw_pps, str):
+                try:
+                    parsed_pps = json.loads(raw_pps) if raw_pps else []
+                except Exception:
+                    parsed_pps = []
+            elif isinstance(raw_pps, list):
+                parsed_pps = list(raw_pps)
+            else:
+                parsed_pps = []
+
+            cur_pps: list[int] = []
+            for i, cap in enumerate(base_pps):
+                raw_val = parsed_pps[i] if i < len(parsed_pps) else cap
+                try:
+                    pp_i = int(raw_val)
+                except Exception:
+                    pp_i = cap
+                cur_pps.append(max(0, min(pp_i, cap)))
+
+            target_indices: list[int]
+            if single_move_item:
+                wanted = _norm_move_token(move)
+                idx = -1
+                for i, mid in enumerate(move_ids):
+                    if _norm_move_token(mid) == wanted or _norm_move_token(mid.replace("-", " ")) == wanted:
+                        idx = i
+                        break
+                if idx < 0:
+                    move_list = ", ".join(f"`{m}`" for m in move_names)
+                    return await inter.followup.send(
+                        f"❌ Move not found on this Pokémon. Available moves: {move_list}",
+                        ephemeral=True,
+                    )
+                target_indices = [idx]
+            else:
+                target_indices = list(range(len(move_ids)))
+
+            before_pps = list(cur_pps)
+            changed = False
+            changed_lines: list[str] = []
+            for i in target_indices:
+                before = cur_pps[i]
+                cap = base_pps[i]
+                after = before
+                if canonical in {"ether", "elixir"}:
+                    after = min(cap, before + 10)
+                elif canonical in {"max_ether", "max_elixir", "pp_max"}:
+                    after = cap
+                elif canonical == "pp_up":
+                    # Treat PP Up as a PP-restoring item in this bot flow.
+                    restore = max(1, int(cap // 5))
+                    after = min(cap, before + restore)
+                if after > before:
+                    changed = True
+                    cur_pps[i] = after
+                    changed_lines.append(f"• **{move_names[i]}**: {before}/{cap} → {after}/{cap}")
+
+            if not changed:
+                if canonical == "pp_up" and target_indices:
+                    i = target_indices[0]
+                    return await inter.followup.send(
+                        f"ℹ️ **{move_names[i]}** is already at max PP (**{before_pps[i]}/{base_pps[i]}**). "
+                        f"**{pretty_item(canonical)}** was not consumed.",
+                        ephemeral=True,
+                    )
+                return await inter.followup.send(
+                    f"ℹ️ No PP could be restored. **{pretty_item(canonical)}** was not consumed.",
+                    ephemeral=True,
+                )
+
+            await conn.execute(
+                "UPDATE pokemons SET moves_pp=? WHERE owner_id=? AND id=?",
+                (json.dumps(cur_pps, ensure_ascii=False), uid, int(row_d.get("id") or mon_id)),
+            )
+            await conn.execute(
+                "UPDATE user_items SET qty = GREATEST(0, qty - 1) WHERE owner_id=? AND item_id=? AND qty>=1",
+                (uid, bag_item_id),
+            )
+            await conn.commit()
+
+    try:
+        db.invalidate_bag_cache(uid)
+        db.invalidate_pokemons_cache(uid)
+    except Exception:
+        pass
+
+    item_disp = pretty_item(canonical)
+    species_disp = str(mon.get("species") or "Pokémon").replace("-", " ").title()
+    if len(changed_lines) == 1:
+        msg = f"✅ Used **{item_disp}** on **{species_disp}**.\n{changed_lines[0]}"
+    else:
+        msg = f"✅ Used **{item_disp}** on **{species_disp}**.\n" + "\n".join(changed_lines[:4])
+    await inter.followup.send(msg, ephemeral=True)
 
 
 async def _consume_item_for_evolution(owner_id: str, item_id: str) -> bool:
@@ -19309,6 +19541,47 @@ def _team_parse_moves(raw: Any) -> list[str]:
             name = str(m).strip()
         if name:
             out.append(name.replace("-", " ").title())
+    return out
+
+
+def _team_parse_move_ids(raw: Any) -> list[str]:
+    moves = raw
+    if isinstance(moves, str):
+        try:
+            moves = json.loads(moves)
+        except Exception:
+            moves = [moves]
+    if not isinstance(moves, (list, tuple)):
+        return []
+    out: list[str] = []
+    for m in moves[:4]:
+        if isinstance(m, str):
+            name = m.strip()
+        elif isinstance(m, dict):
+            name = str(m.get("name") or "").strip()
+        else:
+            name = str(m).strip()
+        if not name:
+            continue
+        out.append(name.replace("_", "-").replace(" ", "-").lower())
+    return out
+
+
+def _team_parse_moves_pp(raw: Any) -> list[int]:
+    pps = raw
+    if isinstance(pps, str):
+        try:
+            pps = json.loads(pps) if pps else []
+        except Exception:
+            pps = []
+    if not isinstance(pps, (list, tuple)):
+        return []
+    out: list[int] = []
+    for v in list(pps)[:4]:
+        try:
+            out.append(max(0, int(v)))
+        except Exception:
+            out.append(0)
     return out
 
 
@@ -20512,10 +20785,27 @@ class TeamPanelView(discord.ui.View):
         else:
             held_disp = "None"
         emb.add_field(name="Held Item", value=held_disp, inline=True)
+        move_ids = _team_parse_move_ids(row.get("moves"))
         moves = _team_parse_moves(row.get("moves"))
+        pps = _team_parse_moves_pp(row.get("moves_pp"))
+        move_lines: list[str] = []
+        for i, move_name in enumerate(moves):
+            move_id = move_ids[i] if i < len(move_ids) else move_name.replace(" ", "-").lower()
+            try:
+                max_pp = int(_base_pp(move_id, generation=self.current_gen))
+            except Exception:
+                max_pp = 20
+            cur_pp = pps[i] if i < len(pps) else None
+            if cur_pp is not None:
+                try:
+                    cur_pp = max(0, min(int(cur_pp), int(max_pp)))
+                except Exception:
+                    cur_pp = None
+            cur_txt = str(cur_pp) if cur_pp is not None else "?"
+            move_lines.append(f"**{i+1}.** {move_name} ({cur_txt}/{max_pp})")
         emb.add_field(
             name="Moves",
-            value="\n".join(f"**{i+1}.** {m}" for i, m in enumerate(moves)) if moves else "—",
+            value="\n".join(move_lines) if move_lines else "—",
             inline=False,
         )
         emb.set_footer(text=f"Pokémon ID #{int(row.get('id') or 0)}")
@@ -20614,7 +20904,7 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
                             "id": p.get("id"), "species": p.get("species"), "level": p.get("level"),
                             "gender": p.get("gender"), "shiny": p.get("shiny"), "team_slot": p.get("team_slot"),
                             "held_item": p.get("held_item"), "item_emoji": item_emoji,
-                            "hp": p.get("hp"), "hp_now": p.get("hp_now"), "moves": p.get("moves"),
+                            "hp": p.get("hp"), "hp_now": p.get("hp_now"), "moves": p.get("moves"), "moves_pp": p.get("moves_pp"),
                             "nature": p.get("nature"), "ability": p.get("ability"), "friendship": p.get("friendship"),
                             "form": p.get("form"),
                         })
@@ -20624,7 +20914,7 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
         async with db.session() as conn:
             cur = await conn.execute("""
             SELECT p.id, p.species, p.level, p.gender, p.shiny, p.team_slot, p.held_item, i.emoji AS item_emoji,
-                   p.hp, p.hp_now, p.moves, p.nature, p.ability, p.friendship, p.form
+                   p.hp, p.hp_now, p.moves, p.moves_pp, p.nature, p.ability, p.friendship, p.form
             FROM pokemons p
             LEFT JOIN items i ON i.id = p.held_item
             WHERE p.owner_id = ? AND p.team_slot BETWEEN 1 AND 6
@@ -20677,10 +20967,11 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
             "hp": r[8] if len(r) > 8 else None,
             "hp_now": r[9] if len(r) > 9 else None,
             "moves": r[10] if len(r) > 10 else None,
-            "nature": r[11] if len(r) > 11 else None,
-            "ability": r[12] if len(r) > 12 else None,
-            "friendship": r[13] if len(r) > 13 else None,
-            "form": r[14] if len(r) > 14 else None,
+            "moves_pp": r[11] if len(r) > 11 else None,
+            "nature": r[12] if len(r) > 12 else None,
+            "ability": r[13] if len(r) > 13 else None,
+            "friendship": r[14] if len(r) > 14 else None,
+            "form": r[15] if len(r) > 15 else None,
         }
         try:
             rid = int(row.get("id") or 0)

@@ -1583,6 +1583,22 @@ class BattleState:
                 if mon:
                     revert_mega_evolution(mon)
 
+    def restore_abilities(self) -> None:
+        """Restore battle-temporary ability changes (e.g., Trace, Mummy) to original ability."""
+        for team in (self.p1_team, self.p2_team):
+            for mon in team:
+                if mon is None:
+                    continue
+                original_ability = getattr(mon, "_original_ability", None)
+                if original_ability:
+                    mon.ability = original_ability
+                # Reset Trace one-switch activation flag so next battle starts clean.
+                if hasattr(mon, "_trace_activated_this_switch"):
+                    try:
+                        delattr(mon, "_trace_activated_this_switch")
+                    except Exception:
+                        pass
+
     def _choice_move(self, uid: int) -> Optional[str]:
         return self._choice_locked.get(uid)
 
@@ -8617,6 +8633,10 @@ async def _finish(st: BattleState, p1_itx: discord.Interaction, p2_itx: discord.
         pass
     try:
         st.restore_mega_evolution()
+    except Exception:
+        pass
+    try:
+        st.restore_abilities()
     except Exception:
         pass
     
