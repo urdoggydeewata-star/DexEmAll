@@ -17057,7 +17057,7 @@ class MPokeInfo(commands.Cog):
         def _draw_row_value(value: str, *, left: int, top: int, width: int) -> None:
             label_h = max(8, int(round(18 * sy)))
             value_h = max(10, int(round(34 * sy)))
-            value_nudge = 0
+            value_nudge = max(1, int(round(2 * sy)))
             _draw_center_value(value, left, top + label_h, width, value_h, y_nudge=value_nudge)
 
         def _ival(key: str) -> int:
@@ -17098,7 +17098,8 @@ class MPokeInfo(commands.Cog):
             _draw_row_value(value, left=right_x, top=_pt(0, y)[1], width=right_w)
 
         ot_name = str(getattr(interaction.user, "display_name", None) or "Trainer").strip()
-        ot_box_left, ot_box_y = _pt(342, 13)
+        # Match front-panel header geometry (scaled into this panel's coordinate system).
+        ot_box_left, ot_box_y = _pt(212, 15)
         ot_box_w = max(24, int(round(164 * sx)))
         ot_box_h = max(10, int(round(14 * sy)))
         _draw_center_value(
@@ -17140,18 +17141,18 @@ class MPokeInfo(commands.Cog):
         g_key = str(gender or "").strip().lower()
         g_sym = {"male": "♂", "m": "♂", "♀": "♀", "female": "♀", "f": "♀"}.get(g_key, "")
         lv_text = f"{int(level)}"
-        lv_box_left, lv_box_y = _pt(520, 13)
-        lv_box_w = max(18, int(round(44 * sx)))
+        lv_box_left, lv_box_y = _pt(404, 13)
+        lv_box_w = max(18, int(round(112 * sx)))
         lv_box_h = max(10, int(round(14 * sy)))
         lv_font = self._mpokeinfo_fit_font(
             draw_probe,
             lv_text,
-            max_width=max(12, int(round(lv_box_w * 0.7))),
+            max_width=max(12, int(round(lv_box_w * 0.6))),
             start_size=max(8, int(round(10 * scale))),
             min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        lv_text = _clip_text(lv_text, lv_font, max(12, int(round(lv_box_w * 0.7))))
+        lv_text = _clip_text(lv_text, lv_font, max(12, int(round(lv_box_w * 0.6))))
         if lv_text and lv_font is not None:
             lv_w = self._mpokeinfo_text_width(draw_probe, lv_text, lv_font)
             lv_h = max(8, int(round(10 * sy)))
@@ -17181,18 +17182,21 @@ class MPokeInfo(commands.Cog):
             gap = max(1, int(round(2 * sx))) if g_sym else 0
             group_w = int(lv_w + (gap + gw if g_sym else 0))
             group_x = int(lv_box_left + max(0, (lv_box_w - group_w) // 2))
-            lv_y = int(lv_box_y + max(0, (lv_box_h - lv_h) // 2))
+            lv_nudge_x = max(4, int(round(8 * sx)))
+            lv_y = int(lv_box_y + max(0, ((lv_box_h - lv_h) // 2) - 1))
             self._mpokeinfo_draw_shadow_text(
                 draw,
-                (group_x, lv_y),
+                (group_x + lv_nudge_x, lv_y),
                 lv_text,
                 font=lv_font,
                 fill=(246, 232, 255, 255),
                 shadow=(24, 12, 35, 220),
             )
             if g_sym and gender_font is not None:
-                gx = int(group_x + lv_w + gap)
-                gy = int(lv_box_y + max(0, (lv_box_h - gh) // 2))
+                gender_nudge_x = max(2, int(round(4 * sx)))
+                gx = int(group_x + lv_nudge_x + lv_w + gap + gender_nudge_x)
+                gender_nudge_y = -max(1, int(round(1 * sy)))
+                gy = int(lv_box_y + max(0, ((lv_box_h - gh) // 2) - 1 + gender_nudge_y))
                 gfill = (112, 190, 255, 255) if g_key in {"male", "m", "♂"} else (255, 156, 214, 255)
                 self._mpokeinfo_draw_shadow_text(
                     draw,
@@ -17209,9 +17213,9 @@ class MPokeInfo(commands.Cog):
         type_tokens = [str(t or "").strip().lower() for t in list(types or []) if str(t or "").strip()]
         if not type_tokens:
             type_tokens = ["normal"]
-        type_left, type_top = _pt(308, 31)
-        type_w = max(28, int(round(126 * sx)))
-        type_h = max(14, int(round(34 * sy)))
+        type_left, type_top = _pt(300, 30)
+        type_w = max(28, int(round(156 * sx)))
+        type_h = max(14, int(round(38 * sy)))
         type_gap = max(1, int(round(4 * sy)))
         for i, tok in enumerate(type_tokens[:2]):
             row_y = int(type_top + (i * (type_h + type_gap)))
@@ -17265,7 +17269,7 @@ class MPokeInfo(commands.Cog):
             side_star_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
             self._mpokeinfo_draw_shadow_text(
                 draw,
-                _pt(538, 61),
+                _pt(500, 108),
                 "★",
                 font=star_font,
                 fill=(255, 110, 132, 255),
@@ -17273,7 +17277,7 @@ class MPokeInfo(commands.Cog):
             )
             self._mpokeinfo_draw_shadow_text(
                 draw,
-                _pt(514, 72),
+                _pt(334, 128),
                 "★",
                 font=side_star_font,
                 fill=(255, 230, 130, 255),
