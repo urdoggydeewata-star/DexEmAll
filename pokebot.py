@@ -16526,8 +16526,8 @@ class MPokeInfo(commands.Cog):
         if not type_tokens:
             type_tokens = ["Normal"]
         badge_left, badge_top = _pt(198, 31)
-        badge_w = max(20, int(round(54 * sx)))
-        badge_h = max(10, int(round(11 * sy)))
+        badge_w = max(24, int(round(63 * sx)))
+        badge_h = max(10, int(round(13 * sy)))
         badge_gap = max(1, int(round(2 * sy)))
         for i, tok in enumerate(type_tokens[:2]):
             row_y = int(badge_top + (i * (badge_h + badge_gap)))
@@ -16713,15 +16713,15 @@ class MPokeInfo(commands.Cog):
             side_star_font = self._mpokeinfo_font(max(7, int(round(9 * scale))), bold=True)
             self._mpokeinfo_draw_shadow_text(
                 draw,
-                _pt(82, 73),
+                _pt(74, 72),
                 "★",
                 font=star_font,
-                fill=(255, 230, 130, 255),
-                shadow=(78, 42, 10, 220),
+                fill=(255, 110, 132, 255),
+                shadow=(88, 20, 26, 220),
             )
             self._mpokeinfo_draw_shadow_text(
                 draw,
-                _pt(132, 67),
+                _pt(88, 62),
                 "★",
                 font=side_star_font,
                 fill=(255, 110, 132, 255),
@@ -17057,7 +17057,7 @@ class MPokeInfo(commands.Cog):
         def _draw_row_value(value: str, *, left: int, top: int, width: int) -> None:
             label_h = max(8, int(round(18 * sy)))
             value_h = max(10, int(round(34 * sy)))
-            value_nudge = max(1, int(round(2 * sy)))
+            value_nudge = max(2, int(round(4 * sy)))
             _draw_center_value(value, left, top + label_h, width, value_h, y_nudge=value_nudge)
 
         def _ival(key: str) -> int:
@@ -17100,7 +17100,7 @@ class MPokeInfo(commands.Cog):
         ot_name = str(getattr(interaction.user, "display_name", None) or "Trainer").strip()
         # Match front-panel header geometry (scaled into this panel's coordinate system).
         ot_box_left, ot_box_y = _pt(212, 15)
-        ot_box_w = max(24, int(round(164 * sx)))
+        ot_box_w = max(24, int(round(148 * sx)))
         ot_box_h = max(10, int(round(14 * sy)))
         _draw_center_value(
             ot_name,
@@ -17141,7 +17141,7 @@ class MPokeInfo(commands.Cog):
         g_key = str(gender or "").strip().lower()
         g_sym = {"male": "♂", "m": "♂", "♀": "♀", "female": "♀", "f": "♀"}.get(g_key, "")
         lv_text = f"{int(level)}"
-        lv_box_left, lv_box_y = _pt(404, 13)
+        lv_box_left, lv_box_y = _pt(404, 15)
         lv_box_w = max(18, int(round(112 * sx)))
         lv_box_h = max(10, int(round(14 * sy)))
         lv_font = self._mpokeinfo_fit_font(
@@ -17213,9 +17213,9 @@ class MPokeInfo(commands.Cog):
         type_tokens = [str(t or "").strip().lower() for t in list(types or []) if str(t or "").strip()]
         if not type_tokens:
             type_tokens = ["normal"]
-        type_left, type_top = _pt(300, 30)
-        type_w = max(28, int(round(156 * sx)))
-        type_h = max(14, int(round(38 * sy)))
+        type_left, type_top = _pt(304, 31)
+        type_w = max(24, int(round(124 * sx)))
+        type_h = max(12, int(round(30 * sy)))
         type_gap = max(1, int(round(4 * sy)))
         for i, tok in enumerate(type_tokens[:2]):
             row_y = int(type_top + (i * (type_h + type_gap)))
@@ -17235,6 +17235,7 @@ class MPokeInfo(commands.Cog):
                     iw, ih = t_icon.size
                     if iw > 0 and ih > 0:
                         scale_fit = min(float(type_w) / float(iw), float(type_h) / float(ih))
+                        scale_fit = min(scale_fit, 1.7)
                         nw = max(1, int(round(iw * scale_fit)))
                         nh = max(1, int(round(ih * scale_fit)))
                         # Allow upscaling so small source badges still fill the back UI.
