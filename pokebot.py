@@ -758,8 +758,10 @@ def _roll_default_tera_type(types: Sequence[str]) -> str | None:
 # =========================
 #  Config / Intents
 # =========================
-# Modern EXP Share (Gen VI+ behavior): when True, all non-fainted party mons gain full EXP
-EXP_SHARE_ALWAYS_ON = True
+# Modern EXP Share (Gen VI+ behavior): when True, all non-fainted party mons gain full EXP.
+# Default to off unless explicitly enabled via environment so participant-only gains
+# remain the baseline when no Exp Share effect is present.
+EXP_SHARE_ALWAYS_ON = str(os.getenv("EXP_SHARE_ALWAYS_ON", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 # .env is already loaded above before importing db
 TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
@@ -4614,6 +4616,18 @@ def parse_abilities(abilities_raw) -> tuple[list[str], list[str]]:
                 seen.add(k); out.append(s)
         return out
     return _dedup(regs), _dedup(hides)
+
+
+def _norm_ability_id(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def _ability_set_from_entry(entry: Optional[Mapping[str, Any]]) -> tuple[list[str], list[str], set[str]]:
+    regs_raw, hides_raw = parse_abilities((entry or {}).get("abilities") or [])
+    regs = [_norm_ability_id(a) for a in regs_raw if _norm_ability_id(a)]
+    hides = [_norm_ability_id(a) for a in hides_raw if _norm_ability_id(a)]
+    valid = set(regs) | set(hides)
+    return regs, hides, valid
 def roll_hidden_ability(abilities_raw, ha_denominator: int = 10) -> tuple[str, bool]:
     """
     Returns (ability_name, is_hidden).
@@ -11540,11 +11554,28 @@ async def _add_caught_wild_to_team(
         evs_long = _mon_to_long_stats(getattr(mon, "evs", {}) or {})
         level = int(getattr(mon, "level", 5))
         nature = (getattr(mon, "nature", None) or "hardy").strip() or "hardy"
-        ability = (getattr(mon, "ability", None) or "").strip() or None
+        ability = _norm_ability_id(getattr(mon, "ability", None))
         gender = (getattr(mon, "gender", None) or "").strip() or None
         species = (getattr(mon, "species", None) or "").strip()
         if not species:
             return None
+        # Guard against stale/invalid carried abilities (e.g. species mismatch).
+        try:
+            entry = None
+            species_key = _daycare_norm_species(species)
+            if db_cache is not None:
+                entry = (
+                    db_cache.get_cached_pokedex(species_key)
+                    or db_cache.get_cached_pokedex(species.replace("-", " "))
+                    or db_cache.get_cached_pokedex(species.lower())
+                )
+            if entry is None:
+                entry = await ensure_species_and_learnsets(species)
+            regs, hides, valid = _ability_set_from_entry(entry)
+            if valid and ability not in valid:
+                ability = regs[0] if regs else hides[0]
+        except Exception:
+            pass
         final_stats = calc_all_stats(base_long, ivs_long, evs_long, level, nature)
         hp_max = int(max(1, final_stats.get("hp", 1)))
         ball_item_id = _normalize_ball_item_id(
@@ -11656,27 +11687,80 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
 
     party = st.team_for(winner_id)
     participants = st.p1_participants if winner_id == st.p1_id else st.p2_participants
-    exp_share_on = EXP_SHARE_ALWAYS_ON
+    participant_raw = set(participants or set())
+    participant_text = {str(p) for p in participant_raw}
+
+    def _mon_participated(mon: "Mon") -> bool:
+        key = getattr(mon, "_db_id", None) or mon.species
+        return (key in participant_raw) or (str(key) in participant_text)
+
+    def _has_exp_share_item(mon: "Mon") -> bool:
+        item_norm = str(getattr(mon, "item", "") or "").strip().lower().replace("_", "-").replace(" ", "-").replace(".", "")
+        return item_norm in {"exp-share", "expshare"}
+
+    exp_share_on = bool(EXP_SHARE_ALWAYS_ON) or any(_has_exp_share_item(m) for m in party if m)
     party_recipients = []
     for m in party:
         if not m or m.hp <= 0:
             continue
-        key = getattr(m, "_db_id", None) or m.species
-        if exp_share_on or key in participants:
+        if exp_share_on or _mon_participated(m):
             party_recipients.append(m)
     db_ids = [getattr(m, "_db_id", None) for m in party_recipients if getattr(m, "_db_id", None) is not None]
     if not db_ids:
         return empty
 
-    # Total EV yield from all defeated foes (for wild EV farming)
-    total_ev_yield = {k: 0 for k in _STAT_KEYS_SHORT}
-    for foe in defeated:
-        yield_one = _get_ev_yield_for_species(getattr(foe, "species", "") or "")
-        for k in _STAT_KEYS_SHORT:
-            total_ev_yield[k] = total_ev_yield.get(k, 0) + yield_one.get(k, 0)
-    has_ev_yield = any(total_ev_yield.get(k, 0) > 0 for k in _STAT_KEYS_SHORT)
-
     async with db.session() as conn:
+        # Total EV yield from all defeated foes (wild/trainer) with DB fallback when cache misses.
+        ev_yield_cache: dict[str, dict[str, int]] = {}
+
+        def _to_ev_map(raw: Any) -> dict[str, int]:
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw) if raw else {}
+                except Exception:
+                    raw = {}
+            if not isinstance(raw, Mapping):
+                raw = {}
+            normalized = _normalize_stats_keys(dict(raw))
+            return {
+                "hp": max(0, int(normalized.get("hp", 0) or 0)),
+                "atk": max(0, int(normalized.get("atk", normalized.get("attack", 0)) or 0)),
+                "defn": max(0, int(normalized.get("defn", normalized.get("def", normalized.get("defense", 0))) or 0)),
+                "spa": max(0, int(normalized.get("spa", normalized.get("special_attack", 0)) or 0)),
+                "spd": max(0, int(normalized.get("spd", normalized.get("special_defense", 0)) or 0)),
+                "spe": max(0, int(normalized.get("spe", normalized.get("speed", 0)) or 0)),
+            }
+
+        async def _species_ev_yield(species_name: str) -> dict[str, int]:
+            key = _daycare_norm_species(species_name)
+            if key in ev_yield_cache:
+                return ev_yield_cache[key]
+            out = _get_ev_yield_for_species(species_name)
+            if any(out.get(k, 0) > 0 for k in _STAT_KEYS_SHORT):
+                ev_yield_cache[key] = out
+                return out
+            fetched: dict[str, int] = {k: 0 for k in _STAT_KEYS_SHORT}
+            try:
+                cur_ev = await conn.execute(
+                    "SELECT ev_yield FROM pokedex WHERE LOWER(name)=LOWER(?) LIMIT 1",
+                    (species_name,),
+                )
+                row_ev = await cur_ev.fetchone()
+                await cur_ev.close()
+                if row_ev:
+                    fetched = _to_ev_map(row_ev.get("ev_yield") if hasattr(row_ev, "keys") else row_ev[0])
+            except Exception:
+                fetched = {k: 0 for k in _STAT_KEYS_SHORT}
+            ev_yield_cache[key] = fetched
+            return fetched
+
+        total_ev_yield = {k: 0 for k in _STAT_KEYS_SHORT}
+        for foe in defeated:
+            yield_one = await _species_ev_yield(getattr(foe, "species", "") or "")
+            for k in _STAT_KEYS_SHORT:
+                total_ev_yield[k] = total_ev_yield.get(k, 0) + yield_one.get(k, 0)
+        has_ev_yield = any(total_ev_yield.get(k, 0) > 0 for k in _STAT_KEYS_SHORT)
+
         placeholders = ",".join("?" for _ in db_ids)
         cur = await conn.execute(
             f"SELECT id, exp, exp_group, evs FROM pokemons WHERE id IN ({placeholders})",
@@ -11708,7 +11792,7 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
         trainer_foe = not (str(st.p2_name).lower().startswith("wild "))
         split = 1 if exp_share_on else max(
             1,
-            len([m for m in party if (getattr(m, "_db_id", None) or m.species) in participants and m and m.hp > 0]),
+            len([m for m in party if m and m.hp > 0 and _mon_participated(m)]),
         )
         for mon in party_recipients:
             mid = getattr(mon, "_db_id", None)
@@ -16907,11 +16991,22 @@ class MPokeInfo(commands.Cog):
                 draw_star = ImageDraw.Draw(target_img)
             except Exception:
                 return
-            star_font = self._mpokeinfo_font(max(9, int(round(12 * scale))), bold=True)
-            side_star_font = self._mpokeinfo_font(max(7, int(round(9 * scale))), bold=True)
+            try:
+                from PIL import ImageFont  # type: ignore
+                star_font = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                    max(10, int(round(14 * scale))),
+                )
+                side_star_font = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                    max(8, int(round(10 * scale))),
+                )
+            except Exception:
+                star_font = self._mpokeinfo_font(max(10, int(round(14 * scale))), bold=True)
+                side_star_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
             self._mpokeinfo_draw_shadow_text(
                 draw_star,
-                _pt(56, 74),
+                _pt(98, 79),
                 "★",
                 font=star_font,
                 fill=(255, 110, 132, 255),
@@ -16919,7 +17014,7 @@ class MPokeInfo(commands.Cog):
             )
             self._mpokeinfo_draw_shadow_text(
                 draw_star,
-                _pt(70, 64),
+                _pt(112, 69),
                 "★",
                 font=side_star_font,
                 fill=(255, 110, 132, 255),
@@ -17155,7 +17250,7 @@ class MPokeInfo(commands.Cog):
 
         # Emit animated panel if animated sprite exists; otherwise static PNG.
         if sprite_frames:
-            cx, cy = _pt(162, 80)
+            cx, cy = _pt(162, 84)
             if len(sprite_frames) > 1:
                 out_frames: list[Any] = []
                 for spr in sprite_frames:
@@ -17338,8 +17433,7 @@ class MPokeInfo(commands.Cog):
             label_h = max(8, int(round(18 * sy)))
             value_h = max(10, int(round(34 * sy)))
             value_nudge = max(2, int(round(4 * sy)))
-            # Slight right nudge to account for thicker left border strokes in the template.
-            _draw_center_value(value, left, top + label_h, width, value_h, y_nudge=value_nudge, x_nudge=max(1, int(round(2 * sx))))
+            _draw_center_value(value, left, top + label_h, width, value_h, y_nudge=value_nudge, x_nudge=0)
 
         def _ival(key: str) -> int:
             try:
@@ -17381,9 +17475,9 @@ class MPokeInfo(commands.Cog):
         ot_name = str(getattr(interaction.user, "display_name", None) or "Trainer").strip()
         # Match front-panel header geometry (scaled into this panel's coordinate system).
         # Front-equivalent top-row geometry adapted to this panel's scale grid.
-        ot_box_left, ot_box_y = _pt(212, 15)
+        ot_box_left, ot_box_y = _pt(212, 24)
         ot_box_w = max(24, int(round(148 * sx)))
-        ot_box_h = max(10, int(round(14 * sy)))
+        ot_box_h = max(10, int(round(21 * sy)))
         _draw_center_value(
             ot_name,
             ot_box_left,
@@ -17423,9 +17517,9 @@ class MPokeInfo(commands.Cog):
         g_key = str(gender or "").strip().lower()
         g_sym = {"male": "♂", "m": "♂", "♀": "♀", "female": "♀", "f": "♀"}.get(g_key, "")
         lv_text = f"{int(level)}"
-        lv_box_left, lv_box_y = _pt(404, 13)
+        lv_box_left, lv_box_y = _pt(404, 21)
         lv_box_w = max(18, int(round(112 * sx)))
-        lv_box_h = max(10, int(round(14 * sy)))
+        lv_box_h = max(10, int(round(21 * sy)))
         lv_font = self._mpokeinfo_fit_font(
             draw_probe,
             lv_text,
@@ -17547,24 +17641,41 @@ class MPokeInfo(commands.Cog):
                 ty = int(row_y + max(0, (type_h - int(round(10 * scale))) // 2) - 1)
                 self._mpokeinfo_draw_shadow_text(draw, (tx, ty), t_txt, font=t_font, fill=(240, 244, 248, 255), shadow=(0, 0, 0, 220))
 
-        if shiny:
-            star_font = self._mpokeinfo_font(max(10, int(round(13 * scale))), bold=True)
-            side_star_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
+        def _draw_back_shiny_stars(target_img: Any) -> None:
+            if not shiny:
+                return
+            try:
+                draw_star = ImageDraw.Draw(target_img)
+            except Exception:
+                return
+            try:
+                from PIL import ImageFont  # type: ignore
+                star_font = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                    max(10, int(round(13 * scale))),
+                )
+                side_star_font = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                    max(8, int(round(10 * scale))),
+                )
+            except Exception:
+                star_font = self._mpokeinfo_font(max(10, int(round(13 * scale))), bold=True)
+                side_star_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
             self._mpokeinfo_draw_shadow_text(
-                draw,
-                _pt(500, 108),
+                draw_star,
+                _pt(500, 112),
                 "★",
                 font=star_font,
                 fill=(255, 110, 132, 255),
                 shadow=(88, 20, 26, 220),
             )
             self._mpokeinfo_draw_shadow_text(
-                draw,
-                _pt(334, 128),
+                draw_star,
+                _pt(334, 132),
                 "★",
                 font=side_star_font,
-                fill=(255, 230, 130, 255),
-                shadow=(78, 42, 10, 220),
+                fill=(255, 110, 132, 255),
+                shadow=(88, 20, 26, 220),
             )
 
         sprite_frames: list[Any] = []
@@ -17630,7 +17741,7 @@ class MPokeInfo(commands.Cog):
                 fitted.append(sp)
             sprite_frames = fitted
 
-        sprite_cx, sprite_cy = _pt(438, 141)
+        sprite_cx, sprite_cy = _pt(438, 146)
         if sprite_frames and len(sprite_frames) > 1:
             out_frames: list[Any] = []
             for sp in sprite_frames:
@@ -17639,6 +17750,7 @@ class MPokeInfo(commands.Cog):
                     fr.alpha_composite(sp, dest=(int(sprite_cx - (sp.width // 2)), int(sprite_cy - (sp.height // 2))))
                 except Exception:
                     pass
+                _draw_back_shiny_stars(fr)
                 out_frames.append(fr)
             if out_frames:
                 out = BytesIO()
@@ -17664,6 +17776,7 @@ class MPokeInfo(commands.Cog):
                 panel_static.alpha_composite(sp, dest=(int(sprite_cx - (sp.width // 2)), int(sprite_cy - (sp.height // 2))))
             except Exception:
                 pass
+        _draw_back_shiny_stars(panel_static)
 
         out = BytesIO()
         try:
@@ -17819,6 +17932,22 @@ class MPokeInfo(commands.Cog):
                 dex = None
             except Exception:
                 dex = None
+            # Auto-heal invalid stored abilities against species learnset data
+            # (e.g. stale carry-over like Blaze on non-Fire species).
+            try:
+                regs, hides, valid = _ability_set_from_entry(dex if isinstance(dex, Mapping) else None)
+                if valid:
+                    current_ability = _norm_ability_id(mon.get("ability"))
+                    if current_ability not in valid:
+                        fixed_ability = regs[0] if regs else hides[0]
+                        mon["ability"] = fixed_ability
+                        await conn.execute(
+                            "UPDATE pokemons SET ability=? WHERE owner_id=? AND id=?",
+                            (fixed_ability, uid, int(mon.get("id") or 0)),
+                        )
+                        await conn.commit()
+            except Exception:
+                pass
 
         level   = int(mon.get("level") or 1)
         shiny   = bool(mon.get("shiny"))
@@ -18832,6 +18961,8 @@ def _team_species_visual_scale(row: dict) -> float:
         return 0.68
     if db_cache is None:
         species_norm = _daycare_norm_species(row.get("species"))
+        if species_norm == "charmander":
+            return 0.74
         if species_norm == "stakataka":
             return 0.86
         return 1.0
@@ -18841,6 +18972,8 @@ def _team_species_visual_scale(row: dict) -> float:
     species_norm = _daycare_norm_species(species_raw)
     # Wide/tall forms like Stakataka can clip into the name strip if rendered by
     # generic height scaling, so cap them with a hand-tuned value.
+    if species_norm == "charmander":
+        return 0.74
     if species_norm == "stakataka":
         return 0.86
     candidates = [
