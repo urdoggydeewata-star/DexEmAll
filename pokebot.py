@@ -3400,6 +3400,60 @@ async def _get_usage(owner_id: str, item_id: str, conn=None) -> tuple[int, int]:
             except Exception:
                 pass
 
+
+def _item_category_is_consumable(category: Any) -> bool:
+    """Return True for item categories that should spend bag qty on /give."""
+    c = str(category or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not c:
+        return False
+    if c in {"consumable", "single_use", "singleuse", "one_time_use"}:
+        return True
+    return "consum" in c
+
+
+async def _item_is_consumable_conn(conn, item_id: str) -> bool:
+    try:
+        cur = await conn.execute("SELECT category FROM items WHERE id=? LIMIT 1", (str(item_id),))
+        row = await cur.fetchone()
+        await cur.close()
+        cat = (row["category"] if hasattr(row, "keys") else (row[0] if row else None))
+        return _item_category_is_consumable(cat)
+    except Exception:
+        return False
+
+
+async def _bag_adjust_conn(conn, owner_id: str, item_id: str, delta: int) -> bool:
+    """
+    Adjust one bag stack by delta within an existing DB connection.
+    Returns False when the adjustment would make qty negative.
+    """
+    d = int(delta or 0)
+    if d == 0:
+        return True
+    cur = await conn.execute(
+        "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
+        (str(owner_id), str(item_id)),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    old_qty = int((row["qty"] if hasattr(row, "keys") else (row[0] if row else 0)) or 0)
+    new_qty = old_qty + d
+    if new_qty < 0:
+        return False
+    if row:
+        await conn.execute(
+            "UPDATE user_items SET qty=? WHERE owner_id=? AND item_id=?",
+            (new_qty, str(owner_id), str(item_id)),
+        )
+    else:
+        if new_qty <= 0:
+            return False
+        await conn.execute(
+            "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,?)",
+            (str(owner_id), str(item_id), new_qty),
+        )
+    return True
+
 async def _usage_str(owner_id: str, item_id: str, conn=None) -> str:
     used, total = await _get_usage(owner_id, item_id, conn)
     return f"{used}/{total}"
@@ -3442,7 +3496,7 @@ class ConfirmSwapView(discord.ui.View):
 
 @bot.tree.command(
     name="give",
-    description="Give an item from your bag to a team Pokémon (does not consume; enforces used/total)."
+    description="Give an item from your bag to a team Pokémon (consumables spend one copy)."
 )
 @app_commands.describe(
     name="Pokémon species (e.g., garchomp)",
@@ -3474,7 +3528,7 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
             )
         
         # Get full item details
-        cur = await conn.execute("SELECT id, name, emoji FROM items WHERE id = ?", (item_id,))
+        cur = await conn.execute("SELECT id, name, emoji, category FROM items WHERE id = ?", (item_id,))
         row = await cur.fetchone()
         await cur.close()
         
@@ -3490,16 +3544,40 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
         give_emoji_raw = (row_dict.get("emoji") or "").strip()
         give_emoji = give_emoji_raw if _is_displayable_item_emoji(give_emoji_raw) else ""
         give_disp = pretty_item_name(row_dict.get("name") or row_dict.get("id") or item)
+        give_is_consumable = _item_category_is_consumable(row_dict.get("category"))
         # Show autocorrect if the matched item is different from what user typed
         ac_suffix = f" _(autocorrected to {give_disp})_" if item.lower().replace(" ", "-") != give_id.lower() else ""
 
-        # Check ownership and capacity (single _get_usage call)
-        used_now, total_qty = await _get_usage(uid, give_id, conn)
-        if total_qty <= 0:
-            return await interaction.followup.send(
-                f"❌ You don't have {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** in your bag.{ac_suffix}",
-                ephemeral=True
-            )
+        async def _stock_text(item_id_local: str, *, consumable: bool) -> str:
+            if consumable:
+                qty_local = await _get_item_qty(uid, item_id_local, conn)
+                return f"{qty_local} in bag"
+            usage_local = await _usage_str(uid, item_id_local, conn)
+            return f"{usage_local} in use"
+
+        if give_is_consumable:
+            bag_qty = await _get_item_qty(uid, give_id, conn)
+            if bag_qty <= 0:
+                return await interaction.followup.send(
+                    f"❌ You don't have {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** in your bag.{ac_suffix}",
+                    ephemeral=True,
+                )
+        else:
+            # Non-consumables use free-pool usage checks.
+            used_now, total_qty = await _get_usage(uid, give_id, conn)
+            if total_qty <= 0:
+                return await interaction.followup.send(
+                    f"❌ You don't have {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** in your bag.{ac_suffix}",
+                    ephemeral=True,
+                )
+            free = total_qty - used_now
+            if free <= 0:
+                usage = f"{used_now}/{total_qty}"
+                return await interaction.followup.send(
+                    f"❌ All copies of {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** are in use (**{usage}**).\n"
+                    f"💡 Use `/take` to remove it from another Pokémon first.{ac_suffix}",
+                    ephemeral=True,
+                )
 
         # Get current held item
         cur = await conn.execute("SELECT held_item FROM pokemons WHERE owner_id=? AND id=?", (uid, mon_id))
@@ -3509,34 +3587,37 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
 
         # Check if already holding the same item
         if current_held and str(current_held).lower() == give_id.lower():
-            usage = await _usage_str(uid, give_id, conn)
+            usage = await _stock_text(give_id, consumable=give_is_consumable)
             return await interaction.followup.send(
-                f"ℹ️ **{mon_name}** already holds {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** (**{usage}** in use).{ac_suffix}",
-                ephemeral=True
-            )
-
-        # Check item capacity
-        free = total_qty - used_now
-        if free <= 0:
-            usage = f"{used_now}/{total_qty}"
-            return await interaction.followup.send(
-                f"❌ All copies of {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** are in use (**{usage}**).\n"
-                f"💡 Use `/take` to remove it from another Pokémon first.{ac_suffix}",
+                f"ℹ️ **{mon_name}** already holds {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** (**{usage}**).{ac_suffix}",
                 ephemeral=True
             )
 
         # If no current item, just give it
         if not current_held:
             try:
-                await db.set_held_item(uid, mon_id, give_id)
-            except Exception:
+                if give_is_consumable:
+                    consumed = await _bag_adjust_conn(conn, uid, give_id, -1)
+                    if not consumed:
+                        return await interaction.followup.send(
+                            f"❌ No copies of {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** left in your bag.{ac_suffix}",
+                            ephemeral=True,
+                        )
                 await conn.execute("UPDATE pokemons SET held_item=? WHERE owner_id=? AND id=?", (give_id, uid, mon_id))
                 await conn.commit()
                 db.invalidate_pokemons_cache(uid)
-            
-            new_usage = await _usage_str(uid, give_id, conn)
+                if give_is_consumable:
+                    db.invalidate_bag_cache(uid)
+            except Exception:
+                try:
+                    await conn.rollback()
+                except Exception:
+                    pass
+                return await interaction.followup.send("❌ Failed to give item. Please try again.", ephemeral=True)
+
+            new_usage = await _stock_text(give_id, consumable=give_is_consumable)
             return await interaction.followup.send(
-                f"✅ Gave {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** to **{mon_name}** (**{new_usage}** in use).{ac_suffix}",
+                f"✅ Gave {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** to **{mon_name}** (**{new_usage}**).{ac_suffix}",
                 ephemeral=True
             )
 
@@ -3547,15 +3628,19 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
         pemoji_raw = (prow.get("emoji") if prow else "") or ""
         pemoji = pemoji_raw if _is_displayable_item_emoji(pemoji_raw) else ""
         pdisp = pretty_item_name(prow.get("name") if prow else str(current_held))
-        usage_prev = await _usage_str(uid, str(current_held), conn)
-        usage_new = await _usage_str(uid, give_id, conn)
+        current_is_consumable = _item_category_is_consumable((prow or {}).get("category"))
+        if not current_is_consumable and current_held:
+            # Fallback if category metadata is missing from cache/fuzzy row.
+            current_is_consumable = await _item_is_consumable_conn(conn, str(current_held))
+        usage_prev = await _stock_text(str(current_held), consumable=current_is_consumable)
+        usage_new = await _stock_text(give_id, consumable=give_is_consumable)
 
         # Create confirmation view
         view = ConfirmSwapView(timeout=60.0)
         msg = await interaction.followup.send(
             content=(
-                f"**{mon_name}** currently holds {(pemoji + ' ') if pemoji else ''}**{pdisp}** (**{usage_prev}** in use).\n\n"
-                f"Switch to {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** (**{usage_new}** in use)?{ac_suffix}"
+                f"**{mon_name}** currently holds {(pemoji + ' ') if pemoji else ''}**{pdisp}** (**{usage_prev}**).\n\n"
+                f"Switch to {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** (**{usage_new}**)?{ac_suffix}"
             ),
             view=view,
             ephemeral=True,
@@ -3566,30 +3651,53 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
         await view.wait()
         
         if view.confirmed:
-            # Double-check capacity (race condition protection)
-            used_check, total_check = await _get_usage(uid, give_id, conn)
-            if used_check >= total_check:
-                return await msg.edit(
-                    content=f"❌ All copies of **{give_disp}** are now in use. Try again.",
-                    view=None
-                )
-            
-            # Perform the swap
             try:
-                await db.set_held_item(uid, mon_id, give_id)
-            except Exception:
+                if give_is_consumable:
+                    give_qty = await _get_item_qty(uid, give_id, conn)
+                    if give_qty <= 0:
+                        return await msg.edit(
+                            content=f"❌ No copies of **{give_disp}** are left in your bag. Try again.",
+                            view=None,
+                        )
+                    consumed = await _bag_adjust_conn(conn, uid, give_id, -1)
+                    if not consumed:
+                        return await msg.edit(
+                            content=f"❌ No copies of **{give_disp}** are left in your bag. Try again.",
+                            view=None,
+                        )
+                else:
+                    # Double-check capacity (race condition protection)
+                    used_check, total_check = await _get_usage(uid, give_id, conn)
+                    if used_check >= total_check:
+                        return await msg.edit(
+                            content=f"❌ All copies of **{give_disp}** are now in use. Try again.",
+                            view=None
+                        )
+
+                # Return previous held consumable to bag when unequipping.
+                if current_is_consumable and current_held:
+                    await _bag_adjust_conn(conn, uid, str(current_held), 1)
+
                 await conn.execute("UPDATE pokemons SET held_item=? WHERE owner_id=? AND id=?", (give_id, uid, mon_id))
                 await conn.commit()
                 db.invalidate_pokemons_cache(uid)
-            
-            new_usage2 = await _usage_str(uid, give_id, conn)
-            prev_usage2 = await _usage_str(uid, str(current_held), conn)
+                if give_is_consumable or current_is_consumable:
+                    db.invalidate_bag_cache(uid)
+            except Exception:
+                try:
+                    await conn.rollback()
+                except Exception:
+                    pass
+                return await msg.edit(content="❌ Failed to swap held items. Please try again.", view=None)
+
+            new_usage2 = await _stock_text(give_id, consumable=give_is_consumable)
+            prev_usage2 = await _stock_text(str(current_held), consumable=current_is_consumable)
             
             await msg.edit(
                 content=(
                     f"✅ Switched **{mon_name}'s** held item!\n"
-                    f"• Removed: {(pemoji + ' ') if pemoji else ''}**{pdisp}** (now **{prev_usage2}** in use)\n"
-                    f"• Equipped: {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** (now **{new_usage2}** in use){ac_suffix}"
+                    f"• Removed: {(pemoji + ' ') if pemoji else ''}**{pdisp}** (now **{prev_usage2}**)\n"
+                    f"• Equipped: {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** (now **{new_usage2}**){ac_suffix}"
                 ),
                 view=None
             )
@@ -5819,7 +5927,12 @@ class AdminGivePokemon(commands.Cog):
     ):
         await interaction.response.defer(ephemeral=True)
 
-        # Admin gate removed - command now available to all users
+        # Owner-only safety lock.
+        if int(interaction.user.id) not in OWNER_IDS:
+            return await interaction.followup.send(
+                "❌ `/givepokemon` is owner-only.",
+                ephemeral=True,
+            )
         
         target = user or interaction.user
         target_id = str(target.id)
@@ -19661,8 +19774,9 @@ TEAM_BATTLE_SYNC_DURATION_MS = _battle_sync_frame_duration_ms()
 TEAM_DEFAULT_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
 TEAM_MIN_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
 TEAM_MAX_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
-TEAM_MAX_SPRITE_FRAMES = 64
-TEAM_MAX_COMPOSITE_FRAMES = 64
+# Keep enough frames to preserve full loops for longer Showdown GIFs (e.g. Rattata).
+TEAM_MAX_SPRITE_FRAMES = 128
+TEAM_MAX_COMPOSITE_FRAMES = 128
 TEAM_FETCH_SHOWDOWN_FOR_TEAM = False
 TEAM_OVERVIEW_CACHE_TTL_SECONDS = 12.0
 TEAM_WARM_CACHE_INTERVAL_SECONDS = 120.0
@@ -20273,6 +20387,8 @@ def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None], *,
             "current_gen": int(current_gen or 0),
             "slots": snapshot,
             "sync_ms": int(TEAM_BATTLE_SYNC_DURATION_MS),
+            "sprite_cap": int(TEAM_MAX_SPRITE_FRAMES),
+            "composite_cap": int(TEAM_MAX_COMPOSITE_FRAMES),
         },
         ensure_ascii=False,
         sort_keys=True,
