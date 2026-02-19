@@ -695,6 +695,23 @@ def _record_last_move(mon: Mon, move_name: str, battle_state: Any = None) -> Non
             mon_id_raw = getattr(mon, "_db_id", None)
             owner_id = str(owner_raw or "")
             mon_id = int(mon_id_raw or 0)
+            if mon_id <= 0 and battle_state is not None and owner_id:
+                try:
+                    owner_uid = int(owner_id)
+                except Exception:
+                    owner_uid = 0
+                if owner_uid > 0:
+                    try:
+                        team = battle_state.team_for(owner_uid) if hasattr(battle_state, "team_for") else []
+                    except Exception:
+                        team = []
+                    for candidate in team or []:
+                        if candidate is mon:
+                            try:
+                                mon_id = int(getattr(candidate, "_db_id", 0) or 0)
+                            except Exception:
+                                mon_id = 0
+                            break
             should_track = bool(_register_stats is not None and owner_id and mon_id > 0)
             if should_track:
                 mv_key = str(move_name or "").strip().lower().replace("_", "-").replace(" ", "-")
@@ -730,6 +747,23 @@ def _record_registered_ko(atk: Mon, dfn: Mon, battle_state: Any = None) -> None:
         mon_id_raw = getattr(atk, "_db_id", None)
         owner_id = str(owner_raw or "")
         mon_id = int(mon_id_raw or 0)
+        if mon_id <= 0 and battle_state is not None and owner_id:
+            try:
+                owner_uid = int(owner_id)
+            except Exception:
+                owner_uid = 0
+            if owner_uid > 0:
+                try:
+                    team = battle_state.team_for(owner_uid) if hasattr(battle_state, "team_for") else []
+                except Exception:
+                    team = []
+                for candidate in team or []:
+                    if candidate is atk:
+                        try:
+                            mon_id = int(getattr(candidate, "_db_id", 0) or 0)
+                        except Exception:
+                            mon_id = 0
+                        break
         if not owner_id or mon_id <= 0:
             return
         if _register_stats is None:
@@ -3098,9 +3132,9 @@ class BattleState:
         # Recharge flag is set in engine.py's apply_move function
         # It only sets the flag if the move actually connected and had an effect
 
-        _record_last_move(atk, chosen)
+        _record_last_move(atk, chosen, battle_state=self)
         if hasattr(atk, '_mirror_move_copied') and atk._mirror_move_copied:
-            _record_last_move(atk, atk._mirror_move_copied)
+            _record_last_move(atk, atk._mirror_move_copied, battle_state=self)
             delattr(atk, '_mirror_move_copied')
 
         if dfn is not None and atk is not dfn:
@@ -5248,7 +5282,7 @@ class BattleState:
             # Update last move used
             _record_last_move(atk, chosen, battle_state=self)
             if hasattr(atk, '_mirror_move_copied') and atk._mirror_move_copied:
-                _record_last_move(atk, atk._mirror_move_copied)
+                _record_last_move(atk, atk._mirror_move_copied, battle_state=self)
                 delattr(atk, '_mirror_move_copied')
 
             # Record the last move that targeted the defender (for Mirror Move behaviour)

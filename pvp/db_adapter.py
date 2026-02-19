@@ -344,6 +344,27 @@ async def get_active_sprite_info(user_id: int) -> Tuple[str, bool, bool]:
 # ─────────────────────── public: rich team for engine ───────────────────────
 # NOTE: The actual implementation is below (newer version with form/shiny support)
 
+def _party_cache_has_required_ids(party: Any) -> bool:
+    """
+    Validate cached party payload shape so battle tracking has stable mon IDs.
+    Older cache entries may miss `id`, which breaks registered stat tracking.
+    """
+    if not isinstance(party, list):
+        return False
+    if not party:
+        return True
+    for mon in party[:6]:
+        if not isinstance(mon, dict):
+            return False
+        try:
+            mon_id = int(mon.get("id") or 0)
+        except Exception:
+            mon_id = 0
+        if mon_id <= 0:
+            return False
+    return True
+
+
 async def get_party_for_engine(user_id: int, *, save_to_battle_cache: bool = False) -> List[Dict[str, Any]]:
     """
     Get user's team data formatted for the battle engine and legality checking.
@@ -354,10 +375,10 @@ async def get_party_for_engine(user_id: int, *, save_to_battle_cache: bool = Fal
     """
     if db_cache:
         cached = db_cache.get_battle_party_cached(user_id)
-        if cached is not None:
+        if cached is not None and _party_cache_has_required_ids(cached):
             return cached
         party_cached = db_cache.get_cached_party(str(user_id))
-        if party_cached is not None:
+        if party_cached is not None and _party_cache_has_required_ids(party_cached):
             if save_to_battle_cache:
                 db_cache.set_battle_party_cached(user_id, party_cached)
             return party_cached

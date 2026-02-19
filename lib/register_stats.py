@@ -711,13 +711,39 @@ async def flush_battle_state(st: Any) -> None:
         if not _is_positive_owner(owner_id):
             continue
         mids: set[int] = set()
+        species_tokens: set[str] = set()
         for token in (participants or set()):
             try:
                 mid = int(token)
             except Exception:
+                species_key = _norm_species_key(str(token or ""))
+                if species_key:
+                    species_tokens.add(species_key)
                 continue
             if mid > 0:
                 mids.add(mid)
+        if species_tokens and hasattr(st, "team_for"):
+            try:
+                owner_uid = int(owner_id)
+            except Exception:
+                owner_uid = 0
+            if owner_uid > 0:
+                try:
+                    team = st.team_for(owner_uid) or []
+                except Exception:
+                    team = []
+                for mon in team:
+                    if mon is None:
+                        continue
+                    species_key = _norm_species_key(str(getattr(mon, "species", "") or ""))
+                    if not species_key or species_key not in species_tokens:
+                        continue
+                    try:
+                        mid = int(getattr(mon, "_db_id", 0) or 0)
+                    except Exception:
+                        mid = 0
+                    if mid > 0:
+                        mids.add(mid)
         if not mids:
             continue
         reg_ids = _registered_set_from_cache(registered_cache, owner_id)

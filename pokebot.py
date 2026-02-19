@@ -17700,15 +17700,11 @@ class MPokeInfo(commands.Cog):
                 tb = draw_probe.textbbox((0, 0), txt, font=font)
                 tw = max(1, int(tb[2] - tb[0]))
                 th = max(1, int(tb[3] - tb[1]))
-                bx = int(tb[0])
-                by = int(tb[1])
             except Exception:
                 tw = self._mpokeinfo_text_width(draw_probe, txt, font)
                 th = max(8, int(round(12 * scale)))
-                bx = 0
-                by = 0
-            tx = int(left + max(0, (int(width) - tw) // 2) - bx + int(x_nudge))
-            ty = int(top + max(0, (int(height) - th) // 2) - by + int(y_nudge))
+            tx = int(left + max(0, (int(width) - tw) // 2) + int(x_nudge))
+            ty = int(top + max(0, (int(height) - th) // 2) + int(y_nudge))
             self._mpokeinfo_draw_shadow_text(
                 draw,
                 (tx, ty),
@@ -17738,36 +17734,53 @@ class MPokeInfo(commands.Cog):
 
         left_x = _pt(44, 0)[0]
         left_w = max(40, int(round(278 * sx)))
-        right_x = _pt(336, 0)[0]
-        right_w = max(40, int(round(282 * sx)))
+        # Under-sprite rows use slightly narrower, shifted boxes on the template.
+        left_under_exp_x = _pt(86, 0)[0]
+        left_under_exp_w = max(32, int(round(240 * sx)))
+        left_under_pb_x = _pt(54, 0)[0]
+        left_under_pb_w = max(32, int(round(262 * sx)))
+        left_under_shiny_x = _pt(52, 0)[0]
+        left_under_shiny_w = max(32, int(round(268 * sx)))
+        left_under_leg_x = _pt(44, 0)[0]
+        left_under_leg_w = max(32, int(round(282 * sx)))
+
+        right_under_rw_x = _pt(348, 0)[0]
+        right_under_rw_w = max(32, int(round(272 * sx)))
+        right_under_rl_x = _pt(348, 0)[0]
+        right_under_rl_w = max(32, int(round(258 * sx)))
+        right_under_bw_x = _pt(344, 0)[0]
+        right_under_bw_w = max(32, int(round(270 * sx)))
+        right_under_bl_x = _pt(338, 0)[0]
+        right_under_bl_w = max(32, int(round(282 * sx)))
+
         top_rows = [
-            (most_used_move, 12),
-            (f"{_ival('times_traded')}", 74),
-            (f"{_ival('eggs_bred')}", 128),
-            (f"{_ival('total_routes')}", 182),
-            (f"{_ival('total_exp_gained')}", 236),
-            (f"{_ival('pokemon_beat')}", 290),
-            (f"{_ival('shinies_killed')}", 344),
-            (f"{_ival('legendaries_killed')}", 398),
+            (most_used_move, 12, left_x, left_w),
+            (f"{_ival('times_traded')}", 74, left_x, left_w),
+            (f"{_ival('eggs_bred')}", 128, left_x, left_w),
+            (f"{_ival('total_routes')}", 182, left_x, left_w),
+            (f"{_ival('total_exp_gained')}", 236, left_under_exp_x, left_under_exp_w),
+            (f"{_ival('pokemon_beat')}", 290, left_under_pb_x, left_under_pb_w),
+            (f"{_ival('shinies_killed')}", 344, left_under_shiny_x, left_under_shiny_w),
+            (f"{_ival('legendaries_killed')}", 398, left_under_leg_x, left_under_leg_w),
         ]
-        for value, y in top_rows:
-            _draw_row_value(value, left=left_x, top=_pt(0, y)[1], width=left_w)
+        for value, y, row_left, row_w in top_rows:
+            _draw_row_value(value, left=row_left, top=_pt(0, y)[1], width=row_w)
 
         right_rows = [
-            (f"{_ival('raids_won')}", 236),
-            (f"{_ival('raids_lost')}", 290),
-            (f"{_ival('battles_won')}", 344),
-            (f"{_ival('battles_lost')}", 398),
+            (f"{_ival('raids_won')}", 236, right_under_rw_x, right_under_rw_w),
+            (f"{_ival('raids_lost')}", 290, right_under_rl_x, right_under_rl_w),
+            (f"{_ival('battles_won')}", 344, right_under_bw_x, right_under_bw_w),
+            (f"{_ival('battles_lost')}", 398, right_under_bl_x, right_under_bl_w),
         ]
-        for value, y in right_rows:
-            _draw_row_value(value, left=right_x, top=_pt(0, y)[1], width=right_w)
+        for value, y, row_left, row_w in right_rows:
+            _draw_row_value(value, left=row_left, top=_pt(0, y)[1], width=row_w)
 
         ot_name = str(getattr(interaction.user, "display_name", None) or "Trainer").strip()
         # Match front-panel header geometry (scaled into this panel's coordinate system).
         # Front-equivalent top-row geometry adapted to this panel's scale grid.
-        ot_box_left, ot_box_y = _pt(212, 24)
-        ot_box_w = max(24, int(round(148 * sx)))
-        ot_box_h = max(10, int(round(21 * sy)))
+        ot_box_left, ot_box_y = _pt(214, 21)
+        ot_box_w = max(24, int(round(142 * sx)))
+        ot_box_h = max(10, int(round(20 * sy)))
         _draw_center_value(
             ot_name,
             ot_box_left,
@@ -17807,9 +17820,9 @@ class MPokeInfo(commands.Cog):
         g_key = str(gender or "").strip().lower()
         g_sym = {"male": "♂", "m": "♂", "♀": "♀", "female": "♀", "f": "♀"}.get(g_key, "")
         lv_text = f"{int(level)}"
-        lv_box_left, lv_box_y = _pt(404, 21)
-        lv_box_w = max(18, int(round(112 * sx)))
-        lv_box_h = max(10, int(round(21 * sy)))
+        lv_box_left, lv_box_y = _pt(444, 20)
+        lv_box_w = max(18, int(round(126 * sx)))
+        lv_box_h = max(10, int(round(20 * sy)))
         lv_font = self._mpokeinfo_fit_font(
             draw_probe,
             lv_text,
@@ -17848,7 +17861,7 @@ class MPokeInfo(commands.Cog):
             gap = max(1, int(round(2 * sx))) if g_sym else 0
             group_w = int(lv_w + (gap + gw if g_sym else 0))
             group_x = int(lv_box_left + max(0, (lv_box_w - group_w) // 2))
-            lv_nudge_x = max(4, int(round(8 * sx)))
+            lv_nudge_x = max(1, int(round(2 * sx)))
             lv_y = int(lv_box_y + max(0, ((lv_box_h - lv_h) // 2) - 1))
             self._mpokeinfo_draw_shadow_text(
                 draw,
@@ -17859,7 +17872,7 @@ class MPokeInfo(commands.Cog):
                 shadow=(24, 12, 35, 220),
             )
             if g_sym and gender_font is not None:
-                gender_nudge_x = max(2, int(round(4 * sx)))
+                gender_nudge_x = max(1, int(round(2 * sx)))
                 gx = int(group_x + lv_nudge_x + lv_w + gap + gender_nudge_x)
                 gender_nudge_y = -max(1, int(round(1 * sy)))
                 gy = int(lv_box_y + max(0, ((lv_box_h - gh) // 2) - 1 + gender_nudge_y))
@@ -17879,9 +17892,9 @@ class MPokeInfo(commands.Cog):
         type_tokens = [str(t or "").strip().lower() for t in list(types or []) if str(t or "").strip()]
         if not type_tokens:
             type_tokens = ["normal"]
-        type_left, type_top = _pt(304, 31)
-        type_w = max(24, int(round(124 * sx)))
-        type_h = max(12, int(round(30 * sy)))
+        type_left, type_top = _pt(488, 56)
+        type_w = max(24, int(round(122 * sx)))
+        type_h = max(12, int(round(26 * sy)))
         type_gap = max(1, int(round(4 * sy)))
         for i, tok in enumerate(type_tokens[:2]):
             row_y = int(type_top + (i * (type_h + type_gap)))
