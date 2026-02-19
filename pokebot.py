@@ -10667,20 +10667,60 @@ def _normalize_ivs_evs(raw, default_val: int = 0) -> dict:
     """Normalize IVs/EVs from team entry to short-key dict (hp, atk, defn, spa, spd, spe). No rolls."""
     if not raw:
         return {k: default_val for k in _STAT_KEYS_SHORT}
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw) if raw else {}
+            raw = parsed
+        except Exception:
+            raw = {}
     if isinstance(raw, (list, tuple)) and len(raw) >= 6:
-        return dict(zip(_STAT_KEYS_SHORT, [int(raw[i]) for i in range(6)]))
-    if isinstance(raw, dict):
-        long_to_short = {"hp": "hp", "attack": "atk", "atk": "atk", "defense": "defn", "def": "defn", "defn": "defn",
-                         "special_attack": "spa", "spa": "spa", "special_defense": "spd", "spd": "spd", "speed": "spe", "spe": "spe"}
         out = {k: default_val for k in _STAT_KEYS_SHORT}
+        for i, key in enumerate(_STAT_KEYS_SHORT):
+            try:
+                out[key] = int(float(raw[i]))
+            except Exception:
+                continue
+        return out
+    if isinstance(raw, dict):
+        long_to_short = {
+            "hp": "hp",
+            "attack": "atk", "atk": "atk",
+            "defense": "defn", "def": "defn", "defn": "defn",
+            "special_attack": "spa", "special_atk": "spa", "specialattack": "spa", "spa": "spa", "spatk": "spa", "sp_atk": "spa",
+            "special_defense": "spd", "special_def": "spd", "specialdefense": "spd", "spd": "spd", "spdef": "spd", "sp_def": "spd",
+            "speed": "spe", "spe": "spe",
+            "0": "hp", "1": "atk", "2": "defn", "3": "spa", "4": "spd", "5": "spe",
+        }
+        pref_aliases = {
+            "hp": ("ev_hp", "hp_ev", "iv_hp", "hp_iv"),
+            "atk": ("ev_atk", "atk_ev", "iv_atk", "atk_iv", "ev_attack", "attack_ev", "iv_attack", "attack_iv"),
+            "defn": ("ev_def", "def_ev", "iv_def", "def_iv", "ev_defense", "defense_ev", "iv_defense", "defense_iv", "ev_defn", "defn_ev", "iv_defn", "defn_iv"),
+            "spa": ("ev_spa", "spa_ev", "iv_spa", "spa_iv", "ev_sp_atk", "sp_atk_ev", "iv_sp_atk", "sp_atk_iv", "ev_special_attack", "special_attack_ev", "iv_special_attack", "special_attack_iv", "ev_special-attack", "special-attack_ev", "iv_special-attack", "special-attack_iv", "ev_spatk", "spatk_ev", "iv_spatk", "spatk_iv"),
+            "spd": ("ev_spd", "spd_ev", "iv_spd", "spd_iv", "ev_sp_def", "sp_def_ev", "iv_sp_def", "sp_def_iv", "ev_special_defense", "special_defense_ev", "iv_special_defense", "special_defense_iv", "ev_special-defense", "special-defense_ev", "iv_special-defense", "special-defense_iv", "ev_spdef", "spdef_ev", "iv_spdef", "spdef_iv"),
+            "spe": ("ev_spe", "spe_ev", "iv_spe", "spe_iv", "ev_speed", "speed_ev", "iv_speed", "speed_iv"),
+        }
+        out = {k: default_val for k in _STAT_KEYS_SHORT}
+        norm_raw: dict[str, Any] = {}
         for key, val in raw.items():
-            k = (key or "").lower().replace("-", "_")
+            k = str(key or "").lower().replace("-", "_").replace(" ", "_")
+            norm_raw[k] = val
             short = long_to_short.get(k) or (k if k in _STAT_KEYS_SHORT else None)
             if short is not None:
                 try:
-                    out[short] = int(val)
+                    out[short] = int(float(val))
                 except (TypeError, ValueError):
                     pass
+        for dest, keys in pref_aliases.items():
+            if out.get(dest, default_val) != default_val:
+                continue
+            for k in keys:
+                kn = str(k).lower().replace("-", "_").replace(" ", "_")
+                if kn in norm_raw and norm_raw.get(kn) not in (None, ""):
+                    try:
+                        out[dest] = int(float(norm_raw.get(kn)))
+                        break
+                    except Exception:
+                        continue
         return out
     return {k: default_val for k in _STAT_KEYS_SHORT}
 
@@ -17521,14 +17561,19 @@ class MPokeInfo(commands.Cog):
             )
             if not txt or font is None:
                 return
-            tw = self._mpokeinfo_text_width(draw_probe, txt, font)
             try:
                 tb = draw_probe.textbbox((0, 0), txt, font=font)
+                tw = max(1, int(tb[2] - tb[0]))
                 th = max(1, int(tb[3] - tb[1]))
+                bx = int(tb[0])
+                by = int(tb[1])
             except Exception:
+                tw = self._mpokeinfo_text_width(draw_probe, txt, font)
                 th = max(8, int(round(12 * scale)))
-            tx = int(left + max(0, (int(width) - tw) // 2) + int(x_nudge))
-            ty = int(top + max(0, (int(height) - th) // 2) + int(y_nudge))
+                bx = 0
+                by = 0
+            tx = int(left + max(0, (int(width) - tw) // 2) - bx + int(x_nudge))
+            ty = int(top + max(0, (int(height) - th) // 2) - by + int(y_nudge))
             self._mpokeinfo_draw_shadow_text(
                 draw,
                 (tx, ty),
@@ -17556,10 +17601,10 @@ class MPokeInfo(commands.Cog):
         if move_count > 0 and most_used_move != "—":
             most_used_move = f"{most_used_move} ×{move_count}"
 
-        left_x = _pt(16, 0)[0]
-        left_w = max(50, int(round(294 * sx)))
-        right_x = _pt(320, 0)[0]
-        right_w = max(40, int(round(236 * sx)))
+        left_x = _pt(44, 0)[0]
+        left_w = max(40, int(round(278 * sx)))
+        right_x = _pt(336, 0)[0]
+        right_w = max(40, int(round(282 * sx)))
         top_rows = [
             (most_used_move, 12),
             (f"{_ival('times_traded')}", 74),
