@@ -17043,6 +17043,22 @@ class MPokeInfo(commands.Cog):
                 d["spd"] = d.get("4")
             if "spe" not in d and "5" in d:
                 d["spe"] = d.get("5")
+            # Common prefixed key styles used by legacy rows / migrations.
+            pref_aliases = {
+                "hp": ("ev_hp", "hp_ev", "iv_hp", "hp_iv"),
+                "atk": ("ev_atk", "atk_ev", "iv_atk", "atk_iv", "ev_attack", "attack_ev", "iv_attack", "attack_iv"),
+                "def": ("ev_def", "def_ev", "iv_def", "def_iv", "ev_defense", "defense_ev", "iv_defense", "defense_iv", "ev_defn", "defn_ev", "iv_defn", "defn_iv"),
+                "spa": ("ev_spa", "spa_ev", "iv_spa", "spa_iv", "ev_sp_atk", "sp_atk_ev", "iv_sp_atk", "sp_atk_iv", "ev_special_attack", "special_attack_ev", "iv_special_attack", "special_attack_iv", "ev_special-attack", "special-attack_ev", "iv_special-attack", "special-attack_iv", "ev_spatk", "spatk_ev", "iv_spatk", "spatk_iv"),
+                "spd": ("ev_spd", "spd_ev", "iv_spd", "spd_iv", "ev_sp_def", "sp_def_ev", "iv_sp_def", "sp_def_iv", "ev_special_defense", "special_defense_ev", "iv_special_defense", "special_defense_iv", "ev_special-defense", "special-defense_ev", "iv_special-defense", "special-defense_iv", "ev_spdef", "spdef_ev", "iv_spdef", "spdef_iv"),
+                "spe": ("ev_spe", "spe_ev", "iv_spe", "spe_iv", "ev_speed", "speed_ev", "iv_speed", "speed_iv"),
+            }
+            for dest, keys in pref_aliases.items():
+                if dest in d and d.get(dest) not in (None, ""):
+                    continue
+                for k in keys:
+                    if k in d and d.get(k) not in (None, ""):
+                        d[dest] = d.get(k)
+                        break
             return d
 
         def _pick_int(maps: list[dict[str, Any]], *keys: str) -> int:
@@ -17083,20 +17099,20 @@ class MPokeInfo(commands.Cog):
             "spe": _pick_int(stat_maps, "speed", "spe"),
         }
         iv_vals = {
-            "hp": _pick_int(iv_maps, "hp"),
-            "atk": _pick_int(iv_maps, "attack", "atk"),
-            "def": _pick_int(iv_maps, "defense", "def", "defn"),
-            "spa": _pick_int(iv_maps, "special_attack", "special-attack", "spa", "sp_atk", "spatk"),
-            "spd": _pick_int(iv_maps, "special_defense", "special-defense", "spd", "sp_def", "spdef"),
-            "spe": _pick_int(iv_maps, "speed", "spe"),
+            "hp": _pick_int(iv_maps, "hp", "iv_hp", "hp_iv"),
+            "atk": _pick_int(iv_maps, "attack", "atk", "iv_atk", "atk_iv", "iv_attack", "attack_iv"),
+            "def": _pick_int(iv_maps, "defense", "def", "defn", "iv_def", "def_iv", "iv_defense", "defense_iv", "iv_defn", "defn_iv"),
+            "spa": _pick_int(iv_maps, "special_attack", "special-attack", "spa", "sp_atk", "spatk", "iv_spa", "spa_iv", "iv_sp_atk", "sp_atk_iv", "iv_special_attack", "special_attack_iv", "iv_special-attack", "special-attack_iv", "iv_spatk", "spatk_iv"),
+            "spd": _pick_int(iv_maps, "special_defense", "special-defense", "spd", "sp_def", "spdef", "iv_spd", "spd_iv", "iv_sp_def", "sp_def_iv", "iv_special_defense", "special_defense_iv", "iv_special-defense", "special-defense_iv", "iv_spdef", "spdef_iv"),
+            "spe": _pick_int(iv_maps, "speed", "spe", "iv_spe", "spe_iv", "iv_speed", "speed_iv"),
         }
         ev_vals = {
-            "hp": _pick_int(ev_maps, "hp"),
-            "atk": _pick_int(ev_maps, "attack", "atk"),
-            "def": _pick_int(ev_maps, "defense", "def", "defn"),
-            "spa": _pick_int(ev_maps, "special_attack", "special-attack", "spa", "sp_atk", "spatk"),
-            "spd": _pick_int(ev_maps, "special_defense", "special-defense", "spd", "sp_def", "spdef"),
-            "spe": _pick_int(ev_maps, "speed", "spe"),
+            "hp": _pick_int(ev_maps, "hp", "ev_hp", "hp_ev"),
+            "atk": _pick_int(ev_maps, "attack", "atk", "ev_atk", "atk_ev", "ev_attack", "attack_ev"),
+            "def": _pick_int(ev_maps, "defense", "def", "defn", "ev_def", "def_ev", "ev_defense", "defense_ev", "ev_defn", "defn_ev"),
+            "spa": _pick_int(ev_maps, "special_attack", "special-attack", "spa", "sp_atk", "spatk", "ev_spa", "spa_ev", "ev_sp_atk", "sp_atk_ev", "ev_special_attack", "special_attack_ev", "ev_special-attack", "special-attack_ev", "ev_spatk", "spatk_ev"),
+            "spd": _pick_int(ev_maps, "special_defense", "special-defense", "spd", "sp_def", "spdef", "ev_spd", "spd_ev", "ev_sp_def", "sp_def_ev", "ev_special_defense", "special_defense_ev", "ev_special-defense", "special-defense_ev", "ev_spdef", "spdef_ev"),
+            "spe": _pick_int(ev_maps, "speed", "spe", "ev_spe", "spe_ev", "ev_speed", "speed_ev"),
         }
         stat_rows = ["hp", "atk", "def", "spa", "spd", "spe"]
         stat_ys = [170, 190, 210, 230, 250, 270]
