@@ -8069,9 +8069,9 @@ ADVENTURE_ROUTES = {
                 "encounters": [
                     {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
                     {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
-                    {"species": "kakuna", "weight": 15, "min_level": 5, "max_level": 6},
-                    {"species": "metapod", "weight": 15, "min_level": 5, "max_level": 6},
-                    {"species": "ralts", "weight": 10, "min_level": 2, "max_level": 4},
+                    {"species": "kakuna", "weight": 17.5, "min_level": 5, "max_level": 6},
+                    {"species": "metapod", "weight": 17.5, "min_level": 5, "max_level": 6},
+                    {"species": "ralts", "weight": 5, "min_level": 2, "max_level": 4},
                 ],
             },
             "2-2": {
