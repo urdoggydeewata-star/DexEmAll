@@ -5784,31 +5784,10 @@ def _team_embed(user_id: int, st: BattleState) -> discord.Embed:
 
 
 def _team_switch_embed(user_id: int, st: BattleState, description_override: Optional[str] = None) -> discord.Embed:
-    """Build the Swapping UI with opponent moves always hidden."""
-    my_active = st._active(user_id)
-    opp_id = st.p2_id if user_id == st.p1_id else st.p1_id
-    opp_active = st._active(opp_id)
-
-    def _mon_block(m, *, hide_moves: bool = False) -> str:
-        if m is None:
-            return "—"
-        name = _format_pokemon_name(m)
-        hp_bar = _hp_bar_simple(m.hp, m.max_hp)
-        if hide_moves:
-            moves = "**1.** ???　**2.** ???　**3.** ???　**4.** ???"
-        else:
-            mv = getattr(m, "moves", None) or []
-            move_labels = []
-            for move in mv:
-                norm = move.lower().replace(" ", "-").strip()
-                if norm.startswith("hidden-power"):
-                    from .hidden_power import calculate_hidden_power_type
-                    hp_type = calculate_hidden_power_type(m.ivs, generation=st.gen)
-                    move_labels.append(f"HP [{hp_type}]")
-                else:
-                    move_labels.append(move)
-            moves = "　".join([f"**{i+1}.** {move_labels[i] if i < len(move_labels) else '-'}" for i in range(4)])
-        return f"**{name}** Lv{m.level}\n{hp_bar}\n{moves}"
+    """Build the Swapping UI as a full self-team overview (moves + HP)."""
+    team = st.team_for(user_id)
+    active_idx = st.p1_active if user_id == st.p1_id else st.p2_active
+    switchable = set(st.switch_options(user_id) or [])
 
     desc = description_override or "Click the name of the Pokémon you wish to swap to."
     em = discord.Embed(
@@ -5816,8 +5795,44 @@ def _team_switch_embed(user_id: int, st: BattleState, description_override: Opti
         description=desc,
         color=discord.Color.dark_grey(),
     )
-    em.add_field(name="Your Pokémon", value=_mon_block(my_active, hide_moves=False), inline=True)
-    em.add_field(name="Opponent", value=_mon_block(opp_active, hide_moves=True), inline=True)
+
+    chunks: list[str] = []
+    for idx, m in enumerate(team):
+        if m is None:
+            continue
+        name = _format_pokemon_name(m)
+        hp_bar = _hp_bar_simple(m.hp, m.max_hp)
+        hp_text = f"**{m.hp}/{m.max_hp} HP**" if m.hp > 0 else "**FNT**"
+        mv = getattr(m, "moves", None) or []
+        move_labels = []
+        for move in mv:
+            norm = move.lower().replace(" ", "-").strip()
+            if norm.startswith("hidden-power"):
+                from .hidden_power import calculate_hidden_power_type
+                hp_type = calculate_hidden_power_type(m.ivs, generation=st.gen)
+                move_labels.append(f"HP [{hp_type}]")
+            else:
+                move_labels.append(move)
+        active_mark = "▶️ " if idx == active_idx else "　"
+        faint = " 💀" if m.hp <= 0 else ""
+        if idx == active_idx:
+            status_line = "Current Active"
+        elif idx in switchable:
+            status_line = "Switchable"
+        else:
+            status_line = "Not switchable"
+        chunks.append(
+            f"{active_mark}**{name}** Lv{m.level}{faint} — *{status_line}*\n"
+            f"{hp_bar} {hp_text}\n"
+            f"**1.** {move_labels[0] if len(move_labels) > 0 else '-'}　**2.** {move_labels[1] if len(move_labels) > 1 else '-'}\n"
+            f"**3.** {move_labels[2] if len(move_labels) > 2 else '-'}　**4.** {move_labels[3] if len(move_labels) > 3 else '-'}"
+        )
+
+    team_block = "\n\n".join(chunks) if chunks else "—"
+    full_desc = f"{desc}\n\n{team_block}".strip()
+    if len(full_desc) > 4096:
+        full_desc = full_desc[:4093] + "..."
+    em.description = full_desc
     return em
 
 def _already_locked_embed(turn_no: int) -> discord.Embed:

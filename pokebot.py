@@ -758,8 +758,10 @@ def _roll_default_tera_type(types: Sequence[str]) -> str | None:
 # =========================
 #  Config / Intents
 # =========================
-# Modern EXP Share (Gen VI+ behavior): when True, all non-fainted party mons gain full EXP
-EXP_SHARE_ALWAYS_ON = True
+# Modern EXP Share (Gen VI+ behavior): when True, all non-fainted party mons gain full EXP.
+# Default to off unless explicitly enabled via environment so participant-only gains
+# remain the baseline when no Exp Share effect is present.
+EXP_SHARE_ALWAYS_ON = str(os.getenv("EXP_SHARE_ALWAYS_ON", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 # .env is already loaded above before importing db
 TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
@@ -3319,6 +3321,36 @@ async def _get_item_qty(owner_id: str, item_id: str, conn=None) -> int:
             except Exception:
                 pass
 
+
+EXP_SHARE_ITEM_IDS: tuple[str, ...] = ("exp_share", "exp-share", "expshare")
+EXP_SHARE_COST_PKC = 20_000
+
+
+async def _has_exp_share_bag_item(owner_id: str, conn=None) -> bool:
+    own_conn = conn is None
+    if own_conn:
+        conn = await db.connect()
+    try:
+        oid = str(owner_id)
+        placeholders = ", ".join("?" for _ in EXP_SHARE_ITEM_IDS)
+        cur = await conn.execute(
+            f"SELECT COALESCE(SUM(qty), 0) AS total_qty FROM user_items WHERE owner_id=? AND item_id IN ({placeholders})",
+            (oid, *EXP_SHARE_ITEM_IDS),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        try:
+            total_qty = int((row.get("total_qty") if hasattr(row, "keys") else row[0]) or 0) if row else 0
+        except Exception:
+            total_qty = 0
+        return total_qty > 0
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
 async def _count_item_in_use(owner_id: str, item_id: str, conn=None) -> int:
     own_conn = conn is None
     if own_conn:
@@ -4614,6 +4646,18 @@ def parse_abilities(abilities_raw) -> tuple[list[str], list[str]]:
                 seen.add(k); out.append(s)
         return out
     return _dedup(regs), _dedup(hides)
+
+
+def _norm_ability_id(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def _ability_set_from_entry(entry: Optional[Mapping[str, Any]]) -> tuple[list[str], list[str], set[str]]:
+    regs_raw, hides_raw = parse_abilities((entry or {}).get("abilities") or [])
+    regs = [_norm_ability_id(a) for a in regs_raw if _norm_ability_id(a)]
+    hides = [_norm_ability_id(a) for a in hides_raw if _norm_ability_id(a)]
+    valid = set(regs) | set(hides)
+    return regs, hides, valid
 def roll_hidden_ability(abilities_raw, ha_denominator: int = 10) -> tuple[str, bool]:
     """
     Returns (ability_name, is_hidden).
@@ -10735,20 +10779,60 @@ def _normalize_ivs_evs(raw, default_val: int = 0) -> dict:
     """Normalize IVs/EVs from team entry to short-key dict (hp, atk, defn, spa, spd, spe). No rolls."""
     if not raw:
         return {k: default_val for k in _STAT_KEYS_SHORT}
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw) if raw else {}
+            raw = parsed
+        except Exception:
+            raw = {}
     if isinstance(raw, (list, tuple)) and len(raw) >= 6:
-        return dict(zip(_STAT_KEYS_SHORT, [int(raw[i]) for i in range(6)]))
-    if isinstance(raw, dict):
-        long_to_short = {"hp": "hp", "attack": "atk", "atk": "atk", "defense": "defn", "def": "defn", "defn": "defn",
-                         "special_attack": "spa", "spa": "spa", "special_defense": "spd", "spd": "spd", "speed": "spe", "spe": "spe"}
         out = {k: default_val for k in _STAT_KEYS_SHORT}
+        for i, key in enumerate(_STAT_KEYS_SHORT):
+            try:
+                out[key] = int(float(raw[i]))
+            except Exception:
+                continue
+        return out
+    if isinstance(raw, dict):
+        long_to_short = {
+            "hp": "hp",
+            "attack": "atk", "atk": "atk",
+            "defense": "defn", "def": "defn", "defn": "defn",
+            "special_attack": "spa", "special_atk": "spa", "specialattack": "spa", "spa": "spa", "spatk": "spa", "sp_atk": "spa",
+            "special_defense": "spd", "special_def": "spd", "specialdefense": "spd", "spd": "spd", "spdef": "spd", "sp_def": "spd",
+            "speed": "spe", "spe": "spe",
+            "0": "hp", "1": "atk", "2": "defn", "3": "spa", "4": "spd", "5": "spe",
+        }
+        pref_aliases = {
+            "hp": ("ev_hp", "hp_ev", "iv_hp", "hp_iv"),
+            "atk": ("ev_atk", "atk_ev", "iv_atk", "atk_iv", "ev_attack", "attack_ev", "iv_attack", "attack_iv"),
+            "defn": ("ev_def", "def_ev", "iv_def", "def_iv", "ev_defense", "defense_ev", "iv_defense", "defense_iv", "ev_defn", "defn_ev", "iv_defn", "defn_iv"),
+            "spa": ("ev_spa", "spa_ev", "iv_spa", "spa_iv", "ev_sp_atk", "sp_atk_ev", "iv_sp_atk", "sp_atk_iv", "ev_special_attack", "special_attack_ev", "iv_special_attack", "special_attack_iv", "ev_special-attack", "special-attack_ev", "iv_special-attack", "special-attack_iv", "ev_spatk", "spatk_ev", "iv_spatk", "spatk_iv"),
+            "spd": ("ev_spd", "spd_ev", "iv_spd", "spd_iv", "ev_sp_def", "sp_def_ev", "iv_sp_def", "sp_def_iv", "ev_special_defense", "special_defense_ev", "iv_special_defense", "special_defense_iv", "ev_special-defense", "special-defense_ev", "iv_special-defense", "special-defense_iv", "ev_spdef", "spdef_ev", "iv_spdef", "spdef_iv"),
+            "spe": ("ev_spe", "spe_ev", "iv_spe", "spe_iv", "ev_speed", "speed_ev", "iv_speed", "speed_iv"),
+        }
+        out = {k: default_val for k in _STAT_KEYS_SHORT}
+        norm_raw: dict[str, Any] = {}
         for key, val in raw.items():
-            k = (key or "").lower().replace("-", "_")
+            k = str(key or "").lower().replace("-", "_").replace(" ", "_")
+            norm_raw[k] = val
             short = long_to_short.get(k) or (k if k in _STAT_KEYS_SHORT else None)
             if short is not None:
                 try:
-                    out[short] = int(val)
+                    out[short] = int(float(val))
                 except (TypeError, ValueError):
                     pass
+        for dest, keys in pref_aliases.items():
+            if out.get(dest, default_val) != default_val:
+                continue
+            for k in keys:
+                kn = str(k).lower().replace("-", "_").replace(" ", "_")
+                if kn in norm_raw and norm_raw.get(kn) not in (None, ""):
+                    try:
+                        out[dest] = int(float(norm_raw.get(kn)))
+                        break
+                    except Exception:
+                        continue
         return out
     return {k: default_val for k in _STAT_KEYS_SHORT}
 
@@ -11652,11 +11736,28 @@ async def _add_caught_wild_to_team(
         evs_long = _mon_to_long_stats(getattr(mon, "evs", {}) or {})
         level = int(getattr(mon, "level", 5))
         nature = (getattr(mon, "nature", None) or "hardy").strip() or "hardy"
-        ability = (getattr(mon, "ability", None) or "").strip() or None
+        ability = _norm_ability_id(getattr(mon, "ability", None))
         gender = (getattr(mon, "gender", None) or "").strip() or None
         species = (getattr(mon, "species", None) or "").strip()
         if not species:
             return None
+        # Guard against stale/invalid carried abilities (e.g. species mismatch).
+        try:
+            entry = None
+            species_key = _daycare_norm_species(species)
+            if db_cache is not None:
+                entry = (
+                    db_cache.get_cached_pokedex(species_key)
+                    or db_cache.get_cached_pokedex(species.replace("-", " "))
+                    or db_cache.get_cached_pokedex(species.lower())
+                )
+            if entry is None:
+                entry = await ensure_species_and_learnsets(species)
+            regs, hides, valid = _ability_set_from_entry(entry)
+            if valid and ability not in valid:
+                ability = regs[0] if regs else hides[0]
+        except Exception:
+            pass
         final_stats = calc_all_stats(base_long, ivs_long, evs_long, level, nature)
         hp_max = int(max(1, final_stats.get("hp", 1)))
         ball_item_id = _normalize_ball_item_id(
@@ -11768,27 +11869,90 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
 
     party = st.team_for(winner_id)
     participants = st.p1_participants if winner_id == st.p1_id else st.p2_participants
-    exp_share_on = EXP_SHARE_ALWAYS_ON
-    party_recipients = []
-    for m in party:
-        if not m or m.hp <= 0:
-            continue
-        key = getattr(m, "_db_id", None) or m.species
-        if exp_share_on or key in participants:
-            party_recipients.append(m)
-    db_ids = [getattr(m, "_db_id", None) for m in party_recipients if getattr(m, "_db_id", None) is not None]
-    if not db_ids:
-        return empty
+    participant_raw = set(participants or set())
+    participant_text = {str(p) for p in participant_raw}
 
-    # Total EV yield from all defeated foes (for wild EV farming)
-    total_ev_yield = {k: 0 for k in _STAT_KEYS_SHORT}
-    for foe in defeated:
-        yield_one = _get_ev_yield_for_species(getattr(foe, "species", "") or "")
-        for k in _STAT_KEYS_SHORT:
-            total_ev_yield[k] = total_ev_yield.get(k, 0) + yield_one.get(k, 0)
-    has_ev_yield = any(total_ev_yield.get(k, 0) > 0 for k in _STAT_KEYS_SHORT)
+    def _mon_participated(mon: "Mon") -> bool:
+        key = getattr(mon, "_db_id", None) or mon.species
+        return (key in participant_raw) or (str(key) in participant_text)
+
+    def _has_exp_share_item(mon: "Mon") -> bool:
+        item_norm = str(getattr(mon, "item", "") or "").strip().lower().replace("_", "-").replace(" ", "-").replace(".", "")
+        return item_norm in {"exp-share", "expshare"}
+
+    exp_share_on = bool(EXP_SHARE_ALWAYS_ON) or any(_has_exp_share_item(m) for m in party if m)
 
     async with db.session() as conn:
+        # Teamwide Exp Share from bag purchase (/expshare).
+        if not exp_share_on:
+            try:
+                owner_id = str(winner_id)
+                if int(owner_id) > 0 and await _has_exp_share_bag_item(owner_id, conn=conn):
+                    exp_share_on = True
+            except Exception:
+                pass
+
+        party_recipients = []
+        for m in party:
+            if not m or m.hp <= 0:
+                continue
+            if exp_share_on or _mon_participated(m):
+                party_recipients.append(m)
+        db_ids = [getattr(m, "_db_id", None) for m in party_recipients if getattr(m, "_db_id", None) is not None]
+        if not db_ids:
+            return empty
+
+        # Total EV yield from all defeated foes (wild/trainer) with DB fallback when cache misses.
+        ev_yield_cache: dict[str, dict[str, int]] = {}
+
+        def _to_ev_map(raw: Any) -> dict[str, int]:
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw) if raw else {}
+                except Exception:
+                    raw = {}
+            if not isinstance(raw, Mapping):
+                raw = {}
+            normalized = _normalize_stats_keys(dict(raw))
+            return {
+                "hp": max(0, int(normalized.get("hp", 0) or 0)),
+                "atk": max(0, int(normalized.get("atk", normalized.get("attack", 0)) or 0)),
+                "defn": max(0, int(normalized.get("defn", normalized.get("def", normalized.get("defense", 0))) or 0)),
+                "spa": max(0, int(normalized.get("spa", normalized.get("special_attack", 0)) or 0)),
+                "spd": max(0, int(normalized.get("spd", normalized.get("special_defense", 0)) or 0)),
+                "spe": max(0, int(normalized.get("spe", normalized.get("speed", 0)) or 0)),
+            }
+
+        async def _species_ev_yield(species_name: str) -> dict[str, int]:
+            key = _daycare_norm_species(species_name)
+            if key in ev_yield_cache:
+                return ev_yield_cache[key]
+            out = _get_ev_yield_for_species(species_name)
+            if any(out.get(k, 0) > 0 for k in _STAT_KEYS_SHORT):
+                ev_yield_cache[key] = out
+                return out
+            fetched: dict[str, int] = {k: 0 for k in _STAT_KEYS_SHORT}
+            try:
+                cur_ev = await conn.execute(
+                    "SELECT ev_yield FROM pokedex WHERE LOWER(name)=LOWER(?) LIMIT 1",
+                    (species_name,),
+                )
+                row_ev = await cur_ev.fetchone()
+                await cur_ev.close()
+                if row_ev:
+                    fetched = _to_ev_map(row_ev.get("ev_yield") if hasattr(row_ev, "keys") else row_ev[0])
+            except Exception:
+                fetched = {k: 0 for k in _STAT_KEYS_SHORT}
+            ev_yield_cache[key] = fetched
+            return fetched
+
+        total_ev_yield = {k: 0 for k in _STAT_KEYS_SHORT}
+        for foe in defeated:
+            yield_one = await _species_ev_yield(getattr(foe, "species", "") or "")
+            for k in _STAT_KEYS_SHORT:
+                total_ev_yield[k] = total_ev_yield.get(k, 0) + yield_one.get(k, 0)
+        has_ev_yield = any(total_ev_yield.get(k, 0) > 0 for k in _STAT_KEYS_SHORT)
+
         placeholders = ",".join("?" for _ in db_ids)
         cur = await conn.execute(
             f"SELECT id, exp, exp_group, evs FROM pokemons WHERE id IN ({placeholders})",
@@ -11820,7 +11984,7 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
         trainer_foe = not (str(st.p2_name).lower().startswith("wild "))
         split = 1 if exp_share_on else max(
             1,
-            len([m for m in party if (getattr(m, "_db_id", None) or m.species) in participants and m and m.hp > 0]),
+            len([m for m in party if m and m.hp > 0 and _mon_participated(m)]),
         )
         for mon in party_recipients:
             mid = getattr(mon, "_db_id", None)
@@ -15884,6 +16048,76 @@ class _MPokeInfoFlipView(discord.ui.View):
             pass
 
 
+class _ConfirmDeclineView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        owner_user_id: int,
+        confirm_label: str = "Confirm",
+        decline_label: str = "Decline",
+        timeout: float = 90.0,
+    ):
+        super().__init__(timeout=timeout)
+        self.owner_user_id = int(owner_user_id)
+        self.choice: Optional[bool] = None
+        confirm_btn = discord.ui.Button(label=str(confirm_label), style=discord.ButtonStyle.success)
+        decline_btn = discord.ui.Button(label=str(decline_label), style=discord.ButtonStyle.danger)
+        confirm_btn.callback = self._on_confirm
+        decline_btn.callback = self._on_decline
+        self.add_item(confirm_btn)
+        self.add_item(decline_btn)
+
+    def _disable_all(self) -> None:
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_user_id:
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("Only the command user can choose this.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("Only the command user can choose this.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+        return True
+
+    async def _on_confirm(self, interaction: discord.Interaction) -> None:
+        self.choice = True
+        self._disable_all()
+        try:
+            if interaction.response.is_done():
+                await interaction.message.edit(view=self)  # type: ignore[union-attr]
+            else:
+                await interaction.response.edit_message(view=self)
+        except Exception:
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
+        self.stop()
+
+    async def _on_decline(self, interaction: discord.Interaction) -> None:
+        self.choice = False
+        self._disable_all()
+        try:
+            if interaction.response.is_done():
+                await interaction.message.edit(view=self)  # type: ignore[union-attr]
+            else:
+                await interaction.response.edit_message(view=self)
+        except Exception:
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        self._disable_all()
+
+
 class MPokeInfo(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -17019,11 +17253,22 @@ class MPokeInfo(commands.Cog):
                 draw_star = ImageDraw.Draw(target_img)
             except Exception:
                 return
-            star_font = self._mpokeinfo_font(max(9, int(round(12 * scale))), bold=True)
-            side_star_font = self._mpokeinfo_font(max(7, int(round(9 * scale))), bold=True)
+            try:
+                from PIL import ImageFont  # type: ignore
+                star_font = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                    max(10, int(round(14 * scale))),
+                )
+                side_star_font = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                    max(8, int(round(10 * scale))),
+                )
+            except Exception:
+                star_font = self._mpokeinfo_font(max(10, int(round(14 * scale))), bold=True)
+                side_star_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
             self._mpokeinfo_draw_shadow_text(
                 draw_star,
-                _pt(56, 74),
+                _pt(98, 79),
                 "★",
                 font=star_font,
                 fill=(255, 110, 132, 255),
@@ -17031,7 +17276,7 @@ class MPokeInfo(commands.Cog):
             )
             self._mpokeinfo_draw_shadow_text(
                 draw_star,
-                _pt(70, 64),
+                _pt(112, 69),
                 "★",
                 font=side_star_font,
                 fill=(255, 110, 132, 255),
@@ -17267,7 +17512,7 @@ class MPokeInfo(commands.Cog):
 
         # Emit animated panel if animated sprite exists; otherwise static PNG.
         if sprite_frames:
-            cx, cy = _pt(162, 80)
+            cx, cy = _pt(162, 84)
             if len(sprite_frames) > 1:
                 out_frames: list[Any] = []
                 for spr in sprite_frames:
@@ -17428,14 +17673,19 @@ class MPokeInfo(commands.Cog):
             )
             if not txt or font is None:
                 return
-            tw = self._mpokeinfo_text_width(draw_probe, txt, font)
             try:
                 tb = draw_probe.textbbox((0, 0), txt, font=font)
+                tw = max(1, int(tb[2] - tb[0]))
                 th = max(1, int(tb[3] - tb[1]))
+                bx = int(tb[0])
+                by = int(tb[1])
             except Exception:
+                tw = self._mpokeinfo_text_width(draw_probe, txt, font)
                 th = max(8, int(round(12 * scale)))
-            tx = int(left + max(0, (int(width) - tw) // 2) + int(x_nudge))
-            ty = int(top + max(0, (int(height) - th) // 2) + int(y_nudge))
+                bx = 0
+                by = 0
+            tx = int(left + max(0, (int(width) - tw) // 2) - bx + int(x_nudge))
+            ty = int(top + max(0, (int(height) - th) // 2) - by + int(y_nudge))
             self._mpokeinfo_draw_shadow_text(
                 draw,
                 (tx, ty),
@@ -17450,8 +17700,7 @@ class MPokeInfo(commands.Cog):
             label_h = max(8, int(round(18 * sy)))
             value_h = max(10, int(round(34 * sy)))
             value_nudge = max(2, int(round(4 * sy)))
-            # Slight right nudge to account for thicker left border strokes in the template.
-            _draw_center_value(value, left, top + label_h, width, value_h, y_nudge=value_nudge, x_nudge=max(1, int(round(2 * sx))))
+            _draw_center_value(value, left, top + label_h, width, value_h, y_nudge=value_nudge, x_nudge=0)
 
         def _ival(key: str) -> int:
             try:
@@ -17464,10 +17713,10 @@ class MPokeInfo(commands.Cog):
         if move_count > 0 and most_used_move != "—":
             most_used_move = f"{most_used_move} ×{move_count}"
 
-        left_x = _pt(16, 0)[0]
-        left_w = max(50, int(round(294 * sx)))
-        right_x = _pt(320, 0)[0]
-        right_w = max(40, int(round(236 * sx)))
+        left_x = _pt(44, 0)[0]
+        left_w = max(40, int(round(278 * sx)))
+        right_x = _pt(336, 0)[0]
+        right_w = max(40, int(round(282 * sx)))
         top_rows = [
             (most_used_move, 12),
             (f"{_ival('times_traded')}", 74),
@@ -17493,9 +17742,9 @@ class MPokeInfo(commands.Cog):
         ot_name = str(getattr(interaction.user, "display_name", None) or "Trainer").strip()
         # Match front-panel header geometry (scaled into this panel's coordinate system).
         # Front-equivalent top-row geometry adapted to this panel's scale grid.
-        ot_box_left, ot_box_y = _pt(212, 15)
+        ot_box_left, ot_box_y = _pt(212, 24)
         ot_box_w = max(24, int(round(148 * sx)))
-        ot_box_h = max(10, int(round(14 * sy)))
+        ot_box_h = max(10, int(round(21 * sy)))
         _draw_center_value(
             ot_name,
             ot_box_left,
@@ -17535,9 +17784,9 @@ class MPokeInfo(commands.Cog):
         g_key = str(gender or "").strip().lower()
         g_sym = {"male": "♂", "m": "♂", "♀": "♀", "female": "♀", "f": "♀"}.get(g_key, "")
         lv_text = f"{int(level)}"
-        lv_box_left, lv_box_y = _pt(404, 13)
+        lv_box_left, lv_box_y = _pt(404, 21)
         lv_box_w = max(18, int(round(112 * sx)))
-        lv_box_h = max(10, int(round(14 * sy)))
+        lv_box_h = max(10, int(round(21 * sy)))
         lv_font = self._mpokeinfo_fit_font(
             draw_probe,
             lv_text,
@@ -17659,24 +17908,41 @@ class MPokeInfo(commands.Cog):
                 ty = int(row_y + max(0, (type_h - int(round(10 * scale))) // 2) - 1)
                 self._mpokeinfo_draw_shadow_text(draw, (tx, ty), t_txt, font=t_font, fill=(240, 244, 248, 255), shadow=(0, 0, 0, 220))
 
-        if shiny:
-            star_font = self._mpokeinfo_font(max(10, int(round(13 * scale))), bold=True)
-            side_star_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
+        def _draw_back_shiny_stars(target_img: Any) -> None:
+            if not shiny:
+                return
+            try:
+                draw_star = ImageDraw.Draw(target_img)
+            except Exception:
+                return
+            try:
+                from PIL import ImageFont  # type: ignore
+                star_font = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                    max(10, int(round(13 * scale))),
+                )
+                side_star_font = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                    max(8, int(round(10 * scale))),
+                )
+            except Exception:
+                star_font = self._mpokeinfo_font(max(10, int(round(13 * scale))), bold=True)
+                side_star_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
             self._mpokeinfo_draw_shadow_text(
-                draw,
-                _pt(500, 108),
+                draw_star,
+                _pt(500, 112),
                 "★",
                 font=star_font,
                 fill=(255, 110, 132, 255),
                 shadow=(88, 20, 26, 220),
             )
             self._mpokeinfo_draw_shadow_text(
-                draw,
-                _pt(334, 128),
+                draw_star,
+                _pt(334, 132),
                 "★",
                 font=side_star_font,
-                fill=(255, 230, 130, 255),
-                shadow=(78, 42, 10, 220),
+                fill=(255, 110, 132, 255),
+                shadow=(88, 20, 26, 220),
             )
 
         sprite_frames: list[Any] = []
@@ -17742,7 +18008,7 @@ class MPokeInfo(commands.Cog):
                 fitted.append(sp)
             sprite_frames = fitted
 
-        sprite_cx, sprite_cy = _pt(438, 141)
+        sprite_cx, sprite_cy = _pt(438, 146)
         if sprite_frames and len(sprite_frames) > 1:
             out_frames: list[Any] = []
             for sp in sprite_frames:
@@ -17751,6 +18017,7 @@ class MPokeInfo(commands.Cog):
                     fr.alpha_composite(sp, dest=(int(sprite_cx - (sp.width // 2)), int(sprite_cy - (sp.height // 2))))
                 except Exception:
                     pass
+                _draw_back_shiny_stars(fr)
                 out_frames.append(fr)
             if out_frames:
                 out = BytesIO()
@@ -17776,6 +18043,7 @@ class MPokeInfo(commands.Cog):
                 panel_static.alpha_composite(sp, dest=(int(sprite_cx - (sp.width // 2)), int(sprite_cy - (sp.height // 2))))
             except Exception:
                 pass
+        _draw_back_shiny_stars(panel_static)
 
         out = BytesIO()
         try:
@@ -17784,6 +18052,133 @@ class MPokeInfo(commands.Cog):
             return None
         out.seek(0)
         return discord.File(fp=out, filename=f"register_{int(mon.get('id') or 0)}.png")
+
+    @app_commands.command(name="expshare", description="Buy Exp. Share for your team (20,000 PKC).")
+    async def expshare(self, interaction: Interaction):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=False)
+
+        uid = str(interaction.user.id)
+        async with db.session() as conn:
+            await conn.execute(
+                "INSERT INTO users(user_id, coins, currencies) VALUES(?, 0, '{\"coins\": 0}'::jsonb) ON CONFLICT(user_id) DO NOTHING",
+                (uid,),
+            )
+            cur_user = await conn.execute("SELECT * FROM users WHERE user_id=? LIMIT 1", (uid,))
+            user_row = await cur_user.fetchone()
+            await cur_user.close()
+            balance = int(db.get_currency_from_row(dict(user_row) if user_row else None, "coins"))
+            already_owned = await _has_exp_share_bag_item(uid, conn=conn)
+
+        if already_owned:
+            return await interaction.followup.send(
+                "ℹ️ You already own **Exp. Share**. It is active for your team.",
+                ephemeral=True,
+            )
+        if balance < int(EXP_SHARE_COST_PKC):
+            return await interaction.followup.send(
+                f"❌ You need **{int(EXP_SHARE_COST_PKC):,} {PKDollar_NAME}** for Exp. Share, "
+                f"but you only have **{int(balance):,}**.",
+                ephemeral=True,
+            )
+
+        confirm_view = _ConfirmDeclineView(
+            owner_user_id=interaction.user.id,
+            confirm_label=f"Confirm (-{int(EXP_SHARE_COST_PKC):,})",
+            decline_label="Decline",
+            timeout=120,
+        )
+        prompt_text = (
+            f"Buy **Exp. Share** for **{int(EXP_SHARE_COST_PKC):,} {PKDollar_NAME}**?\n"
+            f"Current balance: **{int(balance):,}**."
+        )
+        prompt_msg = await interaction.followup.send(prompt_text, view=confirm_view, ephemeral=False, wait=True)
+        await confirm_view.wait()
+
+        if confirm_view.choice is not True:
+            cancel_msg = (
+                "⌛ Exp. Share purchase timed out. No PKC was spent."
+                if confirm_view.choice is None
+                else "❌ Exp. Share purchase cancelled. No PKC was spent."
+            )
+            try:
+                await prompt_msg.edit(content=cancel_msg, view=None)
+            except Exception:
+                await interaction.followup.send(cancel_msg, ephemeral=True)
+            return
+
+        charged = int(EXP_SHARE_COST_PKC)
+        remaining = int(balance)
+        already_owned_after = False
+        async with DB_WRITE_LOCK:
+            async with db.session() as conn:
+                await conn.execute(
+                    "INSERT INTO users(user_id, coins, currencies) VALUES(?, 0, '{\"coins\": 0}'::jsonb) ON CONFLICT(user_id) DO NOTHING",
+                    (uid,),
+                )
+                if await _has_exp_share_bag_item(uid, conn=conn):
+                    already_owned_after = True
+                else:
+                    cur_user = await conn.execute("SELECT * FROM users WHERE user_id=? LIMIT 1", (uid,))
+                    user_row = await cur_user.fetchone()
+                    await cur_user.close()
+                    live_balance = int(db.get_currency_from_row(dict(user_row) if user_row else None, "coins"))
+                    if live_balance < charged:
+                        try:
+                            await prompt_msg.edit(
+                                content=(
+                                    f"❌ You need **{charged:,} {PKDollar_NAME}** for Exp. Share, "
+                                    f"but you only have **{live_balance:,}**."
+                                ),
+                                view=None,
+                            )
+                        except Exception:
+                            await interaction.followup.send(
+                                f"❌ You need **{charged:,} {PKDollar_NAME}** for Exp. Share, "
+                                f"but you only have **{live_balance:,}**.",
+                                ephemeral=True,
+                            )
+                        return
+
+                    await conn.execute(
+                        "INSERT INTO items (id, name) VALUES (?, ?) ON CONFLICT (id) DO NOTHING",
+                        ("exp_share", "Exp. Share"),
+                    )
+                    await db.add_currency_conn(conn, uid, "coins", -charged)
+                    await conn.execute(
+                        "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,1) "
+                        "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = 1",
+                        (uid, "exp_share"),
+                    )
+                    await conn.commit()
+                    remaining = max(0, live_balance - charged)
+
+        try:
+            db.invalidate_bag_cache(uid)
+        except Exception:
+            pass
+
+        if already_owned_after:
+            try:
+                await prompt_msg.edit(content="ℹ️ You already own **Exp. Share**. It is active for your team.", view=None)
+            except Exception:
+                await interaction.followup.send("ℹ️ You already own **Exp. Share**. It is active for your team.", ephemeral=True)
+            return
+
+        try:
+            await prompt_msg.edit(
+                content=(
+                    f"✅ Purchased **Exp. Share** for **{charged:,} {PKDollar_NAME}**.\n"
+                    f"Remaining balance: **{remaining:,}**.\n"
+                    f"All team Pokémon now receive EXP/EVs after battles while Exp. Share is owned."
+                ),
+                view=None,
+            )
+        except Exception:
+            await interaction.followup.send(
+                f"✅ Purchased **Exp. Share** for **{charged:,} {PKDollar_NAME}**. Remaining balance: **{remaining:,}**.",
+                ephemeral=True,
+            )
 
     @app_commands.command(name="register", description="Register a Pokémon for tracking (costs 500,000 PKC).")
     @app_commands.describe(
@@ -17814,26 +18209,75 @@ class MPokeInfo(commands.Cog):
         if mon_id <= 0:
             return await interaction.followup.send("Could not resolve Pokémon ID for registration.", ephemeral=True)
 
-        reg = await register_stats.register_mon(
-            uid,
-            mon_id,
-            species,
-            cost=register_stats.REGISTER_COST_PKC,
-        )
-        if not bool(reg.get("ok")):
-            if str(reg.get("reason")) == "insufficient_funds":
-                bal = int(reg.get("balance") or 0)
-                cost = int(register_stats.REGISTER_COST_PKC)
+        reg_cost = int(register_stats.REGISTER_COST_PKC)
+        profile = await register_stats.get_profile(uid, mon_id)
+        reg_created = False
+        reg_balance = await db.get_currency(uid, "coins")
+
+        if profile is None:
+            if int(reg_balance) < reg_cost:
                 return await interaction.followup.send(
-                    f"❌ You need **{cost:,} {PKDollar_NAME}** to register this Pokémon, but you only have **{bal:,}**.",
+                    f"❌ You need **{reg_cost:,} {PKDollar_NAME}** to register this Pokémon, "
+                    f"but you only have **{int(reg_balance):,}**.",
                     ephemeral=True,
                 )
-            return await interaction.followup.send("❌ Could not register this Pokémon right now.", ephemeral=True)
 
-        profile = reg.get("profile") if isinstance(reg.get("profile"), dict) else None
-        if profile is None:
-            profile = await register_stats.get_profile(uid, mon_id)
-        profile = profile or {}
+            confirm_view = _ConfirmDeclineView(
+                owner_user_id=interaction.user.id,
+                confirm_label=f"Confirm (-{reg_cost:,})",
+                decline_label="Decline",
+                timeout=120,
+            )
+            confirm_msg = await interaction.followup.send(
+                (
+                    f"Register **{species.replace('-', ' ').title()}** for stat tracking "
+                    f"for **{reg_cost:,} {PKDollar_NAME}**?\n"
+                    f"Current balance: **{int(reg_balance):,}**."
+                ),
+                view=confirm_view,
+                ephemeral=False,
+                wait=True,
+            )
+            await confirm_view.wait()
+            if confirm_view.choice is not True:
+                cancel_text = (
+                    "⌛ Registration timed out. No PKC was spent."
+                    if confirm_view.choice is None
+                    else "❌ Registration cancelled. No PKC was spent."
+                )
+                try:
+                    await confirm_msg.edit(content=cancel_text, view=None)
+                except Exception:
+                    await interaction.followup.send(cancel_text, ephemeral=True)
+                return
+
+            reg = await register_stats.register_mon(
+                uid,
+                mon_id,
+                species,
+                cost=reg_cost,
+            )
+            if not bool(reg.get("ok")):
+                if str(reg.get("reason")) == "insufficient_funds":
+                    bal = int(reg.get("balance") or 0)
+                    return await interaction.followup.send(
+                        f"❌ You need **{reg_cost:,} {PKDollar_NAME}** to register this Pokémon, but you only have **{bal:,}**.",
+                        ephemeral=True,
+                    )
+                return await interaction.followup.send("❌ Could not register this Pokémon right now.", ephemeral=True)
+
+            reg_created = bool(reg.get("created"))
+            reg_balance = int(reg.get("balance") or reg_balance)
+            profile = reg.get("profile") if isinstance(reg.get("profile"), dict) else None
+            if profile is None:
+                profile = await register_stats.get_profile(uid, mon_id)
+            profile = profile or {}
+            try:
+                await confirm_msg.edit(content="✅ Registration confirmed.", view=None)
+            except Exception:
+                pass
+        else:
+            profile = profile or {}
 
         level = int(mon.get("level") or 1)
         shiny = bool(mon.get("shiny"))
@@ -17855,9 +18299,9 @@ class MPokeInfo(commands.Cog):
             types=types,
         )
 
-        if bool(reg.get("created")):
-            charged = int(reg.get("cost_charged") or register_stats.REGISTER_COST_PKC)
-            remaining = int(reg.get("balance") or 0)
+        if reg_created:
+            charged = reg_cost
+            remaining = int(reg_balance or 0)
             msg = (
                 f"✅ Registered **{species.replace('-', ' ').title()}** for stat tracking "
                 f"(-{charged:,} {PKDollar_NAME}). Remaining balance: **{remaining:,}**."
@@ -17931,6 +18375,22 @@ class MPokeInfo(commands.Cog):
                 dex = None
             except Exception:
                 dex = None
+            # Auto-heal invalid stored abilities against species learnset data
+            # (e.g. stale carry-over like Blaze on non-Fire species).
+            try:
+                regs, hides, valid = _ability_set_from_entry(dex if isinstance(dex, Mapping) else None)
+                if valid:
+                    current_ability = _norm_ability_id(mon.get("ability"))
+                    if current_ability not in valid:
+                        fixed_ability = regs[0] if regs else hides[0]
+                        mon["ability"] = fixed_ability
+                        await conn.execute(
+                            "UPDATE pokemons SET ability=? WHERE owner_id=? AND id=?",
+                            (fixed_ability, uid, int(mon.get("id") or 0)),
+                        )
+                        await conn.commit()
+            except Exception:
+                pass
 
         level   = int(mon.get("level") or 1)
         shiny   = bool(mon.get("shiny"))
@@ -18944,6 +19404,8 @@ def _team_species_visual_scale(row: dict) -> float:
         return 0.68
     if db_cache is None:
         species_norm = _daycare_norm_species(row.get("species"))
+        if species_norm == "charmander":
+            return 0.74
         if species_norm == "stakataka":
             return 0.86
         return 1.0
@@ -18953,6 +19415,8 @@ def _team_species_visual_scale(row: dict) -> float:
     species_norm = _daycare_norm_species(species_raw)
     # Wide/tall forms like Stakataka can clip into the name strip if rendered by
     # generic height scaling, so cap them with a hand-tuned value.
+    if species_norm == "charmander":
+        return 0.74
     if species_norm == "stakataka":
         return 0.86
     candidates = [
