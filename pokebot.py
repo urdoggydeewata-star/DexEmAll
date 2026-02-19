@@ -16118,6 +16118,7 @@ class _MPokeInfoFlipView(discord.ui.View):
             evs_map=self.evs_map,
             moves=self.moves,
             use_back_sprite=False,
+            is_registered=True,
         )
 
     async def _back_file(self, interaction: discord.Interaction) -> Optional[discord.File]:
@@ -16132,6 +16133,7 @@ class _MPokeInfoFlipView(discord.ui.View):
             current_form=self.current_form,
             types=self.types,
             use_back_sprite=True,
+            is_registered=True,
         )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -16915,6 +16917,7 @@ class MPokeInfo(commands.Cog):
         evs_map: dict,
         moves: list[str],
         use_back_sprite: bool = False,
+        is_registered: bool = False,
     ) -> Optional[discord.File]:
         if Image is None:
             return None
@@ -16941,6 +16944,15 @@ class MPokeInfo(commands.Cog):
         sx = float(w) / 400.0
         sy = float(h) / 300.0
         scale = min(sx, sy)
+        if bool(is_registered):
+            theme_fill = (255, 116, 116, 255)
+            theme_shadow = (92, 20, 20, 220)
+        elif bool(shiny):
+            theme_fill = (255, 224, 118, 255)
+            theme_shadow = (98, 74, 24, 220)
+        else:
+            theme_fill = (236, 244, 248, 255)
+            theme_shadow = (0, 0, 0, 220)
 
         def _pt(x: int, y: int) -> tuple[int, int]:
             return int(round(x * sx)), int(round(y * sy))
@@ -17066,8 +17078,8 @@ class MPokeInfo(commands.Cog):
             y: int,
             width: int,
             height: Optional[int] = None,
-            fill: tuple[int, int, int, int] = (236, 244, 248, 255),
-            shadow: tuple[int, int, int, int] = (0, 0, 0, 220),
+            fill: tuple[int, int, int, int] = theme_fill,
+            shadow: tuple[int, int, int, int] = theme_shadow,
         ) -> str:
             txt = _clip_text(text, font, max(8, int(width)))
             if not txt or font is None:
@@ -17149,7 +17161,7 @@ class MPokeInfo(commands.Cog):
         lv_w = self._mpokeinfo_text_width(draw_probe, lv_line, lv_font)
 
         gender_font = None
-        gfill = (214, 214, 226, 255)
+        gfill = theme_fill
         gw = 0
         gh = max(8, int(round(9 * sy)))
         if gender_symbol:
@@ -17161,7 +17173,6 @@ class MPokeInfo(commands.Cog):
                 )
             except Exception:
                 gender_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
-            gfill = (112, 190, 255, 255) if gender_key == "male" else (255, 156, 214, 255) if gender_key == "female" else (214, 214, 226, 255)
             gw = self._mpokeinfo_text_width(draw_probe, gender_symbol, gender_font)
             try:
                 gb = draw_probe.textbbox((0, 0), gender_symbol, font=gender_font)
@@ -17179,8 +17190,8 @@ class MPokeInfo(commands.Cog):
             (group_x + lv_nudge_x, lv_y),
             lv_line,
             font=lv_font,
-            fill=(236, 244, 248, 255),
-            shadow=(0, 0, 0, 220),
+            fill=theme_fill,
+            shadow=theme_shadow,
         )
         if gender_symbol and gender_font is not None:
             gender_nudge_x = max(2, int(round(4 * sx)))
@@ -17193,7 +17204,7 @@ class MPokeInfo(commands.Cog):
                 gender_symbol,
                 font=gender_font,
                 fill=gfill,
-                shadow=(12, 12, 12, 220),
+                shadow=theme_shadow,
             )
 
         type_tokens = [str(t or "").strip() for t in list(types or []) if str(t or "").strip()]
@@ -17245,8 +17256,8 @@ class MPokeInfo(commands.Cog):
                 (type_x, type_y),
                 fallback_type,
                 font=type_font,
-                fill=(240, 246, 251, 255),
-                shadow=(60, 66, 74, 210),
+                fill=theme_fill,
+                shadow=theme_shadow,
             )
 
         nature_text = str(mon.get("nature") or "Hardy").replace("-", " ").replace("_", " ").title()
@@ -17471,7 +17482,7 @@ class MPokeInfo(commands.Cog):
                 bold=False,
             )
             mv = _clip_text(mv, mv_font, move_box_w)
-            self._mpokeinfo_draw_shadow_text(draw, (move_start_x, y), mv, font=mv_font, fill=(240, 245, 250, 255))
+            self._mpokeinfo_draw_shadow_text(draw, (move_start_x, y), mv, font=mv_font, fill=theme_fill, shadow=theme_shadow)
 
         ability_text = str(mon.get("ability") or "Unknown").replace("-", " ").replace("_", " ").title() or "Unknown"
         ability_font = self._mpokeinfo_fit_font(
@@ -17486,7 +17497,14 @@ class MPokeInfo(commands.Cog):
         ability_center_x = _pt(156, 0)[0]
         ability_y = _pt(0, 238)[1]
         ability_w = self._mpokeinfo_text_width(draw_probe, ability_text, ability_font)
-        self._mpokeinfo_draw_shadow_text(draw, (ability_center_x - (ability_w // 2), ability_y), ability_text, font=ability_font)
+        self._mpokeinfo_draw_shadow_text(
+            draw,
+            (ability_center_x - (ability_w // 2), ability_y),
+            ability_text,
+            font=ability_font,
+            fill=theme_fill,
+            shadow=theme_shadow,
+        )
 
         item_text = pretty_item_name(held_item_raw) if held_item_raw else "None"
         item_font = self._mpokeinfo_fit_font(
@@ -17501,7 +17519,14 @@ class MPokeInfo(commands.Cog):
         item_center_x = _pt(156, 0)[0]
         item_y = _pt(0, 272)[1]
         item_w = self._mpokeinfo_text_width(draw_probe, item_text, item_font)
-        self._mpokeinfo_draw_shadow_text(draw, (item_center_x - (item_w // 2), item_y), item_text, font=item_font)
+        self._mpokeinfo_draw_shadow_text(
+            draw,
+            (item_center_x - (item_w // 2), item_y),
+            item_text,
+            font=item_font,
+            fill=theme_fill,
+            shadow=theme_shadow,
+        )
 
         # --- stats table ---
         def _as_stat_map(v: Any) -> dict[str, Any]:
@@ -17733,6 +17758,7 @@ class MPokeInfo(commands.Cog):
         current_form: Optional[str],
         types: List[str],
         use_back_sprite: bool = True,
+        is_registered: bool = True,
     ) -> Optional[discord.File]:
         if Image is None:
             return None
@@ -17753,6 +17779,15 @@ class MPokeInfo(commands.Cog):
         sx = max(0.1, float(W) / 800.0)
         sy = max(0.1, float(H) / 488.0)
         scale = min(sx, sy)
+        if bool(is_registered):
+            theme_fill = (255, 116, 116, 255)
+            theme_shadow = (92, 20, 20, 220)
+        elif bool(shiny):
+            theme_fill = (255, 224, 118, 255)
+            theme_shadow = (98, 74, 24, 220)
+        else:
+            theme_fill = (242, 246, 250, 255)
+            theme_shadow = (0, 0, 0, 220)
         draw_probe = ImageDraw.Draw(base)
 
         def _pt(x: float, y: float) -> tuple[int, int]:
@@ -17823,8 +17858,8 @@ class MPokeInfo(commands.Cog):
                 (tx, ty),
                 txt,
                 font=font,
-                fill=(242, 246, 250, 255),
-                shadow=(0, 0, 0, 220),
+                fill=theme_fill,
+                shadow=theme_shadow,
             )
 
         # Template already includes static labels; draw only dynamic values.
@@ -17926,8 +17961,8 @@ class MPokeInfo(commands.Cog):
                 _pt(332, 216),
                 species_display,
                 font=name_font,
-                fill=(242, 246, 250, 255),
-                shadow=(0, 0, 0, 220),
+                fill=theme_fill,
+                shadow=theme_shadow,
             )
 
         g_key = str(gender or "").strip().lower()
@@ -17981,22 +18016,21 @@ class MPokeInfo(commands.Cog):
                 (group_x + lv_nudge_x, lv_y),
                 lv_text,
                 font=lv_font,
-                fill=(246, 232, 255, 255),
-                shadow=(24, 12, 35, 220),
+                fill=theme_fill,
+                shadow=theme_shadow,
             )
             if g_sym and gender_font is not None:
                 gender_nudge_x = max(1, int(round(2 * sx)))
                 gx = int(group_x + lv_nudge_x + lv_w + gap + gender_nudge_x)
                 gender_nudge_y = -max(1, int(round(1 * sy)))
                 gy = int(lv_box_y + max(0, ((lv_box_h - gh) // 2) - 1 + gender_nudge_y))
-                gfill = (112, 190, 255, 255) if g_key in {"male", "m", "♂"} else (255, 156, 214, 255)
                 self._mpokeinfo_draw_shadow_text(
                     draw,
                     (gx, gy),
                     g_sym,
                     font=gender_font,
-                    fill=gfill,
-                    shadow=(24, 12, 35, 220),
+                    fill=theme_fill,
+                    shadow=theme_shadow,
                 )
 
         ribbons = _ival("ribbons")
@@ -18055,7 +18089,7 @@ class MPokeInfo(commands.Cog):
                 tw = self._mpokeinfo_text_width(draw_probe, t_txt, t_font)
                 tx = int(type_left + max(0, (type_w - tw) // 2))
                 ty = int(row_y + max(0, (type_h - int(round(10 * scale))) // 2) - 1)
-                self._mpokeinfo_draw_shadow_text(draw, (tx, ty), t_txt, font=t_font, fill=(240, 244, 248, 255), shadow=(0, 0, 0, 220))
+                self._mpokeinfo_draw_shadow_text(draw, (tx, ty), t_txt, font=t_font, fill=theme_fill, shadow=theme_shadow)
 
         def _draw_back_shiny_stars(target_img: Any) -> None:
             if not shiny:
@@ -18446,6 +18480,7 @@ class MPokeInfo(commands.Cog):
             gender=gender,
             current_form=current_form,
             types=types,
+            is_registered=True,
         )
 
         if reg_created:
@@ -18685,6 +18720,7 @@ class MPokeInfo(commands.Cog):
             register_profile = await register_stats.get_profile(uid, int(mon.get("id") or 0))
         except Exception:
             register_profile = None
+        is_registered_mon = register_profile is not None
 
         # Preferred UI: render the custom mpokeinfo template image.
         panel_file = await self._render_mpokeinfo_panel(
@@ -18704,9 +18740,10 @@ class MPokeInfo(commands.Cog):
             ivs_map=ivs_map,
             evs_map=evs_map,
             moves=moves,
+            is_registered=is_registered_mon,
         )
         if panel_file is not None:
-            if register_profile:
+            if is_registered_mon:
                 view = _MPokeInfoFlipView(
                     self,
                     owner_user_id=interaction.user.id,
@@ -18725,7 +18762,7 @@ class MPokeInfo(commands.Cog):
                     ivs_map=ivs_map,
                     evs_map=evs_map,
                     moves=moves,
-                    register_profile=register_profile,
+                    register_profile=register_profile or {},
                 )
                 await interaction.followup.send(file=panel_file, view=view, ephemeral=True)
             else:
