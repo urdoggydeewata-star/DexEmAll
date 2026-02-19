@@ -8050,7 +8050,7 @@ ADVENTURE_ROUTES = {
                 "image": ASSETS_ROUTES / "viridian-forest-1-1.png",
                 "exits": [
                     {"id": "south", "label": "➡️ East", "target": "2-1"},
-                    {"id": "north", "label": "⬆️ North", "target": "2-2"},
+                    {"id": "north", "label": "⬆️ North", "target": "1-2"},
                 ],
                 "encounters": [
                     {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
@@ -16905,7 +16905,7 @@ class MPokeInfo(commands.Cog):
             side_star_font = self._mpokeinfo_font(max(7, int(round(9 * scale))), bold=True)
             self._mpokeinfo_draw_shadow_text(
                 draw,
-                _pt(56, 74),
+                _pt(74, 72),
                 "★",
                 font=star_font,
                 fill=(255, 110, 132, 255),
@@ -16913,7 +16913,7 @@ class MPokeInfo(commands.Cog):
             )
             self._mpokeinfo_draw_shadow_text(
                 draw,
-                _pt(70, 64),
+                _pt(88, 62),
                 "★",
                 font=side_star_font,
                 fill=(255, 110, 132, 255),
@@ -17263,11 +17263,10 @@ class MPokeInfo(commands.Cog):
         if move_count > 0 and most_used_move != "—":
             most_used_move = f"{most_used_move} ×{move_count}"
 
-        # Match actual template column borders so values are truly centered.
-        left_x = _pt(44, 0)[0]
-        left_w = max(40, int(round(278 * sx)))
-        right_x = _pt(336, 0)[0]
-        right_w = max(40, int(round(282 * sx)))
+        left_x = _pt(16, 0)[0]
+        left_w = max(50, int(round(294 * sx)))
+        right_x = _pt(320, 0)[0]
+        right_w = max(40, int(round(236 * sx)))
         top_rows = [
             (most_used_move, 12),
             (f"{_ival('times_traded')}", 74),
@@ -17292,10 +17291,9 @@ class MPokeInfo(commands.Cog):
 
         ot_name = str(getattr(interaction.user, "display_name", None) or "Trainer").strip()
         # Match front-panel header geometry (scaled into this panel's coordinate system).
-        # Front-equivalent top-row geometry adapted to this panel's scale grid.
-        ot_box_left, ot_box_y = _pt(236, 24)
+        ot_box_left, ot_box_y = _pt(212, 15)
         ot_box_w = max(24, int(round(148 * sx)))
-        ot_box_h = max(10, int(round(21 * sy)))
+        ot_box_h = max(10, int(round(14 * sy)))
         _draw_center_value(
             ot_name,
             ot_box_left,
@@ -17335,9 +17333,9 @@ class MPokeInfo(commands.Cog):
         g_key = str(gender or "").strip().lower()
         g_sym = {"male": "♂", "m": "♂", "♀": "♀", "female": "♀", "f": "♀"}.get(g_key, "")
         lv_text = f"{int(level)}"
-        lv_box_left, lv_box_y = _pt(452, 21)
+        lv_box_left, lv_box_y = _pt(404, 15)
         lv_box_w = max(18, int(round(112 * sx)))
-        lv_box_h = max(10, int(round(21 * sy)))
+        lv_box_h = max(10, int(round(14 * sy)))
         lv_font = self._mpokeinfo_fit_font(
             draw_probe,
             lv_text,
@@ -17407,11 +17405,10 @@ class MPokeInfo(commands.Cog):
         type_tokens = [str(t or "").strip().lower() for t in list(types or []) if str(t or "").strip()]
         if not type_tokens:
             type_tokens = ["normal"]
-        # Mirror front-panel type chip size to back side.
-        type_left, type_top = _pt(280, 36)
-        type_w = max(24, int(round(126 * sx)))
-        type_h = max(10, int(round(21 * sy)))
-        type_gap = max(1, int(round(3 * sy)))
+        type_left, type_top = _pt(304, 31)
+        type_w = max(24, int(round(124 * sx)))
+        type_h = max(12, int(round(30 * sy)))
+        type_gap = max(1, int(round(4 * sy)))
         for i, tok in enumerate(type_tokens[:2]):
             row_y = int(type_top + (i * (type_h + type_gap)))
             badge = self._mpokeinfo_type_badge_path(tok)
@@ -17460,30 +17457,24 @@ class MPokeInfo(commands.Cog):
                 ty = int(row_y + max(0, (type_h - int(round(10 * scale))) // 2) - 1)
                 self._mpokeinfo_draw_shadow_text(draw, (tx, ty), t_txt, font=t_font, fill=(240, 244, 248, 255), shadow=(0, 0, 0, 220))
 
-        def _draw_back_shiny_stars(target_img: Any) -> None:
-            if not shiny:
-                return
-            try:
-                draw_star = ImageDraw.Draw(target_img)
-            except Exception:
-                return
+        if shiny:
             star_font = self._mpokeinfo_font(max(10, int(round(13 * scale))), bold=True)
             side_star_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
             self._mpokeinfo_draw_shadow_text(
-                draw_star,
-                _pt(294, 126),
+                draw,
+                _pt(500, 108),
                 "★",
                 font=star_font,
                 fill=(255, 110, 132, 255),
                 shadow=(88, 20, 26, 220),
             )
             self._mpokeinfo_draw_shadow_text(
-                draw_star,
-                _pt(312, 116),
+                draw,
+                _pt(334, 128),
                 "★",
                 font=side_star_font,
-                fill=(255, 110, 132, 255),
-                shadow=(88, 20, 26, 220),
+                fill=(255, 230, 130, 255),
+                shadow=(78, 42, 10, 220),
             )
 
         sprite_frames: list[Any] = []
@@ -17558,7 +17549,6 @@ class MPokeInfo(commands.Cog):
                     fr.alpha_composite(sp, dest=(int(sprite_cx - (sp.width // 2)), int(sprite_cy - (sp.height // 2))))
                 except Exception:
                     pass
-                _draw_back_shiny_stars(fr)
                 out_frames.append(fr)
             if out_frames:
                 out = BytesIO()
@@ -17584,7 +17574,6 @@ class MPokeInfo(commands.Cog):
                 panel_static.alpha_composite(sp, dest=(int(sprite_cx - (sp.width // 2)), int(sprite_cy - (sp.height // 2))))
             except Exception:
                 pass
-        _draw_back_shiny_stars(panel_static)
 
         out = BytesIO()
         try:
