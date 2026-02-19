@@ -41,6 +41,10 @@ try:
     from lib import db_cache as _lib_db_cache
 except ImportError:
     _lib_db_cache = None
+try:
+    from lib import register_stats as _register_stats  # type: ignore
+except Exception:
+    _register_stats = None
 from .move_effects import get_move_secondary_effect
 
 # Helper to get move data with battle cache support (no recursion)
@@ -683,7 +687,13 @@ def _record_last_move(mon: Mon, move_name: str, battle_state: Any = None) -> Non
             mon_id_raw = getattr(mon, "_db_id", None)
             owner_id = str(owner_raw or "")
             mon_id = int(mon_id_raw or 0)
+            should_track = False
             if owner_id and mon_id > 0:
+                try:
+                    should_track = bool(_register_stats and _register_stats.is_registered_in_battle_cache(battle_state, owner_id, mon_id))
+                except Exception:
+                    should_track = False
+            if should_track:
                 mv_key = str(move_name or "").strip().lower().replace("_", "-").replace(" ", "-")
                 if mv_key and mv_key != "recharge":
                     usage_buf = getattr(battle_state, "_registered_move_usage", None)
@@ -718,6 +728,11 @@ def _record_registered_ko(atk: Mon, dfn: Mon, battle_state: Any = None) -> None:
         owner_id = str(owner_raw or "")
         mon_id = int(mon_id_raw or 0)
         if not owner_id or mon_id <= 0:
+            return
+        try:
+            if not (_register_stats and _register_stats.is_registered_in_battle_cache(battle_state, owner_id, mon_id)):
+                return
+        except Exception:
             return
         ko_buf = getattr(battle_state, "_registered_ko_stats", None)
         if not isinstance(ko_buf, dict):
@@ -8202,8 +8217,8 @@ async def _finish(st: BattleState, p1_itx: discord.Interaction, p2_itx: discord.
 
     # Flush per-battle /register tracking buffers.
     try:
-        from lib import register_stats as _register_stats  # type: ignore
-        await _register_stats.flush_battle_state(st)
+        if _register_stats is not None:
+            await _register_stats.flush_battle_state(st)
     except Exception:
         pass
 
@@ -8444,6 +8459,21 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                         print(f"[Stream] Initial stream send failed: {send_err}")
             except Exception as init_err:
                 print(f"[Stream] Initial stream setup failed: {init_err}")
+
+    # Preload registered-mon cache once so per-move tracking stays O(1).
+    if not bool(getattr(st, "_register_cache_ready", False)):
+        try:
+            if _register_stats is not None:
+                await _register_stats.seed_battle_registration_cache(st)
+            else:
+                st._registered_mon_ids = {}
+                st._register_cache_ready = True
+        except Exception:
+            try:
+                st._registered_mon_ids = {}
+                st._register_cache_ready = True
+            except Exception:
+                pass
 
     # Check if active Pokémon are fainted - FORCE MANUAL SWITCH
     p1_active_mon = st._active(st.p1_id)

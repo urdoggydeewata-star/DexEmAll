@@ -11824,7 +11824,7 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
         await conn.commit()
         db.invalidate_pokemons_cache(str(winner_id))
         try:
-            await register_stats.add_exp_from_summary(str(winner_id), exp_summary)
+            register_stats.buffer_exp_from_summary(st, str(winner_id), exp_summary)
         except Exception:
             pass
         return (level_ups, exp_summary, ev_summary)
@@ -15418,6 +15418,137 @@ class PokeInfoFormView(discord.ui.View):
             )
         return callback
 
+
+class _MPokeInfoFlipView(discord.ui.View):
+    """Front/back flip button for /mypokeinfo when a mon is registered."""
+    def __init__(
+        self,
+        cog: "MPokeInfo",
+        *,
+        owner_user_id: int,
+        mon: dict,
+        species: str,
+        level: int,
+        shiny: bool,
+        gender: str,
+        current_form: Optional[str],
+        types: List[str],
+        exp_to_next_val: Optional[int],
+        friendship_value: int,
+        is_locked: bool,
+        hp_max: int,
+        stats_obj: dict,
+        ivs_map: dict,
+        evs_map: dict,
+        moves: list[str],
+        register_profile: dict,
+    ):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = int(owner_user_id)
+        self.mon = dict(mon or {})
+        self.species = str(species or "")
+        self.level = int(level or 1)
+        self.shiny = bool(shiny)
+        self.gender = str(gender or "")
+        self.current_form = current_form
+        self.types = list(types or [])
+        self.exp_to_next_val = exp_to_next_val
+        self.friendship_value = int(friendship_value or 0)
+        self.is_locked = bool(is_locked)
+        self.hp_max = int(hp_max or 1)
+        self.stats_obj = dict(stats_obj or {})
+        self.ivs_map = dict(ivs_map or {})
+        self.evs_map = dict(evs_map or {})
+        self.moves = list(moves or [])
+        self.register_profile = dict(register_profile or {})
+        self.showing_back = False
+
+    async def _front_file(self, interaction: discord.Interaction) -> Optional[discord.File]:
+        return await self.cog._render_mpokeinfo_panel(
+            interaction,
+            self.mon,
+            species=self.species,
+            level=self.level,
+            shiny=self.shiny,
+            gender=self.gender,
+            current_form=self.current_form,
+            types=self.types,
+            exp_to_next_val=self.exp_to_next_val,
+            friendship_value=self.friendship_value,
+            is_locked=self.is_locked,
+            hp_max=self.hp_max,
+            stats_obj=self.stats_obj,
+            ivs_map=self.ivs_map,
+            evs_map=self.evs_map,
+            moves=self.moves,
+            use_back_sprite=False,
+        )
+
+    async def _back_file(self, interaction: discord.Interaction) -> Optional[discord.File]:
+        return await self.cog._render_register_panel(
+            interaction,
+            self.mon,
+            profile=self.register_profile,
+            species=self.species,
+            level=self.level,
+            shiny=self.shiny,
+            gender=self.gender,
+            current_form=self.current_form,
+            types=self.types,
+            use_back_sprite=True,
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_user_id:
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("Only the command user can flip this card.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("Only the command user can flip this card.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+        return True
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary)
+    async def flip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+        target_back = not self.showing_back
+        file: Optional[discord.File] = None
+        try:
+            file = await (self._back_file(interaction) if target_back else self._front_file(interaction))
+            if file is None:
+                await interaction.followup.send("Could not render that panel.", ephemeral=True)
+                return
+            self.showing_back = target_back
+            button.label = "Front" if self.showing_back else "Back"
+            button.style = discord.ButtonStyle.primary if self.showing_back else discord.ButtonStyle.secondary
+            await interaction.edit_original_response(attachments=[file], view=self)
+        except Exception:
+            try:
+                await interaction.followup.send("Could not update panel.", ephemeral=True)
+            except Exception:
+                pass
+        finally:
+            if file is not None:
+                try:
+                    file.close()
+                except Exception:
+                    pass
+
+    async def on_timeout(self) -> None:
+        try:
+            for item in self.children:
+                if isinstance(item, discord.ui.Button):
+                    item.disabled = True
+        except Exception:
+            pass
+
+
 class MPokeInfo(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -15863,7 +15994,7 @@ class MPokeInfo(commands.Cog):
                 return f
         return self._mpokeinfo_font(max(8, int(min_size)), bold=bold)
 
-    def _pick_sprite_path(self, species: str, gender: str, shiny: bool, form: Optional[str] = None) -> Optional[Path]:
+    def _pick_sprite_path(self, species: str, gender: str, shiny: bool, form: Optional[str] = None, *, back: bool = False) -> Optional[Path]:
         base_species = self._species_folder_name(species)
         form_norm = self._species_folder_name(form or "")
         folder_candidates: List[Path] = []
@@ -15877,13 +16008,24 @@ class MPokeInfo(commands.Cog):
         g_norm = str(gender or "").strip().lower()
         is_female = g_norm in {"female", "f", "♀"}
         filenames: List[str] = []
+        side = "back" if bool(back) else "front"
         if is_female:
             if shiny:
-                filenames += ["female-animated-shiny-front.gif", "female-shiny-front.png"]
-            filenames += ["female-animated-front.gif", "female-front.png"]
+                filenames += [f"female-animated-shiny-{side}.gif", f"female-shiny-{side}.png"]
+            filenames += [f"female-animated-{side}.gif", f"female-{side}.png"]
         if shiny:
-            filenames += ["animated-shiny-front.gif", "shiny-front.png"]
-        filenames += ["animated-front.gif", "front.png", "icon.png"]
+            filenames += [f"animated-shiny-{side}.gif", f"shiny-{side}.png"]
+        filenames += [f"animated-{side}.gif", f"{side}.png"]
+        # If back sprite doesn't exist, gracefully fall back to front/icon.
+        if bool(back):
+            if is_female:
+                if shiny:
+                    filenames += ["female-animated-shiny-front.gif", "female-shiny-front.png"]
+                filenames += ["female-animated-front.gif", "female-front.png"]
+            if shiny:
+                filenames += ["animated-shiny-front.gif", "shiny-front.png"]
+            filenames += ["animated-front.gif", "front.png"]
+        filenames += ["icon.png"]
 
         for folder in folder_candidates:
             try:
@@ -15994,6 +16136,7 @@ class MPokeInfo(commands.Cog):
         ivs_map: dict,
         evs_map: dict,
         moves: list[str],
+        use_back_sprite: bool = False,
     ) -> Optional[discord.File]:
         if Image is None:
             return None
@@ -16054,7 +16197,7 @@ class MPokeInfo(commands.Cog):
         sprite_frame_durations: list[int] = []
         species_norm_for_anim = _daycare_norm_species(species)
         sprite_frame_limit = 120 if species_norm_for_anim == "eevee" else 24
-        sprite_path = self._pick_sprite_path(species, gender, shiny, current_form)
+        sprite_path = self._pick_sprite_path(species, gender, shiny, current_form, back=bool(use_back_sprite))
         if sprite_path is not None:
             try:
                 with Image.open(str(sprite_path)) as src:
@@ -16687,6 +16830,8 @@ class MPokeInfo(commands.Cog):
     @staticmethod
     def _register_panel_base_path() -> Optional[Path]:
         candidates = [
+            ASSETS_DIR / "ui" / "pkinfo-back.png",
+            ASSETS_DIR / "ui" / "pkinfo-back-template.png",
             ASSETS_DIR / "ui" / "register-base.png",
             ASSETS_DIR / "ui" / "register_base.png",
             ASSETS_DIR / "ui" / "register-template.png",
@@ -16713,6 +16858,7 @@ class MPokeInfo(commands.Cog):
         gender: str,
         current_form: Optional[str],
         types: List[str],
+        use_back_sprite: bool = True,
     ) -> Optional[discord.File]:
         if Image is None:
             return None
@@ -16974,7 +17120,7 @@ class MPokeInfo(commands.Cog):
 
         sprite_frames: list[Any] = []
         durations: list[int] = []
-        sprite_path = self._pick_sprite_path(species, gender, shiny, current_form)
+        sprite_path = self._pick_sprite_path(species, gender, shiny, current_form, back=bool(use_back_sprite))
         if sprite_path is not None:
             try:
                 with PILImage.open(str(sprite_path)) as src:
@@ -17355,6 +17501,12 @@ class MPokeInfo(commands.Cog):
             moves_lines.append("—")
         moves_text = "\n".join(moves_lines)
 
+        register_profile: Optional[dict] = None
+        try:
+            register_profile = await register_stats.get_profile(uid, int(mon.get("id") or 0))
+        except Exception:
+            register_profile = None
+
         # Preferred UI: render the custom mpokeinfo template image.
         panel_file = await self._render_mpokeinfo_panel(
             interaction,
@@ -17375,7 +17527,30 @@ class MPokeInfo(commands.Cog):
             moves=moves,
         )
         if panel_file is not None:
-            await interaction.followup.send(file=panel_file, ephemeral=True)
+            if register_profile:
+                view = _MPokeInfoFlipView(
+                    self,
+                    owner_user_id=interaction.user.id,
+                    mon=mon,
+                    species=species,
+                    level=level,
+                    shiny=shiny,
+                    gender=gender,
+                    current_form=current_form,
+                    types=types,
+                    exp_to_next_val=exp_to_next_val,
+                    friendship_value=fr,
+                    is_locked=is_locked,
+                    hp_max=hp_max,
+                    stats_obj=stats_obj,
+                    ivs_map=ivs_map,
+                    evs_map=evs_map,
+                    moves=moves,
+                    register_profile=register_profile,
+                )
+                await interaction.followup.send(file=panel_file, view=view, ephemeral=True)
+            else:
+                await interaction.followup.send(file=panel_file, ephemeral=True)
             return
 
         files: List[discord.File] = []

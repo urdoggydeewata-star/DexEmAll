@@ -149,6 +149,128 @@ async def _get_profile_conn(conn: Any, owner_id: str, mon_id: int) -> Optional[d
     return _dict_from_row(row) if row else None
 
 
+def _registered_set_from_cache(cache: Any, owner_id: str) -> set[int]:
+    if not isinstance(cache, Mapping):
+        return set()
+    raw = cache.get(str(owner_id))
+    if isinstance(raw, set):
+        return {int(x) for x in raw if str(x).isdigit()}
+    if isinstance(raw, (list, tuple)):
+        out: set[int] = set()
+        for x in raw:
+            try:
+                i = int(x)
+            except Exception:
+                continue
+            if i > 0:
+                out.add(i)
+        return out
+    return set()
+
+
+def is_registered_in_battle_cache(st: Any, owner_id: str, mon_id: int) -> bool:
+    if not owner_id:
+        return False
+    try:
+        mid = int(mon_id)
+    except Exception:
+        return False
+    if mid <= 0:
+        return False
+    cache = getattr(st, "_registered_mon_ids", None)
+    mids = _registered_set_from_cache(cache, str(owner_id))
+    return mid in mids
+
+
+async def seed_battle_registration_cache(st: Any) -> dict[str, set[int]]:
+    """
+    Preload registered mon IDs for both sides once per battle.
+    This lets move/KO hooks stay O(1) and avoids DB reads each turn/event.
+    """
+    owner_to_mon_ids: dict[str, set[int]] = {}
+    for mon in list(getattr(st, "p1_team", []) or []) + list(getattr(st, "p2_team", []) or []):
+        if mon is None:
+            continue
+        owner = str(getattr(mon, "_owner_id", "") or "")
+        try:
+            mon_id = int(getattr(mon, "_db_id", 0) or 0)
+        except Exception:
+            mon_id = 0
+        if not _is_positive_owner(owner) or mon_id <= 0:
+            continue
+        owner_to_mon_ids.setdefault(owner, set()).add(mon_id)
+
+    if not owner_to_mon_ids:
+        setattr(st, "_registered_mon_ids", {})
+        setattr(st, "_register_cache_ready", True)
+        return {}
+
+    out: dict[str, set[int]] = {owner: set() for owner in owner_to_mon_ids}
+    async with db.session() as conn:
+        await ensure_schema(conn)
+        for owner, mon_ids in owner_to_mon_ids.items():
+            mids = sorted({int(m) for m in mon_ids if int(m) > 0})
+            if not mids:
+                continue
+            placeholders = ",".join("?" for _ in mids)
+            cur = await conn.execute(
+                f"SELECT mon_id FROM registered_mons WHERE owner_id=? AND mon_id IN ({placeholders})",
+                (str(owner), *mids),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            for row in rows or []:
+                d = _dict_from_row(row)
+                try:
+                    mid = int(d.get("mon_id", 0) or 0)
+                except Exception:
+                    mid = 0
+                if mid > 0:
+                    out[str(owner)].add(mid)
+
+    setattr(st, "_registered_mon_ids", out)
+    setattr(st, "_register_cache_ready", True)
+    return out
+
+
+def buffer_exp_from_summary(st: Any, default_owner_id: str, exp_summary: Iterable[tuple[Any, int, int, int]]) -> None:
+    """
+    Buffer EXP gains in-memory for registered mons only.
+    Flushed once in flush_battle_state().
+    """
+    cache = getattr(st, "_registered_mon_ids", None)
+    if not isinstance(cache, Mapping):
+        return
+    buf = getattr(st, "_registered_exp_gains", None)
+    if not isinstance(buf, dict):
+        buf = {}
+        setattr(st, "_registered_exp_gains", buf)
+    for item in exp_summary or []:
+        if not isinstance(item, (tuple, list)) or len(item) < 2:
+            continue
+        mon = item[0]
+        try:
+            gain = int(item[1] or 0)
+        except Exception:
+            gain = 0
+        if gain <= 0:
+            continue
+        owner = str(getattr(mon, "_owner_id", default_owner_id) or "")
+        if not _is_positive_owner(owner):
+            continue
+        try:
+            mon_id = int(getattr(mon, "_db_id", 0) or 0)
+        except Exception:
+            mon_id = 0
+        if mon_id <= 0:
+            continue
+        reg_ids = _registered_set_from_cache(cache, owner)
+        if mon_id not in reg_ids:
+            continue
+        key = (owner, mon_id)
+        buf[key] = int(buf.get(key, 0) or 0) + gain
+
+
 def _split_key(key: Any) -> tuple[Optional[str], Optional[int]]:
     if isinstance(key, tuple) and len(key) >= 2:
         owner_raw, mon_raw = key[0], key[1]
@@ -372,10 +494,29 @@ async def increment_eggs_bred(owner_id: str, parent_mon_ids: Iterable[int], coun
         return
     async with db.session() as conn:
         await ensure_schema(conn)
+        placeholders = ",".join("?" for _ in pids)
+        cur = await conn.execute(
+            f"SELECT mon_id FROM registered_mons WHERE owner_id=? AND mon_id IN ({placeholders})",
+            (owner, *pids),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        registered_ids = []
+        for row in rows or []:
+            d = _dict_from_row(row)
+            try:
+                rid = int(d.get("mon_id", 0) or 0)
+            except Exception:
+                rid = 0
+            if rid > 0:
+                registered_ids.append(rid)
         changed = False
-        for mid in pids:
-            ok = await _apply_update_conn(conn, owner, mid, deltas={"eggs_bred": n})
-            changed = changed or ok
+        for rid in registered_ids:
+            await conn.execute(
+                "UPDATE registered_mons SET eggs_bred=GREATEST(0, eggs_bred + ?) WHERE owner_id=? AND mon_id=?",
+                (int(n), owner, int(rid)),
+            )
+            changed = True
         if changed:
             await conn.commit()
 
@@ -483,6 +624,7 @@ async def flush_battle_state(st: Any) -> None:
       - p1_participants / p2_participants for route/raid/battle W-L counters
     """
     agg: dict[tuple[str, int], dict[str, Any]] = {}
+    registered_cache = getattr(st, "_registered_mon_ids", None)
 
     def _entry(owner_id: str, mon_id: int) -> dict[str, Any]:
         key = (str(owner_id), int(mon_id))
@@ -495,6 +637,8 @@ async def flush_battle_state(st: Any) -> None:
     for raw_key, usage in move_buf.items():
         owner, mon_id = _split_key(raw_key)
         if owner is None or mon_id is None:
+            continue
+        if not is_registered_in_battle_cache(st, owner, mon_id):
             continue
         if not isinstance(usage, Mapping):
             continue
@@ -515,6 +659,8 @@ async def flush_battle_state(st: Any) -> None:
     for raw_key, payload in ko_buf.items():
         owner, mon_id = _split_key(raw_key)
         if owner is None or mon_id is None:
+            continue
+        if not is_registered_in_battle_cache(st, owner, mon_id):
             continue
         if not isinstance(payload, Mapping):
             continue
@@ -539,6 +685,24 @@ async def flush_battle_state(st: Any) -> None:
                 if n > 0:
                     rec["species_kos"][species_key] += n
 
+    # EXP gains buffered during battle; registered-only by design.
+    exp_buf = getattr(st, "_registered_exp_gains", None) or {}
+    if isinstance(exp_buf, Mapping):
+        for raw_key, raw_gain in exp_buf.items():
+            owner, mon_id = _split_key(raw_key)
+            if owner is None or mon_id is None:
+                continue
+            if not is_registered_in_battle_cache(st, owner, mon_id):
+                continue
+            try:
+                gain = int(raw_gain or 0)
+            except Exception:
+                gain = 0
+            if gain <= 0:
+                continue
+            rec = _entry(owner, mon_id)
+            rec["deltas"]["total_exp_gained"] += gain
+
     # Per-battle summary counters (routes, raids, battles).
     fmt = str(getattr(st, "fmt_label", "") or "").strip().lower()
     is_adventure = fmt.startswith("adventure") or fmt == "rival"
@@ -560,6 +724,13 @@ async def flush_battle_state(st: Any) -> None:
                 continue
             if mid > 0:
                 mids.add(mid)
+        if not mids:
+            continue
+        reg_ids = _registered_set_from_cache(registered_cache, owner_id)
+        if reg_ids:
+            mids = {mid for mid in mids if mid in reg_ids}
+        else:
+            mids = set()
         if not mids:
             continue
         for mid in mids:
