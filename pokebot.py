@@ -15875,7 +15875,25 @@ class MPokeInfo(commands.Cog):
                     out.append(key)
             return out
 
-        # 1) Prefer dex (pokedex / ensure_species) as source of truth for fixed info
+        def _fmt_types(li: list[str]) -> list[str]:
+            return [s.replace("_", " ").replace("-", " ").title() for s in li[:2]]
+
+        best: list[str] = []
+
+        def _consider(cand: Any) -> None:
+            nonlocal best
+            if cand is None:
+                return
+            li = _norm_list(cand)
+            if not li:
+                return
+            li = li[:2]
+            if len(li) > len(best):
+                best = li
+
+        # 1) Prefer dex (pokedex / ensure_species) as source of truth for fixed info.
+        # Keep scanning instead of returning early so a single-type stale field
+        # doesn't override a valid dual-type candidate from another source.
         d = self._as_mapping(dex) if dex else {}
         for cand in (
             d.get("types"),
@@ -15888,21 +15906,36 @@ class MPokeInfo(commands.Cog):
             d.get("type"),
             mon.get("type") if isinstance(mon, Mapping) else None,
         ):
-            if cand is None:
-                continue
-            li = _norm_list(cand)
-            if li:
-                return [s.replace("_", " ").replace("-", " ").title() for s in li]
+            _consider(cand)
+        if len(best) >= 2:
+            return _fmt_types(best)
 
-        # 2) If dex was None or missing types, fetch from pokedex table by species
+        # 2) Zero-DB fallback: static cache is usually warmed at startup.
+        if db_cache:
+            species_key = str(species or "").strip().lower()
+            cache_keys = {
+                species_key,
+                species_key.replace(" ", "-"),
+                species_key.replace("-", " "),
+                species_key.replace("_", "-"),
+                species_key.replace("-", "_"),
+            }
+            for ck in cache_keys:
+                entry = db_cache.get_cached_pokedex(ck)
+                if not isinstance(entry, Mapping):
+                    continue
+                _consider(entry.get("types"))
+                _consider([entry.get("type1"), entry.get("type2"), entry.get("primary_type"), entry.get("secondary_type")])
+            if len(best) >= 2:
+                return _fmt_types(best)
+
+        # 3) DB fallback by species.
         try:
             db_mod = globals().get("db")
             if db_mod:
                 pokedex_row = await db_mod.get_pokedex_by_name(species.lower())
                 if pokedex_row:
-                    tlist = _norm_list(pokedex_row.get("types"))
-                    if tlist:
-                        return [s.replace("_", " ").replace("-", " ").title() for s in tlist]
+                    _consider(pokedex_row.get("types"))
                 # Direct query fallback (pokedex has types JSONB only)
                 conn = await db_mod.connect()
                 try:
@@ -15913,14 +15946,23 @@ class MPokeInfo(commands.Cog):
                     row = await cur.fetchone()
                     await cur.close()
                     if row and row.get("types"):
-                        tlist = _norm_list(row.get("types"))
-                        if tlist:
-                            return [s.replace("_", " ").replace("-", " ").title() for s in tlist]
+                        _consider(row.get("types"))
                 finally:
                     await conn.close()
         except Exception:
             pass
-        return []
+
+        # 4) Last fallback: re-fetch canonical species payload.
+        if len(best) < 2:
+            try:
+                ref = await ensure_species_and_learnsets(species)
+                if isinstance(ref, Mapping):
+                    _consider(ref.get("types"))
+                    _consider([ref.get("type1"), ref.get("type2"), ref.get("primary_type"), ref.get("secondary_type")])
+            except Exception:
+                pass
+
+        return _fmt_types(best) if best else []
 
     def _pick_sprite_file(self, species: str, gender: str, shiny: bool, form: Optional[str] = None) -> Optional[discord.File]:
         # Try form-specific folder first, then fall back to base species
@@ -16479,27 +16521,25 @@ class MPokeInfo(commands.Cog):
         badge_w = max(24, int(round(63 * sx)))
         badge_h = max(10, int(round(13 * sy)))
         badge_gap = max(1, int(round(2 * sy)))
-        rendered_badge = False
         for i, tok in enumerate(type_tokens[:2]):
+            row_y = int(badge_top + (i * (badge_h + badge_gap)))
             icon_path = self._mpokeinfo_type_badge_path(tok)
-            if icon_path is None:
-                continue
-            try:
-                with Image.open(str(icon_path)) as src:
-                    icon = src.convert("RGBA")
-                icon.thumbnail((badge_w, badge_h), resample=resample)
-                row_y = int(badge_top + (i * (badge_h + badge_gap)))
-                icon_x = int(badge_left + max(0, (badge_w - icon.width) // 2))
-                icon_y = int(row_y + max(0, (badge_h - icon.height) // 2))
-                panel_static.alpha_composite(icon, dest=(icon_x, icon_y))
-                rendered_badge = True
-            except Exception:
-                continue
-        if not rendered_badge:
-            primary_type = str(type_tokens[0]).upper()
+            if icon_path is not None:
+                try:
+                    with Image.open(str(icon_path)) as src:
+                        icon = src.convert("RGBA")
+                    icon.thumbnail((badge_w, badge_h), resample=resample)
+                    icon_x = int(badge_left + max(0, (badge_w - icon.width) // 2))
+                    icon_y = int(row_y + max(0, (badge_h - icon.height) // 2))
+                    panel_static.alpha_composite(icon, dest=(icon_x, icon_y))
+                    continue
+                except Exception:
+                    pass
+            # Per-row fallback so missing one badge does not hide dual typing.
+            fallback_type = str(tok).upper()
             try:
                 draw.rectangle(
-                    (badge_left, badge_top, badge_left + badge_w, badge_top + badge_h),
+                    (badge_left, row_y, badge_left + badge_w, row_y + badge_h),
                     fill=(160, 168, 181, 205),
                     outline=(188, 198, 214, 228),
                     width=max(1, int(round(1 * scale))),
@@ -16508,20 +16548,20 @@ class MPokeInfo(commands.Cog):
                 pass
             type_font = self._mpokeinfo_fit_font(
                 draw_probe,
-                primary_type,
+                fallback_type,
                 max_width=max(18, badge_w - 4),
                 start_size=max(8, int(round(9 * scale))),
                 min_size=max(7, int(round(8 * scale))),
                 bold=True,
             )
-            primary_type = _clip_text(primary_type, type_font, max(18, badge_w - 4))
-            type_w = self._mpokeinfo_text_width(draw_probe, primary_type, type_font)
+            fallback_type = _clip_text(fallback_type, type_font, max(18, badge_w - 4))
+            type_w = self._mpokeinfo_text_width(draw_probe, fallback_type, type_font)
             type_x = int(badge_left + ((badge_w - type_w) // 2))
-            type_y = int(badge_top + max(0, (badge_h - int(round(9 * scale))) // 2) - 1)
+            type_y = int(row_y + max(0, (badge_h - int(round(9 * scale))) // 2) - 1)
             self._mpokeinfo_draw_shadow_text(
                 draw,
                 (type_x, type_y),
-                primary_type,
+                fallback_type,
                 font=type_font,
                 fill=(240, 246, 251, 255),
                 shadow=(60, 66, 74, 210),
@@ -17111,23 +17151,41 @@ class MPokeInfo(commands.Cog):
         if ribbon_font is not None:
             _draw_center_value(ribbon_text, _pt(568, 0)[0], _pt(0, 96)[1], max(16, int(round(132 * sx))), max(10, int(round(24 * sy))))
 
-        primary_type = str(types[0] if types else "Normal").strip().lower()
-        badge = self._mpokeinfo_type_badge_path(primary_type)
-        if badge is not None:
-            try:
-                with PILImage.open(str(badge)) as src:
-                    t_icon = src.convert("RGBA")
-                t_icon.thumbnail((max(18, int(round(54 * sx))), max(10, int(round(19 * sy)))), resample=PILImage.Resampling.LANCZOS)
-                panel_static.alpha_composite(t_icon, dest=_pt(330, 40))
-            except Exception:
-                pass
-        else:
-            t_txt = primary_type.replace("-", " ").title()
+        type_tokens = [str(t or "").strip().lower() for t in list(types or []) if str(t or "").strip()]
+        if not type_tokens:
+            type_tokens = ["normal"]
+        type_left, type_top = _pt(330, 40)
+        type_w = max(18, int(round(54 * sx)))
+        type_h = max(10, int(round(18 * sy)))
+        type_gap = max(1, int(round(2 * sy)))
+        for i, tok in enumerate(type_tokens[:2]):
+            row_y = int(type_top + (i * (type_h + type_gap)))
+            badge = self._mpokeinfo_type_badge_path(tok)
+            if badge is not None:
+                try:
+                    with PILImage.open(str(badge)) as src:
+                        t_icon = src.convert("RGBA")
+                    t_icon.thumbnail((type_w, type_h), resample=PILImage.Resampling.LANCZOS)
+                    icon_x = int(type_left + max(0, (type_w - t_icon.width) // 2))
+                    icon_y = int(row_y + max(0, (type_h - t_icon.height) // 2))
+                    panel_static.alpha_composite(t_icon, dest=(icon_x, icon_y))
+                    continue
+                except Exception:
+                    pass
+            t_txt = str(tok).replace("-", " ").title()
             t_font = self._mpokeinfo_fit_font(
-                draw_probe, t_txt, max_width=max(12, int(round(86 * sx))), start_size=max(8, int(round(14 * scale))), min_size=max(7, int(round(10 * scale))), bold=True
+                draw_probe,
+                t_txt,
+                max_width=max(12, int(round(86 * sx))),
+                start_size=max(8, int(round(14 * scale))),
+                min_size=max(7, int(round(10 * scale))),
+                bold=True,
             )
             if t_font is not None:
-                self._mpokeinfo_draw_shadow_text(draw, _pt(332, 44), t_txt, font=t_font, fill=(240, 244, 248, 255), shadow=(0, 0, 0, 220))
+                tw = self._mpokeinfo_text_width(draw_probe, t_txt, t_font)
+                tx = int(type_left + max(0, (type_w - tw) // 2))
+                ty = int(row_y + max(0, (type_h - int(round(10 * scale))) // 2) - 1)
+                self._mpokeinfo_draw_shadow_text(draw, (tx, ty), t_txt, font=t_font, fill=(240, 244, 248, 255), shadow=(0, 0, 0, 220))
 
         if shiny:
             def _spark(cx: int, cy: int, size: int = 3) -> None:
