@@ -16900,11 +16900,17 @@ class MPokeInfo(commands.Cog):
             width=nick_max_w,
         )
 
-        if shiny:
+        def _draw_front_shiny_stars(target_img: Any) -> None:
+            if not shiny:
+                return
+            try:
+                draw_star = ImageDraw.Draw(target_img)
+            except Exception:
+                return
             star_font = self._mpokeinfo_font(max(9, int(round(12 * scale))), bold=True)
             side_star_font = self._mpokeinfo_font(max(7, int(round(9 * scale))), bold=True)
             self._mpokeinfo_draw_shadow_text(
-                draw,
+                draw_star,
                 _pt(56, 74),
                 "★",
                 font=star_font,
@@ -16912,7 +16918,7 @@ class MPokeInfo(commands.Cog):
                 shadow=(88, 20, 26, 220),
             )
             self._mpokeinfo_draw_shadow_text(
-                draw,
+                draw_star,
                 _pt(70, 64),
                 "★",
                 font=side_star_font,
@@ -17005,29 +17011,92 @@ class MPokeInfo(commands.Cog):
         self._mpokeinfo_draw_shadow_text(draw, (item_center_x - (item_w // 2), item_y), item_text, font=item_font)
 
         # --- stats table ---
+        def _as_stat_map(v: Any) -> dict[str, Any]:
+            if isinstance(v, Mapping):
+                d = dict(v)
+            elif isinstance(v, str):
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, Mapping):
+                        d = dict(parsed)
+                    elif isinstance(parsed, list):
+                        d = {str(i): parsed[i] for i in range(min(6, len(parsed)))}
+                    else:
+                        d = {}
+                except Exception:
+                    d = {}
+            elif isinstance(v, (list, tuple)):
+                seq = list(v)
+                d = {str(i): seq[i] for i in range(min(6, len(seq)))}
+            else:
+                d = {}
+            # Normalize legacy numeric keys into stat aliases.
+            if "hp" not in d and "0" in d:
+                d["hp"] = d.get("0")
+            if "atk" not in d and "1" in d:
+                d["atk"] = d.get("1")
+            if "def" not in d and "2" in d:
+                d["def"] = d.get("2")
+            if "spa" not in d and "3" in d:
+                d["spa"] = d.get("3")
+            if "spd" not in d and "4" in d:
+                d["spd"] = d.get("4")
+            if "spe" not in d and "5" in d:
+                d["spe"] = d.get("5")
+            return d
+
+        def _pick_int(maps: list[dict[str, Any]], *keys: str) -> int:
+            for m in maps:
+                for k in keys:
+                    if k in m and m.get(k) not in (None, ""):
+                        try:
+                            return int(float(m.get(k)))
+                        except Exception:
+                            continue
+            return 0
+
+        stat_maps = [
+            _as_stat_map(stats_obj),
+            _as_stat_map(mon.get("final_stats")),
+            _as_stat_map(mon.get("stats")),
+            _as_stat_map(mon),
+        ]
+        iv_maps = [
+            _as_stat_map(ivs_map),
+            _as_stat_map(mon.get("ivs")),
+            _as_stat_map(mon.get("iv")),
+            _as_stat_map(mon),
+        ]
+        ev_maps = [
+            _as_stat_map(evs_map),
+            _as_stat_map(mon.get("evs")),
+            _as_stat_map(mon.get("ev")),
+            _as_stat_map(mon),
+        ]
+
         final_stats = {
             "hp": int(max(1, hp_max)),
-            "atk": int(stats_obj.get("attack", stats_obj.get("atk", mon.get("atk", 0)))),
-            "def": int(stats_obj.get("defense", stats_obj.get("defn", stats_obj.get("def", mon.get("def", mon.get("defn", 0)))))),
-            "spa": int(stats_obj.get("special_attack", stats_obj.get("special-attack", stats_obj.get("spa", mon.get("spa", 0))))),
-            "spd": int(stats_obj.get("special_defense", stats_obj.get("special-defense", stats_obj.get("spd", mon.get("spd", 0))))),
-            "spe": int(stats_obj.get("speed", stats_obj.get("spe", mon.get("spe", 0)))),
+            "atk": _pick_int(stat_maps, "attack", "atk"),
+            "def": _pick_int(stat_maps, "defense", "def", "defn"),
+            "spa": _pick_int(stat_maps, "special_attack", "special-attack", "spa", "sp_atk", "spatk"),
+            "spd": _pick_int(stat_maps, "special_defense", "special-defense", "spd", "sp_def", "spdef"),
+            "spe": _pick_int(stat_maps, "speed", "spe"),
         }
         iv_vals = {
-            "hp": int(ivs_map.get("hp", 0)),
-            "atk": int(ivs_map.get("atk", ivs_map.get("attack", 0))),
-            "def": int(ivs_map.get("def", ivs_map.get("defn", ivs_map.get("defense", 0)))),
-            "spa": int(ivs_map.get("spa", ivs_map.get("special_attack", ivs_map.get("special-attack", 0)))),
-            "spd": int(ivs_map.get("spd", ivs_map.get("special_defense", ivs_map.get("special-defense", 0)))),
-            "spe": int(ivs_map.get("spe", ivs_map.get("speed", 0))),
+            "hp": _pick_int(iv_maps, "hp"),
+            "atk": _pick_int(iv_maps, "attack", "atk"),
+            "def": _pick_int(iv_maps, "defense", "def", "defn"),
+            "spa": _pick_int(iv_maps, "special_attack", "special-attack", "spa", "sp_atk", "spatk"),
+            "spd": _pick_int(iv_maps, "special_defense", "special-defense", "spd", "sp_def", "spdef"),
+            "spe": _pick_int(iv_maps, "speed", "spe"),
         }
         ev_vals = {
-            "hp": int(evs_map.get("hp", 0)),
-            "atk": int(evs_map.get("atk", evs_map.get("attack", 0))),
-            "def": int(evs_map.get("def", evs_map.get("defn", evs_map.get("defense", 0)))),
-            "spa": int(evs_map.get("spa", evs_map.get("special_attack", evs_map.get("special-attack", 0)))),
-            "spd": int(evs_map.get("spd", evs_map.get("special_defense", evs_map.get("special-defense", 0)))),
-            "spe": int(evs_map.get("spe", evs_map.get("speed", 0))),
+            "hp": _pick_int(ev_maps, "hp"),
+            "atk": _pick_int(ev_maps, "attack", "atk"),
+            "def": _pick_int(ev_maps, "defense", "def", "defn"),
+            "spa": _pick_int(ev_maps, "special_attack", "special-attack", "spa", "sp_atk", "spatk"),
+            "spd": _pick_int(ev_maps, "special_defense", "special-defense", "spd", "sp_def", "spdef"),
+            "spe": _pick_int(ev_maps, "speed", "spe"),
         }
         stat_rows = ["hp", "atk", "def", "spa", "spd", "spe"]
         stat_ys = [170, 190, 210, 230, 250, 270]
@@ -17081,6 +17150,7 @@ class MPokeInfo(commands.Cog):
                         fr.alpha_composite(spr, dest=(dx, dy))
                     except Exception:
                         pass
+                    _draw_front_shiny_stars(fr)
                     out_frames.append(fr)
                 if out_frames:
                     out = BytesIO()
@@ -17111,6 +17181,7 @@ class MPokeInfo(commands.Cog):
                 panel_static.alpha_composite(spr, dest=(int(cx - (spr.width // 2)), int(cy - (spr.height // 2))))
             except Exception:
                 pass
+        _draw_front_shiny_stars(panel_static)
 
         out = BytesIO()
         try:
@@ -17214,6 +17285,7 @@ class MPokeInfo(commands.Cog):
             min_size: Optional[int] = None,
             bold: bool = True,
             y_nudge: int = 0,
+            x_nudge: int = 0,
         ) -> None:
             txt = str(text or "—")
             font = self._mpokeinfo_fit_font(
@@ -17234,7 +17306,7 @@ class MPokeInfo(commands.Cog):
                 th = max(1, int(tb[3] - tb[1]))
             except Exception:
                 th = max(8, int(round(12 * scale)))
-            tx = int(left + max(0, (int(width) - tw) // 2))
+            tx = int(left + max(0, (int(width) - tw) // 2) + int(x_nudge))
             ty = int(top + max(0, (int(height) - th) // 2) + int(y_nudge))
             self._mpokeinfo_draw_shadow_text(
                 draw,
@@ -17250,7 +17322,8 @@ class MPokeInfo(commands.Cog):
             label_h = max(8, int(round(18 * sy)))
             value_h = max(10, int(round(34 * sy)))
             value_nudge = max(2, int(round(4 * sy)))
-            _draw_center_value(value, left, top + label_h, width, value_h, y_nudge=value_nudge)
+            # Slight right nudge to account for thicker left border strokes in the template.
+            _draw_center_value(value, left, top + label_h, width, value_h, y_nudge=value_nudge, x_nudge=max(1, int(round(2 * sx))))
 
         def _ival(key: str) -> int:
             try:
@@ -17293,9 +17366,9 @@ class MPokeInfo(commands.Cog):
         ot_name = str(getattr(interaction.user, "display_name", None) or "Trainer").strip()
         # Match front-panel header geometry (scaled into this panel's coordinate system).
         # Front-equivalent top-row geometry adapted to this panel's scale grid.
-        ot_box_left, ot_box_y = _pt(236, 24)
+        ot_box_left, ot_box_y = _pt(212, 15)
         ot_box_w = max(24, int(round(148 * sx)))
-        ot_box_h = max(10, int(round(21 * sy)))
+        ot_box_h = max(10, int(round(14 * sy)))
         _draw_center_value(
             ot_name,
             ot_box_left,
@@ -17335,9 +17408,9 @@ class MPokeInfo(commands.Cog):
         g_key = str(gender or "").strip().lower()
         g_sym = {"male": "♂", "m": "♂", "♀": "♀", "female": "♀", "f": "♀"}.get(g_key, "")
         lv_text = f"{int(level)}"
-        lv_box_left, lv_box_y = _pt(452, 21)
+        lv_box_left, lv_box_y = _pt(404, 13)
         lv_box_w = max(18, int(round(112 * sx)))
-        lv_box_h = max(10, int(round(21 * sy)))
+        lv_box_h = max(10, int(round(14 * sy)))
         lv_font = self._mpokeinfo_fit_font(
             draw_probe,
             lv_text,
