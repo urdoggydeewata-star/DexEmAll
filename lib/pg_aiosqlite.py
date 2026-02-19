@@ -48,6 +48,14 @@ def _get_float(name: str, default: float) -> float:
         return default
 
 
+def _default_pool_max() -> int:
+    """
+    High-concurrency default for larger Discord bot hosts.
+    Can be overridden by DB_POOL_DEFAULT_MAX, DB_POOL_SIZE, or DB_POOL_MAX.
+    """
+    return max(20, _get_int("DB_POOL_DEFAULT_MAX", 120))
+
+
 def _is_transient_acquire_error(exc: Exception) -> bool:
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return True
@@ -64,8 +72,8 @@ async def _acquire_with_retry(
     *,
     timeout: Optional[float] = None,
 ) -> asyncpg.Connection:
-    acquire_timeout = float(timeout if timeout is not None else _get_float("DB_POOL_ACQUIRE_TIMEOUT", 20.0))
-    retries = max(0, _get_int("DB_POOL_ACQUIRE_RETRIES", 2))
+    acquire_timeout = float(timeout if timeout is not None else _get_float("DB_POOL_ACQUIRE_TIMEOUT", 30.0))
+    retries = max(0, _get_int("DB_POOL_ACQUIRE_RETRIES", 4))
     base_backoff = max(0.01, _get_float("DB_POOL_ACQUIRE_BACKOFF", 0.06))
     last_exc: Optional[Exception] = None
     for attempt in range(retries + 1):
@@ -172,8 +180,9 @@ async def _get_pool() -> asyncpg.pool.Pool:
             dsn = _dsn()
             is_managed_pool = ":6432" in dsn or os.getenv("GOOGLE_CLOUD_SQL_POOL", "").lower() in ("1", "true", "yes")
 
+            default_max = _default_pool_max()
             min_size = _get_int("DB_POOL_MIN", 1)
-            max_size = _get_int("DB_POOL_MAX", _get_int("DB_POOL_SIZE", 20))
+            max_size = _get_int("DB_POOL_MAX", _get_int("DB_POOL_SIZE", default_max))
             if min_size > max_size:
                 min_size, max_size = max_size, min_size
 
@@ -181,7 +190,7 @@ async def _get_pool() -> asyncpg.pool.Pool:
                 # pgbouncer/managed pool: keep prepared statements off; allow
                 # DB_POOL_MAX/DB_POOL_SIZE to scale concurrency.
                 min_size = _get_int("DB_POOL_MIN", 1)
-                max_size = _get_int("DB_POOL_MAX", _get_int("DB_POOL_SIZE", 20))
+                max_size = _get_int("DB_POOL_MAX", _get_int("DB_POOL_SIZE", default_max))
                 pool_kwargs = {
                     "dsn": dsn,
                     "min_size": min_size,
