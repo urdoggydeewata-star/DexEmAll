@@ -17004,15 +17004,26 @@ class MPokeInfo(commands.Cog):
         draw = ImageDraw.Draw(panel_static)
         value_font_base_size = max(8, int(round(18 * scale)))
 
-        def _draw_center_value(text: str, left: int, top: int, width: int, height: int) -> None:
+        def _draw_center_value(
+            text: str,
+            left: int,
+            top: int,
+            width: int,
+            height: int,
+            *,
+            start_size: Optional[int] = None,
+            min_size: Optional[int] = None,
+            bold: bool = True,
+            y_nudge: int = 0,
+        ) -> None:
             txt = str(text or "—")
             font = self._mpokeinfo_fit_font(
                 draw_probe,
                 txt,
                 max_width=max(10, int(width - max(6, int(round(8 * sx))))),
-                start_size=value_font_base_size,
-                min_size=max(8, int(round(11 * scale))),
-                bold=True,
+                start_size=int(start_size if start_size is not None else value_font_base_size),
+                min_size=int(min_size if min_size is not None else max(8, int(round(11 * scale)))),
+                bold=bool(bold),
             )
             txt = _clip_text(txt, font, max(10, int(width - max(6, int(round(8 * sx)))))
             )
@@ -17025,7 +17036,7 @@ class MPokeInfo(commands.Cog):
             except Exception:
                 th = max(8, int(round(12 * scale)))
             tx = int(left + max(0, (int(width) - tw) // 2))
-            ty = int(top + max(0, (int(height) - th) // 2 - 1))
+            ty = int(top + max(0, (int(height) - th) // 2) + int(y_nudge))
             self._mpokeinfo_draw_shadow_text(
                 draw,
                 (tx, ty),
@@ -17037,9 +17048,10 @@ class MPokeInfo(commands.Cog):
 
         # Template already includes static labels; draw only dynamic values.
         def _draw_row_value(value: str, *, left: int, top: int, width: int) -> None:
-            label_h = max(10, int(round(22 * sy)))
+            label_h = max(10, int(round(23 * sy)))
             value_h = max(10, int(round(22 * sy)))
-            _draw_center_value(value, left, top + label_h, width, value_h)
+            value_nudge = max(1, int(round(2 * sy)))
+            _draw_center_value(value, left, top + label_h, width, value_h, y_nudge=value_nudge)
 
         def _ival(key: str) -> int:
             try:
@@ -17078,28 +17090,26 @@ class MPokeInfo(commands.Cog):
         for value, y in right_rows:
             _draw_row_value(value, left=right_x, top=_pt(0, y)[1], width=right_w)
 
-        ot_name = interaction.user.display_name if getattr(interaction, "user", None) else "Trainer"
-        ot_text = f"{ot_name}"
-        ot_font = self._mpokeinfo_fit_font(
-            draw_probe,
-            ot_text,
-            max_width=max(20, int(round(214 * sx))),
-            start_size=max(9, int(round(17 * scale))),
-            min_size=max(8, int(round(10 * scale))),
+        ot_name = str(getattr(interaction.user, "display_name", None) or "Trainer").strip()
+        ot_box_left, ot_box_y = _pt(352, 14)
+        ot_box_w = max(24, int(round(156 * sx)))
+        ot_box_h = max(10, int(round(14 * sy)))
+        _draw_center_value(
+            ot_name,
+            ot_box_left,
+            ot_box_y,
+            ot_box_w,
+            ot_box_h,
+            start_size=max(8, int(round(10 * scale))),
+            min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        ot_text = _clip_text(ot_text, ot_font, max(20, int(round(214 * sx))))
-        if ot_text and ot_font is not None:
-            self._mpokeinfo_draw_shadow_text(
-                draw,
-                _pt(322, 8),
-                ot_text,
-                font=ot_font,
-                fill=(242, 246, 250, 255),
-                shadow=(0, 0, 0, 220),
-            )
 
-        species_display = str(mon.get("nickname") or species or "Pokémon").replace("-", " ").replace("_", " ").title()
+        raw_nick = str(mon.get("nickname") or "").strip()
+        if raw_nick:
+            species_display = raw_nick
+        else:
+            species_display = str(species or "pokemon").replace("-", " ").replace("_", " ")
         name_font = self._mpokeinfo_fit_font(
             draw_probe,
             species_display,
@@ -17122,26 +17132,19 @@ class MPokeInfo(commands.Cog):
         g_key = str(gender or "").strip().lower()
         g_sym = {"male": "♂", "m": "♂", "♀": "♀", "female": "♀", "f": "♀"}.get(g_key, "")
         lv_text = f"{int(level)}{g_sym}"
-        lv_font = self._mpokeinfo_fit_font(
-            draw_probe,
+        lv_box_left, lv_box_y = _pt(520, 14)
+        lv_box_w = max(18, int(round(44 * sx)))
+        lv_box_h = max(10, int(round(14 * sy)))
+        _draw_center_value(
             lv_text,
-            max_width=max(20, int(round(86 * sx))),
-            start_size=max(9, int(round(16 * scale))),
-            min_size=max(7, int(round(10 * scale))),
+            lv_box_left,
+            lv_box_y,
+            lv_box_w,
+            lv_box_h,
+            start_size=max(8, int(round(10 * scale))),
+            min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
-        lv_text = _clip_text(lv_text, lv_font, max(20, int(round(86 * sx))))
-        if lv_text and lv_font is not None:
-            tw = self._mpokeinfo_text_width(draw_probe, lv_text, lv_font)
-            tx = int(_pt(548, 8)[0] - tw)
-            self._mpokeinfo_draw_shadow_text(
-                draw,
-                (tx, _pt(0, 8)[1]),
-                lv_text,
-                font=lv_font,
-                fill=(246, 232, 255, 255),
-                shadow=(24, 12, 35, 220),
-            )
 
         ribbons = _ival("ribbons")
         ribbon_text = f"{ribbons}" if ribbons > 0 else "0"
