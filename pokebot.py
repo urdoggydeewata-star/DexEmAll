@@ -15790,9 +15790,32 @@ class MPokeInfo(commands.Cog):
                     x.get("type2") or x.get("type_2"),
                     x.get("primary_type"),
                     x.get("secondary_type"),
+                    x.get("primary"),
+                    x.get("secondary"),
+                    x.get("first_type"),
+                    x.get("second_type"),
+                    x.get("main_type"),
+                    x.get("sub_type"),
+                    x.get("0"),
+                    x.get("1"),
+                    x.get(0),  # type: ignore[index]
+                    x.get(1),  # type: ignore[index]
                 ]
                 if any(pairs):
                     return _norm_list(pairs)
+                keyed_vals: list[Any] = []
+                for k, vv in x.items():
+                    kk = str(k or "").strip().lower().replace("-", "_")
+                    if kk in {
+                        "0", "1", "2", "primary", "secondary", "first", "second",
+                        "type1", "type2", "type_1", "type_2", "primary_type", "secondary_type",
+                        "first_type", "second_type", "main_type", "sub_type",
+                    } or "type" in kk:
+                        keyed_vals.append(vv)
+                if keyed_vals:
+                    parsed = _norm_list(keyed_vals)
+                    if parsed:
+                        return parsed
                 tok = _extract_token(x)
                 return [tok] if tok else []
             if isinstance(x, (list, tuple, set)):
@@ -16196,7 +16219,7 @@ class MPokeInfo(commands.Cog):
         sprite_duration_ms = 95
         sprite_frame_durations: list[int] = []
         species_norm_for_anim = _daycare_norm_species(species)
-        sprite_frame_limit = 120 if species_norm_for_anim == "eevee" else 24
+        sprite_frame_limit = 192 if species_norm_for_anim == "eevee" else 128
         sprite_path = self._pick_sprite_path(species, gender, shiny, current_form, back=bool(use_back_sprite))
         if sprite_path is not None:
             try:
@@ -16229,7 +16252,7 @@ class MPokeInfo(commands.Cog):
                             if species_norm_for_anim == "eevee":
                                 fd = max(90, min(260, int(fd)))
                             else:
-                                fd = max(55, min(180, int(fd)))
+                                fd = max(70, min(220, int(fd)))
                             sprite_frame_durations.append(int(fd))
                     else:
                         sprite_frames = [src.convert("RGBA")]
@@ -16714,27 +16737,27 @@ class MPokeInfo(commands.Cog):
         # --- stats table ---
         final_stats = {
             "hp": int(max(1, hp_max)),
-            "atk": int(stats_obj.get("attack", mon.get("atk", 0))),
-            "def": int(stats_obj.get("defense", mon.get("def", 0))),
-            "spa": int(stats_obj.get("special_attack", mon.get("spa", 0))),
-            "spd": int(stats_obj.get("special_defense", mon.get("spd", 0))),
-            "spe": int(stats_obj.get("speed", mon.get("spe", 0))),
+            "atk": int(stats_obj.get("attack", stats_obj.get("atk", mon.get("atk", 0)))),
+            "def": int(stats_obj.get("defense", stats_obj.get("defn", stats_obj.get("def", mon.get("def", mon.get("defn", 0)))))),
+            "spa": int(stats_obj.get("special_attack", stats_obj.get("special-attack", stats_obj.get("spa", mon.get("spa", 0))))),
+            "spd": int(stats_obj.get("special_defense", stats_obj.get("special-defense", stats_obj.get("spd", mon.get("spd", 0))))),
+            "spe": int(stats_obj.get("speed", stats_obj.get("spe", mon.get("spe", 0)))),
         }
         iv_vals = {
             "hp": int(ivs_map.get("hp", 0)),
-            "atk": int(ivs_map.get("atk", 0)),
-            "def": int(ivs_map.get("def", 0)),
-            "spa": int(ivs_map.get("spa", 0)),
-            "spd": int(ivs_map.get("spd", 0)),
-            "spe": int(ivs_map.get("spe", 0)),
+            "atk": int(ivs_map.get("atk", ivs_map.get("attack", 0))),
+            "def": int(ivs_map.get("def", ivs_map.get("defn", ivs_map.get("defense", 0)))),
+            "spa": int(ivs_map.get("spa", ivs_map.get("special_attack", ivs_map.get("special-attack", 0)))),
+            "spd": int(ivs_map.get("spd", ivs_map.get("special_defense", ivs_map.get("special-defense", 0)))),
+            "spe": int(ivs_map.get("spe", ivs_map.get("speed", 0))),
         }
         ev_vals = {
             "hp": int(evs_map.get("hp", 0)),
-            "atk": int(evs_map.get("atk", 0)),
-            "def": int(evs_map.get("def", 0)),
-            "spa": int(evs_map.get("spa", 0)),
-            "spd": int(evs_map.get("spd", 0)),
-            "spe": int(evs_map.get("spe", 0)),
+            "atk": int(evs_map.get("atk", evs_map.get("attack", 0))),
+            "def": int(evs_map.get("def", evs_map.get("defn", evs_map.get("defense", 0)))),
+            "spa": int(evs_map.get("spa", evs_map.get("special_attack", evs_map.get("special-attack", 0)))),
+            "spd": int(evs_map.get("spd", evs_map.get("special_defense", evs_map.get("special-defense", 0)))),
+            "spe": int(evs_map.get("spe", evs_map.get("speed", 0))),
         }
         stat_rows = ["hp", "atk", "def", "spa", "spd", "spe"]
         stat_ys = [170, 190, 210, 230, 250, 270]
@@ -16805,6 +16828,7 @@ class MPokeInfo(commands.Cog):
                             duration=durations_to_save,
                             loop=0,
                             disposal=2,
+                            optimize=False,
                         )
                     except Exception:
                         return None
@@ -17126,7 +17150,7 @@ class MPokeInfo(commands.Cog):
                 with PILImage.open(str(sprite_path)) as src:
                     is_anim = bool(getattr(src, "is_animated", False))
                     if is_anim:
-                        frame_cap = 120 if _daycare_norm_species(species) == "eevee" else 48
+                        frame_cap = 192 if _daycare_norm_species(species) == "eevee" else 128
                         for i, fr in enumerate(ImageSequence.Iterator(src)):
                             if i >= frame_cap:
                                 break
@@ -17138,7 +17162,7 @@ class MPokeInfo(commands.Cog):
                                 d = int(fr.info.get("duration") or src.info.get("duration") or 95)
                             except Exception:
                                 d = 95
-                            d = max(85, min(260, d)) if _daycare_norm_species(species) == "eevee" else max(55, min(180, d))
+                            d = max(85, min(260, d)) if _daycare_norm_species(species) == "eevee" else max(70, min(220, d))
                             durations.append(int(d))
                     else:
                         sprite_frames = [src.convert("RGBA")]
@@ -17202,6 +17226,7 @@ class MPokeInfo(commands.Cog):
                         duration=durations[:len(out_frames)] if durations else 95,
                         loop=0,
                         disposal=2,
+                        optimize=False,
                     )
                 except Exception:
                     return None
@@ -17442,13 +17467,21 @@ class MPokeInfo(commands.Cog):
 
         def _stat6(d: dict | None) -> dict:
             d = d if isinstance(d, dict) else {}
+            def _pick(*keys: str) -> int:
+                for k in keys:
+                    try:
+                        if k in d and d.get(k) not in (None, ""):
+                            return int(float(d.get(k)))
+                    except Exception:
+                        continue
+                return 0
             return {
-                "hp": int(d.get("hp", 0)),
-                "atk": int(d.get("attack", d.get("atk", 0))),
-                "def": int(d.get("defense", d.get("def", 0))),
-                "spa": int(d.get("special_attack", d.get("spa", 0))),
-                "spd": int(d.get("special_defense", d.get("spd", 0))),
-                "spe": int(d.get("speed", d.get("spe", 0))),
+                "hp": _pick("hp"),
+                "atk": _pick("attack", "atk"),
+                "def": _pick("defense", "def", "defn"),
+                "spa": _pick("special_attack", "special-attack", "spa", "sp_atk", "spatk"),
+                "spd": _pick("special_defense", "special-defense", "spd", "sp_def", "spdef"),
+                "spe": _pick("speed", "spe"),
             }
 
         def _fmt_stat_block(s: dict) -> str:
@@ -17460,11 +17493,11 @@ class MPokeInfo(commands.Cog):
         stats_line = _fmt_stat_block(
             {
                 "hp": int(hp_now),
-                "atk": int(stats_obj.get("attack", mon.get("atk", 0))),
-                "def": int(stats_obj.get("defense", mon.get("def", 0))),
-                "spa": int(stats_obj.get("special_attack", mon.get("spa", 0))),
-                "spd": int(stats_obj.get("special_defense", mon.get("spd", 0))),
-                "spe": int(stats_obj.get("speed", mon.get("spe", 0))),
+                "atk": int(stats_obj.get("attack", stats_obj.get("atk", mon.get("atk", 0)))),
+                "def": int(stats_obj.get("defense", stats_obj.get("defn", stats_obj.get("def", mon.get("def", mon.get("defn", 0)))))),
+                "spa": int(stats_obj.get("special_attack", stats_obj.get("special-attack", stats_obj.get("spa", mon.get("spa", 0))))),
+                "spd": int(stats_obj.get("special_defense", stats_obj.get("special-defense", stats_obj.get("spd", mon.get("spd", 0))))),
+                "spe": int(stats_obj.get("speed", stats_obj.get("spe", mon.get("spe", 0)))),
             }
         )
 
@@ -17655,18 +17688,19 @@ async def _dispatch_pokeinfo_alias(
     except Exception:
         cmd_obj = None
     if cmd_obj is None:
+        try:
+            for c in bot.tree.walk_commands():
+                if getattr(c, "name", "") == "pokeinfo":
+                    cmd_obj = c
+                    break
+        except Exception:
+            cmd_obj = None
+    if cmd_obj is None:
         cmd_obj = globals().get("pokeinfo")
 
     cb = getattr(cmd_obj, "callback", None)
+    last_error: Optional[Exception] = None
     if callable(cb):
-        try:
-            await cb(interaction, name_or_id, bool(shiny), gender, gen)
-            return
-        except TypeError:
-            pass
-        except Exception:
-            import traceback
-            traceback.print_exc()
         try:
             await cb(
                 interaction,
@@ -17676,35 +17710,50 @@ async def _dispatch_pokeinfo_alias(
                 gen=gen,
             )
             return
+        except TypeError:
+            # Fallback for callback styles that require positional args.
+            try:
+                await cb(interaction, name_or_id, bool(shiny), gender, gen)
+                return
+            except Exception as e:
+                last_error = e
         except Exception:
             import traceback
             traceback.print_exc()
+            last_error = Exception("pokeinfo_callback_failed")
 
     # Last fallback: call the command object directly if available.
     try:
         if callable(cmd_obj):
             try:
-                await cmd_obj(interaction, name_or_id, bool(shiny), gender, gen)
+                await cmd_obj(
+                    interaction,
+                    name_or_id=name_or_id,
+                    shiny=bool(shiny),
+                    gender=gender,
+                    gen=gen,
+                )
                 return
             except TypeError:
-                pass
-            await cmd_obj(
-                interaction,
-                name_or_id=name_or_id,
-                shiny=bool(shiny),
-                gender=gender,
-                gen=gen,
-            )
-            return
+                await cmd_obj(interaction, name_or_id, bool(shiny), gender, gen)
+                return
     except Exception:
         import traceback
         traceback.print_exc()
+        last_error = Exception("pokeinfo_command_invoke_failed")
 
     try:
-        if interaction.response.is_done():
-            await interaction.followup.send("❌ Pokédex info command is not loaded yet. Try again in a moment.", ephemeral=True)
+        if last_error is not None:
+            msg = "❌ Pokédex lookup failed. Please try again."
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
         else:
-            await interaction.response.send_message("❌ Pokédex info command is not loaded yet. Try again in a moment.", ephemeral=True)
+            if interaction.response.is_done():
+                await interaction.followup.send("❌ Pokédex info command is not loaded yet. Try again in a moment.", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ Pokédex info command is not loaded yet. Try again in a moment.", ephemeral=True)
     except Exception:
         pass
 
@@ -23620,7 +23669,8 @@ async def pokeinfo(
     gen: Optional[int] = None,
 ):
     """Full /pokeinfo with forms + fuzzy name + stats-key normalization."""
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
     # ---------- resolve base species row (+ form_key) ----------
     target = name_or_id.strip()
