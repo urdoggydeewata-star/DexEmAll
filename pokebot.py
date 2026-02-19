@@ -3321,6 +3321,36 @@ async def _get_item_qty(owner_id: str, item_id: str, conn=None) -> int:
             except Exception:
                 pass
 
+
+EXP_SHARE_ITEM_IDS: tuple[str, ...] = ("exp_share", "exp-share", "expshare")
+EXP_SHARE_COST_PKC = 20_000
+
+
+async def _has_exp_share_bag_item(owner_id: str, conn=None) -> bool:
+    own_conn = conn is None
+    if own_conn:
+        conn = await db.connect()
+    try:
+        oid = str(owner_id)
+        placeholders = ", ".join("?" for _ in EXP_SHARE_ITEM_IDS)
+        cur = await conn.execute(
+            f"SELECT COALESCE(SUM(qty), 0) AS total_qty FROM user_items WHERE owner_id=? AND item_id IN ({placeholders})",
+            (oid, *EXP_SHARE_ITEM_IDS),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        try:
+            total_qty = int((row.get("total_qty") if hasattr(row, "keys") else row[0]) or 0) if row else 0
+        except Exception:
+            total_qty = 0
+        return total_qty > 0
+    finally:
+        if own_conn and conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
 async def _count_item_in_use(owner_id: str, item_id: str, conn=None) -> int:
     own_conn = conn is None
     if own_conn:
@@ -11699,17 +11729,27 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
         return item_norm in {"exp-share", "expshare"}
 
     exp_share_on = bool(EXP_SHARE_ALWAYS_ON) or any(_has_exp_share_item(m) for m in party if m)
-    party_recipients = []
-    for m in party:
-        if not m or m.hp <= 0:
-            continue
-        if exp_share_on or _mon_participated(m):
-            party_recipients.append(m)
-    db_ids = [getattr(m, "_db_id", None) for m in party_recipients if getattr(m, "_db_id", None) is not None]
-    if not db_ids:
-        return empty
 
     async with db.session() as conn:
+        # Teamwide Exp Share from bag purchase (/expshare).
+        if not exp_share_on:
+            try:
+                owner_id = str(winner_id)
+                if int(owner_id) > 0 and await _has_exp_share_bag_item(owner_id, conn=conn):
+                    exp_share_on = True
+            except Exception:
+                pass
+
+        party_recipients = []
+        for m in party:
+            if not m or m.hp <= 0:
+                continue
+            if exp_share_on or _mon_participated(m):
+                party_recipients.append(m)
+        db_ids = [getattr(m, "_db_id", None) for m in party_recipients if getattr(m, "_db_id", None) is not None]
+        if not db_ids:
+            return empty
+
         # Total EV yield from all defeated foes (wild/trainer) with DB fallback when cache misses.
         ev_yield_cache: dict[str, dict[str, int]] = {}
 
@@ -15856,6 +15896,76 @@ class _MPokeInfoFlipView(discord.ui.View):
             pass
 
 
+class _ConfirmDeclineView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        owner_user_id: int,
+        confirm_label: str = "Confirm",
+        decline_label: str = "Decline",
+        timeout: float = 90.0,
+    ):
+        super().__init__(timeout=timeout)
+        self.owner_user_id = int(owner_user_id)
+        self.choice: Optional[bool] = None
+        confirm_btn = discord.ui.Button(label=str(confirm_label), style=discord.ButtonStyle.success)
+        decline_btn = discord.ui.Button(label=str(decline_label), style=discord.ButtonStyle.danger)
+        confirm_btn.callback = self._on_confirm
+        decline_btn.callback = self._on_decline
+        self.add_item(confirm_btn)
+        self.add_item(decline_btn)
+
+    def _disable_all(self) -> None:
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_user_id:
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("Only the command user can choose this.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("Only the command user can choose this.", ephemeral=True)
+            except Exception:
+                pass
+            return False
+        return True
+
+    async def _on_confirm(self, interaction: discord.Interaction) -> None:
+        self.choice = True
+        self._disable_all()
+        try:
+            if interaction.response.is_done():
+                await interaction.message.edit(view=self)  # type: ignore[union-attr]
+            else:
+                await interaction.response.edit_message(view=self)
+        except Exception:
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
+        self.stop()
+
+    async def _on_decline(self, interaction: discord.Interaction) -> None:
+        self.choice = False
+        self._disable_all()
+        try:
+            if interaction.response.is_done():
+                await interaction.message.edit(view=self)  # type: ignore[union-attr]
+            else:
+                await interaction.response.edit_message(view=self)
+        except Exception:
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        self._disable_all()
+
+
 class MPokeInfo(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -17786,6 +17896,133 @@ class MPokeInfo(commands.Cog):
         out.seek(0)
         return discord.File(fp=out, filename=f"register_{int(mon.get('id') or 0)}.png")
 
+    @app_commands.command(name="expshare", description="Buy Exp. Share for your team (20,000 PKC).")
+    async def expshare(self, interaction: Interaction):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=False)
+
+        uid = str(interaction.user.id)
+        async with db.session() as conn:
+            await conn.execute(
+                "INSERT INTO users(user_id, coins, currencies) VALUES(?, 0, '{\"coins\": 0}'::jsonb) ON CONFLICT(user_id) DO NOTHING",
+                (uid,),
+            )
+            cur_user = await conn.execute("SELECT * FROM users WHERE user_id=? LIMIT 1", (uid,))
+            user_row = await cur_user.fetchone()
+            await cur_user.close()
+            balance = int(db.get_currency_from_row(dict(user_row) if user_row else None, "coins"))
+            already_owned = await _has_exp_share_bag_item(uid, conn=conn)
+
+        if already_owned:
+            return await interaction.followup.send(
+                "ℹ️ You already own **Exp. Share**. It is active for your team.",
+                ephemeral=True,
+            )
+        if balance < int(EXP_SHARE_COST_PKC):
+            return await interaction.followup.send(
+                f"❌ You need **{int(EXP_SHARE_COST_PKC):,} {PKDollar_NAME}** for Exp. Share, "
+                f"but you only have **{int(balance):,}**.",
+                ephemeral=True,
+            )
+
+        confirm_view = _ConfirmDeclineView(
+            owner_user_id=interaction.user.id,
+            confirm_label=f"Confirm (-{int(EXP_SHARE_COST_PKC):,})",
+            decline_label="Decline",
+            timeout=120,
+        )
+        prompt_text = (
+            f"Buy **Exp. Share** for **{int(EXP_SHARE_COST_PKC):,} {PKDollar_NAME}**?\n"
+            f"Current balance: **{int(balance):,}**."
+        )
+        prompt_msg = await interaction.followup.send(prompt_text, view=confirm_view, ephemeral=False, wait=True)
+        await confirm_view.wait()
+
+        if confirm_view.choice is not True:
+            cancel_msg = (
+                "⌛ Exp. Share purchase timed out. No PKC was spent."
+                if confirm_view.choice is None
+                else "❌ Exp. Share purchase cancelled. No PKC was spent."
+            )
+            try:
+                await prompt_msg.edit(content=cancel_msg, view=None)
+            except Exception:
+                await interaction.followup.send(cancel_msg, ephemeral=True)
+            return
+
+        charged = int(EXP_SHARE_COST_PKC)
+        remaining = int(balance)
+        already_owned_after = False
+        async with DB_WRITE_LOCK:
+            async with db.session() as conn:
+                await conn.execute(
+                    "INSERT INTO users(user_id, coins, currencies) VALUES(?, 0, '{\"coins\": 0}'::jsonb) ON CONFLICT(user_id) DO NOTHING",
+                    (uid,),
+                )
+                if await _has_exp_share_bag_item(uid, conn=conn):
+                    already_owned_after = True
+                else:
+                    cur_user = await conn.execute("SELECT * FROM users WHERE user_id=? LIMIT 1", (uid,))
+                    user_row = await cur_user.fetchone()
+                    await cur_user.close()
+                    live_balance = int(db.get_currency_from_row(dict(user_row) if user_row else None, "coins"))
+                    if live_balance < charged:
+                        try:
+                            await prompt_msg.edit(
+                                content=(
+                                    f"❌ You need **{charged:,} {PKDollar_NAME}** for Exp. Share, "
+                                    f"but you only have **{live_balance:,}**."
+                                ),
+                                view=None,
+                            )
+                        except Exception:
+                            await interaction.followup.send(
+                                f"❌ You need **{charged:,} {PKDollar_NAME}** for Exp. Share, "
+                                f"but you only have **{live_balance:,}**.",
+                                ephemeral=True,
+                            )
+                        return
+
+                    await conn.execute(
+                        "INSERT INTO items (id, name) VALUES (?, ?) ON CONFLICT (id) DO NOTHING",
+                        ("exp_share", "Exp. Share"),
+                    )
+                    await db.add_currency_conn(conn, uid, "coins", -charged)
+                    await conn.execute(
+                        "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,1) "
+                        "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = 1",
+                        (uid, "exp_share"),
+                    )
+                    await conn.commit()
+                    remaining = max(0, live_balance - charged)
+
+        try:
+            db.invalidate_bag_cache(uid)
+        except Exception:
+            pass
+
+        if already_owned_after:
+            try:
+                await prompt_msg.edit(content="ℹ️ You already own **Exp. Share**. It is active for your team.", view=None)
+            except Exception:
+                await interaction.followup.send("ℹ️ You already own **Exp. Share**. It is active for your team.", ephemeral=True)
+            return
+
+        try:
+            await prompt_msg.edit(
+                content=(
+                    f"✅ Purchased **Exp. Share** for **{charged:,} {PKDollar_NAME}**.\n"
+                    f"Remaining balance: **{remaining:,}**.\n"
+                    f"All team Pokémon now receive EXP/EVs after battles while Exp. Share is owned."
+                ),
+                view=None,
+            )
+        except Exception:
+            await interaction.followup.send(
+                f"✅ Purchased **Exp. Share** for **{charged:,} {PKDollar_NAME}**. Remaining balance: **{remaining:,}**.",
+                ephemeral=True,
+            )
+
     @app_commands.command(name="register", description="Register a Pokémon for tracking (costs 500,000 PKC).")
     @app_commands.describe(
         name="Pokémon species from your team (e.g. pikachu)",
@@ -17815,26 +18052,75 @@ class MPokeInfo(commands.Cog):
         if mon_id <= 0:
             return await interaction.followup.send("Could not resolve Pokémon ID for registration.", ephemeral=True)
 
-        reg = await register_stats.register_mon(
-            uid,
-            mon_id,
-            species,
-            cost=register_stats.REGISTER_COST_PKC,
-        )
-        if not bool(reg.get("ok")):
-            if str(reg.get("reason")) == "insufficient_funds":
-                bal = int(reg.get("balance") or 0)
-                cost = int(register_stats.REGISTER_COST_PKC)
+        reg_cost = int(register_stats.REGISTER_COST_PKC)
+        profile = await register_stats.get_profile(uid, mon_id)
+        reg_created = False
+        reg_balance = await db.get_currency(uid, "coins")
+
+        if profile is None:
+            if int(reg_balance) < reg_cost:
                 return await interaction.followup.send(
-                    f"❌ You need **{cost:,} {PKDollar_NAME}** to register this Pokémon, but you only have **{bal:,}**.",
+                    f"❌ You need **{reg_cost:,} {PKDollar_NAME}** to register this Pokémon, "
+                    f"but you only have **{int(reg_balance):,}**.",
                     ephemeral=True,
                 )
-            return await interaction.followup.send("❌ Could not register this Pokémon right now.", ephemeral=True)
 
-        profile = reg.get("profile") if isinstance(reg.get("profile"), dict) else None
-        if profile is None:
-            profile = await register_stats.get_profile(uid, mon_id)
-        profile = profile or {}
+            confirm_view = _ConfirmDeclineView(
+                owner_user_id=interaction.user.id,
+                confirm_label=f"Confirm (-{reg_cost:,})",
+                decline_label="Decline",
+                timeout=120,
+            )
+            confirm_msg = await interaction.followup.send(
+                (
+                    f"Register **{species.replace('-', ' ').title()}** for stat tracking "
+                    f"for **{reg_cost:,} {PKDollar_NAME}**?\n"
+                    f"Current balance: **{int(reg_balance):,}**."
+                ),
+                view=confirm_view,
+                ephemeral=False,
+                wait=True,
+            )
+            await confirm_view.wait()
+            if confirm_view.choice is not True:
+                cancel_text = (
+                    "⌛ Registration timed out. No PKC was spent."
+                    if confirm_view.choice is None
+                    else "❌ Registration cancelled. No PKC was spent."
+                )
+                try:
+                    await confirm_msg.edit(content=cancel_text, view=None)
+                except Exception:
+                    await interaction.followup.send(cancel_text, ephemeral=True)
+                return
+
+            reg = await register_stats.register_mon(
+                uid,
+                mon_id,
+                species,
+                cost=reg_cost,
+            )
+            if not bool(reg.get("ok")):
+                if str(reg.get("reason")) == "insufficient_funds":
+                    bal = int(reg.get("balance") or 0)
+                    return await interaction.followup.send(
+                        f"❌ You need **{reg_cost:,} {PKDollar_NAME}** to register this Pokémon, but you only have **{bal:,}**.",
+                        ephemeral=True,
+                    )
+                return await interaction.followup.send("❌ Could not register this Pokémon right now.", ephemeral=True)
+
+            reg_created = bool(reg.get("created"))
+            reg_balance = int(reg.get("balance") or reg_balance)
+            profile = reg.get("profile") if isinstance(reg.get("profile"), dict) else None
+            if profile is None:
+                profile = await register_stats.get_profile(uid, mon_id)
+            profile = profile or {}
+            try:
+                await confirm_msg.edit(content="✅ Registration confirmed.", view=None)
+            except Exception:
+                pass
+        else:
+            profile = profile or {}
 
         level = int(mon.get("level") or 1)
         shiny = bool(mon.get("shiny"))
@@ -17856,9 +18142,9 @@ class MPokeInfo(commands.Cog):
             types=types,
         )
 
-        if bool(reg.get("created")):
-            charged = int(reg.get("cost_charged") or register_stats.REGISTER_COST_PKC)
-            remaining = int(reg.get("balance") or 0)
+        if reg_created:
+            charged = reg_cost
+            remaining = int(reg_balance or 0)
             msg = (
                 f"✅ Registered **{species.replace('-', ' ').title()}** for stat tracking "
                 f"(-{charged:,} {PKDollar_NAME}). Remaining balance: **{remaining:,}**."
