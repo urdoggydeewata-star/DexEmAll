@@ -687,12 +687,7 @@ def _record_last_move(mon: Mon, move_name: str, battle_state: Any = None) -> Non
             mon_id_raw = getattr(mon, "_db_id", None)
             owner_id = str(owner_raw or "")
             mon_id = int(mon_id_raw or 0)
-            should_track = False
-            if owner_id and mon_id > 0:
-                try:
-                    should_track = bool(_register_stats and _register_stats.is_registered_in_battle_cache(battle_state, owner_id, mon_id))
-                except Exception:
-                    should_track = False
+            should_track = bool(_register_stats is not None and owner_id and mon_id > 0)
             if should_track:
                 mv_key = str(move_name or "").strip().lower().replace("_", "-").replace(" ", "-")
                 if mv_key and mv_key != "recharge":
@@ -729,10 +724,7 @@ def _record_registered_ko(atk: Mon, dfn: Mon, battle_state: Any = None) -> None:
         mon_id = int(mon_id_raw or 0)
         if not owner_id or mon_id <= 0:
             return
-        try:
-            if not (_register_stats and _register_stats.is_registered_in_battle_cache(battle_state, owner_id, mon_id)):
-                return
-        except Exception:
+        if _register_stats is None:
             return
         ko_buf = getattr(battle_state, "_registered_ko_stats", None)
         if not isinstance(ko_buf, dict):
@@ -753,6 +745,23 @@ def _record_registered_ko(atk: Mon, dfn: Mon, battle_state: Any = None) -> None:
         defeated_species = str(getattr(dfn, "species", "") or "").strip().lower().replace("_", "-")
         if defeated_species:
             species_kos[defeated_species] = int(species_kos.get(defeated_species, 0) or 0) + 1
+    except Exception:
+        pass
+
+
+def _dispatch_award_exp_on_faint_callback(battle_state: Any, fainted_mon: Mon) -> None:
+    """Best-effort fire-and-forget hook used by adventure per-faint EXP logic."""
+    try:
+        faint_cb = getattr(battle_state, "_award_exp_on_faint_callback", None)
+        if not callable(faint_cb):
+            return
+        ret = faint_cb(battle_state, fainted_mon)
+        if asyncio.iscoroutine(ret):
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(ret)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -3088,6 +3097,7 @@ class BattleState:
             break_jaw_lock(dfn)
             release_octolock(dfn)
             _record_registered_ko(atk, dfn, battle_state=self)
+            _dispatch_award_exp_on_faint_callback(self, dfn)
             log.append(f"**{dfn.species}** fainted!")
             self._reconcile_special_weather(immediate_log=log)
             defender_uid = self.p2_id if uid == self.p1_id else self.p1_id
@@ -5225,6 +5235,7 @@ class BattleState:
                 from .engine import release_octolock
                 release_octolock(dfn)
                 _record_registered_ko(atk, dfn, battle_state=self)
+                _dispatch_award_exp_on_faint_callback(self, dfn)
                 log.append(f"**{dfn.species}** fainted!")
                 self._reconcile_special_weather(immediate_log=log)
                 

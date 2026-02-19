@@ -12302,6 +12302,13 @@ async def _start_pve_battle(
     st._exp_ev_summary = []
 
     async def _on_opponent_faint(_st: "BattleState", fainted_mon: "Mon") -> None:
+        try:
+            fainted_owner = str(getattr(fainted_mon, "_owner_id", "") or "")
+        except Exception:
+            fainted_owner = ""
+        # Ignore ally faint callbacks; only award when the opponent faints.
+        if fainted_owner and fainted_owner == str(itx.user.id):
+            return
         lu, es, evs = await _award_exp_to_party(_st, itx.user.id, [fainted_mon], force_per_faint=True)
         _st._exp_level_ups.extend(lu)
         _st._exp_summary.extend(es)
@@ -12407,6 +12414,12 @@ async def _start_pve_battle(
                 ev_summary = getattr(st, "_exp_ev_summary", []) or []
             else:
                 level_ups, exp_summary, ev_summary = await _award_exp_to_party(st, itx.user.id, opponent_team)
+                # End-of-battle fallback: if per-faint callback did not run, persist register EXP now.
+                try:
+                    if exp_summary:
+                        await register_stats.add_exp_from_summary(str(itx.user.id), exp_summary)
+                except Exception:
+                    pass
         except Exception:
             pass
         # Adventure (wild or trainer/rival): send one combined embed (battle ended + outcome + last turn + EXP/level-ups + money)

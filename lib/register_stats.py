@@ -239,8 +239,7 @@ def buffer_exp_from_summary(st: Any, default_owner_id: str, exp_summary: Iterabl
     Flushed once in flush_battle_state().
     """
     cache = getattr(st, "_registered_mon_ids", None)
-    if not isinstance(cache, Mapping):
-        return
+    cache_map = cache if isinstance(cache, Mapping) else None
     buf = getattr(st, "_registered_exp_gains", None)
     if not isinstance(buf, dict):
         buf = {}
@@ -264,9 +263,10 @@ def buffer_exp_from_summary(st: Any, default_owner_id: str, exp_summary: Iterabl
             mon_id = 0
         if mon_id <= 0:
             continue
-        reg_ids = _registered_set_from_cache(cache, owner)
-        if mon_id not in reg_ids:
-            continue
+        if cache_map is not None:
+            reg_ids = _registered_set_from_cache(cache_map, owner)
+            if reg_ids and mon_id not in reg_ids:
+                continue
         key = (owner, mon_id)
         buf[key] = int(buf.get(key, 0) or 0) + gain
 
@@ -638,8 +638,6 @@ async def flush_battle_state(st: Any) -> None:
         owner, mon_id = _split_key(raw_key)
         if owner is None or mon_id is None:
             continue
-        if not is_registered_in_battle_cache(st, owner, mon_id):
-            continue
         if not isinstance(usage, Mapping):
             continue
         rec = _entry(owner, mon_id)
@@ -659,8 +657,6 @@ async def flush_battle_state(st: Any) -> None:
     for raw_key, payload in ko_buf.items():
         owner, mon_id = _split_key(raw_key)
         if owner is None or mon_id is None:
-            continue
-        if not is_registered_in_battle_cache(st, owner, mon_id):
             continue
         if not isinstance(payload, Mapping):
             continue
@@ -691,8 +687,6 @@ async def flush_battle_state(st: Any) -> None:
         for raw_key, raw_gain in exp_buf.items():
             owner, mon_id = _split_key(raw_key)
             if owner is None or mon_id is None:
-                continue
-            if not is_registered_in_battle_cache(st, owner, mon_id):
                 continue
             try:
                 gain = int(raw_gain or 0)
@@ -729,8 +723,6 @@ async def flush_battle_state(st: Any) -> None:
         reg_ids = _registered_set_from_cache(registered_cache, owner_id)
         if reg_ids:
             mids = {mid for mid in mids if mid in reg_ids}
-        else:
-            mids = set()
         if not mids:
             continue
         for mid in mids:
