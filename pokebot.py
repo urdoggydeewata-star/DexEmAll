@@ -16389,20 +16389,28 @@ class MPokeInfo(commands.Cog):
         raw = str(type_name or "").strip().lower()
         if not raw:
             return None
-        badge_dir = ASSETS_DIR / "ui" / "mypokeinfo-types"
+        base_dir = Path(__file__).resolve().parent
+        candidate_dirs = [
+            # Preferred runtime location requested by user.
+            base_dir / "pvp" / "_common" / "types",
+            Path("/home/container/pvp/_common/types"),
+            # Legacy fallback.
+            ASSETS_DIR / "ui" / "mypokeinfo-types",
+        ]
         norm = raw.replace(" ", "_").replace("-", "_")
         aliases = [norm]
         if norm == "???":
             aliases.append("unknown")
         if norm == "none":
             aliases.append("unknown")
-        for key in aliases:
-            p = badge_dir / f"{key}.png"
-            try:
-                if p.exists() and p.is_file() and p.stat().st_size > 0:
-                    return p
-            except Exception:
-                continue
+        for d in candidate_dirs:
+            for key in aliases:
+                p = d / f"{key}.png"
+                try:
+                    if p.exists() and p.is_file() and p.stat().st_size > 0:
+                        return p
+                except Exception:
+                    continue
         return None
 
     async def _render_mpokeinfo_panel(
@@ -16893,25 +16901,24 @@ class MPokeInfo(commands.Cog):
         )
 
         if shiny:
-            def _draw_sparkle(cx: int, cy: int, size: int = 3) -> None:
-                core = (255, 242, 166, 255)
-                glow = (255, 172, 64, 230)
-                shadow = (72, 38, 9, 210)
-                for d in range(-size, size + 1):
-                    draw.point((cx + d, cy), fill=core)
-                    draw.point((cx, cy + d), fill=core)
-                for d in range(-max(1, size - 1), max(1, size - 1) + 1):
-                    draw.point((cx + d, cy + d), fill=glow)
-                    draw.point((cx + d, cy - d), fill=glow)
-                draw.point((cx + size + 1, cy), fill=shadow)
-                draw.point((cx - size - 1, cy), fill=shadow)
-                draw.point((cx, cy + size + 1), fill=shadow)
-                draw.point((cx, cy - size - 1), fill=shadow)
-
-            sx1, sy1 = _pt(93, 74)
-            sx2, sy2 = _pt(127, 66)
-            _draw_sparkle(int(sx1), int(sy1), size=max(2, int(round(2 * scale))))
-            _draw_sparkle(int(sx2), int(sy2), size=max(1, int(round(1 * scale))))
+            star_font = self._mpokeinfo_font(max(9, int(round(12 * scale))), bold=True)
+            side_star_font = self._mpokeinfo_font(max(7, int(round(9 * scale))), bold=True)
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                _pt(74, 72),
+                "★",
+                font=star_font,
+                fill=(255, 110, 132, 255),
+                shadow=(88, 20, 26, 220),
+            )
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                _pt(88, 62),
+                "★",
+                font=side_star_font,
+                fill=(255, 110, 132, 255),
+                shadow=(88, 20, 26, 220),
+            )
 
         ball_raw = str(mon.get("pokeball") or "poke_ball").strip().lower()
         ball_icon = self._pokeball_icon_path(ball_raw)
@@ -17240,9 +17247,9 @@ class MPokeInfo(commands.Cog):
 
         # Template already includes static labels; draw only dynamic values.
         def _draw_row_value(value: str, *, left: int, top: int, width: int) -> None:
-            label_h = max(10, int(round(23 * sy)))
-            value_h = max(10, int(round(22 * sy)))
-            value_nudge = max(1, int(round(2 * sy)))
+            label_h = max(8, int(round(18 * sy)))
+            value_h = max(10, int(round(34 * sy)))
+            value_nudge = max(2, int(round(4 * sy)))
             _draw_center_value(value, left, top + label_h, width, value_h, y_nudge=value_nudge)
 
         def _ival(key: str) -> int:
@@ -17283,8 +17290,9 @@ class MPokeInfo(commands.Cog):
             _draw_row_value(value, left=right_x, top=_pt(0, y)[1], width=right_w)
 
         ot_name = str(getattr(interaction.user, "display_name", None) or "Trainer").strip()
-        ot_box_left, ot_box_y = _pt(352, 14)
-        ot_box_w = max(24, int(round(156 * sx)))
+        # Match front-panel header geometry (scaled into this panel's coordinate system).
+        ot_box_left, ot_box_y = _pt(212, 15)
+        ot_box_w = max(24, int(round(148 * sx)))
         ot_box_h = max(10, int(round(14 * sy)))
         _draw_center_value(
             ot_name,
@@ -17295,6 +17303,7 @@ class MPokeInfo(commands.Cog):
             start_size=max(8, int(round(10 * scale))),
             min_size=max(7, int(round(8 * scale))),
             bold=True,
+            y_nudge=0,
         )
 
         raw_nick = str(mon.get("nickname") or "").strip()
@@ -17323,36 +17332,83 @@ class MPokeInfo(commands.Cog):
 
         g_key = str(gender or "").strip().lower()
         g_sym = {"male": "♂", "m": "♂", "♀": "♀", "female": "♀", "f": "♀"}.get(g_key, "")
-        lv_text = f"{int(level)}{g_sym}"
-        lv_box_left, lv_box_y = _pt(520, 14)
-        lv_box_w = max(18, int(round(44 * sx)))
+        lv_text = f"{int(level)}"
+        lv_box_left, lv_box_y = _pt(404, 15)
+        lv_box_w = max(18, int(round(112 * sx)))
         lv_box_h = max(10, int(round(14 * sy)))
-        _draw_center_value(
+        lv_font = self._mpokeinfo_fit_font(
+            draw_probe,
             lv_text,
-            lv_box_left,
-            lv_box_y,
-            lv_box_w,
-            lv_box_h,
+            max_width=max(12, int(round(lv_box_w * 0.6))),
             start_size=max(8, int(round(10 * scale))),
             min_size=max(7, int(round(8 * scale))),
             bold=True,
         )
+        lv_text = _clip_text(lv_text, lv_font, max(12, int(round(lv_box_w * 0.6))))
+        if lv_text and lv_font is not None:
+            lv_w = self._mpokeinfo_text_width(draw_probe, lv_text, lv_font)
+            lv_h = max(8, int(round(10 * sy)))
+            try:
+                lb = draw_probe.textbbox((0, 0), lv_text, font=lv_font)
+                lv_h = max(1, int(lb[3] - lb[1]))
+            except Exception:
+                pass
+            gender_font = None
+            gw = 0
+            gh = lv_h
+            if g_sym:
+                try:
+                    from PIL import ImageFont  # type: ignore
+                    gender_font = ImageFont.truetype(
+                        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                        max(8, int(round(10 * scale))),
+                    )
+                except Exception:
+                    gender_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
+                gw = self._mpokeinfo_text_width(draw_probe, g_sym, gender_font)
+                try:
+                    gb = draw_probe.textbbox((0, 0), g_sym, font=gender_font)
+                    gh = max(1, int(gb[3] - gb[1]))
+                except Exception:
+                    pass
+            gap = max(1, int(round(2 * sx))) if g_sym else 0
+            group_w = int(lv_w + (gap + gw if g_sym else 0))
+            group_x = int(lv_box_left + max(0, (lv_box_w - group_w) // 2))
+            lv_nudge_x = max(4, int(round(8 * sx)))
+            lv_y = int(lv_box_y + max(0, ((lv_box_h - lv_h) // 2) - 1))
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                (group_x + lv_nudge_x, lv_y),
+                lv_text,
+                font=lv_font,
+                fill=(246, 232, 255, 255),
+                shadow=(24, 12, 35, 220),
+            )
+            if g_sym and gender_font is not None:
+                gender_nudge_x = max(2, int(round(4 * sx)))
+                gx = int(group_x + lv_nudge_x + lv_w + gap + gender_nudge_x)
+                gender_nudge_y = -max(1, int(round(1 * sy)))
+                gy = int(lv_box_y + max(0, ((lv_box_h - gh) // 2) - 1 + gender_nudge_y))
+                gfill = (112, 190, 255, 255) if g_key in {"male", "m", "♂"} else (255, 156, 214, 255)
+                self._mpokeinfo_draw_shadow_text(
+                    draw,
+                    (gx, gy),
+                    g_sym,
+                    font=gender_font,
+                    fill=gfill,
+                    shadow=(24, 12, 35, 220),
+                )
 
         ribbons = _ival("ribbons")
-        ribbon_text = f"{ribbons}" if ribbons > 0 else "0"
-        ribbon_font = self._mpokeinfo_fit_font(
-            draw_probe, ribbon_text, max_width=max(12, int(round(118 * sx))), start_size=max(8, int(round(15 * scale))), min_size=max(8, int(round(10 * scale))), bold=True
-        )
-        if ribbon_font is not None:
-            _draw_center_value(ribbon_text, _pt(568, 0)[0], _pt(0, 96)[1], max(16, int(round(132 * sx))), max(10, int(round(24 * sy))))
+        _ = ribbons  # ribbon images planned; suppress numeric overlay for now.
 
         type_tokens = [str(t or "").strip().lower() for t in list(types or []) if str(t or "").strip()]
         if not type_tokens:
             type_tokens = ["normal"]
-        type_left, type_top = _pt(330, 40)
-        type_w = max(18, int(round(54 * sx)))
-        type_h = max(10, int(round(18 * sy)))
-        type_gap = max(1, int(round(2 * sy)))
+        type_left, type_top = _pt(304, 31)
+        type_w = max(24, int(round(124 * sx)))
+        type_h = max(12, int(round(30 * sy)))
+        type_gap = max(1, int(round(4 * sy)))
         for i, tok in enumerate(type_tokens[:2]):
             row_y = int(type_top + (i * (type_h + type_gap)))
             badge = self._mpokeinfo_type_badge_path(tok)
@@ -17360,7 +17416,26 @@ class MPokeInfo(commands.Cog):
                 try:
                     with PILImage.open(str(badge)) as src:
                         t_icon = src.convert("RGBA")
-                    t_icon.thumbnail((type_w, type_h), resample=PILImage.Resampling.LANCZOS)
+                    try:
+                        bb = t_icon.split()[-1].getbbox()
+                        if bb is not None:
+                            cropped = t_icon.crop(bb)
+                            if cropped.size[0] > 0 and cropped.size[1] > 0:
+                                t_icon = cropped
+                    except Exception:
+                        pass
+                    iw, ih = t_icon.size
+                    if iw > 0 and ih > 0:
+                        scale_fit = min(float(type_w) / float(iw), float(type_h) / float(ih))
+                        scale_fit = min(scale_fit, 1.7)
+                        nw = max(1, int(round(iw * scale_fit)))
+                        nh = max(1, int(round(ih * scale_fit)))
+                        # Allow upscaling so small source badges still fill the back UI.
+                        if nw != iw or nh != ih:
+                            try:
+                                t_icon = t_icon.resize((nw, nh), resample=PILImage.Resampling.NEAREST)
+                            except Exception:
+                                t_icon = t_icon.resize((nw, nh))
                     icon_x = int(type_left + max(0, (type_w - t_icon.width) // 2))
                     icon_y = int(row_y + max(0, (type_h - t_icon.height) // 2))
                     panel_static.alpha_composite(t_icon, dest=(icon_x, icon_y))
@@ -17371,7 +17446,7 @@ class MPokeInfo(commands.Cog):
             t_font = self._mpokeinfo_fit_font(
                 draw_probe,
                 t_txt,
-                max_width=max(12, int(round(86 * sx))),
+                max_width=max(12, int(round(type_w - 6))),
                 start_size=max(8, int(round(14 * scale))),
                 min_size=max(7, int(round(10 * scale))),
                 bold=True,
@@ -17383,17 +17458,24 @@ class MPokeInfo(commands.Cog):
                 self._mpokeinfo_draw_shadow_text(draw, (tx, ty), t_txt, font=t_font, fill=(240, 244, 248, 255), shadow=(0, 0, 0, 220))
 
         if shiny:
-            def _spark(cx: int, cy: int, size: int = 3) -> None:
-                core = (255, 242, 166, 255)
-                glow = (255, 172, 64, 230)
-                for d in range(-size, size + 1):
-                    draw.point((cx + d, cy), fill=core)
-                    draw.point((cx, cy + d), fill=core)
-                for d in range(-max(1, size - 1), max(1, size - 1) + 1):
-                    draw.point((cx + d, cy + d), fill=glow)
-                    draw.point((cx + d, cy - d), fill=glow)
-
-            _spark(*_pt(545, 62), size=max(2, int(round(2 * scale))))
+            star_font = self._mpokeinfo_font(max(10, int(round(13 * scale))), bold=True)
+            side_star_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                _pt(500, 108),
+                "★",
+                font=star_font,
+                fill=(255, 110, 132, 255),
+                shadow=(88, 20, 26, 220),
+            )
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                _pt(334, 128),
+                "★",
+                font=side_star_font,
+                fill=(255, 230, 130, 255),
+                shadow=(78, 42, 10, 220),
+            )
 
         sprite_frames: list[Any] = []
         durations: list[int] = []
