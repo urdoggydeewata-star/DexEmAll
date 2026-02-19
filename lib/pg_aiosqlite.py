@@ -346,7 +346,9 @@ class Connection:
 
 async def connect(_: str | None = None, timeout: float | None = None) -> Connection:
     pool = await _get_pool()
-    sticky = os.getenv("DB_STICKY_CONN", "1").lower() not in ("0", "false", "no")
+    # Default to non-sticky so short-lived command handlers do not pin pool
+    # connections for their full lifetime on shared hosts (e.g. Pterodactyl).
+    sticky = os.getenv("DB_STICKY_CONN", "0").lower() not in ("0", "false", "no")
     if sticky:
         conn = await _acquire_with_retry(pool, timeout=timeout)
         return Connection(pool, pinned=conn)
@@ -363,7 +365,15 @@ async def session() -> Connection:
         return
 
     pool = await _get_pool()
-    conn = await _acquire_with_retry(pool)
+    try:
+        conn = await _acquire_with_retry(pool)
+    except Exception as exc:
+        # Degrade gracefully under burst load: yield an unpinned connection
+        # facade rather than failing command handlers immediately.
+        if _is_transient_acquire_error(exc):
+            yield Connection(pool)
+            return
+        raise
     token = _session_conn.set(conn)
     try:
         yield Connection(pool)
