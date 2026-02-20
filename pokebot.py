@@ -12648,6 +12648,16 @@ async def _start_pve_battle(
         st.adventure_area_id = area_id
     if route_display_name is not None:
         st.adventure_route_display_name = route_display_name
+    # Route battles should be public (non-ephemeral).
+    is_route_battle = str(area_id or "").strip().lower().startswith("route-")
+    try:
+        st.public_battle_ui = bool(is_route_battle)
+    except Exception:
+        pass
+    try:
+        setattr(itx, "_force_public_battle_messages", bool(is_route_battle))
+    except Exception:
+        pass
     st._bag_embed_builder = lambda p=1: _build_bag_embed_for_battle(itx.user.id, p)
     # Per-faint EXP: award EXP after each opponent Pokémon that faints (not only at battle end)
     st._exp_award_pending = []
@@ -14466,7 +14476,7 @@ class AdventureRouteView(discord.ui.View):
         self._last_handled_id = cid
         self._last_handled_ts = now
         try:
-            await itx.response.defer(ephemeral=True, thinking=False)
+            await itx.response.defer(ephemeral=False, thinking=False)
             state = await _get_adventure_state(str(itx.user.id))
             route = ADVENTURE_ROUTES.get(self.area_id, {})
             rival_id = route.get("rival_battle")
@@ -14524,7 +14534,14 @@ class AdventureRouteView(discord.ui.View):
                             team.append(mon)
                     if not team:
                         return await itx.followup.send("Trainer team failed to load.", ephemeral=False)
-                    won = await _start_pve_battle(itx, team, trainer_name, resend_adventure_panel=False)
+                    won = await _start_pve_battle(
+                        itx,
+                        team,
+                        trainer_name,
+                        area_id=current_area,
+                        route_display_name=route_def.get("name", current_area),
+                        resend_adventure_panel=False,
+                    )
                     if won is None:
                         return await itx.followup.send("Couldn't start the battle. Please try again.", ephemeral=False)
                     if not won:
@@ -14557,7 +14574,7 @@ class AdventureRouteView(discord.ui.View):
         self._last_handled_id = cid
         self._last_handled_ts = now
         try:
-            await itx.response.defer(ephemeral=True, thinking=False)
+            await itx.response.defer(ephemeral=False, thinking=False)
             state = await _get_adventure_state(str(itx.user.id))
             if not isinstance(state.get("area_history"), list) or not state.get("area_history"):
                 return await itx.followup.send("No previous area.", ephemeral=False)
@@ -15097,11 +15114,11 @@ class _AdventureRouteViewRoute1Methods:
                         chance = float(sign_cfg.get("text_chance", 0.9))
                         text = text if random.random() < chance else text_alt
                     if text:
-                        await itx.response.send_message(f"**Sign:**\n>>> {text}", ephemeral=True)
+                        await itx.response.send_message(f"**Sign:**\n>>> {text}", ephemeral=False)
                         return
         except Exception:
             pass
-        await itx.response.send_message("Nothing to read.", ephemeral=True)
+        await itx.response.send_message("Nothing to read.", ephemeral=False)
 
     async def _on_collect(self, itx: discord.Interaction):
         if not self._guard(itx):
@@ -15114,7 +15131,7 @@ class _AdventureRouteViewRoute1Methods:
         self._last_handled_id = cid
         self._last_handled_ts = now
         try:
-            await itx.response.defer(ephemeral=True, thinking=False)
+            await itx.response.defer(ephemeral=False, thinking=False)
             state = await _get_adventure_state(str(itx.user.id))
             route = ADVENTURE_ROUTES.get(self.area_id, {})
             collectible = route.get("collectible_button")
@@ -15152,7 +15169,7 @@ class _AdventureRouteViewRoute1Methods:
         self._last_handled_ts = now
         path_id: Optional[int] = None
         try:
-            await itx.response.defer(ephemeral=True, thinking=False)
+            await itx.response.defer(ephemeral=False, thinking=False)
             state = await _get_adventure_state(str(itx.user.id))
             route = ADVENTURE_ROUTES.get(self.area_id, {})
             rival_id = route.get("rival_battle")
@@ -15205,7 +15222,14 @@ class _AdventureRouteViewRoute1Methods:
                         team.append(mon)
                 if not team:
                     return await itx.followup.send("Trainer team failed to load.", ephemeral=False)
-                won = await _start_pve_battle(itx, team, trainer_name, resend_adventure_panel=False)
+                won = await _start_pve_battle(
+                    itx,
+                    team,
+                    trainer_name,
+                    area_id=self.area_id,
+                    route_display_name=route.get("name", self.area_id),
+                    resend_adventure_panel=False,
+                )
                 if won is None:
                     return await itx.followup.send("Couldn't start the battle. Please try again.", ephemeral=False)
                 if not won:
@@ -15311,7 +15335,7 @@ class _AdventureRouteViewRoute1Methods:
         self._last_handled_id = cid
         self._last_handled_ts = now
         try:
-            await itx.response.defer(ephemeral=True, thinking=False)
+            await itx.response.defer(ephemeral=False, thinking=False)
             state = await _get_adventure_state(str(itx.user.id))
             route = ADVENTURE_ROUTES.get(self.area_id, {})
             tid = itx.data["custom_id"].split(":")[-1]
@@ -15332,6 +15356,8 @@ class _AdventureRouteViewRoute1Methods:
                 itx,
                 team,
                 trainer.get("name", "Trainer"),
+                area_id=self.area_id,
+                route_display_name=route.get("name", self.area_id),
                 resend_adventure_panel=False,
             )
             if won is None:
@@ -15698,7 +15724,14 @@ async def route_cmd(interaction: discord.Interaction, number: int):
     wild_mon = await _build_mon_from_species(species, level=3, sync_nature=sync_nature)
     if not wild_mon:
         return await interaction.followup.send("Encounter failed to load.", ephemeral=True)
-    won = await _start_pve_battle(interaction, [wild_mon], f"Wild {species.title()}")
+    route_display = ADVENTURE_ROUTES.get(route_id, {}).get("name", route_id)
+    won = await _start_pve_battle(
+        interaction,
+        [wild_mon],
+        f"Wild {species.title()}",
+        area_id=route_id,
+        route_display_name=route_display,
+    )
     if won is _PVE_ALREADY_IN_BATTLE:
         return  # "You're already in a battle." was already sent
     if won is None:

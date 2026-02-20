@@ -130,6 +130,13 @@ def _gear_cache_set(kind: str, user_id_str: str, battle_gen: int, value: bool) -
     _gear_cache[key] = (value, time.monotonic())
 
 
+def _battle_ui_is_public(st: Optional["BattleState"]) -> bool:
+    try:
+        return bool(getattr(st, "public_battle_ui", False))
+    except Exception:
+        return False
+
+
 def _format_move_name(move_name: str) -> str:
     """Format move name with capitalized first letter."""
     if not move_name:
@@ -6031,16 +6038,18 @@ class TeamSwitchView(discord.ui.View):
     
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
         """Handle interaction errors gracefully."""
+        public_ui = _battle_ui_is_public(self.state)
+        response_ephemeral = not public_ui
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(
                     "⚠️ This command has timed out. Please wait for the next turn.",
-                    ephemeral=True
+                    ephemeral=response_ephemeral
                 )
             else:
                 await interaction.response.send_message(
                     "⚠️ This command has timed out. Please wait for the next turn.",
-                    ephemeral=True
+                    ephemeral=response_ephemeral
                 )
         except:
             pass
@@ -6054,13 +6063,14 @@ class _SwitchButton(discord.ui.Button):
     async def callback(self, itx: discord.Interaction):
         view: TeamSwitchView = self.view  # type: ignore
         st = view.state
+        response_ephemeral = not _battle_ui_is_public(st)
         if st.is_locked(itx.user.id):
-            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=True)
+            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=response_ephemeral)
             return
         # Lock the player BEFORE processing, but unlock on error
         st.lock(itx.user.id)
         try:
-            await itx.response.send_message(f"Switching to **{self.label}**.", ephemeral=True)
+            await itx.response.send_message(f"Switching to **{self.label}**.", ephemeral=response_ephemeral)
             await self._on_done({"kind": "switch", "value": self.idx}, itx)
         except Exception as e:
             # If an error occurs, unlock the player so they can try again
@@ -6070,12 +6080,12 @@ class _SwitchButton(discord.ui.Button):
                 if not itx.response.is_done():
                     await itx.response.send_message(
                         f"❌ An error occurred. Please try selecting your switch again.",
-                        ephemeral=True
+                        ephemeral=response_ephemeral
                     )
                 else:
                     await itx.followup.send(
                         f"❌ An error occurred. Please try selecting your switch again.",
-                        ephemeral=True
+                        ephemeral=response_ephemeral
                     )
             except:
                 pass  # If we can't send error message, that's okay
@@ -6247,16 +6257,18 @@ class MoveView(discord.ui.View):
     
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
         """Handle interaction errors gracefully."""
+        public_ui = _battle_ui_is_public(self.state)
+        response_ephemeral = not public_ui
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(
                     "⚠️ This command has timed out. Please wait for the next turn.",
-                    ephemeral=True
+                    ephemeral=response_ephemeral
                 )
             else:
                 await interaction.response.send_message(
                     "⚠️ This command has timed out. Please wait for the next turn.",
-                    ephemeral=True
+                    ephemeral=response_ephemeral
                 )
         except:
             pass  # Interaction already expired, nothing we can do
@@ -6294,14 +6306,15 @@ class _MoveButton(discord.ui.Button):
     async def callback(self, itx: discord.Interaction):
         view: MoveView = self.view  # type: ignore
         st = view.state
+        response_ephemeral = not _battle_ui_is_public(st)
         if st.is_locked(itx.user.id):
-            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=True)
+            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=response_ephemeral)
             return
 
         # Block if button was for a move now at 0 PP (race condition), unless Struggle
         active_mon = st._active(itx.user.id)
         if self._move_name.lower() != "struggle" and st._pp_left(itx.user.id, self._move_name, mon=active_mon) <= 0:
-            await itx.response.send_message(f"**{self._move_name}** has no PP left!", ephemeral=True)
+            await itx.response.send_message(f"**{self._move_name}** has no PP left!", ephemeral=response_ephemeral)
             return
 
         # If Dynamaxed, moves are automatically Max Moves (no flag needed, detected in engine)
@@ -6344,7 +6357,7 @@ class _MoveButton(discord.ui.Button):
             
             move_display_text = _format_move_name(str(move_display or self._move_name))
             # Send response and register choice - if either fails, unlock the player
-            await itx.response.send_message(f"✅ Move selected: **{move_display_text}**.", ephemeral=True)
+            await itx.response.send_message(f"✅ Move selected: **{move_display_text}**.", ephemeral=response_ephemeral)
             await self._on_done(move_choice, itx)
         except Exception as e:
             # If an error occurs, unlock the player so they can try again
@@ -6354,12 +6367,12 @@ class _MoveButton(discord.ui.Button):
                 if not itx.response.is_done():
                     await itx.response.send_message(
                         f"❌ An error occurred. Please try selecting your move again.",
-                        ephemeral=True
+                        ephemeral=response_ephemeral
                     )
                 else:
                     await itx.followup.send(
                         f"❌ An error occurred. Please try selecting your move again.",
-                        ephemeral=True
+                        ephemeral=response_ephemeral
                     )
             except:
                 pass  # If we can't send error message, that's okay
@@ -6372,12 +6385,13 @@ class _TeamButton(discord.ui.Button):
     async def callback(self, itx: discord.Interaction):
         view: MoveView = self.view  # type: ignore
         st = view.state
+        response_ephemeral = not _battle_ui_is_public(st)
         if st.is_locked(itx.user.id):
-            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=True)
+            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=response_ephemeral)
             return
         em = _team_switch_embed(itx.user.id, st)
         v = TeamSwitchView(itx.user.id, st, view.on_done)
-        await itx.response.send_message(embed=em, ephemeral=True, view=v)
+        await itx.response.send_message(embed=em, ephemeral=response_ephemeral, view=v)
 
 class _ZMoveButton(discord.ui.Button):
     def __init__(self, move_view: 'MoveView'):
@@ -8153,6 +8167,10 @@ async def safe_send_message(itx: discord.Interaction, content: str = None, embed
     if not itx or not hasattr(itx, 'user'):
         return None
     
+    # Route/adventure wrappers can force public messages for this interaction.
+    if ephemeral and bool(getattr(itx, "_force_public_battle_messages", False)):
+        ephemeral = False
+
     # Check if interaction token is expired (15 minutes = 900 seconds)
     INTERACTION_TOKEN_EXPIRY = 900  # 15 minutes in seconds
     try:
@@ -8339,9 +8357,9 @@ async def _send_player_panel(itx: discord.Interaction, st: BattleState, for_user
     if not embed.title and not embed.description and not embed.fields and not embed.image:
         embed.description = "Battle in progress..."
     
-    # always ephemeral
+    # Route battles can opt into public (non-ephemeral) panels.
     # Only pass file and view if they're not None (Discord library tries to call to_dict() on None objects)
-    send_kwargs = {"embed": embed, "ephemeral": True}
+    send_kwargs = {"embed": embed, "ephemeral": (not _battle_ui_is_public(st))}
     if file is not None:
         send_kwargs["file"] = file
     if view is not None:
@@ -8742,6 +8760,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
     st.unlock_both()
     fmt_key = (getattr(st, "fmt_label", "") or "").strip().lower()
     is_adventure_like = fmt_key.startswith("adventure") or fmt_key == "rival"
+    panel_ephemeral = not _battle_ui_is_public(st)
     # Ensure PP is loaded from stored moves_pp in battle modes that don't
     # already preload/snapshot PP via the Adventure wrapper.
     if not is_adventure_like and not bool(getattr(st, "_pp_persist_loaded", False)):
@@ -8847,7 +8866,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                         description=desc,
                         color=discord.Color.orange()
                     ),
-                    ephemeral=True
+                    ephemeral=panel_ephemeral
                 )
             else:
                 # Multiple options - if bot, use AI logic to pick best switch; if human, show UI
@@ -8881,7 +8900,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                     )
                     em.color = discord.Color.red()
                     v = TeamSwitchView(st.p1_id, st, done1)
-                    await p1_itx.followup.send(embed=em, ephemeral=True, view=v)
+                    await p1_itx.followup.send(embed=em, ephemeral=panel_ephemeral, view=v)
                     await ev1.wait()  # Wait for P1 to choose
                     if p1_choice and p1_choice.get("kind") == "switch":
                         p1_fainted_display = _format_pokemon_name(p1_active_mon)
@@ -8922,7 +8941,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                         description=desc,
                         color=discord.Color.orange()
                     ),
-                    ephemeral=True
+                    ephemeral=panel_ephemeral
                 )
             else:
                 # Multiple options - if bot, use AI logic to pick best switch; if human, show UI
@@ -8956,7 +8975,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                     )
                     em.color = discord.Color.red()
                     v = TeamSwitchView(st.p2_id, st, done2)
-                    await p2_itx.followup.send(embed=em, ephemeral=True, view=v)
+                    await p2_itx.followup.send(embed=em, ephemeral=panel_ephemeral, view=v)
                     await ev2.wait()  # Wait for P2 to choose
                     if p2_choice and p2_choice.get("kind") == "switch":
                         p2_fainted_display = _format_pokemon_name(p2_active_mon)
@@ -8986,7 +9005,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                 description=f"**{p1_active.species}** must recharge after using **{p1_active.recharging_move}**!",
                 color=discord.Color.orange()
             ),
-            ephemeral=True
+            ephemeral=panel_ephemeral
         )
         ev1.set()
     
@@ -9000,7 +9019,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                 description=f"**{p1_active.species}** is finishing **{p1_active.charging_move}**!",
                 color=discord.Color.blue()
             ),
-            ephemeral=True
+            ephemeral=panel_ephemeral
         )
         ev1.set()
     
@@ -9014,7 +9033,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                 description=f"**{p2_active.species}** must recharge after using **{p2_active.recharging_move}**!",
                 color=discord.Color.orange()
             ),
-            ephemeral=True
+            ephemeral=panel_ephemeral
         )
         ev2.set()
     
@@ -9028,7 +9047,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                 description=f"**{p2_active.species}** is finishing **{p2_active.charging_move}**!",
                 color=discord.Color.blue()
             ),
-            ephemeral=True
+            ephemeral=panel_ephemeral
         )
         ev2.set()
 
@@ -9126,7 +9145,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                             description=f"You took too long to make your move (>{int(TURN_TIMER)}s). You have been auto-forfeited.",
                             color=discord.Color.red()
                         ),
-                        ephemeral=True
+                        ephemeral=panel_ephemeral
                     )
                 else:
                     # Use safe_send_message to handle webhook expiration
@@ -9137,7 +9156,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                             description=f"You took too long to make your move (>{int(TURN_TIMER)}s). You have been auto-forfeited.",
                             color=discord.Color.red()
                         ),
-                        ephemeral=True
+                        ephemeral=panel_ephemeral
                     )
             except Exception as e:
                 # Log errors but don't fail
@@ -9154,7 +9173,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                             description=f"You took too long to make your move (>{int(TURN_TIMER)}s). You have been auto-forfeited.",
                             color=discord.Color.red()
                         ),
-                        ephemeral=True
+                        ephemeral=panel_ephemeral
                     )
                 else:
                     # Use safe_send_message to handle webhook expiration
@@ -9165,7 +9184,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                             description=f"You took too long to make your move (>{int(TURN_TIMER)}s). You have been auto-forfeited.",
                             color=discord.Color.red()
                         ),
-                        ephemeral=True
+                        ephemeral=panel_ephemeral
                     )
             except Exception as e:
                 # Log errors but don't fail
@@ -9197,9 +9216,9 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
             if p1_timed_out:
                 try:
                     if not p2_itx.response.is_done():
-                        await p2_itx.response.send_message(f"🏳️ Your opponent timed out! You win by forfeit.", ephemeral=True)
+                        await p2_itx.response.send_message(f"🏳️ Your opponent timed out! You win by forfeit.", ephemeral=panel_ephemeral)
                     else:
-                        await safe_send_message(p2_itx, content="🏳️ Your opponent timed out! You win by forfeit.", ephemeral=True)
+                        await safe_send_message(p2_itx, content="🏳️ Your opponent timed out! You win by forfeit.", ephemeral=panel_ephemeral)
                 except (discord.errors.NotFound, discord.errors.HTTPException):
                     # Webhook expired - silently ignore
                     pass
@@ -9231,9 +9250,9 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
             if p2_timed_out:
                 try:
                     if not p1_itx.response.is_done():
-                        await p1_itx.response.send_message(f"🏳️ Your opponent timed out! You win by forfeit.", ephemeral=True)
+                        await p1_itx.response.send_message(f"🏳️ Your opponent timed out! You win by forfeit.", ephemeral=panel_ephemeral)
                     else:
-                        await safe_send_message(p1_itx, content="🏳️ Your opponent timed out! You win by forfeit.", ephemeral=True)
+                        await safe_send_message(p1_itx, content="🏳️ Your opponent timed out! You win by forfeit.", ephemeral=panel_ephemeral)
                 except (discord.errors.NotFound, discord.errors.HTTPException):
                     # Webhook expired - silently ignore
                     pass
@@ -9304,7 +9323,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                             description=f"You tried to switch out **{p1_mon_display}**!\n{switch_reason}\n\nPlease choose a move instead.",
                             color=discord.Color.orange()
                         ),
-                        ephemeral=True
+                        ephemeral=panel_ephemeral
                     )
                     # Clear choice and reset event to allow new choice
                     p1_choice = None
@@ -9369,7 +9388,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                             description=f"You tried to switch out **{p2_mon_display}**!\n{switch_reason}\n\nPlease choose a move instead.",
                             color=discord.Color.orange()
                         ),
-                        ephemeral=True
+                        ephemeral=panel_ephemeral
                     )
                     # Clear choice and reset event to allow new choice
                     p2_choice = None
@@ -9398,9 +9417,9 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
             if p1_timed_out:
                 try:
                     if not p2_itx.response.is_done():
-                        await p2_itx.response.send_message(f"🏳️ Your opponent timed out! You win by forfeit.", ephemeral=True)
+                        await p2_itx.response.send_message(f"🏳️ Your opponent timed out! You win by forfeit.", ephemeral=panel_ephemeral)
                     else:
-                        await safe_send_message(p2_itx, content="🏳️ Your opponent timed out! You win by forfeit.", ephemeral=True)
+                        await safe_send_message(p2_itx, content="🏳️ Your opponent timed out! You win by forfeit.", ephemeral=panel_ephemeral)
                 except (discord.errors.NotFound, discord.errors.HTTPException):
                     # Webhook expired - silently ignore
                     pass
@@ -9430,9 +9449,9 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
             if p2_timed_out:
                 try:
                     if not p1_itx.response.is_done():
-                        await p1_itx.response.send_message(f"🏳️ Your opponent timed out! You win by forfeit.", ephemeral=True)
+                        await p1_itx.response.send_message(f"🏳️ Your opponent timed out! You win by forfeit.", ephemeral=panel_ephemeral)
                     else:
-                        await safe_send_message(p1_itx, content="🏳️ Your opponent timed out! You win by forfeit.", ephemeral=True)
+                        await safe_send_message(p1_itx, content="🏳️ Your opponent timed out! You win by forfeit.", ephemeral=panel_ephemeral)
                 except (discord.errors.NotFound, discord.errors.HTTPException):
                     # Webhook expired - silently ignore
                     pass
@@ -9497,7 +9516,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                 )
                 em.color = discord.Color.blue()
                 v = TeamSwitchView(pivot_uid, st, done_pivot)
-                await pivot_itx.followup.send(embed=em, ephemeral=True, view=v)
+                await pivot_itx.followup.send(embed=em, ephemeral=panel_ephemeral, view=v)
                 
                 # Wait for choice (with timeout)
                 try:
@@ -9757,9 +9776,9 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
             return
         try:
             if sprite_file:
-                await safe_send_message(p1_itx, embed=turn_embed, file=sprite_file, ephemeral=True)
+                await safe_send_message(p1_itx, embed=turn_embed, file=sprite_file, ephemeral=panel_ephemeral)
             else:
-                await safe_send_message(p1_itx, embed=turn_embed, ephemeral=True)
+                await safe_send_message(p1_itx, embed=turn_embed, ephemeral=panel_ephemeral)
         finally:
             if sprite_file:
                 try:
@@ -9772,9 +9791,9 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
             return
         try:
             if sprite_file2:
-                await safe_send_message(p2_itx, embed=turn_embed2, file=sprite_file2, ephemeral=True)
+                await safe_send_message(p2_itx, embed=turn_embed2, file=sprite_file2, ephemeral=panel_ephemeral)
             else:
-                await safe_send_message(p2_itx, embed=turn_embed2, ephemeral=True)
+                await safe_send_message(p2_itx, embed=turn_embed2, ephemeral=panel_ephemeral)
         finally:
             if sprite_file2:
                 try:
@@ -9914,7 +9933,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                             description=f"{st._active(st.p1_id).species} was sent out!",
                             color=discord.Color.blue()
                         ),
-                        ephemeral=True
+                        ephemeral=panel_ephemeral
                     )
                 else:
                     # Multiple options - show team UI for selection
@@ -9924,7 +9943,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                     )
                     em.color = discord.Color.blue()
                     v = TeamSwitchView(st.p1_id, st, done1)
-                    await p1_itx.followup.send(embed=em, ephemeral=True, view=v)
+                    await p1_itx.followup.send(embed=em, ephemeral=panel_ephemeral, view=v)
                     wait_tasks.append(asyncio.create_task(ev1.wait()))
         
         # Handle P2 pivot switch
@@ -9949,7 +9968,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                             description=f"{st._active(st.p2_id).species} was sent out!",
                             color=discord.Color.blue()
                         ),
-                        ephemeral=True
+                        ephemeral=panel_ephemeral
                     )
                 else:
                     # Multiple options - show team UI for selection
@@ -9959,7 +9978,7 @@ async def _turn_loop(st: BattleState, p1_itx: discord.Interaction, p2_itx: disco
                     )
                     em.color = discord.Color.blue()
                     v = TeamSwitchView(st.p2_id, st, done2)
-                    await p2_itx.followup.send(embed=em, ephemeral=True, view=v)
+                    await p2_itx.followup.send(embed=em, ephemeral=panel_ephemeral, view=v)
                     wait_tasks.append(asyncio.create_task(ev2.wait()))
         
         # Wait for ALL choices simultaneously (if any tasks to wait for)
