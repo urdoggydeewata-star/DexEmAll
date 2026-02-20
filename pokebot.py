@@ -8412,9 +8412,11 @@ ADVENTURE_ROUTES = {
         "next": "route-2-2",
         "prev": "route-2",
         "maze_signs": {
-            "2-1": {"label": "Read Sign", "text": "VIRIDIAN FOREST - Forest thick with trees. Paths lead in all directions."},
-            "1-2": {"label": "Read Sign", "text": "Trainers often rest here before venturing deeper."},
-            "1-3": {"label": "Read Sign", "text": "EXIT - North leads to Route 2. South leads back into the forest."},
+            "2-1": {"label": "Read Sign", "text": "In bigger areas, be careful not to get lost!"},
+            "2-2": {"label": "Read Sign", "text": "A rare foreign Pokemon has been spotted in the large patch of grass to the left of this sign, but nobody has managed to catch it yet"},
+            "3-1": {"label": "Read Sign", "text": "In large areas, make sure to explore. You never know what you might find!"},
+            "3-3": {"label": "Read Sign", "text": "I wonder who keeps putting up these signs? Oh wait, I'm the one who put them up!"},
+            "1-2.5": {"label": "Read Sign", "text": "I dont get paid enough to put down all these signs."}, # yabba dabba doo
         },
         "nodes": {
             "2-1": {
@@ -8457,7 +8459,7 @@ ADVENTURE_ROUTES = {
                     {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
                     {"species": "kakuna", "weight": 17.5, "min_level": 5, "max_level": 6},
                     {"species": "metapod", "weight": 17.5, "min_level": 5, "max_level": 6},
-                    {"species": "ralts", "weight": 0.5, "min_level": 2, "max_level": 4},
+                    {"species": "ralts", "weight": 5, "min_level": 2, "max_level": 4},
                 ],
             },
             "2-2": {
