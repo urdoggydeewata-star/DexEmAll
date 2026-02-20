@@ -1282,9 +1282,9 @@ class BattleState:
                         left = raw_val
                         break
         try:
-            return int(left) if left is not None else int(_max_pp(move_name, generation=self.gen))
+            return int(left) if left is not None else int(_base_pp(move_name, generation=self.gen))
         except Exception:
-            return int(_max_pp(move_name, generation=self.gen))
+            return int(_base_pp(move_name, generation=self.gen))
 
     def _spend_pp(self, uid: int, move_name: str, target: Any = None, move_data: Any = None, mon: Optional[Mon] = None) -> None:
         """
@@ -1321,7 +1321,7 @@ class BattleState:
                     break
         left = store.get(resolved_key)
         if left is None:
-            left = _max_pp(move_name, generation=self.gen)
+            left = _base_pp(move_name, generation=self.gen)
         
         # Calculate PP cost (1 normally, 2+ if Pressure is active)
         pp_cost = 1
@@ -8442,7 +8442,8 @@ async def _load_pp_state_for_user(st: BattleState, uid: int) -> None:
                 global_caps = [_pp_global_max_for_move(mv, generation=st.gen) for mv in move_keys]
                 max_caps = _pp_parse_list(raw_pp_max, count=len(move_keys), defaults=base_caps, lo=1, hi=999)
                 min_caps = _pp_parse_list(raw_pp_min, count=len(move_keys), defaults=[0] * len(move_keys), lo=0, hi=999)
-                pps = _pp_parse_list(raw_pp, count=len(move_keys), defaults=max_caps, lo=0, hi=999)
+                # Missing current PP should start from base PP, not boosted max PP.
+                pps = _pp_parse_list(raw_pp, count=len(move_keys), defaults=base_caps, lo=0, hi=999)
                 for i in range(len(move_keys)):
                     max_caps[i] = max(base_caps[i], min(max_caps[i], global_caps[i]))
                     min_caps[i] = max(0, min(min_caps[i], max_caps[i]))
@@ -8474,7 +8475,7 @@ async def _save_pp_state_for_user(st: BattleState, uid: int) -> None:
             row_d: Dict[str, Any] = {}
             try:
                 cur = await conn.execute(
-                    "SELECT moves_pp_min, moves_pp_max FROM pokemons WHERE id=? LIMIT 1",
+                    "SELECT moves_pp, moves_pp_min, moves_pp_max FROM pokemons WHERE id=? LIMIT 1",
                     (int(db_id),),
                 )
                 bounds_row = await cur.fetchone()
@@ -8488,22 +8489,25 @@ async def _save_pp_state_for_user(st: BattleState, uid: int) -> None:
             global_caps = [_pp_global_max_for_move(mv, generation=st.gen) for mv in move_keys]
             max_caps = _pp_parse_list(row_d.get("moves_pp_max"), count=len(move_keys), defaults=base_caps, lo=1, hi=999)
             min_caps = _pp_parse_list(row_d.get("moves_pp_min"), count=len(move_keys), defaults=[0] * len(move_keys), lo=0, hi=999)
+            stored_pps = _pp_parse_list(row_d.get("moves_pp"), count=len(move_keys), defaults=base_caps, lo=0, hi=999)
             for i in range(len(move_keys)):
                 max_caps[i] = max(base_caps[i], min(max_caps[i], global_caps[i]))
                 min_caps[i] = max(0, min(min_caps[i], max_caps[i]))
+                stored_pps[i] = max(min_caps[i], min(stored_pps[i], max_caps[i]))
             moves_pp: List[int] = []
             for i, mv in enumerate(move_list):
                 cap_i = max_caps[i] if i < len(max_caps) else _pp_global_max_for_move(mv, generation=st.gen)
                 min_i = min_caps[i] if i < len(min_caps) else 0
+                stored_i = stored_pps[i] if i < len(stored_pps) else max(1, int(_base_pp(mv, generation=st.gen)))
                 left = pp_store.get(mv)
                 if left is None:
                     left = pp_store.get(_norm_pp_move_key(mv))
                 if left is None:
                     left = norm_pp_store.get(_norm_pp_move_key(mv))
                 try:
-                    left_i = int(left) if left is not None else int(cap_i)
+                    left_i = int(left) if left is not None else int(stored_i)
                 except Exception:
-                    left_i = int(cap_i)
+                    left_i = int(stored_i)
                 moves_pp.append(max(int(min_i), min(int(left_i), int(cap_i))))
             try:
                 await conn.execute(

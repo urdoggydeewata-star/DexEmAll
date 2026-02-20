@@ -3273,7 +3273,7 @@ async def _user_item_qty(conn, owner_id: str, item_id: str) -> int:
     placeholders = ", ".join("?" for _ in aliases)
     cur = await conn.execute(
         f"SELECT COALESCE(SUM(qty), 0) AS qty_total FROM user_items "
-        f"WHERE owner_id=? AND LOWER(REPLACE(item_id, '-', '_')) IN ({placeholders})",
+        f"WHERE owner_id=? AND LOWER(REPLACE(REPLACE(item_id, '-', '_'), ' ', '_')) IN ({placeholders})",
         (owner_id, *aliases)
     )
     row = await cur.fetchone()
@@ -3391,7 +3391,7 @@ async def _get_item_qty(owner_id: str, item_id: str, conn=None) -> int:
         placeholders = ", ".join("?" for _ in aliases)
         cur = await conn.execute(
             f"SELECT COALESCE(SUM(qty), 0) AS qty_total FROM user_items "
-            f"WHERE owner_id=? AND LOWER(REPLACE(item_id, '-', '_')) IN ({placeholders})",
+            f"WHERE owner_id=? AND LOWER(REPLACE(REPLACE(item_id, '-', '_'), ' ', '_')) IN ({placeholders})",
             (owner_id, *aliases),
         )
         row = await cur.fetchone()
@@ -3451,7 +3451,7 @@ async def _count_item_in_use(owner_id: str, item_id: str, conn=None) -> int:
         placeholders = ", ".join("?" for _ in aliases)
         cur = await conn.execute(
             f"SELECT COUNT(*) AS used_total FROM pokemons "
-            f"WHERE owner_id=? AND LOWER(REPLACE(COALESCE(held_item, ''), '-', '_')) IN ({placeholders})",
+            f"WHERE owner_id=? AND LOWER(REPLACE(REPLACE(COALESCE(held_item, ''), '-', '_'), ' ', '_')) IN ({placeholders})",
             (owner_id, *aliases),
         )
         row = await cur.fetchone()
@@ -3572,7 +3572,7 @@ async def _bag_adjust_conn(conn, owner_id: str, item_id: str, delta: int) -> boo
     placeholders = ", ".join("?" for _ in aliases)
     cur = await conn.execute(
         f"SELECT item_id, qty FROM user_items "
-        f"WHERE owner_id=? AND LOWER(REPLACE(item_id, '-', '_')) IN ({placeholders})",
+        f"WHERE owner_id=? AND LOWER(REPLACE(REPLACE(item_id, '-', '_'), ' ', '_')) IN ({placeholders})",
         (str(owner_id), *aliases),
     )
     rows = await cur.fetchall()
@@ -3602,7 +3602,7 @@ async def _bag_adjust_conn(conn, owner_id: str, item_id: str, delta: int) -> boo
     if new_qty < 0:
         return False
     await conn.execute(
-        f"DELETE FROM user_items WHERE owner_id=? AND LOWER(REPLACE(item_id, '-', '_')) IN ({placeholders})",
+        f"DELETE FROM user_items WHERE owner_id=? AND LOWER(REPLACE(REPLACE(item_id, '-', '_'), ' ', '_')) IN ({placeholders})",
         (str(owner_id), *aliases),
     )
     if new_qty > 0:
@@ -3716,6 +3716,15 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
             or _item_forces_consumable(row_dict.get("name") or "")
             or bool(_canonical_pp_item_id(str(row_dict.get("name") or "")))
         )
+        if not give_is_consumable:
+            try:
+                give_is_consumable = bool(
+                    _canonical_pp_item_id(item)
+                    or _canonical_pp_item_id(str(give_id))
+                    or _canonical_pp_item_id(str(row_dict.get("id") or ""))
+                )
+            except Exception:
+                give_is_consumable = False
         # Show autocorrect if the matched item is different from what user typed
         ac_suffix = f" _(autocorrected to {give_disp})_" if item.lower().replace(" ", "-") != give_id.lower() else ""
 
@@ -7416,22 +7425,7 @@ class StarterView(discord.ui.View):
             base_stats  = _normalize_stats_for_generator(raw_stats)
             abilities   = _j(entry.get("abilities"), [])
             species_types = _extract_species_types(entry)
-            gender_ratio = _j(entry.get("gender_ratio"), None)
-
-            # derive gender ratio fallback
-            if not gender_ratio:
-                gr = entry.get("gender_rate")
-                if isinstance(gr, str):
-                    try: gr = json.loads(gr)
-                    except Exception: pass
-                if isinstance(gr, int):
-                    if gr == -1:
-                        gender_ratio = {"genderless": True}
-                    else:
-                        female = gr * 12.5
-                        gender_ratio = {"male": 100 - female, "female": female}
-            if not gender_ratio:
-                gender_ratio = {"male": 50, "female": 50}
+            gender_ratio = _gender_ratio_from_entry(entry, species_hint=species)
 
             # roll HA + shiny (you already have these helpers)
             ability_name, is_hidden = roll_hidden_ability(abilities, ha_denominator=50)
@@ -10212,7 +10206,7 @@ async def _daycare_hatch_to_team(owner_id: str, egg: dict) -> Optional[dict]:
             ability = "run-away"
             is_hidden = False
 
-    gender = _roll_gender_from_ratio(_gender_ratio_from_entry(entry))
+    gender = _roll_gender_from_ratio(_gender_ratio_from_entry(entry, species_hint=species))
     tera_type = _roll_default_tera_type(_extract_species_types(entry))
     shiny = await shiny_roll(_wild_shiny_denominator())
 
@@ -11290,8 +11284,29 @@ async def _build_mon_from_team_entry(team_entry: dict) -> Optional["Mon"]:
         }
     return build_mon(dto, set_level=level, heal=True)
 
-def _gender_ratio_from_entry(entry: dict) -> dict:
-    """Get gender ratio from DB/cache entry (gender_ratio or gender_rate). Same logic as starter flow."""
+_STARTER_SPECIES_12P5_FEMALE: frozenset[str] = frozenset(
+    {
+        "bulbasaur", "charmander", "squirtle",
+        "chikorita", "cyndaquil", "totodile",
+        "treecko", "torchic", "mudkip",
+        "turtwig", "chimchar", "piplup",
+        "snivy", "tepig", "oshawott",
+        "chespin", "fennekin", "froakie",
+        "rowlet", "litten", "popplio",
+        "grookey", "scorbunny", "sobble",
+        "sprigatito", "fuecoco", "quaxly",
+        "pikachu", "eevee",
+    }
+)
+
+
+def _species_uses_starter_gender_ratio(species_name: Any) -> bool:
+    key = str(species_name or "").strip().lower().replace("_", "-").replace(" ", "-")
+    return key in _STARTER_SPECIES_12P5_FEMALE
+
+
+def _gender_ratio_from_entry(entry: dict, *, species_hint: Optional[str] = None) -> dict:
+    """Get gender ratio from DB/cache entry (gender_ratio or gender_rate) with starter fallback."""
     gender_ratio = _j(entry.get("gender_ratio"), None) if entry else None
     if not gender_ratio or not isinstance(gender_ratio, dict):
         gr = entry.get("gender_rate") if entry else None
@@ -11300,14 +11315,17 @@ def _gender_ratio_from_entry(entry: dict) -> dict:
                 gr = json.loads(gr)
             except Exception:
                 gr = None
-        if isinstance(gr, int):
-            if gr == -1:
+        if isinstance(gr, (int, float)):
+            if int(gr) == -1:
                 gender_ratio = {"genderless": True}
             else:
-                female = gr * 12.5
-                gender_ratio = {"male": 100 - female, "female": female}
+                female = float(gr) * 12.5
+                gender_ratio = {"male": 100.0 - female, "female": female}
     if not gender_ratio or not isinstance(gender_ratio, dict):
-        gender_ratio = {"male": 50, "female": 50}
+        gender_ratio = {"male": 50.0, "female": 50.0}
+    species_name = str(species_hint or (entry.get("name") if isinstance(entry, dict) else "") or "")
+    if _species_uses_starter_gender_ratio(species_name) and not bool(gender_ratio.get("genderless")):
+        return {"male": 87.5, "female": 12.5}
     return gender_ratio
 
 
@@ -11344,8 +11362,9 @@ async def _build_mon_from_species(
     if not abilities_for_gen:
         abilities_for_gen = []
     # Gender ratio from database/cache (same as starter: gender_ratio or gender_rate)
-    gender_ratio = _gender_ratio_from_entry(entry)
+    gender_ratio = _gender_ratio_from_entry(entry, species_hint=species)
     rolled = generate_mon(base_stats=base_long, abilities=abilities_for_gen, gender_ratio=gender_ratio, level=level)
+    rolled_gender = _roll_gender_from_ratio(gender_ratio)
     base_short = {
         "hp": base_long.get("hp", 1),
         "atk": base_long.get("attack", 1),
@@ -11399,7 +11418,7 @@ async def _build_mon_from_species(
         "level": level,
         "moves": [m.title() if isinstance(m, str) else str(m) for m in move_list][:4],
         "ability": rolled.get("ability"),
-        "gender": rolled.get("gender"),
+        "gender": rolled_gender,
         "nature": rolled_nature,
         "is_shiny": await shiny_roll(_wild_shiny_denominator()),
         "hp_now": int(rolled["stats"]["hp"]),
@@ -11497,7 +11516,8 @@ async def _load_pp_from_db(st: "BattleState", uid: int) -> None:
                         global_caps = [_pp_move_global_max(mid, st.gen) for mid in move_ids]
                         max_caps = _pp_parse_int_list(raw_pp_max, count=len(move_ids), defaults=base_caps, lo=1, hi=999)
                         min_caps = _pp_parse_int_list(raw_pp_min, count=len(move_ids), defaults=[0] * len(move_ids), lo=0, hi=999)
-                        pps = _pp_parse_int_list(raw_pps, count=len(move_ids), defaults=max_caps, lo=0, hi=999)
+                        # Missing current-PP state should start from base PP, not boosted max PP.
+                        pps = _pp_parse_int_list(raw_pps, count=len(move_ids), defaults=base_caps, lo=0, hi=999)
                         for i in range(len(move_ids)):
                             max_caps[i] = max(base_caps[i], min(max_caps[i], global_caps[i]))
                             min_caps[i] = max(0, min(min_caps[i], max_caps[i]))
@@ -11538,7 +11558,7 @@ async def _save_party_state_from_battle(st: "BattleState", uid: int) -> None:
             row_d: dict[str, Any] = {}
             try:
                 cur = await conn.execute(
-                    "SELECT moves_pp_min, moves_pp_max FROM pokemons WHERE id=? LIMIT 1",
+                    "SELECT moves_pp, moves_pp_min, moves_pp_max FROM pokemons WHERE id=? LIMIT 1",
                     (int(db_id),),
                 )
                 bounds_row = await cur.fetchone()
@@ -11552,20 +11572,23 @@ async def _save_party_state_from_battle(st: "BattleState", uid: int) -> None:
             global_caps = [_pp_move_global_max(mid, st.gen) for mid in move_ids]
             max_caps = _pp_parse_int_list(row_d.get("moves_pp_max"), count=len(move_ids), defaults=base_caps, lo=1, hi=999)
             min_caps = _pp_parse_int_list(row_d.get("moves_pp_min"), count=len(move_ids), defaults=[0] * len(move_ids), lo=0, hi=999)
+            stored_pps = _pp_parse_int_list(row_d.get("moves_pp"), count=len(move_ids), defaults=base_caps, lo=0, hi=999)
             for i in range(len(move_ids)):
                 max_caps[i] = max(base_caps[i], min(max_caps[i], global_caps[i]))
                 min_caps[i] = max(0, min(min_caps[i], max_caps[i]))
+                stored_pps[i] = max(min_caps[i], min(stored_pps[i], max_caps[i]))
             moves_pp: list[int] = []
             for i, m in enumerate(move_list):
                 cap_i = max_caps[i] if i < len(max_caps) else _pp_move_global_max(str(m), st.gen)
                 min_i = min_caps[i] if i < len(min_caps) else 0
+                stored_i = stored_pps[i] if i < len(stored_pps) else _pp_move_base(str(m), st.gen)
                 left = pp_store.get(m)
                 if left is None:
                     left = norm_pp_store.get(_norm_move_name(str(m)))
                 try:
-                    left_i = int(left) if left is not None else int(cap_i)
+                    left_i = int(left) if left is not None else int(stored_i)
                 except Exception:
-                    left_i = int(cap_i)
+                    left_i = int(stored_i)
                 moves_pp.append(max(int(min_i), min(int(left_i), int(cap_i))))
             try:
                 await conn.execute(
@@ -12057,7 +12080,7 @@ async def _apply_evolution(owner_id: str, mon_db_id: int, evolved_species_name: 
         return False
     async with db.session() as conn:
         cur = await conn.execute(
-            "SELECT id, species, level, hp, hp_now, atk, def, spa, spd, spe, ivs, evs, nature, ability, gender, friendship, held_item, pokeball, shiny, is_hidden_ability, moves, form FROM pokemons WHERE owner_id = ? AND id = ? LIMIT 1",
+            "SELECT id, species, level, hp, hp_now, atk, def, spa, spd, spe, ivs, evs, nature, ability, gender, friendship, held_item, pokeball, shiny, is_hidden_ability, moves, moves_pp, moves_pp_min, moves_pp_max, form FROM pokemons WHERE owner_id = ? AND id = ? LIMIT 1",
             (owner_id, mon_db_id),
         )
         row = await cur.fetchone()
@@ -12105,21 +12128,29 @@ async def _apply_evolution(owner_id: str, mon_db_id: int, evolved_species_name: 
         else:
             new_ability = (regs[0].lower().replace(" ", "-") if regs else "") or (hides[0].lower().replace(" ", "-") if hides else "")
         user_gen = await _user_selected_gen(owner_id)
-        move_list = await _default_levelup_moves(evolved_species_id, level, user_gen)
+        existing_moves_raw = row.get("moves")
+        try:
+            existing_moves = json.loads(existing_moves_raw) if isinstance(existing_moves_raw, str) else existing_moves_raw
+        except Exception:
+            existing_moves = []
+        if not isinstance(existing_moves, list):
+            existing_moves = []
+        move_list = [str(m).strip() for m in existing_moves if str(m).strip()][:4]
         if not move_list:
-            move_list = ["Tackle", "Growl", "Scratch", "Ember"][:4]
-        move_list = move_list[:4]
-        base_pps = []
-        for m in move_list:
-            pp_val = 20
-            try:
-                if db_cache:
-                    cached = db_cache.get_cached_move(m) or db_cache.get_cached_move(m.lower()) or db_cache.get_cached_move(m.lower().replace(" ", "-"))
-                    if cached and cached.get("pp") is not None:
-                        pp_val = int(cached["pp"])
-            except Exception:
-                pass
-            base_pps.append(pp_val)
+            move_list = await _default_levelup_moves(evolved_species_id, level, user_gen)
+            if not move_list:
+                move_list = ["Tackle", "Growl", "Scratch", "Ember"][:4]
+            move_list = move_list[:4]
+        move_ids = [str(m).strip().replace("_", "-").replace(" ", "-").lower() for m in move_list]
+        base_pps = [_pp_move_base(mid, user_gen) for mid in move_ids]
+        global_caps = [_pp_move_global_max(mid, user_gen) for mid in move_ids]
+        max_caps = _pp_parse_int_list(row.get("moves_pp_max"), count=len(move_ids), defaults=base_pps, lo=1, hi=999)
+        min_caps = _pp_parse_int_list(row.get("moves_pp_min"), count=len(move_ids), defaults=[0] * len(move_ids), lo=0, hi=999)
+        cur_pps = _pp_parse_int_list(row.get("moves_pp"), count=len(move_ids), defaults=base_pps, lo=0, hi=999)
+        for i in range(len(move_ids)):
+            max_caps[i] = max(base_pps[i], min(max_caps[i], global_caps[i]))
+            min_caps[i] = max(0, min(min_caps[i], max_caps[i]))
+            cur_pps[i] = max(min_caps[i], min(cur_pps[i], max_caps[i]))
         hp_val = int(final_stats.get("hp", 1))
         try:
             await conn.execute(
@@ -12139,9 +12170,9 @@ async def _apply_evolution(owner_id: str, mon_db_id: int, evolved_species_name: 
                     int(final_stats.get("speed", 0)),
                     new_ability or None,
                     json.dumps(move_list, ensure_ascii=False),
-                    json.dumps(base_pps, ensure_ascii=False),
-                    json.dumps([0] * len(base_pps), ensure_ascii=False),
-                    json.dumps(base_pps, ensure_ascii=False),
+                    json.dumps(cur_pps, ensure_ascii=False),
+                    json.dumps(min_caps, ensure_ascii=False),
+                    json.dumps(max_caps, ensure_ascii=False),
                     None,
                     owner_id,
                     mon_db_id,
@@ -12162,7 +12193,7 @@ async def _apply_evolution(owner_id: str, mon_db_id: int, evolved_species_name: 
                     int(final_stats.get("speed", 0)),
                     new_ability or None,
                     json.dumps(move_list, ensure_ascii=False),
-                    json.dumps(base_pps, ensure_ascii=False),
+                    json.dumps(cur_pps, ensure_ascii=False),
                     None,
                     owner_id,
                     mon_db_id,
@@ -14920,23 +14951,25 @@ async def _route_try_force_with_ball_fallback(
     chance = _route_move_encounter_chance()
     if random.random() <= chance:
         route_cfg = ADVENTURE_ROUTES.get(area_id, {})
+        did_encounter = False
         if route_cfg.get("layout") == "maze":
-            await _route_maze_try_wild_encounter(itx, state, area_id, maze_target_node, force=True)
+            did_encounter = await _route_maze_try_wild_encounter(itx, state, area_id, maze_target_node, force=True)
         else:
-            await _route_panel_try_wild_encounter(itx, state, area_id, force=True)
-        return None
+            did_encounter = await _route_panel_try_wild_encounter(itx, state, area_id, force=True)
+        if did_encounter:
+            return None
     msg = await _roll_and_give_route_move_item_async(str(itx.user.id))
     if msg:
         return msg
     return "No wild Pokémon appeared. You searched around but found no loot ball this time."
 
 
-async def _route_panel_try_wild_encounter(itx: discord.Interaction, state: dict, area_id: str, *, force: bool = False) -> None:
+async def _route_panel_try_wild_encounter(itx: discord.Interaction, state: dict, area_id: str, *, force: bool = False) -> bool:
     """Roll (or force) a wild encounter on a panel route (route-1, route-2, etc.)."""
     route = ADVENTURE_ROUTES.get(area_id, {})
     chance = _route_move_encounter_chance()
     if not force and random.random() > chance:
-        return
+        return False
 
     all_encounters = []
     for p in (route.get("grass_paths") or {}).values():
@@ -14944,7 +14977,7 @@ async def _route_panel_try_wild_encounter(itx: discord.Interaction, state: dict,
         all_encounters.extend(enc)
 
     if not all_encounters:
-        return
+        return False
 
     enc_specs = []
     weights = []
@@ -14967,7 +15000,7 @@ async def _route_panel_try_wild_encounter(itx: discord.Interaction, state: dict,
             weights.append(int(e.get("weight", 1)))
 
     if not enc_specs:
-        return
+        return False
 
     choice = random.choices(enc_specs, weights=weights, k=1)[0]
     species = choice["species"]
@@ -14984,7 +15017,7 @@ async def _route_panel_try_wild_encounter(itx: discord.Interaction, state: dict,
     sync_nature = await _wild_synchronize_nature(str(itx.user.id))
     wild_mon = await _build_mon_from_species(species, level=lvl, sync_nature=sync_nature)
     if not wild_mon:
-        return
+        return False
 
     route_display = route.get("name", area_id)
     won = await _start_pve_battle(
@@ -14993,33 +15026,36 @@ async def _route_panel_try_wild_encounter(itx: discord.Interaction, state: dict,
         f"Wild {species.title()}",
         area_id=area_id,
         route_display_name=route_display,
+        resend_adventure_panel=False,
     )
     if won is _PVE_ALREADY_IN_BATTLE:
-        return
+        return True
     if won is None:
-        return await itx.followup.send("Couldn't start the encounter battle. Please try again.", ephemeral=False)
+        await itx.followup.send("Couldn't start the encounter battle. Please try again.", ephemeral=False)
+        return True
     if won:
         _add_discovered(state, area_id, species)
         try:
             asyncio.create_task(pokedex_mark_seen(str(itx.user.id), species, caught=True))
         except Exception:
             pass
+    return True
 
 
-async def _route_maze_try_wild_encounter(itx: discord.Interaction, state: dict, area_id: str, target_node_id: Optional[str], *, force: bool = False) -> None:
+async def _route_maze_try_wild_encounter(itx: discord.Interaction, state: dict, area_id: str, target_node_id: Optional[str], *, force: bool = False) -> bool:
     """Roll (or force) a wild encounter on a maze route. Uses target node if moving, else current node."""
     route = ADVENTURE_ROUTES.get(area_id, {})
     if route.get("layout") != "maze":
-        return
+        return False
     nodes = route.get("nodes") or {}
     node_id = target_node_id or _maze_get_node(state, area_id, route)
     node_cfg = nodes.get(node_id, {})
     encounters = node_cfg.get("encounters") or []
     if not encounters:
-        return
+        return False
     chance = _route_move_encounter_chance()
     if not force and random.random() > chance:
-        return
+        return False
     enc_specs = []
     weights = []
     version = "red"
@@ -15038,7 +15074,7 @@ async def _route_maze_try_wild_encounter(itx: discord.Interaction, state: dict, 
             })
             weights.append(int(e.get("weight", 1)))
     if not enc_specs:
-        return
+        return False
     choice = random.choices(enc_specs, weights=weights, k=1)[0]
     species = choice["species"]
     state.setdefault("repeat_seen", [])
@@ -15053,19 +15089,28 @@ async def _route_maze_try_wild_encounter(itx: discord.Interaction, state: dict, 
     sync_nature = await _wild_synchronize_nature(str(itx.user.id))
     wild_mon = await _build_mon_from_species(species, level=lvl, sync_nature=sync_nature)
     if not wild_mon:
-        return
+        return False
     route_display = route.get("name", area_id)
-    won = await _start_pve_battle(itx, [wild_mon], f"Wild {species.title()}", area_id=area_id, route_display_name=route_display)
+    won = await _start_pve_battle(
+        itx,
+        [wild_mon],
+        f"Wild {species.title()}",
+        area_id=area_id,
+        route_display_name=route_display,
+        resend_adventure_panel=False,
+    )
     if won is _PVE_ALREADY_IN_BATTLE:
-        return
+        return True
     if won is None:
-        return await itx.followup.send("Couldn't start the encounter battle. Please try again.", ephemeral=False)
+        await itx.followup.send("Couldn't start the encounter battle. Please try again.", ephemeral=False)
+        return True
     if won:
         _add_discovered(state, area_id, species)
         try:
             asyncio.create_task(pokedex_mark_seen(str(itx.user.id), species, caught=True))
         except Exception:
             pass
+    return True
 
 
 def _panel_get_panel(state: dict, area_id: str) -> int:
@@ -20165,7 +20210,7 @@ async def _resolve_pp_item_in_bag_conn(conn, owner_id: str, canonical_item_id: s
         return "", 0
     placeholders = ", ".join("?" for _ in lowered)
     cur = await conn.execute(
-        f"SELECT item_id, qty FROM user_items WHERE owner_id=? AND LOWER(REPLACE(item_id, '-', '_')) IN ({placeholders})",
+        f"SELECT item_id, qty FROM user_items WHERE owner_id=? AND LOWER(REPLACE(REPLACE(item_id, '-', '_'), ' ', '_')) IN ({placeholders})",
         (str(owner_id), *lowered),
     )
     rows = await cur.fetchall()
@@ -20439,7 +20484,7 @@ async def useppitem_cmd(
             cur_pps = _pp_parse_int_list(
                 row_d.get("moves_pp"),
                 count=len(move_ids),
-                defaults=stored_max_pps,
+                defaults=base_pps,
                 lo=0,
                 hi=999,
             )
