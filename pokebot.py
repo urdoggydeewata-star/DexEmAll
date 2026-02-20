@@ -37,7 +37,7 @@ from discord.ext import commands
 from discord import app_commands, ui, Interaction, Embed
 
 from pvp.engine import build_mon
-from pvp.panel import _base_pp, _max_pp
+from pvp.panel import _base_pp, _max_pp, _norm_pp_move_key
 import pvp.panel as _pvp_panel
 if TYPE_CHECKING:
     from pvp.engine import Mon
@@ -3783,6 +3783,14 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
                             f"❌ No copies of {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** left in your bag.{ac_suffix}",
                             ephemeral=True,
                         )
+                else:
+                    # Non-consumables: must remove 1 from bag when equipping (prevents duplication on give+take)
+                    consumed = await _bag_adjust_conn(conn, uid, give_id, -1)
+                    if not consumed:
+                        return await interaction.followup.send(
+                            f"❌ No copies of {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** left in your bag.{ac_suffix}",
+                            ephemeral=True,
+                        )
                 await conn.execute("UPDATE pokemons SET held_item=? WHERE owner_id=? AND id=?", (give_id, uid, mon_id))
                 await conn.commit()
                 db.invalidate_pokemons_cache(uid)
@@ -3846,21 +3854,26 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
                             view=None,
                         )
                 else:
-                    # Double-check capacity (race condition protection)
-                    used_check, total_check = await _get_usage(uid, give_id, conn)
-                    if used_check >= total_check:
+                    # Non-consumables: remove 1 from bag when equipping
+                    consumed = await _bag_adjust_conn(conn, uid, give_id, -1)
+                    if not consumed:
                         return await msg.edit(
-                            content=f"❌ All copies of **{give_disp}** are now in use. Try again.",
-                            view=None
+                            content=f"❌ No copies of **{give_disp}** are left in your bag. Try again.",
+                            view=None,
                         )
 
-                # Consumables are spent when equipped and are not returned on unequip.
+                # Return old item (current_held) to bag if non-consumable
+                if not current_is_consumable and current_held:
+                    await conn.execute(
+                        "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,1) "
+                        "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = user_items.qty + 1;",
+                        (uid, str(_canonical_item_token(current_held) or current_held))
+                    )
 
                 await conn.execute("UPDATE pokemons SET held_item=? WHERE owner_id=? AND id=?", (give_id, uid, mon_id))
                 await conn.commit()
                 db.invalidate_pokemons_cache(uid)
-                if give_is_consumable or current_is_consumable:
-                    db.invalidate_bag_cache(uid)
+                db.invalidate_bag_cache(uid)  # Bag changed (new item equipped and/or old returned)
             except Exception:
                 try:
                     await conn.rollback()
@@ -11521,9 +11534,10 @@ async def _load_pp_from_db(st: "BattleState", uid: int) -> None:
                             min_caps[i] = max(0, min(min_caps[i], max_caps[i]))
                             pps[i] = max(min_caps[i], min(pps[i], max_caps[i]))
                         for m, left_i in zip(moves, pps):
-                            st._pp[key][m] = int(left_i)
+                            m_str = str(m).strip()
+                            st._pp[key][m_str] = int(left_i)
                             try:
-                                st._pp[key][_norm_move_name(str(m))] = int(left_i)
+                                st._pp[key][_norm_pp_move_key(m_str)] = int(left_i)
                             except Exception:
                                 pass
             break
@@ -11550,7 +11564,7 @@ async def _save_party_state_from_battle(st: "BattleState", uid: int) -> None:
             norm_pp_store: dict[str, int] = {}
             for k, v in (pp_store or {}).items():
                 try:
-                    norm_pp_store[_norm_move_name(str(k))] = int(v)
+                    norm_pp_store[_norm_pp_move_key(str(k))] = int(v)
                 except Exception:
                     continue
             row_d: dict[str, Any] = {}
@@ -11582,7 +11596,7 @@ async def _save_party_state_from_battle(st: "BattleState", uid: int) -> None:
                 stored_i = stored_pps[i] if i < len(stored_pps) else _pp_move_base(str(m), st.gen)
                 left = pp_store.get(m)
                 if left is None:
-                    left = norm_pp_store.get(_norm_move_name(str(m)))
+                    left = norm_pp_store.get(_norm_pp_move_key(str(m)))
                 try:
                     left_i = int(left) if left is not None else int(stored_i)
                 except Exception:
