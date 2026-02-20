@@ -4,38 +4,8 @@ from typing import List, Dict, Any
 import discord
 from discord import app_commands
 from discord.ext import commands
-import asyncio
 
 from .formats import get_format, list_formats, get_available_generations
-
-
-def _fmt_keys() -> List[str]:
-    """Get all available format keys from database."""
-    # Run async function in sync context
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # We're in an async context, but need sync - this shouldn't happen
-            return ["ou", "ubers"]  # fallback
-        formats = loop.run_until_complete(list_formats())
-        keys = list(formats.keys())
-        keys.sort(key=lambda k: (formats[k].get("label", k.upper()), k))
-        return keys
-    except Exception:
-        return ["ou", "ubers"]  # fallback
-
-
-def _gens_for(fmt_key: str) -> List[int]:
-    """Get available generations for a format from database."""
-    fmt_key = (fmt_key or "").lower()
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            return list(range(1, 10))  # fallback
-        gens = loop.run_until_complete(get_available_generations(fmt_key))
-        return sorted(gens) if gens else list(range(1, 10))
-    except Exception:
-        return list(range(1, 10))  # fallback
 
 
 def _pretty_list(values: List[str]) -> str:

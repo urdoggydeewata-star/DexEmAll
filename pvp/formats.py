@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, List
-from pathlib import Path
 
 from .db_pool import get_connection
 
@@ -203,21 +202,3 @@ async def get_available_generations(fmt_key: str) -> List[int]:
             ORDER BY generation
         """, (fmt_key.lower(),))
         return [row["generation"] for row in cur.fetchall()]
-
-def max_allowed_mon_gen(rules: Dict[str, Any]) -> int:
-    """Get maximum allowed Pokémon generation from rules"""
-    return int(rules.get("max_mon_gen", 9))
-
-def _default_gen(fmt_key: str) -> int:
-    """Get default generation for a format (highest available)"""
-    cached = _get_available_generations_from_cache(fmt_key)
-    if cached:
-        return max(cached)
-    with get_connection() as conn:
-        cur = conn.execute("""
-            SELECT MAX(generation) as max_gen 
-            FROM pvp_format_rules 
-            WHERE format_key = ?
-        """, (fmt_key.lower(),))
-        row = cur.fetchone()
-        return row["max_gen"] or 9

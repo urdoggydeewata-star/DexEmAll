@@ -62,15 +62,3 @@ def is_gen_range(generation: int, min_gen: int, max_gen: Optional[int] = None) -
         return generation >= min_gen
     return min_gen <= generation <= max_gen
 
-
-# Generation milestones for quick checks
-GEN_1 = 1
-GEN_2 = 2
-GEN_3 = 3
-GEN_4 = 4
-GEN_5 = 5
-GEN_6 = 6
-GEN_7 = 7
-GEN_8 = 8
-GEN_9 = 9
-

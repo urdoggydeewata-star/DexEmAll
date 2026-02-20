@@ -86,7 +86,7 @@ from .battle_flow import (
 from .advanced_mechanics import clear_special_weather, Substitute
 from .move_mechanics import get_move_mechanics
 from .z_moves import is_z_crystal, can_use_z_move, get_z_move_name
-from .abilities import normalize_ability_name, get_ability_effect
+
 try:
     import db_async
 except ImportError:

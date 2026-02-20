@@ -65,10 +65,6 @@ class BattleManager:
         self._user_to_room.pop(room.challenger_id, None)
         self._user_to_room.pop(room.opponent_id, None)
 
-    def render_public(self, room: BattleRoom) -> str:
-        status = "⏳ Waiting for both to accept…" if not room.started else "✅ Battle started!"
-        return f"Room **#{room.id}** — {status}"
-
 _manager: Optional[BattleManager] = None
 
 def get_manager() -> BattleManager:
