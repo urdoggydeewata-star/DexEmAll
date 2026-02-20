@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Prevent recursive runs from the auto-log commit itself.
+if [[ "${MECH_CHANGELOG_AUTO_SKIP:-0}" == "1" ]]; then
+  exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "${repo_root}" ]]; then
+  exit 0
+fi
+cd "${repo_root}"
+
+changelog_path="${repo_root}/MECHANICS_CHANGELOG.txt"
+if [[ ! -f "${changelog_path}" ]]; then
+  exit 0
+fi
+
+head_hash="$(git rev-parse --short HEAD 2>/dev/null || true)"
+if [[ -z "${head_hash}" ]]; then
+  exit 0
+fi
+head_subject="$(git log -1 --pretty=%s 2>/dev/null || true)"
+head_subject="$(printf '%s' "${head_subject}" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+if [[ -z "${head_subject}" ]]; then
+  head_subject="Mechanics update"
+fi
+
+changed_files="$(git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null || true)"
+if [[ -z "${changed_files}" ]]; then
+  exit 0
+fi
+
+# Skip when commit only touches changelog/hook metadata.
+only_meta=1
+while IFS= read -r file_path; do
+  if [[ -z "${file_path}" ]]; then
+    continue
+  fi
+  case "${file_path}" in
+    MECHANICS_CHANGELOG.txt|config/hooks/post-commit|config/hooks/README.md)
+      ;;
+    *)
+      only_meta=0
+      break
+      ;;
+  esac
+done <<< "${changed_files}"
+
+if [[ "${only_meta}" == "1" ]]; then
+  exit 0
+fi
+
+# Avoid duplicate entries for the same commit hash.
+if python3 - "${changelog_path}" "${head_hash}" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+commit_hash = sys.argv[2]
+txt = path.read_text(encoding="utf-8")
+raise SystemExit(0 if f"| {commit_hash} |" in txt else 1)
+PY
+then
+  exit 0
+fi
+
+entry_time="$(date -u +"%Y-%m-%d %H:%M UTC")"
+
+python3 - "${changelog_path}" "${entry_time}" "${head_hash}" "${head_subject}" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+entry_time = sys.argv[2]
+commit_hash = sys.argv[3]
+summary = (sys.argv[4] or "Mechanics update").strip()
+if summary and summary[-1] not in ".!?":
+    summary += "."
+entry = f"{entry_time} | {commit_hash} | {summary}\n\n"
+
+txt = path.read_text(encoding="utf-8")
+lines = txt.splitlines(keepends=True)
+
+insert_idx = len(lines)
+for i, line in enumerate(lines):
+    if line.startswith("20") and " | " in line:
+        insert_idx = i
+        break
+
+new_txt = "".join(lines[:insert_idx] + [entry] + lines[insert_idx:])
+path.write_text(new_txt, encoding="utf-8")
+PY
+
+git add "${changelog_path}"
+if git diff --cached --quiet -- "${changelog_path}"; then
+  exit 0
+fi
+
+# Record changelog update in a dedicated follow-up commit.
+MECH_CHANGELOG_AUTO_SKIP=1 git commit --no-verify -m "Auto-log mechanics change ${head_hash}" >/dev/null 2>&1 || true
+exit 0
