@@ -13046,9 +13046,30 @@ async def _start_pve_battle(
                     emb.add_field(name="", value="\n".join(ev_lines), inline=False)
             # Evolution readiness (level-up trigger): include a summary line in battle result,
             # then send one Yes/No prompt per eligible mon immediately after.
-            if st.winner == itx.user.id and level_ups:
+            if st.winner == itx.user.id and exp_summary:
+                evo_candidates: dict[int, tuple[Any, int]] = {}
+                for mon, _exp_gain, _old_lvl, new_lvl in exp_summary:
+                    try:
+                        mid = int(getattr(mon, "_db_id", 0) or 0)
+                    except Exception:
+                        mid = 0
+                    if mid <= 0:
+                        continue
+                    try:
+                        candidate_lvl = int(new_lvl or getattr(mon, "level", 1) or 1)
+                    except Exception:
+                        candidate_lvl = int(getattr(mon, "level", 1) or 1)
+                    evo_candidates[mid] = (mon, max(1, candidate_lvl))
+                for mid, mon, new_lvl in level_ups:
+                    try:
+                        mid_i = int(mid or 0)
+                    except Exception:
+                        mid_i = 0
+                    if mid_i <= 0:
+                        continue
+                    evo_candidates[mid_i] = (mon, int(new_lvl or getattr(mon, "level", 1) or 1))
                 async with db.session() as conn:
-                    for mid, mon, new_lvl in level_ups:
+                    for mid, (mon, new_lvl) in evo_candidates.items():
                         held = (mon.item or "").strip().lower().replace(" ", "-")
                         if held == "everstone":
                             continue

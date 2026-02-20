@@ -275,6 +275,15 @@ async def _details_match(
 
     if expected == "level-up":
         min_level = details.get("min_level")
+        if min_level is None:
+            # Accept common schema variants used by mixed evolution datasets.
+            min_level = details.get("level")
+        if min_level is None:
+            min_level = details.get("minimum_level")
+        if min_level is None:
+            min_level = details.get("minLevel")
+        if min_level is None:
+            min_level = details.get("minimumLevel")
         if min_level is not None:
             try:
                 if level is None or int(level) < int(min_level):
