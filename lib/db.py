@@ -7,7 +7,7 @@ import os
 import pathlib
 import datetime as dt
 from contextlib import asynccontextmanager
-from typing import Optional, Sequence, List, Dict, Any, Tuple, List
+from typing import Optional, Sequence, List, Dict, Any, Tuple
 import re
 from .market_catalog import resolve_market_key as _catalog_resolve_market_key
 
