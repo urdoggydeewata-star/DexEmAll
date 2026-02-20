@@ -8425,6 +8425,7 @@ ADVENTURE_ROUTES = {
                     {"id": "north", "label": "⬆️ North", "target": "2-2"},
                     {"id": "east", "label": "➡️ East", "target": "3-1"},
                     {"id": "west", "label": "⬅️ West", "target": "1-1"},
+                    {"id": "south", "label": "⬇️ South", "target": "__prev:3__"},
                 ],
                 "encounters": [
                     {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
@@ -15174,6 +15175,20 @@ class AdventureRoute1PersistentView(discord.ui.View):
         if not target:
             await _send_adventure_panel(itx, state, edit_original=False)
             return
+        if isinstance(target, str) and target.startswith("__prev:"):
+            try:
+                panel = int(target.split(":")[1].rstrip("_"))
+            except (ValueError, IndexError):
+                panel = 1
+            prev_area = route.get("prev")
+            if prev_area:
+                _adv_history_push(state, area_id)
+                state["area_id"] = prev_area
+                _panel_set_panel(state, prev_area, panel)
+            state.get("route_panels", {}).pop(area_id, None)
+            await _save_adventure_state(uid, state)
+            await _send_adventure_panel(itx, state, edit_original=False)
+            return
         exit_node = route.get("exit_node")
         moved_within_route = True
         if target == exit_node:
@@ -15357,6 +15372,19 @@ class _AdventureRouteViewRoute1Methods:
                 break
         if not target:
             return await itx.followup.send("That exit isn't available from here.", ephemeral=True)
+        if isinstance(target, str) and target.startswith("__prev:"):
+            try:
+                panel = int(target.split(":")[1].rstrip("_"))
+            except (ValueError, IndexError):
+                panel = 1
+            prev_area = route.get("prev")
+            if prev_area:
+                _adv_history_push(state, area_id)
+                state["area_id"] = prev_area
+                _panel_set_panel(state, prev_area, panel)
+            state.get("route_panels", {}).pop(area_id, None)
+            await _save_adventure_state(str(itx.user.id), state)
+            return await _send_adventure_panel(itx, state, edit_original=False)
         exit_node = route.get("exit_node")
         moved_within_route = True
         if target == exit_node:
