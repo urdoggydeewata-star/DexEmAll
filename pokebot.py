@@ -5107,10 +5107,7 @@ class GivePokemonFormView(discord.ui.View):
                             # If form lookup fails, fall back to base abilities
                             pass
                 
-                    gender_ratio = sp.get("gender_ratio") or {}
-                    if isinstance(gender_ratio, str):
-                        try: gender_ratio = json.loads(gender_ratio)
-                        except Exception: gender_ratio = {}
+                    gender_ratio = _gender_ratio_from_entry(sp, species_hint=self.species_name)
                 
                     # Level
                     lvl = max(1, min(100, int(self.kwargs.get('level')) if self.kwargs.get('level') else 100))
@@ -6348,10 +6345,7 @@ class AdminGivePokemon(commands.Cog):
         if isinstance(abilities, str):
             try: abilities = json.loads(abilities)
             except Exception: abilities = []
-        gender_ratio = sp.get("gender_ratio") or {}
-        if isinstance(gender_ratio, str):
-            try: gender_ratio = json.loads(gender_ratio)
-            except Exception: gender_ratio = {}
+        gender_ratio = _gender_ratio_from_entry(sp, species_hint=species_name)
 
         conn = await db.connect()
         try:
@@ -24382,21 +24376,8 @@ async def _create_pokemon_from_parsed(
     # Get gender (default to random if not specified)
     gender = parsed.gender
     if not gender:
-        gender_ratio = species_entry.get("gender_ratio") or {}
-        if isinstance(gender_ratio, str):
-            try:
-                gender_ratio = json.loads(gender_ratio)
-            except Exception:
-                gender_ratio = {}
-        if gender_ratio.get("genderless"):
-            gender = "genderless"
-        else:
-            # Roll gender based on ratio
-            male = gender_ratio.get("male", 50)
-            if random.randint(1, 100) <= male:
-                gender = "male"
-            else:
-                gender = "female"
+        gender_ratio = _gender_ratio_from_entry(species_entry, species_hint=parsed.species)
+        gender = _roll_gender_from_ratio(gender_ratio)
     
     # Create the Pokémon (cloud DB)
     mon_id = await db.add_pokemon_with_stats(
