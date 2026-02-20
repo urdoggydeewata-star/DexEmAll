@@ -10653,7 +10653,7 @@ def _embed_with_daycare_panel(
             ImageSequence = None  # type: ignore
 
         def _fit_daycare_sprite(src_img: Any, max_size: tuple[int, int], resample_mode: Any) -> Any:
-            """Scale sprite to target bounds; upscale small menu icons for visibility."""
+            """Scale sprite to target bounds. Use NEAREST when upscaling (pixel art), LANCZOS when downscaling (smooth)."""
             img = src_img.convert("RGBA")
             w, h = img.size
             if w <= 0 or h <= 0:
@@ -10661,16 +10661,13 @@ def _embed_with_daycare_panel(
             max_w = max(1, int(max_size[0]))
             max_h = max(1, int(max_size[1]))
             scale = min(max_w / float(w), max_h / float(h))
-            # Keep tiny icons readable in daycare by upscaling toward target bounds.
-            if scale >= 1.0:
-                new_w = max(1, int(round(w * scale)))
-                new_h = max(1, int(round(h * scale)))
-                if new_w != w or new_h != h:
-                    return img.resize((new_w, new_h), resample=resample_mode)
-                return img
             new_w = max(1, int(round(w * scale)))
             new_h = max(1, int(round(h * scale)))
-            return img.resize((new_w, new_h), resample=resample_mode)
+            if new_w == w and new_h == h:
+                return img
+            # Upscaling: use NEAREST to keep pixel art crisp. Downscaling: use LANCZOS to avoid jagged artifacts.
+            resample = resample_pixel if scale >= 1.0 else resample_smooth
+            return img.resize((new_w, new_h), resample=resample)
 
         sprite_layers: list[dict[str, Any]] = []
         for species, (x, y) in zip(parent_species, positions):
@@ -10698,7 +10695,8 @@ def _embed_with_daycare_panel(
                         for i, fr in enumerate(ImageSequence.Iterator(src)):
                             if i >= DAYCARE_MAX_ANIM_FRAMES:
                                 break
-                            sprite = _fit_daycare_sprite(fr, max_size, sprite_resample)
+                            frame_img = fr.copy() if hasattr(fr, "copy") else fr
+                            sprite = _fit_daycare_sprite(frame_img, max_size, sprite_resample)
                             frames.append(sprite)
                     except Exception:
                         frames = []
@@ -10723,7 +10721,7 @@ def _embed_with_daycare_panel(
             try:
                 egg_icon = Image.open(str(egg_icon_path)).convert("RGBA")
                 egg_icon.thumbnail((34, 34), resample=resample_pixel)
-                egg_spots = [(255, 220), (284, 220), (313, 220)]
+                egg_spots = [(255, 194), (284, 184), (313, 194)]
                 for i in range(egg_count):
                     ex, ey = egg_spots[i]
                     egg_layer.alpha_composite(egg_icon, dest=(ex, ey))
