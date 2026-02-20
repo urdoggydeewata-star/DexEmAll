@@ -3924,6 +3924,20 @@ async def take_item(interaction: discord.Interaction, name: str, slot: int | Non
             except Exception:
                 held_is_consumable = _item_forces_consumable(held)
 
+        # Remove from Pokémon first (atomic) to prevent item duplication on concurrent take
+        cur_up = await conn.execute(
+            "UPDATE pokemons SET held_item=NULL WHERE owner_id=? AND id=? AND held_item IS NOT NULL",
+            (uid, mon_id),
+        )
+        rows_affected = getattr(cur_up, "rowcount", -1)
+        await conn.commit()
+        db.invalidate_pokemons_cache(uid)
+        if rows_affected <= 0:
+            return await interaction.followup.send(
+                f"ℹ️ **{mon['species'].title()}** isn't holding anything (may have been taken already).",
+                ephemeral=True,
+            )
+
         # Non-consumables return to bag. Consumables are spent on equip and don't return.
         if not held_is_consumable:
             await conn.execute(
@@ -3933,14 +3947,6 @@ async def take_item(interaction: discord.Interaction, name: str, slot: int | Non
             )
             await conn.commit()
             db.invalidate_bag_cache(uid)
-
-        # Now remove it from the Pokémon
-        try:
-            await db.set_held_item(uid, mon_id, None)
-        except Exception:
-            await conn.execute("UPDATE pokemons SET held_item=NULL WHERE owner_id=? AND id=?", (uid, mon_id))
-            await conn.commit()
-            db.invalidate_pokemons_cache(uid)
 
         # Pretty print with updated usage (success path)
         prow, _, _ = await _resolve_item_fuzzy(conn, str(held))
@@ -10717,7 +10723,7 @@ def _embed_with_daycare_panel(
             try:
                 egg_icon = Image.open(str(egg_icon_path)).convert("RGBA")
                 egg_icon.thumbnail((34, 34), resample=resample_pixel)
-                egg_spots = [(255, 194), (284, 184), (313, 194)]
+                egg_spots = [(255, 220), (284, 220), (313, 220)]
                 for i in range(egg_count):
                     ex, ey = egg_spots[i]
                     egg_layer.alpha_composite(egg_icon, dest=(ex, ey))
@@ -12480,7 +12486,11 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
         ev_summary: List[Tuple["Mon", dict]] = []
 
         def _has_lucky_egg(mon_obj: Any) -> bool:
-            raw_item = str(getattr(mon_obj, "item", None) or "").strip()
+            raw_item = str(
+                getattr(mon_obj, "item", None)
+                or getattr(mon_obj, "held_item", None)
+                or ""
+            ).strip()
             if not raw_item:
                 return False
             norm_dash = raw_item.lower().replace(" ", "-").replace("_", "-")
@@ -12488,6 +12498,9 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
                 return True
             norm_snake = raw_item.lower().replace(" ", "_").replace("-", "_")
             if norm_snake in {"lucky_egg", "luckyegg"}:
+                return True
+            norm_space = raw_item.lower().replace("-", " ").replace("_", " ")
+            if norm_space in {"lucky egg"}:
                 return True
             try:
                 canon_item = _canonical_item_token(raw_item)
@@ -14955,12 +14968,11 @@ async def _route_try_force_with_ball_fallback(
 ) -> Optional[str]:
     """
     Battle button behavior:
-    - Same encounter chance as route movement.
-    - If no encounter, roll the route ball-reward system instead.
+    - Always attempt a wild encounter (100% when Battle is clicked).
+    - If no encounter possible (no encounters defined), roll the route ball-reward system instead.
     Returns an optional panel message for no-battle outcomes.
     """
-    chance = _route_move_encounter_chance()
-    if random.random() <= chance:
+    if True:  # Battle button always tries encounter first
         route_cfg = ADVENTURE_ROUTES.get(area_id, {})
         did_encounter = False
         if route_cfg.get("layout") == "maze":
@@ -15037,7 +15049,7 @@ async def _route_panel_try_wild_encounter(itx: discord.Interaction, state: dict,
         f"Wild {species.title()}",
         area_id=area_id,
         route_display_name=route_display,
-        resend_adventure_panel=False,
+        resend_adventure_panel=True,
     )
     if won is _PVE_ALREADY_IN_BATTLE:
         return True
@@ -15108,7 +15120,7 @@ async def _route_maze_try_wild_encounter(itx: discord.Interaction, state: dict, 
         f"Wild {species.title()}",
         area_id=area_id,
         route_display_name=route_display,
-        resend_adventure_panel=False,
+        resend_adventure_panel=True,
     )
     if won is _PVE_ALREADY_IN_BATTLE:
         return True
@@ -15771,7 +15783,7 @@ class _AdventureRouteViewRoute1Methods:
                 f"Wild {species.title()}",
                 area_id=self.area_id,
                 route_display_name=route_display,
-                resend_adventure_panel=False,
+                resend_adventure_panel=True,
             )
             if won is _PVE_ALREADY_IN_BATTLE:
                 return  # "You're already in a battle." was already sent; don't send a second message
@@ -24002,9 +24014,15 @@ async def _box_take_item(owner_id: str, box_no: int, box_pos: int) -> tuple[bool
         if not held_item:
             return False, f"**{species.replace('-', ' ').title()}** is not holding an item."
 
-        await conn.execute("UPDATE pokemons SET held_item=NULL WHERE owner_id=? AND id=?", (owner_id, mon_id))
+        cur2 = await conn.execute(
+            "UPDATE pokemons SET held_item=NULL WHERE owner_id=? AND id=? AND held_item IS NOT NULL",
+            (owner_id, mon_id),
+        )
         await conn.commit()
+        rows_affected = cur2.rowcount if hasattr(cur2, "rowcount") else 0
     db.invalidate_pokemons_cache(owner_id)
+    if rows_affected <= 0:
+        return False, f"**{species.replace('-', ' ').title()}** is not holding an item (may have been taken already)."
     try:
         await db.give_item(owner_id, held_item, 1)
     except Exception:
