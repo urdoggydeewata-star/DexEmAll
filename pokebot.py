@@ -12479,6 +12479,23 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
         exp_summary: List[Tuple["Mon", int, int, int]] = []
         ev_summary: List[Tuple["Mon", dict]] = []
 
+        def _has_lucky_egg(mon_obj: Any) -> bool:
+            raw_item = str(getattr(mon_obj, "item", None) or "").strip()
+            if not raw_item:
+                return False
+            norm_dash = raw_item.lower().replace(" ", "-").replace("_", "-")
+            if norm_dash in {"lucky-egg", "luckyegg"}:
+                return True
+            norm_snake = raw_item.lower().replace(" ", "_").replace("-", "_")
+            if norm_snake in {"lucky_egg", "luckyegg"}:
+                return True
+            try:
+                canon_item = _canonical_item_token(raw_item)
+            except Exception:
+                canon_item = ""
+            canon_norm = str(canon_item or "").strip().lower().replace("-", "_").replace(" ", "_")
+            return canon_norm in {"lucky_egg", "luckyegg"}
+
         def gain_for(mon_level: int, foe_level: int, base_exp: int, gen: int, trainer_bonus: bool, outsider: bool, lucky_egg: bool, affection_boost: bool, split: int) -> int:
             if gen <= 4:
                 base = (base_exp * foe_level) // 7
@@ -12508,7 +12525,7 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
             )
             total_gain = 0
             outsider = str(getattr(mon, "_owner_id", winner_id)) != str(winner_id)
-            lucky_egg = (mon.item or "").lower().replace(" ", "-") == "lucky-egg"
+            lucky_egg = _has_lucky_egg(mon)
             affection_boost = getattr(mon, "friendship", 0) >= 220
             for foe in defeated:
                 cur_dex = await conn.execute(
