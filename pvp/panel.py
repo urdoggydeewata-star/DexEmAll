@@ -6877,6 +6877,18 @@ _HEALING_ITEMS = {
     "moomoo milk": 100,
 }
 
+
+def _heal_amount_for_item(item_key: str):
+    """Get heal amount for an item (handles max_potion, max-potion, max potion, etc.)."""
+    norm = _normalize_item(item_key)
+    if norm in _HEALING_ITEMS:
+        return _HEALING_ITEMS[norm]
+    compact = norm.replace(" ", "")
+    for k, v in _HEALING_ITEMS.items():
+        if k.replace(" ", "") == compact:
+            return v
+    return 0
+
 _BALLS_BASIC = {
     "poke ball": 1.0,
     "poké ball": 1.0,
@@ -7085,7 +7097,7 @@ class _BagAllItemsView(discord.ui.View):
             return await itx.response.send_message("Invalid selection.", ephemeral=response_ephemeral)
         await itx.response.defer(ephemeral=response_ephemeral, thinking=False)
         st.lock(itx.user.id)
-        heal_amt = _HEALING_ITEMS.get(item_key, 0)
+        heal_amt = _heal_amount_for_item(item_key)
         mon = st._active(itx.user.id)
         if not mon:
             return await itx.followup.send("No active Pokémon.", ephemeral=response_ephemeral)
@@ -7098,7 +7110,7 @@ class _BagAllItemsView(discord.ui.View):
         target = mon.max_hp if heal_amt is None else min(mon.max_hp, mon.hp + heal_amt)
         mon.hp = target
         await _consume_item(itx.user.id, item_key, 1)
-        if heal_amt is None and "full restore" in item_key:
+        if heal_amt is None and "full" in item_key.lower() and "restore" in item_key.lower():
             mon.status = None
         await mv.on_done({"kind": "heal", "value": {"item": item_key, "healed": target - before}}, itx)
 
@@ -7168,7 +7180,7 @@ class _HealSelectView(discord.ui.View):
                 return
             await itx.response.defer(ephemeral=response_ephemeral, thinking=False)
             st.lock(itx.user.id)
-            heal_amt = _HEALING_ITEMS.get(item_key, 0)
+            heal_amt = _heal_amount_for_item(item_key)
             mon = st._active(itx.user.id)
             if not mon:
                 return await itx.followup.send("No active Pokémon.", ephemeral=response_ephemeral)
@@ -7184,7 +7196,7 @@ class _HealSelectView(discord.ui.View):
             # Consume item from DB
             await _consume_item(itx.user.id, item_key, 1)
             # Clear status if Full Restore
-            if heal_amt is None and "full restore" in item_key:
+            if heal_amt is None and "full" in item_key.lower() and "restore" in item_key.lower():
                 mon.status = None
             await mv.on_done({"kind": "heal", "value": {"item": item_key, "healed": target - before}}, itx)
         return _cb
