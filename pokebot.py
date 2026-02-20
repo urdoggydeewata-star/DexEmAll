@@ -7963,31 +7963,31 @@ TM_SELLER_PRICE = 500  # Coins per TM (Gen 1)
 TM_SELLER_ITEMS = [GEN1_TMS[i - 1] for i in (1, 3, 5, 6, 7, 9, 11, 12, 15, 17, 20, 21, 22, 23, 24, 31, 34, 35, 37, 40, 42, 44, 45, 49, 50)]
 
 # Route move loot-ball encounter rates (absolute percentages per roll, not normalized by table sum).
-# Repeat Ball and Timer Ball use special handling in _roll_and_give_route_move_item_async.
+# Rates raised by 1 decimal (×10). Repeat Ball and Timer Ball use special handling in _roll_and_give_route_move_item_async.
 ROUTE_MOVE_BALL_ENCOUNTER_RATES: List[Tuple[str, str, float]] = [
-    ("poke_ball", "Poké Ball", 0.9),
-    ("great_ball", "Great Ball", 0.6),
-    ("ultra_ball", "Ultra Ball", 0.2),
-    ("master_ball", "Master Ball", 0.008),
-    ("nest_ball", "Nest Ball", 0.4),
-    ("net_ball", "Net Ball", 0.4),
-    ("dive_ball", "Dive Ball", 0.4),
-    ("heal_ball", "Heal Ball", 0.4),
-    ("dusk_ball", "Dusk Ball", 0.4),
-    ("dream_ball", "Dream Ball", 0.4),
-    ("sport_ball", "Sport Ball", 0.4),
-    ("level_ball", "Level Ball", 0.4),
-    ("moon_ball", "Moon Ball", 0.4),
-    ("friend_ball", "Friend Ball", 0.4),
-    ("love_ball", "Love Ball", 0.4),
-    ("heavy_ball", "Heavy Ball", 0.4),
-    ("fast_ball", "Fast Ball", 0.4),
-    ("premier_ball", "Premier Ball", 0.4),
-    ("repeat_ball", "Repeat Ball", 0.4),
-    ("tm_ball", "TM Ball", 0.4),
-    ("great_tm_ball", "Great TM Ball", 0.4),
-    ("ultra_tm_ball", "Ultra TM Ball", 0.4),
-    ("timer_ball", "Timer Ball", 0.4),
+    ("poke_ball", "Poké Ball", 9.0),
+    ("great_ball", "Great Ball", 6.0),
+    ("ultra_ball", "Ultra Ball", 2.0),
+    ("master_ball", "Master Ball", 0.08),
+    ("nest_ball", "Nest Ball", 4.0),
+    ("net_ball", "Net Ball", 4.0),
+    ("dive_ball", "Dive Ball", 4.0),
+    ("heal_ball", "Heal Ball", 4.0),
+    ("dusk_ball", "Dusk Ball", 4.0),
+    ("dream_ball", "Dream Ball", 4.0),
+    ("sport_ball", "Sport Ball", 4.0),
+    ("level_ball", "Level Ball", 4.0),
+    ("moon_ball", "Moon Ball", 4.0),
+    ("friend_ball", "Friend Ball", 4.0),
+    ("love_ball", "Love Ball", 4.0),
+    ("heavy_ball", "Heavy Ball", 4.0),
+    ("fast_ball", "Fast Ball", 4.0),
+    ("premier_ball", "Premier Ball", 4.0),
+    ("repeat_ball", "Repeat Ball", 4.0),
+    ("tm_ball", "TM Ball", 4.0),
+    ("great_tm_ball", "Great TM Ball", 4.0),
+    ("ultra_tm_ball", "Ultra TM Ball", 4.0),
+    ("timer_ball", "Timer Ball", 4.0),
 ]
 
 ROUTE_MOVE_ITEMS_BY_BALL: Dict[str, List[Tuple[str, str, float]]] = {
@@ -19798,6 +19798,206 @@ class MPokeInfo(commands.Cog):
 
         await interaction.followup.send(embed=emb, files=files, ephemeral=True)
 
+    async def render_box_mon_mpokeinfo_panel(
+        self,
+        interaction: Interaction,
+        owner_id: str,
+        box_no: int,
+        box_pos: int,
+    ) -> tuple[bool, str | discord.File]:
+        """Render full mpokeinfo panel for a boxed Pokémon. Returns (ok, file_or_error)."""
+        async with db.session() as conn:
+            cur = await conn.execute(
+                """
+                SELECT id FROM pokemons
+                WHERE owner_id=? AND team_slot IS NULL AND box_no=? AND box_pos=?
+                LIMIT 1
+                """,
+                (owner_id, int(box_no), int(box_pos)),
+            )
+            row = await cur.fetchone()
+            await cur.close()
+        if not row:
+            return False, "No Pokémon found in that box slot."
+
+        mon_id = int(row["id"] if hasattr(row, "keys") else row[0])
+        mon = await db.get_pokemon(owner_id, mon_id)
+        if not mon:
+            return False, "Could not load Pokémon data."
+
+        species = str(mon.get("species") or "unknown")
+        level = int(mon.get("level") or 1)
+        shiny = bool(mon.get("shiny"))
+        gender = str(mon.get("gender") or "").lower()
+        current_form = mon.get("form")
+
+        try:
+            nick = await _get_pokemon_nickname(owner_id, mon_id)
+            if nick:
+                mon["nickname"] = nick
+        except Exception:
+            pass
+
+        dex_task = asyncio.create_task(ensure_species_and_learnsets(species))
+        is_locked = False
+        if mon_id > 0:
+            try:
+                is_locked = await _is_pokemon_locked(owner_id, mon_id)
+            except Exception:
+                pass
+
+        exp_to_next_val: Optional[int] = None
+        cur_exp = int(mon.get("exp") or 0)
+        exp_group = (mon.get("exp_group") or "medium_fast").strip().lower()
+        cur_level = int(mon.get("level") or 1)
+        if cur_level < 100:
+            try:
+                async with db.session() as conn:
+                    exp_next_total = await _get_exp_total_for_level(conn, exp_group, cur_level + 1)
+                    if exp_next_total is not None and exp_next_total > 0:
+                        exp_to_next_val = max(0, exp_next_total - cur_exp)
+            except Exception:
+                pass
+
+        try:
+            dex = await dex_task
+        except Exception:
+            dex = None
+
+        def _stat6(d: dict | None) -> dict:
+            d = d if isinstance(d, dict) else {}
+            def _pick(*keys: str) -> int:
+                for k in keys:
+                    try:
+                        if k in d and d.get(k) not in (None, ""):
+                            return int(float(d.get(k)))
+                    except Exception:
+                        continue
+                return 0
+            return {
+                "hp": _pick("hp"),
+                "atk": _pick("attack", "atk"),
+                "def": _pick("defense", "def", "defn"),
+                "spa": _pick("special_attack", "special-attack", "spa", "sp_atk", "spatk"),
+                "spd": _pick("special_defense", "special-defense", "spd", "sp_def", "spdef"),
+                "spe": _pick("speed", "spe"),
+            }
+
+        ivs_map = _stat6(self._as_dict(mon.get("ivs")))
+        evs_map = _stat6(self._as_dict(mon.get("evs")))
+        stats_obj = self._as_dict(mon.get("final_stats"))
+
+        def _stats_payload_to_map(payload: Any) -> dict[str, Any]:
+            raw = payload
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw) if raw else {}
+                except Exception:
+                    raw = {}
+            return dict(raw) if isinstance(raw, Mapping) else {}
+
+        try:
+            base_stats_raw: dict[str, Any] = {}
+            if isinstance(dex, Mapping):
+                base_stats_raw = _stats_payload_to_map(dex.get("stats"))
+            species_norm = _daycare_norm_species(species)
+            form_norm = str(current_form or "").strip().lower().replace("_", "-").replace(" ", "-")
+            candidates: list[str] = []
+            if form_norm and form_norm not in {"normal", "base", "default"}:
+                if form_norm.startswith(f"{species_norm}-"):
+                    candidates.append(form_norm)
+                else:
+                    candidates.append(f"{species_norm}-{form_norm}")
+                    candidates.append(form_norm)
+            candidates.append(species_norm)
+            seen_keys: set[str] = set()
+            for candidate in candidates:
+                key = str(candidate or "").strip().lower()
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                entry = await db.get_pokedex_by_name(key)
+                if not entry:
+                    continue
+                maybe_stats = _stats_payload_to_map(entry.get("stats"))
+                if maybe_stats:
+                    base_stats_raw = maybe_stats
+                    if key != species_norm:
+                        break
+            base_stats_long = normalize_base_stats(base_stats_raw)
+            if any(int(base_stats_long.get(k, 0) or 0) > 0 for k in ("hp", "attack", "defense", "special_attack", "special_defense", "speed")):
+                ivs_long = {
+                    "hp": int(ivs_map.get("hp", 0)),
+                    "attack": int(ivs_map.get("atk", 0)),
+                    "defense": int(ivs_map.get("def", 0)),
+                    "special_attack": int(ivs_map.get("spa", 0)),
+                    "special_defense": int(ivs_map.get("spd", 0)),
+                    "speed": int(ivs_map.get("spe", 0)),
+                }
+                evs_long = {
+                    "hp": int(evs_map.get("hp", 0)),
+                    "attack": int(evs_map.get("atk", 0)),
+                    "defense": int(evs_map.get("def", 0)),
+                    "special_attack": int(evs_map.get("spa", 0)),
+                    "special_defense": int(evs_map.get("spd", 0)),
+                    "speed": int(evs_map.get("spe", 0)),
+                }
+                nature_norm = str(mon.get("nature") or "hardy").strip().lower() or "hardy"
+                scaled_stats = calc_all_stats(base_stats_long, ivs_long, evs_long, int(level), nature_norm)
+                stats_obj.update(
+                    {
+                        "hp": int(scaled_stats.get("hp", 0)),
+                        "attack": int(scaled_stats.get("attack", 0)),
+                        "atk": int(scaled_stats.get("attack", 0)),
+                        "defense": int(scaled_stats.get("defense", 0)),
+                        "def": int(scaled_stats.get("defense", 0)),
+                        "defn": int(scaled_stats.get("defense", 0)),
+                        "special_attack": int(scaled_stats.get("special_attack", 0)),
+                        "special-attack": int(scaled_stats.get("special_attack", 0)),
+                        "spa": int(scaled_stats.get("special_attack", 0)),
+                        "special_defense": int(scaled_stats.get("special_defense", 0)),
+                        "special-defense": int(scaled_stats.get("special_defense", 0)),
+                        "spd": int(scaled_stats.get("special_defense", 0)),
+                        "speed": int(scaled_stats.get("speed", 0)),
+                        "spe": int(scaled_stats.get("speed", 0)),
+                    }
+                )
+        except Exception:
+            pass
+
+        hp_max = int(stats_obj.get("hp", mon.get("hp", 0))) or 1
+        types = await self._extract_types(species, mon, dex)
+        moves = self._as_list(mon.get("moves"))
+        fr = mon.get("friendship", mon.get("happiness", 0))
+        try:
+            fr = int(fr or 0)
+        except Exception:
+            fr = 0
+        fr = max(0, min(255, fr))
+
+        panel_file = await self._render_mpokeinfo_panel(
+            interaction,
+            mon,
+            species=species,
+            level=level,
+            shiny=shiny,
+            gender=gender,
+            current_form=current_form,
+            types=types,
+            exp_to_next_val=exp_to_next_val,
+            friendship_value=fr,
+            is_locked=is_locked,
+            hp_max=hp_max,
+            stats_obj=stats_obj,
+            ivs_map=ivs_map,
+            evs_map=evs_map,
+            moves=moves,
+            is_registered=False,
+        )
+        if panel_file is None:
+            return False, "Could not render mpokeinfo panel."
+        return True, panel_file
+
 async def setup(bot: commands.Bot):
     await bot.add_cog(MPokeInfo(bot))
 
@@ -24086,6 +24286,21 @@ class BoxPkModal(ui.Modal, title="Box PK Info"):
         p = _parse_box_int(str(self.pos.value))
         if not p:
             return await interaction.response.send_message("Please enter a valid slot number.", ephemeral=True)
+        cog = bot.get_cog("MPokeInfo")
+        if isinstance(cog, MPokeInfo):
+            await interaction.response.defer(ephemeral=True)
+            ok, result = await cog.render_box_mon_mpokeinfo_panel(interaction, self.owner_id, self.box_no, int(p))
+            if ok:
+                try:
+                    await interaction.followup.send(file=result, ephemeral=True)
+                finally:
+                    try:
+                        if hasattr(result, "close"):
+                            result.close()
+                    except Exception:
+                        pass
+                return
+            return await interaction.followup.send(f"❌ {result}", ephemeral=True)
         ok, payload = await _box_mon_info_payload(self.owner_id, self.box_no, int(p))
         if not ok:
             return await interaction.response.send_message(f"❌ {payload}", ephemeral=True)
@@ -24289,7 +24504,7 @@ async def boxtake_command(
     await interaction.followup.send(("✅ " if changed else "❌ ") + out, ephemeral=True)
 
 
-@bot.tree.command(name="boxpk", description="View mypokeinfo-style details for a boxed Pokémon.")
+@bot.tree.command(name="boxpk", description="View mpokeinfo-style details for a boxed Pokémon.")
 @app_commands.describe(box_no="Box number", pos="Slot position")
 async def boxpk_command(
     interaction: discord.Interaction,
@@ -24301,6 +24516,20 @@ async def boxpk_command(
     ok, msg, _count, _cap = await _validate_box_and_slot(owner_id, int(box_no), slot=int(pos))
     if not ok:
         return await interaction.followup.send(f"❌ {msg}", ephemeral=True)
+    cog = bot.get_cog("MPokeInfo")
+    if isinstance(cog, MPokeInfo):
+        ok, result = await cog.render_box_mon_mpokeinfo_panel(interaction, owner_id, int(box_no), int(pos))
+        if ok:
+            try:
+                await interaction.followup.send(file=result, ephemeral=True)
+            finally:
+                try:
+                    if hasattr(result, "close"):
+                        result.close()
+                except Exception:
+                    pass
+            return
+        return await interaction.followup.send(f"❌ {result}", ephemeral=True)
     ok, payload = await _box_mon_info_payload(owner_id, int(box_no), int(pos))
     if not ok:
         return await interaction.followup.send(f"❌ {payload}", ephemeral=True)
