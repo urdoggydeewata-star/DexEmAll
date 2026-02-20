@@ -6342,8 +6342,9 @@ class _MoveButton(discord.ui.Button):
             else:
                 move_display = self._move_name
             
+            move_display_text = _format_move_name(str(move_display or self._move_name))
             # Send response and register choice - if either fails, unlock the player
-            await itx.response.send_message(f"Selected **{move_display}**.", ephemeral=True)
+            await itx.response.send_message(f"✅ Move selected: **{move_display_text}**.", ephemeral=True)
             await self._on_done(move_choice, itx)
         except Exception as e:
             # If an error occurs, unlock the player so they can try again

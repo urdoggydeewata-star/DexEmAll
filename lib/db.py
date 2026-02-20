@@ -9,6 +9,7 @@ import datetime as dt
 from contextlib import asynccontextmanager
 from typing import Optional, Sequence, List, Dict, Any, Tuple, List
 import re
+from .market_catalog import resolve_market_key as _catalog_resolve_market_key
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 _env = _ROOT / ".env"
@@ -993,6 +994,35 @@ BAG_ITEMS_PER_PAGE = 24
 _BAG_CACHE_LIMIT = 2000  # max rows to cache per owner for get_inventory_page
 
 
+def _normalize_bag_item_id(item_id: Any) -> str:
+    raw = str(item_id or "").strip().lower()
+    if not raw:
+        return ""
+    token = re.sub(r"[\s\-]+", "_", raw)
+    token = re.sub(r"[^a-z0-9_]", "", token)
+    if not token:
+        return raw
+    try:
+        resolved = _catalog_resolve_market_key(token)
+    except Exception:
+        resolved = token
+    if resolved in {"pokeball", "pok_ball", "poke_ball"}:
+        return "poke_ball"
+    # PP items often appear in multiple alias styles across old rows.
+    if resolved in {"ppmax", "pp_max"}:
+        return "pp_max"
+    if resolved in {"ppup", "pp_up"}:
+        return "pp_up"
+    if resolved in {"maxether", "max_ether"}:
+        return "max_ether"
+    if resolved in {"maxelixir", "max_elixir"}:
+        return "max_elixir"
+    # Only rewrite when resolver actually mapped an alias.
+    if resolved != token:
+        return resolved
+    return raw
+
+
 def invalidate_bag_cache(owner_id: str) -> None:
     """Invalidate cached bag for an owner. Call after any raw SQL that changes user_items for this owner."""
     if _CACHE_ENABLED and db_cache is not None:
@@ -1104,6 +1134,37 @@ async def get_inventory_page(
         "icon_url": r["icon_url"],
     } for r in rows]
 
+    if items_full:
+        merged: Dict[str, Dict[str, Any]] = {}
+        for row in items_full:
+            canonical_id = _normalize_bag_item_id(row.get("item_id"))
+            if not canonical_id:
+                canonical_id = str(row.get("item_id") or "")
+            bucket = merged.get(canonical_id)
+            if bucket is None:
+                bucket = dict(row)
+                bucket["item_id"] = canonical_id
+                merged[canonical_id] = bucket
+            else:
+                bucket["qty"] = int(bucket.get("qty") or 0) + int(row.get("qty") or 0)
+                # Prefer a readable display name when one side is just raw ID.
+                bucket_name = str(bucket.get("name") or "")
+                row_name = str(row.get("name") or "")
+                if (not bucket_name or bucket_name.lower() == str(bucket.get("item_id") or "").lower()) and row_name:
+                    bucket["name"] = row_name
+                if not bucket.get("emoji") and row.get("emoji"):
+                    bucket["emoji"] = row.get("emoji")
+                if not bucket.get("icon_url") and row.get("icon_url"):
+                    bucket["icon_url"] = row.get("icon_url")
+        items_full = sorted(
+            merged.values(),
+            key=lambda d: (
+                (d.get("name") is None),
+                str(d.get("name") or "").lower(),
+                str(d.get("item_id") or "").lower(),
+            ),
+        )
+
     if _CACHE_ENABLED and db_cache is not None:
         try:
             db_cache.set_cached_bag(uid, items_full)
@@ -1134,6 +1195,7 @@ async def give_item(owner_id: str, item_id: str, qty: int) -> int:
     """
     conn = await connect()
     try:
+        item_id = _normalize_bag_item_id(item_id) or str(item_id or "").strip().lower()
         cur = await conn.execute(
             "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
             (owner_id, item_id)

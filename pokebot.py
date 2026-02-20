@@ -3167,7 +3167,7 @@ COIN = "🪙"
 PKDollar_NAME = "PokéDollars"
 
 def _norm_item_query(s: str) -> str:
-    return re.sub(r"[^a-z0-9_]", "", re.sub(r"[\s\-]+", "_", s.strip().lower()))
+    return _canonical_item_token(s)
 
 async def _fetch_item_by_query(conn, q: str) -> dict | None:
     """Find by id or english name (case-insensitive). Uses item cache when available."""
@@ -3199,13 +3199,24 @@ async def _fetch_item_by_query(conn, q: str) -> dict | None:
     return None
 
 async def _user_item_qty(conn, owner_id: str, item_id: str) -> int:
+    aliases = _item_alias_tokens(item_id)
+    if not aliases:
+        base = _canonical_item_token(item_id) or _normalize_item_token(item_id)
+        aliases = [base] if base else []
+    if not aliases:
+        return 0
+    placeholders = ", ".join("?" for _ in aliases)
     cur = await conn.execute(
-        "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
-        (owner_id, item_id)
+        f"SELECT COALESCE(SUM(qty), 0) AS qty_total FROM user_items "
+        f"WHERE owner_id=? AND LOWER(REPLACE(item_id, '-', '_')) IN ({placeholders})",
+        (owner_id, *aliases)
     )
     row = await cur.fetchone()
     await cur.close()
-    return int(row["qty"]) if row else 0
+    try:
+        return int((row.get("qty_total") if hasattr(row, "keys") else (row[0] if row else 0)) or 0)
+    except Exception:
+        return 0
 
 
 async def _user_money(conn, owner_id: str) -> int:
@@ -3288,24 +3299,9 @@ async def _decrement_user_item(owner_id: str, item_id: str, amount: int = 1) -> 
     """
     conn = await db.connect()
     try:
-        cur = await conn.execute(
-            "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
-            (owner_id, item_id),
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        qty = (row["qty"] if hasattr(row, "keys") else row[0]) if row else 0
-        try:
-            qty = int(qty or 0)
-        except Exception:
-            qty = 0
-        if qty < amount:
+        ok = await _bag_adjust_conn(conn, str(owner_id), str(item_id), -int(amount))
+        if not ok:
             return False
-        new_qty = qty - amount
-        await conn.execute(
-            "UPDATE user_items SET qty=? WHERE owner_id=? AND item_id=?",
-            (new_qty, owner_id, item_id),
-        )
         await conn.commit()
         db.invalidate_bag_cache(owner_id)
         return True
@@ -3321,14 +3317,22 @@ async def _get_item_qty(owner_id: str, item_id: str, conn=None) -> int:
     if own_conn:
         conn = await db.connect()
     try:
+        aliases = _item_alias_tokens(item_id)
+        if not aliases:
+            base = _canonical_item_token(item_id) or _normalize_item_token(item_id)
+            aliases = [base] if base else []
+        if not aliases:
+            return 0
+        placeholders = ", ".join("?" for _ in aliases)
         cur = await conn.execute(
-            "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
-            (owner_id, item_id),
+            f"SELECT COALESCE(SUM(qty), 0) AS qty_total FROM user_items "
+            f"WHERE owner_id=? AND LOWER(REPLACE(item_id, '-', '_')) IN ({placeholders})",
+            (owner_id, *aliases),
         )
         row = await cur.fetchone()
         await cur.close()
         try:
-            return int((row["qty"] if hasattr(row, "keys") else (row[0] if row else 0)) or 0)
+            return int((row.get("qty_total") if hasattr(row, "keys") else (row[0] if row else 0)) or 0)
         except Exception:
             return 0
     finally:
@@ -3373,14 +3377,22 @@ async def _count_item_in_use(owner_id: str, item_id: str, conn=None) -> int:
     if own_conn:
         conn = await db.connect()
     try:
+        aliases = _item_alias_tokens(item_id)
+        if not aliases:
+            base = _canonical_item_token(item_id) or _normalize_item_token(item_id)
+            aliases = [base] if base else []
+        if not aliases:
+            return 0
+        placeholders = ", ".join("?" for _ in aliases)
         cur = await conn.execute(
-            "SELECT COUNT(*) FROM pokemons WHERE owner_id=? AND held_item=?",
-            (owner_id, item_id),
+            f"SELECT COUNT(*) AS used_total FROM pokemons "
+            f"WHERE owner_id=? AND LOWER(REPLACE(COALESCE(held_item, ''), '-', '_')) IN ({placeholders})",
+            (owner_id, *aliases),
         )
         row = await cur.fetchone()
         await cur.close()
         try:
-            return int((row[0] if row else 0) or 0)
+            return int((row.get("used_total") if hasattr(row, "keys") else (row[0] if row else 0)) or 0)
         except Exception:
             return 0
     finally:
@@ -3396,17 +3408,8 @@ async def _get_usage(owner_id: str, item_id: str, conn=None) -> tuple[int, int]:
     if own_conn:
         conn = await db.connect()
     try:
-        cur = await conn.execute("""
-            SELECT
-                COALESCE((SELECT qty FROM user_items WHERE owner_id=? AND item_id=? LIMIT 1), 0) AS total,
-                (SELECT COUNT(*) FROM pokemons WHERE owner_id=? AND held_item=?) AS used
-        """, (owner_id, item_id, owner_id, item_id))
-        row = await cur.fetchone()
-        await cur.close()
-        if not row:
-            return 0, 0
-        total = int((row["total"] if hasattr(row, "keys") else row[0]) or 0)
-        used = int((row["used"] if hasattr(row, "keys") else row[1]) or 0)
+        total = int(await _get_item_qty(str(owner_id), str(item_id), conn=conn))
+        used = int(await _count_item_in_use(str(owner_id), str(item_id), conn=conn))
         return used, total
     except Exception:
         return 0, 0
@@ -3428,6 +3431,26 @@ def _item_category_is_consumable(category: Any) -> bool:
     return "consum" in c
 
 
+_CONSUMABLE_ITEM_ID_OVERRIDES: frozenset[str] = frozenset(
+    {
+        "ether",
+        "max_ether",
+        "elixir",
+        "max_elixir",
+        "pp_up",
+        "pp_max",
+    }
+)
+
+
+def _item_forces_consumable(item_id: Any) -> bool:
+    try:
+        canon = _canonical_item_token(str(item_id or ""))
+    except Exception:
+        canon = str(item_id or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return canon in _CONSUMABLE_ITEM_ID_OVERRIDES
+
+
 async def _item_is_consumable_conn(conn, item_id: str) -> bool:
     try:
         cur = await conn.execute("SELECT category FROM items WHERE id=? LIMIT 1", (str(item_id),))
@@ -3447,27 +3470,53 @@ async def _bag_adjust_conn(conn, owner_id: str, item_id: str, delta: int) -> boo
     d = int(delta or 0)
     if d == 0:
         return True
+    canonical_item_id = _canonical_item_token(str(item_id)) or _normalize_item_token(item_id)
+    if not canonical_item_id:
+        return False
+    aliases = _item_alias_tokens(canonical_item_id)
+    if not aliases:
+        aliases = [canonical_item_id]
+    placeholders = ", ".join("?" for _ in aliases)
     cur = await conn.execute(
-        "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
-        (str(owner_id), str(item_id)),
+        f"SELECT item_id, qty FROM user_items "
+        f"WHERE owner_id=? AND LOWER(REPLACE(item_id, '-', '_')) IN ({placeholders})",
+        (str(owner_id), *aliases),
     )
-    row = await cur.fetchone()
+    rows = await cur.fetchall()
     await cur.close()
-    old_qty = int((row["qty"] if hasattr(row, "keys") else (row[0] if row else 0)) or 0)
-    new_qty = old_qty + d
+    if rows:
+        try:
+            seen_ids: list[str] = []
+            for row in rows:
+                rid = str((row["item_id"] if hasattr(row, "keys") else row[0]) or "").strip()
+                if rid:
+                    seen_ids.append(rid)
+            if seen_ids and all(str(canonical_item_id) != rid for rid in seen_ids):
+                canon_norm = _normalize_item_token(canonical_item_id)
+                for rid in seen_ids:
+                    if _normalize_item_token(rid) == canon_norm:
+                        canonical_item_id = rid
+                        break
+        except Exception:
+            pass
+    old_qty = 0
+    for row in rows or []:
+        try:
+            old_qty += int((row["qty"] if hasattr(row, "keys") else row[1]) or 0)
+        except Exception:
+            continue
+    new_qty = int(old_qty + d)
     if new_qty < 0:
         return False
-    if row:
+    await conn.execute(
+        f"DELETE FROM user_items WHERE owner_id=? AND LOWER(REPLACE(item_id, '-', '_')) IN ({placeholders})",
+        (str(owner_id), *aliases),
+    )
+    if new_qty > 0:
         await conn.execute(
-            "UPDATE user_items SET qty=? WHERE owner_id=? AND item_id=?",
-            (new_qty, str(owner_id), str(item_id)),
-        )
-    else:
-        if new_qty <= 0:
-            return False
-        await conn.execute(
-            "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,?)",
-            (str(owner_id), str(item_id), new_qty),
+            "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,?) "
+            "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty=excluded.qty",
+            (str(owner_id), str(canonical_item_id), int(new_qty)),
         )
     return True
 
@@ -3555,13 +3604,20 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
         give_id = row["id"]
         if not give_id:
             return await interaction.followup.send("❌ Invalid item.", ephemeral=True)
-        
+
         # Convert Row to dict for .get() method
         row_dict = dict(row)
+        canonical_give_id = _canonical_item_token(give_id) or str(give_id)
+        if canonical_give_id and canonical_give_id != str(give_id):
+            canonical_row = await _fetch_item_by_query(conn, canonical_give_id)
+            if canonical_row:
+                give_id = canonical_give_id
+                row_dict = dict(canonical_row)
+
         give_emoji_raw = (row_dict.get("emoji") or "").strip()
         give_emoji = give_emoji_raw if _is_displayable_item_emoji(give_emoji_raw) else ""
         give_disp = pretty_item_name(row_dict.get("name") or row_dict.get("id") or item)
-        give_is_consumable = _item_category_is_consumable(row_dict.get("category"))
+        give_is_consumable = _item_category_is_consumable(row_dict.get("category")) or _item_forces_consumable(give_id)
         # Show autocorrect if the matched item is different from what user typed
         ac_suffix = f" _(autocorrected to {give_disp})_" if item.lower().replace(" ", "-") != give_id.lower() else ""
 
@@ -3603,7 +3659,7 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
         current_held = (hold_row["held_item"] if hasattr(hold_row, "keys") else (hold_row[0] if hold_row else None)) or None
 
         # Check if already holding the same item
-        if current_held and str(current_held).lower() == give_id.lower():
+        if current_held and _canonical_item_token(current_held) == _canonical_item_token(give_id):
             usage = await _stock_text(give_id, consumable=give_is_consumable)
             return await interaction.followup.send(
                 f"ℹ️ **{mon_name}** already holds {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** (**{usage}**).{ac_suffix}",
@@ -3645,7 +3701,7 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
         pemoji_raw = (prow.get("emoji") if prow else "") or ""
         pemoji = pemoji_raw if _is_displayable_item_emoji(pemoji_raw) else ""
         pdisp = pretty_item_name(prow.get("name") if prow else str(current_held))
-        current_is_consumable = _item_category_is_consumable((prow or {}).get("category"))
+        current_is_consumable = _item_category_is_consumable((prow or {}).get("category")) or _item_forces_consumable(current_held)
         if not current_is_consumable and current_held:
             # Fallback if category metadata is missing from cache/fuzzy row.
             current_is_consumable = await _item_is_consumable_conn(conn, str(current_held))
@@ -3691,9 +3747,7 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
                             view=None
                         )
 
-                # Return previous held consumable to bag when unequipping.
-                if current_is_consumable and current_held:
-                    await _bag_adjust_conn(conn, uid, str(current_held), 1)
+                # Consumables are spent when equipped and are not returned on unequip.
 
                 await conn.execute("UPDATE pokemons SET held_item=? WHERE owner_id=? AND id=?", (give_id, uid, mon_id))
                 await conn.commit()
@@ -3730,7 +3784,7 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
 
 @bot.tree.command(
     name="take",
-    description="Take the held item from a team Pokémon back to your free pool (does not consume)."
+    description="Take a held item from a team Pokémon. Consumables are not returned to bag."
 )
 @app_commands.describe(
     name="Pokémon species (e.g., garchomp)",
@@ -3756,14 +3810,22 @@ async def take_item(interaction: discord.Interaction, name: str, slot: int | Non
                 f"ℹ️ **{mon['species'].title()}** isn’t holding anything.", ephemeral=True
             )
 
-        # Add the item back to the user's bag before removing it from the Pokémon
-        await conn.execute(
-            "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,1) "
-            "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = user_items.qty + 1;",
-            (uid, str(held))
-        )
-        await conn.commit()
-        db.invalidate_bag_cache(uid)
+        held_is_consumable = _item_forces_consumable(held)
+        if not held_is_consumable:
+            try:
+                held_is_consumable = await _item_is_consumable_conn(conn, str(held))
+            except Exception:
+                held_is_consumable = _item_forces_consumable(held)
+
+        # Non-consumables return to bag. Consumables are spent on equip and don't return.
+        if not held_is_consumable:
+            await conn.execute(
+                "INSERT INTO user_items(owner_id, item_id, qty) VALUES(?,?,1) "
+                "ON CONFLICT(owner_id, item_id) DO UPDATE SET qty = user_items.qty + 1;",
+                (uid, str(_canonical_item_token(held) or held))
+            )
+            await conn.commit()
+            db.invalidate_bag_cache(uid)
 
         # Now remove it from the Pokémon
         try:
@@ -3778,13 +3840,19 @@ async def take_item(interaction: discord.Interaction, name: str, slot: int | Non
         pemoji_raw = (prow.get("emoji") if prow else "") or ""
         pemoji = pemoji_raw if _is_displayable_item_emoji(pemoji_raw) else ""
         pdisp  = pretty_item_name(prow.get("name") if prow else str(held))
-        usage  = await _usage_str(uid, str(held), conn)
-
-        await interaction.followup.send(
-            f"✅ Took {(pemoji + ' ') if pemoji else ''}**{pdisp}** from **{mon['species'].title()}** "
-            f"(now **{usage}** in use).",
-            ephemeral=True
-        )
+        if held_is_consumable:
+            await interaction.followup.send(
+                f"✅ Removed {(pemoji + ' ') if pemoji else ''}**{pdisp}** from **{mon['species'].title()}**.\n"
+                f"ℹ️ This item is consumable, so it was not returned to your bag.",
+                ephemeral=True,
+            )
+        else:
+            usage = await _usage_str(uid, str(held), conn)
+            await interaction.followup.send(
+                f"✅ Took {(pemoji + ' ') if pemoji else ''}**{pdisp}** from **{mon['species'].title()}** "
+                f"(now **{usage}** in use).",
+                ephemeral=True
+            )
     except Exception as e:
         return await interaction.followup.send(f"❌ Failed to take item: {e}", ephemeral=True)
     finally:
@@ -3879,24 +3947,9 @@ async def item_cmd(interaction: discord.Interaction, name: str):
         item_id = row["id"]
         price = int(row.get("price") or 0)
 
-        # ✅ How many of THIS item the user already has (read from user_items; fallback to legacy inventory)
+        # ✅ Alias-aware quantity lookup (collapses legacy ids like pokeball/poke_ball).
         uid = str(interaction.user.id)
-        cur = await conn.execute(
-            "SELECT qty FROM user_items WHERE owner_id=? AND item_id=?",
-            (uid, item_id)
-        )
-        r = await cur.fetchone(); await cur.close()
-        if r is None:
-            # backward-compat (old schema)
-            try:
-                cur = await conn.execute(
-                    "SELECT qty FROM inventory WHERE owner_id=? AND item_id=?",
-                    (uid, item_id)
-                )
-                r = await cur.fetchone(); await cur.close()
-            except Exception:
-                r = None
-        have_qty = int(r[0]) if r else 0
+        have_qty = await _user_item_qty(conn, uid, item_id)
 
         # Build embed (per-unit price is shown inside)
         embed = build_item_embed(row, interaction.user.id, price, have_qty)
@@ -17159,6 +17212,45 @@ class MPokeInfo(commands.Cog):
             theme_fill = (236, 244, 248, 255)
             theme_shadow = (0, 0, 0, 220)
 
+        cache_payload = {
+            "panel": "mpokeinfo-front-v3",
+            "mon_id": int(mon.get("id") or 0),
+            "species": str(species or "").strip().lower(),
+            "level": int(level or 1),
+            "shiny": int(bool(shiny)),
+            "gender": str(gender or "").strip().lower(),
+            "form": str(current_form or "").strip().lower(),
+            "types": [str(t or "").strip().lower() for t in list(types or [])[:2]],
+            "exp_to_next": None if exp_to_next_val is None else int(exp_to_next_val),
+            "friendship": int(friendship_value or 0),
+            "locked": int(bool(is_locked)),
+            "hp_max": int(hp_max or 1),
+            "hp_now": int(mon.get("hp_now") or 0),
+            "nature": str(mon.get("nature") or ""),
+            "ability": str(mon.get("ability") or ""),
+            "held_item": str(mon.get("held_item") or ""),
+            "pokeball": str(mon.get("pokeball") or ""),
+            "nickname": str(mon.get("nickname") or ""),
+            "moves": [str(m or "").strip().lower() for m in list(moves or [])[:4]],
+            "ivs": dict(ivs_map or {}),
+            "evs": dict(evs_map or {}),
+            "stats": dict(stats_obj or {}),
+            "use_back_sprite": int(bool(use_back_sprite)),
+            "registered_theme": int(bool(is_registered)),
+            "ot_name": str(getattr(interaction.user, "display_name", "") or ""),
+        }
+        cache_raw = json.dumps(cache_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+        cache_key = hashlib.sha1(cache_raw.encode("utf-8")).hexdigest()
+        cached_render = _binary_render_cache_get(
+            _MPOKEINFO_RENDER_CACHE,
+            cache_key,
+            ttl_seconds=MPOKEINFO_RENDER_CACHE_TTL_SECONDS,
+        )
+        if cached_render is not None:
+            cached_data, cached_ext = cached_render
+            cached_filename = f"mpokeinfo_{int(mon.get('id') or 0)}.{cached_ext}"
+            return discord.File(fp=BytesIO(cached_data), filename=cached_filename)
+
         def _pt(x: int, y: int) -> tuple[int, int]:
             return int(round(x * sx)), int(round(y * sy))
 
@@ -17911,6 +18003,14 @@ class MPokeInfo(commands.Cog):
                         )
                     except Exception:
                         return None
+                    data = out.getvalue()
+                    _binary_render_cache_set(
+                        _MPOKEINFO_RENDER_CACHE,
+                        cache_key,
+                        data,
+                        "gif",
+                        max_entries=MPOKEINFO_RENDER_CACHE_MAX_ENTRIES,
+                    )
                     out.seek(0)
                     filename = f"mpokeinfo_{int(mon.get('id') or 0)}.gif"
                     return discord.File(fp=out, filename=filename)
@@ -17927,6 +18027,14 @@ class MPokeInfo(commands.Cog):
             panel_static.save(out, format="PNG")
         except Exception:
             return None
+        data = out.getvalue()
+        _binary_render_cache_set(
+            _MPOKEINFO_RENDER_CACHE,
+            cache_key,
+            data,
+            "png",
+            max_entries=MPOKEINFO_RENDER_CACHE_MAX_ENTRIES,
+        )
         out.seek(0)
         filename = f"mpokeinfo_{int(mon.get('id') or 0)}.png"
         return discord.File(fp=out, filename=filename)
@@ -17993,6 +18101,63 @@ class MPokeInfo(commands.Cog):
         else:
             theme_fill = (242, 246, 250, 255)
             theme_shadow = (0, 0, 0, 220)
+
+        profile_keys_int = [
+            "most_used_move_count",
+            "times_traded",
+            "eggs_bred",
+            "total_routes",
+            "total_exp_gained",
+            "pokemon_beat",
+            "shinies_killed",
+            "legendaries_killed",
+            "raids_won",
+            "raids_lost",
+            "battles_won",
+            "battles_lost",
+            "ribbons",
+        ]
+        profile_snapshot: dict[str, int | str] = {
+            "most_used_move": str(profile.get("most_used_move") or ""),
+        }
+        for k in profile_keys_int:
+            try:
+                profile_snapshot[k] = int(profile.get(k, 0) or 0)
+            except Exception:
+                profile_snapshot[k] = 0
+        register_cache_payload = {
+            "panel": "register-back-v3",
+            "mon_id": int(mon.get("id") or 0),
+            "species": str(species or "").strip().lower(),
+            "level": int(level or 1),
+            "shiny": int(bool(shiny)),
+            "gender": str(gender or "").strip().lower(),
+            "form": str(current_form or "").strip().lower(),
+            "types": [str(t or "").strip().lower() for t in list(types or [])[:2]],
+            "profile": profile_snapshot,
+            "use_back_sprite": int(bool(use_back_sprite)),
+            "is_registered": int(bool(is_registered)),
+            "ot_name": str(getattr(interaction.user, "display_name", "") or ""),
+        }
+        register_cache_raw = json.dumps(
+            register_cache_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        register_cache_key = hashlib.sha1(register_cache_raw.encode("utf-8")).hexdigest()
+        cached_render = _binary_render_cache_get(
+            _REGISTER_PANEL_RENDER_CACHE,
+            register_cache_key,
+            ttl_seconds=REGISTER_PANEL_RENDER_CACHE_TTL_SECONDS,
+        )
+        if cached_render is not None:
+            cached_data, cached_ext = cached_render
+            return discord.File(
+                fp=BytesIO(cached_data),
+                filename=f"register_{int(mon.get('id') or 0)}.{cached_ext}",
+            )
         draw_probe = ImageDraw.Draw(base)
 
         def _pt(x: float, y: float) -> tuple[int, int]:
@@ -18427,6 +18592,14 @@ class MPokeInfo(commands.Cog):
                     )
                 except Exception:
                     return None
+                data = out.getvalue()
+                _binary_render_cache_set(
+                    _REGISTER_PANEL_RENDER_CACHE,
+                    register_cache_key,
+                    data,
+                    "gif",
+                    max_entries=REGISTER_PANEL_RENDER_CACHE_MAX_ENTRIES,
+                )
                 out.seek(0)
                 return discord.File(fp=out, filename=f"register_{int(mon.get('id') or 0)}.gif")
 
@@ -18443,6 +18616,14 @@ class MPokeInfo(commands.Cog):
             panel_static.save(out, format="PNG")
         except Exception:
             return None
+        data = out.getvalue()
+        _binary_render_cache_set(
+            _REGISTER_PANEL_RENDER_CACHE,
+            register_cache_key,
+            data,
+            "png",
+            max_entries=REGISTER_PANEL_RENDER_CACHE_MAX_ENTRIES,
+        )
         out.seek(0)
         return discord.File(fp=out, filename=f"register_{int(mon.get('id') or 0)}.png")
 
@@ -18704,7 +18885,13 @@ class MPokeInfo(commands.Cog):
             msg = f"ℹ️ **{species.replace('-', ' ').title()}** is already registered. Showing current tracker card."
 
         if panel_file is not None:
-            await interaction.followup.send(content=msg, file=panel_file, ephemeral=False)
+            try:
+                await interaction.followup.send(content=msg, file=panel_file, ephemeral=False)
+            finally:
+                try:
+                    panel_file.close()
+                except Exception:
+                    pass
         else:
             await interaction.followup.send(content=msg, ephemeral=False)
 
@@ -18953,30 +19140,36 @@ class MPokeInfo(commands.Cog):
             is_registered=is_registered_mon,
         )
         if panel_file is not None:
-            if is_registered_mon:
-                view = _MPokeInfoFlipView(
-                    self,
-                    owner_user_id=interaction.user.id,
-                    mon=mon,
-                    species=species,
-                    level=level,
-                    shiny=shiny,
-                    gender=gender,
-                    current_form=current_form,
-                    types=types,
-                    exp_to_next_val=exp_to_next_val,
-                    friendship_value=fr,
-                    is_locked=is_locked,
-                    hp_max=hp_max,
-                    stats_obj=stats_obj,
-                    ivs_map=ivs_map,
-                    evs_map=evs_map,
-                    moves=moves,
-                    register_profile=register_profile or {},
-                )
-                await interaction.followup.send(file=panel_file, view=view, ephemeral=True)
-            else:
-                await interaction.followup.send(file=panel_file, ephemeral=True)
+            try:
+                if is_registered_mon:
+                    view = _MPokeInfoFlipView(
+                        self,
+                        owner_user_id=interaction.user.id,
+                        mon=mon,
+                        species=species,
+                        level=level,
+                        shiny=shiny,
+                        gender=gender,
+                        current_form=current_form,
+                        types=types,
+                        exp_to_next_val=exp_to_next_val,
+                        friendship_value=fr,
+                        is_locked=is_locked,
+                        hp_max=hp_max,
+                        stats_obj=stats_obj,
+                        ivs_map=ivs_map,
+                        evs_map=evs_map,
+                        moves=moves,
+                        register_profile=register_profile or {},
+                    )
+                    await interaction.followup.send(file=panel_file, view=view, ephemeral=True)
+                else:
+                    await interaction.followup.send(file=panel_file, ephemeral=True)
+            finally:
+                try:
+                    panel_file.close()
+                except Exception:
+                    pass
             return
 
         files: List[discord.File] = []
@@ -19291,12 +19484,65 @@ async def pkname_command(
     )
 
 ## Friendship :
+def _normalize_item_token(s: Any) -> str:
+    token = str(s or "").strip().lower()
+    token = re.sub(r"[\s\-]+", "_", token)
+    token = re.sub(r"[^a-z0-9_]", "", token)
+    return token
+
+
+def _canonical_item_token(s: Any) -> str:
+    raw = str(s or "").strip().lower()
+    token = _normalize_item_token(raw)
+    if not token:
+        return ""
+    # First use market alias rules so catalog aliases collapse (pokeball -> poke_ball, etc.).
+    try:
+        resolved = _catalog_resolve_market_key(token)
+    except Exception:
+        resolved = token
+    token = resolved
+    # Collapse known Poké Ball legacy aliases.
+    if token in {"pokeball", "pok_ball", "poke_ball"}:
+        token = "poke_ball"
+    # Collapse PP item aliases (pp-max, ppmax -> pp_max, etc.).
+    try:
+        pp_canon = _canonical_pp_item_id(token)
+        if pp_canon:
+            token = pp_canon
+    except Exception:
+        pass
+    # Preserve TM/HM-style IDs that intentionally use hyphens in storage.
+    if raw and " " not in raw and token == _normalize_item_token(raw):
+        if raw.startswith("tm-") or raw.startswith("hm-"):
+            return raw
+    return token
+
+
+def _item_alias_tokens(item_id: Any) -> list[str]:
+    canonical = _canonical_item_token(item_id)
+    if not canonical:
+        return []
+    aliases: set[str] = {_normalize_item_token(canonical)}
+    try:
+        for v in _catalog_market_item_variants(canonical):
+            aliases.add(_normalize_item_token(v))
+    except Exception:
+        pass
+    if canonical == "poke_ball":
+        aliases.update({"poke_ball", "pokeball", "pok_ball"})
+    # Include PP aliases so bag/use counts merge old rows.
+    try:
+        for a in (_PP_ITEM_ALIASES.get(canonical, ()) or ()):
+            aliases.add(_normalize_item_token(a))
+    except Exception:
+        pass
+    return sorted(a for a in aliases if a)
+
+
 def item_id_from_user(s: str) -> str:
-    """Normalize user text -> canonical item id (lowercase + underscores)."""
-    s = s.strip().lower()
-    s = re.sub(r"[\s\-]+", "_", s)
-    s = re.sub(r"[^a-z0-9_]", "", s)
-    return s
+    """Normalize user text -> canonical item id."""
+    return _canonical_item_token(s)
 def pretty_item(item_id: str | None) -> str:
     if not item_id:
         return "None"
@@ -19360,7 +19606,7 @@ def _pp_parse_int_list(
 
 
 def _canonical_pp_item_id(item_query: str | None) -> str:
-    token = item_id_from_user(str(item_query or ""))
+    token = _normalize_item_token(str(item_query or ""))
     compact = token.replace("_", "")
     for canon, aliases in _PP_ITEM_ALIASES.items():
         for alias in aliases:
@@ -20115,7 +20361,7 @@ TEAM_MAX_FRAME_DURATION_MS = TEAM_BATTLE_SYNC_DURATION_MS
 TEAM_MAX_SPRITE_FRAMES = 128
 TEAM_MAX_COMPOSITE_FRAMES = 128
 TEAM_FETCH_SHOWDOWN_FOR_TEAM = False
-TEAM_OVERVIEW_CACHE_TTL_SECONDS = 12.0
+TEAM_OVERVIEW_CACHE_TTL_SECONDS = 180.0
 TEAM_WARM_CACHE_INTERVAL_SECONDS = 120.0
 TEAM_SLOT_LAYOUT: tuple[dict[str, tuple[int, int]], ...] = (
     {"box_xy": (236, 93), "box_wh": (177, 197), "sprite_c": (324, 173), "label_xy": (242, 243), "level_right": (402, 243)},
@@ -20144,6 +20390,51 @@ TEAM_EGG_STAGE_LABELS: tuple[str, ...] = (
 
 _TEAM_OVERVIEW_RENDER_CACHE: dict[str, tuple[float, bytes, str]] = {}
 _TEAM_WARM_CACHE_TS: dict[str, float] = {}
+
+MPOKEINFO_RENDER_CACHE_TTL_SECONDS = 120.0
+MPOKEINFO_RENDER_CACHE_MAX_ENTRIES = 64
+_MPOKEINFO_RENDER_CACHE: dict[str, tuple[float, bytes, str]] = {}
+
+REGISTER_PANEL_RENDER_CACHE_TTL_SECONDS = 120.0
+REGISTER_PANEL_RENDER_CACHE_MAX_ENTRIES = 64
+_REGISTER_PANEL_RENDER_CACHE: dict[str, tuple[float, bytes, str]] = {}
+
+
+def _binary_render_cache_get(
+    cache: dict[str, tuple[float, bytes, str]],
+    key: str,
+    *,
+    ttl_seconds: float,
+) -> tuple[bytes, str] | None:
+    entry = cache.get(str(key))
+    if not entry:
+        return None
+    ts, data, ext = entry
+    if (float(time.time()) - float(ts)) > float(ttl_seconds):
+        cache.pop(str(key), None)
+        return None
+    if not data:
+        cache.pop(str(key), None)
+        return None
+    return data, ext
+
+
+def _binary_render_cache_set(
+    cache: dict[str, tuple[float, bytes, str]],
+    key: str,
+    data: bytes,
+    ext: str,
+    *,
+    max_entries: int,
+) -> None:
+    if not data:
+        return
+    cache[str(key)] = (float(time.time()), bytes(data), str(ext))
+    if len(cache) <= int(max_entries):
+        return
+    old_keys = sorted(cache.items(), key=lambda kv: kv[1][0])[: max(1, int(max_entries // 2))]
+    for k, _ in old_keys:
+        cache.pop(k, None)
 
 
 def _team_region_for_gen(gen: Optional[int]) -> str:
@@ -21179,11 +21470,19 @@ class TeamPanelView(discord.ui.View):
     def _guard(self, itx: discord.Interaction) -> bool:
         return itx.user.id == self.author_id
 
-    def _overview_payload(self) -> tuple[Optional[discord.Embed], list[discord.File]]:
+    async def _overview_payload(self) -> tuple[Optional[discord.Embed], list[discord.File]]:
         # Send the overview as a direct image attachment (no embed) so Discord
         # can display the panel larger while preserving the same buttons.
         files: list[discord.File] = []
-        panel = _team_overview_panel_file(self.target_name, self.slots, current_gen=self.current_gen)
+        try:
+            panel = await asyncio.to_thread(
+                _team_overview_panel_file,
+                self.target_name,
+                self.slots,
+                current_gen=self.current_gen,
+            )
+        except Exception:
+            panel = _team_overview_panel_file(self.target_name, self.slots, current_gen=self.current_gen)
         if panel:
             files.append(panel)
             return None, files
@@ -21302,11 +21601,13 @@ class TeamPanelView(discord.ui.View):
                 await _apply(itx.edit_original_response, use_files_kw=False)
             except TypeError:
                 await _apply(itx.edit_original_response, use_files_kw=True)
+        finally:
+            _close_discord_files(files)
 
     async def _on_overview(self, itx: discord.Interaction):
         if not self._guard(itx):
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
-        emb, files = self._overview_payload()
+        emb, files = await self._overview_payload()
         await self._edit_payload(itx, emb, files)
 
     async def _on_slot(self, itx: discord.Interaction):
@@ -21524,11 +21825,14 @@ async def team(interaction: discord.Interaction, user: discord.User | None = Non
         target_gen = 1
 
     view = TeamPanelView(interaction.user.id, target.display_name, slots, current_gen=target_gen)
-    emb, files = view._overview_payload()
-    if emb is None:
-        await interaction.followup.send(files=files, view=view, ephemeral=True)
-    else:
-        await interaction.followup.send(embed=emb, files=files, view=view, ephemeral=True)
+    emb, files = await view._overview_payload()
+    try:
+        if emb is None:
+            await interaction.followup.send(files=files, view=view, ephemeral=True)
+        else:
+            await interaction.followup.send(embed=emb, files=files, view=view, ephemeral=True)
+    finally:
+        _close_discord_files(files)
     if hatch_messages and uid == str(interaction.user.id):
         for line in hatch_messages[:3]:
             try:
@@ -23957,6 +24261,8 @@ class BagCog(commands.Cog):
         Runs _count_item_in_use in parallel for all items.
         """
         uid = str(owner_id)
+        merged_by_item: dict[str, dict[str, Any]] = {}
+        order_idx = 0
         rows_data = []
         for r in items:
             asdict = dict(r) if hasattr(r, "keys") else {
@@ -23964,7 +24270,26 @@ class BagCog(commands.Cog):
                 "name": r[1] if len(r) > 1 else None,
                 "qty": r[2] if len(r) > 2 else 0,
             }
-            item_id = (asdict.get("id") or asdict.get("item_id") or asdict.get("name") or "").strip()
+            raw_item_id = (asdict.get("id") or asdict.get("item_id") or asdict.get("name") or "").strip()
+            item_id = _canonical_item_token(raw_item_id) or raw_item_id
+            total = int((asdict.get("qty") or 0) or 0)
+            bucket = merged_by_item.get(item_id)
+            if bucket is None:
+                row_copy = dict(asdict)
+                row_copy["id"] = item_id
+                row_copy["item_id"] = item_id
+                row_copy["_order"] = order_idx
+                order_idx += 1
+                merged_by_item[item_id] = row_copy
+                bucket = row_copy
+            bucket["qty"] = int(bucket.get("qty") or 0) + total
+
+        merged_rows = sorted(
+            merged_by_item.values(),
+            key=lambda d: (int(d.get("_order", 0)), str(d.get("name") or d.get("item_id") or "")),
+        )
+        for asdict in merged_rows:
+            item_id = str(asdict.get("item_id") or asdict.get("id") or "").strip()
             total = int((asdict.get("qty") or 0) or 0)
             rows_data.append((asdict, item_id, total))
         async def _zero():
@@ -23976,6 +24301,7 @@ class BagCog(commands.Cog):
             used = int(used) if isinstance(used, (int, float)) else 0
             free = max(0, total - used)
             asdict["qty"] = f"{free}/{total}"
+            asdict.pop("_order", None)
             out.append(asdict)
         return out
 
@@ -26118,10 +26444,10 @@ async def _pokeball_emoji(guild: discord.Guild | None) -> str:
     return ""  # fallback to nothing; you can replace with a unicode like '◓' if you want
 
 METHOD_SYMBOL: Dict[str, str] = {
-    "level-up": "L",
-    "machine":  "Ｍ",
-    "tutor":    "Ｔ",
-    "egg":      "🥚",
+    "level-up": "LV",
+    "machine":  "TM",
+    "tutor":    "TR",
+    "egg":      "EGG",
 }
 METHOD_ORDER: Dict[str, int] = {"level-up": 0, "machine": 1, "tutor": 2, "egg": 3}
 
@@ -26134,15 +26460,15 @@ def _tc(s: str) -> str:
 
 def _fmt_line(name: str, method: str, level: Optional[int], form_label: str) -> str:
     """
-    Compact single line with **bold method**, power hidden.
-      • level-up: '[Form] Razor Leaf **L**19'
-      • others:   '[Form] Brick Break **Ｍ**' / 'Spore **🥚**'
+    Compact single line:
+      • level-up: '[Form] Lv.19 • Razor Leaf'
+      • others:   '[Form] [TM] Brick Break' / '[Form] [EGG] Spore'
     """
-    sym = METHOD_SYMBOL.get(method, "?")
+    tag = METHOD_SYMBOL.get(method, "?")
     prefix = f"[{_tc(form_label)}] " if form_label and form_label != "(default)" else ""
     if method == "level-up" and level is not None:
-        return f"{prefix}{_tc(name)} **{sym}**{level}"
-    return f"{prefix}{_tc(name)} **{sym}**"
+        return f"{prefix}Lv.{int(level):>2} • {_tc(name)}"
+    return f"{prefix}[{tag}] {_tc(name)}"
 
 def _paginate_15(flat: List[str]) -> List[List[str]]:
     """Make pages of exactly 15 lines (pad the last one)."""
@@ -26370,8 +26696,8 @@ async def moves(
     )
 
     # footer legend with bold symbols
-    legend = "Symbols — " + "  ".join(f"**{v}**={k}" for k, v in METHOD_SYMBOL.items())
-    totals = "  ".join(f"{METHOD_SYMBOL[k]}×{v}" for k, v in counts.items() if v)
+    legend = "Legend — " + "  ".join(f"**{v}**={k}" for k, v in METHOD_SYMBOL.items())
+    totals = "  ".join(f"{k}:{v}" for k, v in counts.items() if v)
     if totals:
         legend += f"  |  Totals: {totals}"
 
@@ -27045,11 +27371,15 @@ async def learn_cmd(interaction: discord.Interaction, mon: str, move: str):
     legal_names = [str(r.get("move_name") or "") for r in now_rows if str(r.get("move_name") or "").strip()]
     best_move, confidence, suggestions = FuzzyMatcher.fuzzy_match(move, legal_names, threshold=0.70)
     if not best_move or confidence < 0.70:
-        sugg_text = f"\n\n**Available now examples:** {', '.join(legal_names[:8])}" if legal_names else ""
-        if suggestions:
-            sugg_text += f"\n**Did you mean:** {', '.join(suggestions[:5])}"
+        pretty_examples = [str(m).replace("-", " ").replace("_", " ").title() for m in legal_names[:8]]
+        pretty_suggestions = [str(s).replace("-", " ").replace("_", " ").title() for s in suggestions[:5]]
+        sugg_text = f"\n\n**Try one of these now:** {', '.join(pretty_examples)}" if pretty_examples else ""
+        if pretty_suggestions:
+            sugg_text += f"\n**Did you mean:** {', '.join(pretty_suggestions)}"
+        move_display = str(move or "").replace("-", " ").replace("_", " ").title()
+        species_display = species_name.replace("-", " ").title()
         return await interaction.followup.send(
-            f"❌ **{move}** is not a currently learnable level-up move for **{species_name.replace('-', ' ').title()}**.{sugg_text}",
+            f"❌ **{move_display}** can't be learned by **{species_display}** at **Lv.{int(level)}**.{sugg_text}",
             ephemeral=True,
         )
 
