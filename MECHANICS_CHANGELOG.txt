@@ -1,0 +1,61 @@
+DexEmAll Mechanics Changelog
+
+Purpose:
+- Track gameplay/mechanics changes only (fixes, balance, command behavior, encounters, evolution rules, UI behavior tied to mechanics).
+- Do NOT store code-level implementation details here.
+
+Update rule:
+- Append every new mechanics-facing change to this file (newest first).
+- Keep entries short and player-facing.
+
+Format:
+- YYYY-MM-DD HH:MM UTC | short-hash | mechanics summary
+
+2026-02-20 04:05 UTC | (this update) | Added this mechanics changelog file and started 24h history tracking.
+
+Past 24 hours mechanics history (captured from branch commits):
+
+2026-02-20 03:57 UTC | 03de6591 | Added owner-only EV reset command for team Pokemon.
+2026-02-20 03:48 UTC | 3dbe5726 | Added /manualevolve alias for manual evolution access.
+2026-02-20 03:42 UTC | 4e3055bf | Fixed overdue level-up evolution prompts at evolution threshold.
+2026-02-20 03:31 UTC | 96ec8338 | Fixed EV overflow locking and made route force-battle buttons use encounter rolls.
+2026-02-20 02:40 UTC | 5f264cf4 | Scaled displayed stats by level+nature and updated registered-theme text styling.
+2026-02-20 01:47 UTC | 3f41f422 | Fixed route battle public mode for non route-* area IDs.
+2026-02-20 01:43 UTC | 925d8136 | Added /moves buttons for missing level-up and TM move views.
+2026-02-20 01:28 UTC | 5309f6f8 | Removed /move command; kept learning flow under /learn.
+2026-02-20 01:24 UTC | 6ee56647 | Fixed PP Max consumable detection and refocused /moves on team-mon level-up context.
+2026-02-20 01:17 UTC | 59e749ad | Separated route battle visibility handling from PvP visibility handling.
+2026-02-20 00:57 UTC | 636251d2 | Made routes and route battles non-ephemeral/public.
+2026-02-20 00:42 UTC | 9b86aee5 | Removed TM shard system and related shard drops.
+2026-02-20 00:31 UTC | 2e5f5119 | Reduced Ralts wild encounter rate in Viridian Forest.
+2026-02-20 00:23 UTC | eeb44f38 | Fixed item resolver None regressions in battle/adventure flows.
+2026-02-20 00:14 UTC | a2d03b82 | Improved panel performance and normalized item behavior.
+2026-02-19 23:28 UTC | a4d44cd2 | Updated learnset commands, sync nature behavior, and removed /expshare slash command.
+2026-02-19 23:12 UTC | 18468f42 | Fixed PP cap persistence, team theming, and DB task session handling.
+2026-02-19 09:45 UTC | dbfd51c8 | Themed mypokeinfo text colors for shiny and registered mons.
+2026-02-19 09:40 UTC | 8e93f680 | Fixed give consumables, owner-locked givepokemon, and extended team loops.
+2026-02-19 09:31 UTC | 950baf19 | Adjusted register panel, showed team PP, and restored Trace ability messaging.
+2026-02-19 08:48 UTC | 2b3a2287 | Fixed register tracking and back-panel alignment.
+2026-02-19 08:36 UTC | 69048fd3 | Persisted PP across swaps and battle boundaries.
+2026-02-19 08:25 UTC | 99db68a2 | Fixed register EXP and KO tracking in battles.
+2026-02-19 08:23 UTC | 68f3c976 | Branch merge/sync commit (no standalone mechanics note).
+2026-02-19 08:23 UTC | 0bd6f3fe | Basework completed for Viridian Forest route content.
+2026-02-19 08:08 UTC | 4703692d | Fixed EV persistence and swap-panel team details.
+2026-02-19 07:55 UTC | a88c889e | Added Exp Share purchase flow and confirm prompts.
+2026-02-19 07:43 UTC | 4c69b283 | Fixed route EV awards and mypokeinfo/team regressions.
+2026-02-19 07:23 UTC | 2060ac10 | Additional Ralts rarity reduction change.
+2026-02-19 07:18 UTC | 4b7bd170 | Branch merge/sync commit (no standalone mechanics note).
+2026-02-19 07:18 UTC | dd0a6a21 | Branch merge/sync commit (no standalone mechanics note).
+2026-02-19 07:12 UTC | 22c74c55 | Reverted project state to previous baseline before reapplying fixes.
+2026-02-19 07:12 UTC | 7082aa7e | Reapplied mypokeinfo EV and shiny-star regression fixes.
+2026-02-19 06:59 UTC | 276e6eea | Fixed EV parsing regression and preserved shiny stars on front panel.
+2026-02-19 06:52 UTC | be1ccb6b | Enabled periodic auto-pull loop during runtime.
+2026-02-19 06:24 UTC | 6a5583d2 | Realigned back header and centered register columns to template bounds.
+2026-02-19 06:21 UTC | f390a625 | Branch merge/sync commit (no standalone mechanics note).
+2026-02-19 06:21 UTC | b766e05b | Continued Viridian Forest work.
+2026-02-19 05:45 UTC | b0540ede | Adjusted back-panel centering and restored front type sizing.
+2026-02-19 05:33 UTC | bf21621b | Matched back-header geometry and recentered register values.
+2026-02-19 05:28 UTC | c0c0dad5 | Refined shiny star styling and rebalanced type badge sizes.
+2026-02-19 05:26 UTC | 23d5a48b | Tuned front/back type badges, stars, and back-panel centering.
+2026-02-19 05:11 UTC | a9f93252 | Switched to shared type icon folder and realigned mypokeinfo back panel.
+2026-02-19 05:01 UTC | 941b8f08 | Hardened AI choice generation against None HP values.
