@@ -132,9 +132,15 @@ def _gear_cache_set(kind: str, user_id_str: str, battle_gen: int, value: bool) -
 
 def _battle_ui_is_public(st: Optional["BattleState"]) -> bool:
     try:
+        if str(getattr(st, "battle_mode", "") or "").strip().lower() == "route":
+            return True
         return bool(getattr(st, "public_battle_ui", False))
     except Exception:
         return False
+
+
+def _battle_ui_ephemeral(st: Optional["BattleState"]) -> bool:
+    return not _battle_ui_is_public(st)
 
 
 def _format_move_name(move_name: str) -> str:
@@ -6418,8 +6424,9 @@ class _ZMoveButton(discord.ui.Button):
     async def callback(self, itx: discord.Interaction):
         view: MoveView = self.view  # type: ignore
         st = view.state
+        response_ephemeral = _battle_ui_ephemeral(st)
         if st.is_locked(itx.user.id):
-            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=True)
+            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=response_ephemeral)
             return
         
         # Verify Z-Ring equipment
@@ -6460,12 +6467,12 @@ class _ZMoveButton(discord.ui.Button):
             if st.gen != 7:
                 await itx.response.send_message(
                     f"❌ Z-Moves can only be used in Gen 7 battles! This battle is Gen {st.gen}.",
-                    ephemeral=True
+                    ephemeral=response_ephemeral
                 )
             else:
                 await itx.response.send_message(
                     "❌ You need a Z-Ring equipped to use Z-Moves! Use `/equipgear` to equip one.",
-                    ephemeral=True
+                    ephemeral=response_ephemeral
                 )
             return
         
@@ -6473,7 +6480,7 @@ class _ZMoveButton(discord.ui.Button):
         if st._z_move_used.get(itx.user.id, False):
             await itx.response.send_message(
                 "❌ You've already used a Z-Move this battle!",
-                ephemeral=True
+                ephemeral=response_ephemeral
             )
             return
         
@@ -6485,11 +6492,11 @@ class _ZMoveButton(discord.ui.Button):
         if view.z_move_mode:
             self.label = "Cancel"
             await itx.response.edit_message(view=view)
-            await itx.followup.send("✨ Z-Move mode activated! Move names now show Z-Move names.", ephemeral=True)
+            await itx.followup.send("✨ Z-Move mode activated! Move names now show Z-Move names.", ephemeral=response_ephemeral)
         else:
             self.label = "Z-Move"
             await itx.response.edit_message(view=view)
-            await itx.followup.send("Z-Move mode deactivated.", ephemeral=True)
+            await itx.followup.send("Z-Move mode deactivated.", ephemeral=response_ephemeral)
 
 class _MegaButton(discord.ui.Button):
     def __init__(self, move_view: 'MoveView'):
@@ -6513,34 +6520,35 @@ class _MegaButton(discord.ui.Button):
         self.disabled = False
     
     async def callback(self, itx: discord.Interaction):
-        await itx.response.defer(ephemeral=True)
         view: MoveView = self.view  # type: ignore
         st = view.state
+        response_ephemeral = _battle_ui_ephemeral(st)
+        await itx.response.defer(ephemeral=response_ephemeral)
         if st.is_locked(itx.user.id):
-            await itx.followup.send(embed=_already_locked_embed(st.turn), ephemeral=True)
+            await itx.followup.send(embed=_already_locked_embed(st.turn), ephemeral=response_ephemeral)
             return
         if st.gen < 6 or st.gen > 7:
-            await itx.followup.send(f"❌ Mega Evolution is not available in Gen {st.gen}.", ephemeral=True)
+            await itx.followup.send(f"❌ Mega Evolution is not available in Gen {st.gen}.", ephemeral=response_ephemeral)
             return
         if st._mega_used.get(itx.user.id, False):
-            await itx.followup.send("❌ You've already Mega Evolved this battle!", ephemeral=True)
+            await itx.followup.send("❌ You've already Mega Evolved this battle!", ephemeral=response_ephemeral)
             return
         if not _check_mega_gear_sync(str(itx.user.id), battle_gen=st.gen):
             await itx.followup.send(
                 "❌ You need your Mega gear equipped and unlocked to Mega Evolve.",
-                ephemeral=True
+                ephemeral=response_ephemeral
             )
             return
         mon = st._active(itx.user.id)
         if not mon:
-            await itx.followup.send("❌ No active Pokémon to Mega Evolve.", ephemeral=True)
+            await itx.followup.send("❌ No active Pokémon to Mega Evolve.", ephemeral=response_ephemeral)
             return
         if getattr(mon, "mega_evolved", False):
-            await itx.followup.send(f"{mon.species} is already Mega Evolved.", ephemeral=True)
+            await itx.followup.send(f"{mon.species} is already Mega Evolved.", ephemeral=response_ephemeral)
             return
         can, reason, variant = can_mega_evolve(mon, state=st, generation=st.gen)
         if not can or not variant:
-            await itx.followup.send(f"❌ {reason or 'Cannot Mega Evolve right now.'}", ephemeral=True)
+            await itx.followup.send(f"❌ {reason or 'Cannot Mega Evolve right now.'}", ephemeral=response_ephemeral)
             return
         # Store mega evolution choice instead of applying immediately
         # Mega evolution will be applied AFTER switches are processed
@@ -6555,7 +6563,7 @@ class _MegaButton(discord.ui.Button):
         mon_name = _format_pokemon_name(mon)
         await itx.followup.send(
             f"✅ {mon_name} will Mega Evolve this turn!\n\n⚠️ **Don't forget to select a move!**",
-            ephemeral=True
+            ephemeral=response_ephemeral
         )
         try:
             message_obj = await itx.original_response()
@@ -6612,12 +6620,12 @@ class _DynamaxButton(discord.ui.Button):
     
     async def callback(self, itx: discord.Interaction):
         # Defer immediately to prevent timeout
-        await itx.response.defer(ephemeral=True)
-        
         view: MoveView = self.view  # type: ignore
         st = view.state
+        response_ephemeral = _battle_ui_ephemeral(st)
+        await itx.response.defer(ephemeral=response_ephemeral)
         if st.is_locked(itx.user.id):
-            await itx.followup.send(embed=_already_locked_embed(st.turn), ephemeral=True)
+            await itx.followup.send(embed=_already_locked_embed(st.turn), ephemeral=response_ephemeral)
             return
         
         mon = st._active(itx.user.id)
@@ -6645,14 +6653,14 @@ class _DynamaxButton(discord.ui.Button):
             except Exception:
                 pass  # If we can't edit, that's okay
             
-            await itx.followup.send(f"**{mon.species}** returned to normal size!", ephemeral=True)
+            await itx.followup.send(f"**{mon.species}** returned to normal size!", ephemeral=response_ephemeral)
             return
         
         # Check if already Dynamaxed (shouldn't happen if cancel works)
         if mon.dynamaxed:
             await itx.followup.send(
                 f"**{mon.species}** is already Dynamaxed!",
-                ephemeral=True
+                ephemeral=response_ephemeral
             )
             return
         
@@ -6660,7 +6668,7 @@ class _DynamaxButton(discord.ui.Button):
         if st._dynamax_used.get(itx.user.id, False):
             await itx.followup.send(
                 "❌ You've already used Dynamax this battle!",
-                ephemeral=True
+                ephemeral=response_ephemeral
             )
             return
         
@@ -6670,7 +6678,7 @@ class _DynamaxButton(discord.ui.Button):
         if not can_dmax:
             await itx.followup.send(
                 f"❌ {reason or 'Cannot Dynamax'}",
-                ephemeral=True
+                ephemeral=response_ephemeral
             )
             return
         
@@ -6698,7 +6706,7 @@ class _DynamaxButton(discord.ui.Button):
         if not has_dmax_gear:
             await itx.followup.send(
                 "❌ You need a Dynamax Band equipped to use Dynamax! Use `/equipgear` to equip one.",
-                ephemeral=True
+                ephemeral=response_ephemeral
             )
             return
         
@@ -6725,11 +6733,11 @@ class _DynamaxButton(discord.ui.Button):
             except Exception:
                 pass  # If we can't edit, that's okay
             
-            await itx.followup.send(f"🔴 **{message}**", ephemeral=True)
+            await itx.followup.send(f"🔴 **{message}**", ephemeral=response_ephemeral)
         else:
             await itx.followup.send(
                 f"❌ {message}",
-                ephemeral=True
+                ephemeral=response_ephemeral
             )
 
 class _TerastallizeButton(discord.ui.Button):
@@ -6757,29 +6765,30 @@ class _TerastallizeButton(discord.ui.Button):
             self.disabled = True
     
     async def callback(self, itx: discord.Interaction):
-        await itx.response.defer(ephemeral=True)
         view: MoveView = self.view  # type: ignore
         st = view.state
+        response_ephemeral = _battle_ui_ephemeral(st)
+        await itx.response.defer(ephemeral=response_ephemeral)
         if st.is_locked(itx.user.id):
-            await itx.followup.send(embed=_already_locked_embed(st.turn), ephemeral=True)
+            await itx.followup.send(embed=_already_locked_embed(st.turn), ephemeral=response_ephemeral)
             return
         
         mon = st._active(itx.user.id)
         if not mon:
-            await itx.followup.send("❌ No active Pokémon to Terastallize.", ephemeral=True)
+            await itx.followup.send("❌ No active Pokémon to Terastallize.", ephemeral=response_ephemeral)
             return
         
         if getattr(mon, "terastallized", False):
-            await itx.followup.send(f"❌ **{mon.species}** is already Terastallized!", ephemeral=True)
+            await itx.followup.send(f"❌ **{mon.species}** is already Terastallized!", ephemeral=response_ephemeral)
             return
         
         if st._tera_used.get(itx.user.id, False):
-            await itx.followup.send("❌ You've already Terastallized this battle!", ephemeral=True)
+            await itx.followup.send("❌ You've already Terastallized this battle!", ephemeral=response_ephemeral)
             return
         
         can_tera, reason = can_terastallize(mon)
         if not can_tera:
-            await itx.followup.send(f"❌ {reason or 'Cannot Terastallize'}", ephemeral=True)
+            await itx.followup.send(f"❌ {reason or 'Cannot Terastallize'}", ephemeral=response_ephemeral)
             return
         
         has_tera_gear = _check_tera_gear_sync(str(itx.user.id), battle_gen=st.gen)
@@ -6805,7 +6814,7 @@ class _TerastallizeButton(discord.ui.Button):
         if not has_tera_gear:
             await itx.followup.send(
                 "❌ You need a Tera Orb equipped to Terastallize! Use `/equipgear` to equip one.",
-                ephemeral=True
+                ephemeral=response_ephemeral
             )
             return
         
@@ -6822,9 +6831,9 @@ class _TerastallizeButton(discord.ui.Button):
                     await message_obj.edit(view=view)
             except Exception:
                 pass
-            await itx.followup.send(f"✨ **{message}**", ephemeral=True)
+            await itx.followup.send(f"✨ **{message}**", ephemeral=response_ephemeral)
         else:
-            await itx.followup.send(f"❌ {message}", ephemeral=True)
+            await itx.followup.send(f"❌ {message}", ephemeral=response_ephemeral)
 
 class _ForfeitButton(discord.ui.Button):
     def __init__(self, state: BattleState):
@@ -6836,6 +6845,7 @@ class _ForfeitButton(discord.ui.Button):
     async def callback(self, itx: discord.Interaction):
         view: MoveView = self.view  # type: ignore
         st = view.state
+        response_ephemeral = _battle_ui_ephemeral(st)
         # Forfeit always works, even if already locked
         # (Don't check is_locked - allow forfeit anytime)
         if not st.is_locked(itx.user.id):
@@ -6848,9 +6858,9 @@ class _ForfeitButton(discord.ui.Button):
                 description=f"{species} fled the battle successfully!",
                 color=0x5865F2,
             )
-            await itx.response.send_message(embed=emb, ephemeral=True)
+            await itx.response.send_message(embed=emb, ephemeral=response_ephemeral)
         else:
-            await itx.response.send_message("🏳️ You forfeited the battle.", ephemeral=True)
+            await itx.response.send_message("🏳️ You forfeited the battle.", ephemeral=response_ephemeral)
         await view.on_done({"kind": "forfeit", "value": None}, itx)
 
 
@@ -6979,28 +6989,30 @@ class _BagLikeView(discord.ui.View):
     async def _on_heal(self, itx: discord.Interaction):
         view: MoveView = self.move_view
         st = view.state
+        response_ephemeral = _battle_ui_ephemeral(st)
         if st.is_locked(itx.user.id):
-            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=True)
+            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=response_ephemeral)
             return
         healing_items = await _fetch_user_items(itx.user.id, list(_HEALING_ITEMS.keys()))
         if not healing_items:
-            return await itx.response.send_message("No healing items in your bag.", ephemeral=True)
+            return await itx.response.send_message("No healing items in your bag.", ephemeral=response_ephemeral)
         menu = _BagAllItemsView(view, healing_items, None, False)
-        await itx.response.send_message("Choose an item to heal with:", ephemeral=True, view=menu)
+        await itx.response.send_message("Choose an item to heal with:", ephemeral=response_ephemeral, view=menu)
 
     async def _on_throw(self, itx: discord.Interaction):
         view: MoveView = self.move_view
         st = view.state
+        response_ephemeral = _battle_ui_ephemeral(st)
         if st.is_locked(itx.user.id):
-            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=True)
+            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=response_ephemeral)
             return
         if not st.p2_name.lower().startswith("wild "):
-            return await itx.response.send_message("You can't throw Poké Balls at a trainer's Pokémon.", ephemeral=True)
+            return await itx.response.send_message("You can't throw Poké Balls at a trainer's Pokémon.", ephemeral=response_ephemeral)
         ball_items = await _fetch_user_items(itx.user.id, list(_BALLS_BASIC.keys()))
         if not ball_items:
-            return await itx.response.send_message("No Poké Balls in your bag.", ephemeral=True)
+            return await itx.response.send_message("No Poké Balls in your bag.", ephemeral=response_ephemeral)
         menu = _BagAllItemsView(view, {}, ball_items, True)
-        await itx.response.send_message("Choose a ball to throw:", ephemeral=True, view=menu)
+        await itx.response.send_message("Choose a ball to throw:", ephemeral=response_ephemeral, view=menu)
 
 
 class _BagButton(discord.ui.Button):
@@ -7010,17 +7022,18 @@ class _BagButton(discord.ui.Button):
 
     async def callback(self, itx: discord.Interaction):
         view: MoveView = self.view  # type: ignore
-        if view.state.is_locked(itx.user.id):
-            await itx.response.send_message(embed=_already_locked_embed(view.state.turn), ephemeral=True)
-            return
         st = view.state
+        response_ephemeral = _battle_ui_ephemeral(st)
+        if view.state.is_locked(itx.user.id):
+            await itx.response.send_message(embed=_already_locked_embed(view.state.turn), ephemeral=response_ephemeral)
+            return
         builder = getattr(st, "_bag_embed_builder", None)
         if builder is not None:
             try:
                 embed, files = await builder(1)
                 bag_view = _BagLikeView(self.move_view, st.p2_name.lower().startswith("wild "))
                 try:
-                    await itx.response.send_message(embed=embed, view=bag_view, files=files or [], ephemeral=True)
+                    await itx.response.send_message(embed=embed, view=bag_view, files=files or [], ephemeral=response_ephemeral)
                 finally:
                     if files:
                         for f in files:
@@ -7037,9 +7050,9 @@ class _BagButton(discord.ui.Button):
             ball_items: Optional[dict[str, int]] = await _fetch_user_items(itx.user.id, list(_BALLS_BASIC.keys())) if is_wild else None
             if not healing_items and not (is_wild and ball_items):
                 msg = "No healing items or Poké Balls in your bag." if is_wild else "No healing items in your bag."
-                return await itx.response.send_message(msg, ephemeral=True)
+                return await itx.response.send_message(msg, ephemeral=response_ephemeral)
             menu = _BagAllItemsView(self.move_view, healing_items, ball_items if is_wild else None, is_wild)
-            await itx.response.send_message("📦 Your bag:", ephemeral=True, view=menu)
+            await itx.response.send_message("📦 Your bag:", ephemeral=response_ephemeral, view=menu)
 
 
 class _BagAllItemsView(discord.ui.View):
@@ -7063,18 +7076,19 @@ class _BagAllItemsView(discord.ui.View):
     async def _on_heal_select(self, itx: discord.Interaction):
         mv = self.move_view
         st = mv.state
+        response_ephemeral = _battle_ui_ephemeral(st)
         if st.is_locked(itx.user.id):
-            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=True)
+            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=response_ephemeral)
             return
         item_key = (itx.data or {}).get("values", [None])[0]  # type: ignore
         if not item_key:
-            return await itx.response.send_message("Invalid selection.", ephemeral=True)
-        await itx.response.defer(ephemeral=True, thinking=False)
+            return await itx.response.send_message("Invalid selection.", ephemeral=response_ephemeral)
+        await itx.response.defer(ephemeral=response_ephemeral, thinking=False)
         st.lock(itx.user.id)
         heal_amt = _HEALING_ITEMS.get(item_key, 0)
         mon = st._active(itx.user.id)
         if not mon:
-            return await itx.followup.send("No active Pokémon.", ephemeral=True)
+            return await itx.followup.send("No active Pokémon.", ephemeral=response_ephemeral)
         from .engine import _calc_hp
         current_max = _calc_hp(mon.base["hp"], mon.ivs["hp"], mon.evs["hp"], mon.level)
         if (mon.species or "").strip().lower() == "shedinja":
@@ -7091,17 +7105,18 @@ class _BagAllItemsView(discord.ui.View):
     async def _on_throw_select(self, itx: discord.Interaction):
         mv = self.move_view
         st = mv.state
+        response_ephemeral = _battle_ui_ephemeral(st)
         if st.is_locked(itx.user.id):
-            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=True)
+            await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=response_ephemeral)
             return
         if not st.p2_name.lower().startswith("wild "):
-            return await itx.response.send_message("You can't throw Poké Balls at a trainer's Pokémon.", ephemeral=True)
+            return await itx.response.send_message("You can't throw Poké Balls at a trainer's Pokémon.", ephemeral=response_ephemeral)
         ball_key = (itx.data or {}).get("values", [None])[0]  # type: ignore
         if not ball_key:
-            return await itx.response.send_message("Invalid selection.", ephemeral=True)
+            return await itx.response.send_message("Invalid selection.", ephemeral=response_ephemeral)
         st._last_throw_ball = ball_key
         st._last_throw_uid = itx.user.id
-        await itx.response.defer(ephemeral=True, thinking=False)
+        await itx.response.defer(ephemeral=response_ephemeral, thinking=False)
         st.lock(itx.user.id)
         await _consume_item(itx.user.id, ball_key, 1)
         await mv.on_done({"kind": "throw", "value": {"ball": ball_key}}, itx)
@@ -7147,15 +7162,16 @@ class _HealSelectView(discord.ui.View):
         async def _cb(itx: discord.Interaction):
             mv = self.move_view
             st = mv.state
+            response_ephemeral = _battle_ui_ephemeral(st)
             if st.is_locked(itx.user.id):
-                await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=True)
+                await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=response_ephemeral)
                 return
-            await itx.response.defer(ephemeral=True, thinking=False)
+            await itx.response.defer(ephemeral=response_ephemeral, thinking=False)
             st.lock(itx.user.id)
             heal_amt = _HEALING_ITEMS.get(item_key, 0)
             mon = st._active(itx.user.id)
             if not mon:
-                return await itx.followup.send("No active Pokémon.", ephemeral=True)
+                return await itx.followup.send("No active Pokémon.", ephemeral=response_ephemeral)
             # Recalculate current max HP from level and stats so heal uses up-to-date max (e.g. after level-up)
             from .engine import _calc_hp
             current_max = _calc_hp(mon.base["hp"], mon.ivs["hp"], mon.evs["hp"], mon.level)
@@ -7188,14 +7204,15 @@ class _BallSelectView(discord.ui.View):
         async def _cb(itx: discord.Interaction):
             mv = self.move_view
             st = mv.state
+            response_ephemeral = _battle_ui_ephemeral(st)
             if st.is_locked(itx.user.id):
-                await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=True)
+                await itx.response.send_message(embed=_already_locked_embed(st.turn), ephemeral=response_ephemeral)
                 return
             if not st.p2_name.lower().startswith("wild "):
-                return await itx.response.send_message("You can't throw Poké Balls at a trainer’s Pokémon.", ephemeral=True)
+                return await itx.response.send_message("You can't throw Poké Balls at a trainer’s Pokémon.", ephemeral=response_ephemeral)
             st._last_throw_ball = ball_key
             st._last_throw_uid = itx.user.id
-            await itx.response.defer(ephemeral=True, thinking=False)
+            await itx.response.defer(ephemeral=response_ephemeral, thinking=False)
             st.lock(itx.user.id)
             await _consume_item(itx.user.id, ball_key, 1)
             await mv.on_done({"kind": "throw", "value": {"ball": ball_key}}, itx)

@@ -12651,6 +12651,10 @@ async def _start_pve_battle(
     # Route battles should be public (non-ephemeral).
     is_route_battle = str(area_id or "").strip().lower().startswith("route-")
     try:
+        st.battle_mode = "route" if is_route_battle else "adventure"
+    except Exception:
+        pass
+    try:
         st.public_battle_ui = bool(is_route_battle)
     except Exception:
         pass
