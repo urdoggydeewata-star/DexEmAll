@@ -86,6 +86,15 @@ from .battle_flow import (
 from .advanced_mechanics import clear_special_weather, Substitute
 from .move_mechanics import get_move_mechanics
 from .z_moves import is_z_crystal, can_use_z_move, get_z_move_name
+from .panel_items import (
+    _HEALING_ITEMS,
+    _BALLS_BASIC,
+    _ULTRA_BEAST_SPECIES,
+    _BALL_NAME_ALIASES,
+    normalize_item as _normalize_item,
+    heal_amount_for_item as _heal_amount_for_item,
+    normalize_ball_name as _normalize_ball_name,
+)
 
 try:
     import db_async
@@ -6864,125 +6873,7 @@ class _ForfeitButton(discord.ui.Button):
         await view.on_done({"kind": "forfeit", "value": None}, itx)
 
 
-# ---------------- Bag / Heal / Throw ----------------
-_HEALING_ITEMS = {
-    "potion": 20,
-    "super potion": 50,
-    "hyper potion": 120,
-    "max potion": None,  # full
-    "full restore": None,  # full + status clear
-    "fresh water": 30,
-    "soda pop": 50,
-    "lemonade": 70,
-    "moomoo milk": 100,
-}
-
-
-def _heal_amount_for_item(item_key: str):
-    """Get heal amount for an item (handles max_potion, max-potion, max potion, etc.)."""
-    norm = _normalize_item(item_key)
-    if norm in _HEALING_ITEMS:
-        return _HEALING_ITEMS[norm]
-    compact = norm.replace(" ", "")
-    for k, v in _HEALING_ITEMS.items():
-        if k.replace(" ", "") == compact:
-            return v
-    return 0
-
-_BALLS_BASIC = {
-    "poke ball": 1.0,
-    "poké ball": 1.0,
-    "great ball": 1.5,
-    "ultra ball": 2.0,
-    "master ball": 9999.0,
-    "safari ball": 1.5,
-    "repeat ball": None,  # gen dependent
-    "timer ball": None,  # turn based
-    "quick ball": None,  # turn based
-    "dusk ball": None,   # env based
-    "net ball": None,    # type based
-    "nest ball": None,   # level based
-    "heavy ball": None,  # weight based
-    "love ball": None,   # same species
-    "level ball": None,  # level compare
-    "lure ball": None,
-    "moon ball": None,
-    "fast ball": None,
-    "friend ball": 1.0,
-    "heal ball": 1.0,
-    "luxury ball": 1.0,
-    "premier ball": 1.0,
-    "beast ball": None,
-    "dive ball": None,
-    "cherish ball": 1.0,
-    "sport ball": 1.0,
-    "dream ball": None,
-    "park ball": 1.0,
-}
-
-# Gen VII+ Ultra Beasts (for Beast Ball bonus handling).
-_ULTRA_BEAST_SPECIES = {
-    "nihilego",
-    "buzzwole",
-    "pheromosa",
-    "xurkitree",
-    "celesteela",
-    "kartana",
-    "guzzlord",
-    "poipole",
-    "naganadel",
-    "stakataka",
-    "blacephalon",
-}
-
-def _normalize_item(name: str) -> str:
-    n = str(name or "").strip().lower().replace("é", "e")
-    # Normalize common dash variants and separators to spaces.
-    for ch in ("-", "_", "–", "—", "‑", "‒", "−", "﹣", "－", ":"):
-        n = n.replace(ch, " ")
-    return " ".join(n.split())
-
-
-_BALL_NAME_ALIASES = {
-    "pokeball": "poke ball",
-    "greatball": "great ball",
-    "ultraball": "ultra ball",
-    "masterball": "master ball",
-    "safariball": "safari ball",
-    "repeatball": "repeat ball",
-    "timerball": "timer ball",
-    "quickball": "quick ball",
-    "duskball": "dusk ball",
-    "netball": "net ball",
-    "nestball": "nest ball",
-    "heavyball": "heavy ball",
-    "loveball": "love ball",
-    "levelball": "level ball",
-    "lureball": "lure ball",
-    "moonball": "moon ball",
-    "fastball": "fast ball",
-    "friendball": "friend ball",
-    "healball": "heal ball",
-    "luxuryball": "luxury ball",
-    "premierball": "premier ball",
-    "beastball": "beast ball",
-    "diveball": "dive ball",
-    "cherishball": "cherish ball",
-    "sportball": "sport ball",
-    "dreamball": "dream ball",
-    "parkball": "park ball",
-}
-
-
-def _normalize_ball_name(name: str) -> str:
-    n = _normalize_item(name)
-    compact = "".join(ch for ch in n if ch.isalnum())
-    if n in _BALLS_BASIC:
-        return n
-    if compact in _BALL_NAME_ALIASES:
-        return _BALL_NAME_ALIASES[compact]
-    return n
-
+# ---------------- Bag / Heal / Throw (constants from .panel_items) ----------------
 
 class _BagLikeView(discord.ui.View):
     """Bag embed + Heal and Throw ball buttons (same content as /bag, buttons underneath)."""
