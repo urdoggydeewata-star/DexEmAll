@@ -8597,6 +8597,8 @@ ADVENTURE_ROUTES = {
         "image_cleared": ASSETS_ROUTES / "route-2-2.png",
         "next": None,
         "next_always": True,
+        "prev": "Viridian-Forest",
+        "down_target": {"area": "Viridian-Forest", "node": "1-3"},
         "grass_paths": {},
         "trainers": {},
     },
@@ -14718,12 +14720,22 @@ class AdventureRouteView(discord.ui.View):
                 btn = discord.ui.Button(label=label, style=discord.ButtonStyle.danger, custom_id=f"adv:rematch:{tid}")
                 btn.callback = self._on_rematch
                 self.add_item(btn)
-        # Back button if history exists or route always shows back (e.g. route-22)
+        # Back/Down button if history exists or route always shows back (e.g. route-22)
         # Panel/maze routes use their own navigation, not this button
         if (self.state.get("area_history") or route.get("back_always")) and not has_panels and not has_maze:
-            back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, custom_id="adv:back")
-            back_btn.callback = self._on_back
-            self.add_item(back_btn)
+            down_target = route.get("down_target")
+            if isinstance(down_target, dict) and down_target.get("area") and down_target.get("node"):
+                down_btn = discord.ui.Button(
+                    label="⬇️ Down",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"adv:down:{down_target['area']}:{down_target['node']}",
+                )
+                down_btn.callback = self._on_down_to_maze
+                self.add_item(down_btn)
+            else:
+                back_btn = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, custom_id="adv:back")
+                back_btn.callback = self._on_back
+                self.add_item(back_btn)
 
     async def _on_next(self, itx: discord.Interaction):
         if not self._guard(itx):
@@ -14844,6 +14856,24 @@ class AdventureRouteView(discord.ui.View):
         finally:
             self._handled = False
 
+    async def _on_down_to_maze(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        cid = (itx.data or {}).get("custom_id", "")
+        parts = cid.split(":") if cid else []
+        if len(parts) < 4:
+            return await itx.response.send_message("Invalid.", ephemeral=True)
+        try:
+            await itx.response.defer(ephemeral=False, thinking=False)
+        except Exception:
+            pass
+        target_area, target_node = parts[2], parts[3]
+        state = await _get_adventure_state(str(itx.user.id))
+        _adv_history_push(state, self.area_id)
+        state["area_id"] = target_area
+        _maze_set_node(state, target_area, target_node)
+        await _save_adventure_state(str(itx.user.id), state)
+        await _send_adventure_panel(itx, state, edit_original=False)
 
     # ===== Route 1 3-panel navigation =====
     def _r1_get(self, state: dict) -> dict:
@@ -15124,6 +15154,17 @@ class AdventureRoute1PersistentView(discord.ui.View):
             bb = discord.ui.Button(label="⬅️ Back", style=discord.ButtonStyle.secondary, custom_id=f"adv:maze:{area_id}:back")
             bb.callback = self._handle_maze
             self.add_item(bb)
+        # Routes with down_target (e.g. route-2-2 back to Viridian Forest 1-3)
+        for rid, r in ADVENTURE_ROUTES.items():
+            dt = r.get("down_target") if isinstance(r, dict) else None
+            if isinstance(dt, dict) and dt.get("area") and dt.get("node"):
+                db = discord.ui.Button(
+                    label="⬇️ South",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"adv:down:{dt['area']}:{dt['node']}",
+                )
+                db.callback = self._handle_down_to_maze
+                self.add_item(db)
         # Legacy adv:r1:back/fwd for old Route 1 messages
         for cid, label, style in [("adv:r1:back", "⬇️", discord.ButtonStyle.secondary), ("adv:r1:fwd", "⬆️", discord.ButtonStyle.primary)]:
             b = discord.ui.Button(label=label, style=style, custom_id=cid)
@@ -15191,7 +15232,8 @@ class AdventureRoute1PersistentView(discord.ui.View):
             return
         exit_node = route.get("exit_node")
         moved_within_route = True
-        if target == exit_node:
+        if target == exit_node and node_id == exit_node:
+            # Already on exit node, clicking North to leave (panel fwd)
             next_area = route.get("next")
             if next_area:
                 _adv_history_push(state, area_id)
@@ -15199,6 +15241,7 @@ class AdventureRoute1PersistentView(discord.ui.View):
             state.get("route_panels", {}).pop(area_id, None)
             moved_within_route = False
         else:
+            # Moving to target (including moving TO exit_node from another node)
             _maze_set_node(state, area_id, target)
         await _save_adventure_state(uid, state)
         if moved_within_route:
@@ -15254,6 +15297,24 @@ class AdventureRoute1PersistentView(discord.ui.View):
             await _route_panel_try_wild_encounter(itx, state, area_id)
             await _save_adventure_state(uid, state)
         await _send_adventure_panel(itx, state, edit_original=False, roll_route1_item=moved_within_route)
+
+    async def _handle_down_to_maze(self, itx: discord.Interaction, button: discord.ui.Button):
+        cid = (button.custom_id or (itx.data or {}).get("custom_id") or "")
+        parts = cid.split(":") if cid else []
+        if len(parts) < 4:
+            return await itx.response.send_message("Invalid.", ephemeral=True)
+        try:
+            await itx.response.defer(ephemeral=False, thinking=False)
+        except Exception:
+            pass
+        target_area, target_node = parts[2], parts[3]
+        uid = str(itx.user.id)
+        state = await _get_adventure_state(uid)
+        _adv_history_push(state, state.get("area_id"))
+        state["area_id"] = target_area
+        _maze_set_node(state, target_area, target_node)
+        await _save_adventure_state(uid, state)
+        await _send_adventure_panel(itx, state, edit_original=False)
 
 
 class _AdventureRouteViewRoute1Methods:
@@ -15387,7 +15448,8 @@ class _AdventureRouteViewRoute1Methods:
             return await _send_adventure_panel(itx, state, edit_original=False)
         exit_node = route.get("exit_node")
         moved_within_route = True
-        if target == exit_node:
+        if target == exit_node and node_id == exit_node:
+            # Already on exit node (shouldn't happen via exits - panel uses panel:fwd)
             next_area = route.get("next")
             if next_area:
                 _adv_history_push(state, area_id)
