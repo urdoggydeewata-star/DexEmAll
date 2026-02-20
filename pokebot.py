@@ -1578,27 +1578,6 @@ async def import_items_cmd(interaction: discord.Interaction):
         ephemeral=True
     )
 
-@bot.tree.command(name="seed_tm_fragments", description="(DB Admin) Ensure TM Fragment + all Gen1 TMs exist in items; give you 1 fragment per TM.")
-@admin_only()
-async def seed_tm_fragments_cmd(interaction: discord.Interaction):
-    """Ensure item_master has tm-fragment and every GEN1 TM; give the invoker 1 TM Fragment per TM (for testing/exchange)."""
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    uid = str(interaction.user.id)
-    try:
-        await db.upsert_item_master(TM_FRAGMENT_ITEM_ID, name="TM Fragment")
-        for item_id, move_name in GEN1_TMS:
-            num = item_id.replace("tm-", "").zfill(2)
-            await db.upsert_item_master(item_id, name=f"TM{num} {move_name}")
-        n_tms = len(GEN1_TMS)
-        await db.give_item(uid, TM_FRAGMENT_ITEM_ID, n_tms)
-    except Exception as e:
-        return await interaction.followup.send(f"❌ Seed failed: {e}", ephemeral=True)
-    await interaction.followup.send(
-        f"✅ Seeded **TM Fragment** and all **{n_tms}** Gen 1 TMs in the item catalog.\n"
-        f"You received **{n_tms}** TM Fragment(s).",
-        ephemeral=True
-    )
-
 @bot.tree.command(name="mygen", description="Show your current game generation.")
 async def mygen(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
@@ -7842,8 +7821,6 @@ GEN1_TMS: List[Tuple[str, str]] = [
 GEN1_HMS: List[Tuple[str, str]] = [
     ("hm-01", "Cut"), ("hm-02", "Fly"), ("hm-03", "Surf"), ("hm-04", "Strength"), ("hm-05", "Flash"),
 ]
-TM_FRAGMENT_ITEM_ID = "tm-fragment"  # Rare encounter drop; display name "TM Fragment"
-TM_FRAGMENT_DROP_CHANCE = 0.02  # Rolled for every adventure wild win (grass path + /route)
 TM_SELLER_PRICE = 500  # Coins per TM (Gen 1)
 # Seller has 25 TMs (rolled from 1–50 via script, fixed)
 TM_SELLER_ITEMS = [GEN1_TMS[i - 1] for i in (1, 3, 5, 6, 7, 9, 11, 12, 15, 17, 20, 21, 22, 23, 24, 31, 34, 35, 37, 40, 42, 44, 45, 49, 50)]
@@ -12988,14 +12965,6 @@ async def _start_pve_battle(
                             emb.add_field(name="", value=msg, inline=False)
                     except Exception as e:
                         print(f"[PvP] Error adding caught wild to storage: {e}")
-            # Rare drop: TM Fragment (rolled for every adventure wild win: grass path + /route)
-            if is_adventure_wild and st.winner == itx.user.id and random.random() < TM_FRAGMENT_DROP_CHANCE:
-                try:
-                    await db.upsert_item_master(TM_FRAGMENT_ITEM_ID, name="TM Fragment")
-                    await db.give_item(str(itx.user.id), TM_FRAGMENT_ITEM_ID, 1)
-                    emb.add_field(name="", value="You found a **TM Fragment** on the ground!", inline=False)
-                except Exception:
-                    pass
             try:
                 await itx.followup.send(embed=emb, ephemeral=False)
             except Exception:
@@ -15930,12 +15899,8 @@ async def tm_machine_cmd(interaction: discord.Interaction):
         if q > 0:
             num = item_id.replace("hm-", "").zfill(2)
             hm_lines.append(f"**HM{num}** {move_name} ✓ (permanent)")
-    fragment_q = qty_by_id.get(TM_FRAGMENT_ITEM_ID, 0)
     if not tm_lines and not hm_lines:
-        msg = "You have no TMs or HMs."
-        if fragment_q > 0:
-            msg += f"\n\nYou have **{fragment_q}** TM Fragment(s) — exchange them at the TM Seller."
-        return await interaction.followup.send(msg, ephemeral=True)
+        return await interaction.followup.send("You have no TMs or HMs.", ephemeral=True)
     emb = discord.Embed(title="Your TM Machine", description="TMs are **consumable** (single use). HMs are **permanent**.", color=0x5865F2)
     if tm_lines:
         emb.add_field(name="TMs (consumable)", value="\n".join(tm_lines), inline=False)
@@ -15945,8 +15910,6 @@ async def tm_machine_cmd(interaction: discord.Interaction):
         emb.add_field(name="HMs (permanent)", value="\n".join(hm_lines), inline=False)
     else:
         emb.add_field(name="HMs (permanent)", value="*None*", inline=False)
-    if fragment_q > 0:
-        emb.add_field(name="TM Fragment", value=f"You have **{fragment_q}** TM Fragment(s). (Rare finds from the field — exchange at the TM Seller.)", inline=False)
     view = UseTMHMSelectView(interaction.user.id, uid, qty_by_id) if any(qty_by_id.get(iid, 0) > 0 for iid, _ in GEN1_TMS + GEN1_HMS) else None
     send_kwargs: Dict[str, Any] = {"embed": emb, "ephemeral": True}
     if view is not None:
