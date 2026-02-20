@@ -11,6 +11,8 @@ Update rule:
 Format:
 - YYYY-MM-DD HH:MM UTC | short-hash | mechanics summary
 
+2026-02-20 07:39 UTC | 95e3dd62 | Added a repo post-commit automation hook that automatically records non-changelog mechanics commits into this file.
+
 2026-02-20 07:38 UTC | ac46cc16 | Normalized legacy stat-stage key aliases during battle state updates so stage-changing status moves remain consistent even with older stage data.
 
 2026-02-20 07:22 UTC | 81b31827 | Fixed status-stage handling so Growl-style debuffs apply consistently and corrected /team sprite size scaling so small species no longer render oversized.
