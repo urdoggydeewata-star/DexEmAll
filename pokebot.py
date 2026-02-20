@@ -4353,6 +4353,36 @@ def _cap_evs(evs_dict: dict) -> dict:
         total -= 1
     return evs
 
+
+def _apply_ev_gain_locked(current_evs: Mapping[str, Any], ev_gain: Mapping[str, Any]) -> dict[str, int]:
+    """
+    Apply EV gain without ever redistributing/decreasing existing EVs.
+    - Per-stat cap: 252
+    - Total cap: 510
+    Extra gain beyond caps is discarded.
+    """
+    keys = list(_STAT_KEYS_SHORT)
+    out: dict[str, int] = {
+        k: max(0, min(252, int((current_evs or {}).get(k, 0) or 0)))
+        for k in keys
+    }
+    remaining_total = max(0, 510 - sum(out.values()))
+    if remaining_total <= 0:
+        return out
+    for k in keys:
+        gain_k = max(0, int((ev_gain or {}).get(k, 0) or 0))
+        if gain_k <= 0 or remaining_total <= 0:
+            continue
+        stat_room = max(0, 252 - out[k])
+        if stat_room <= 0:
+            continue
+        add = min(gain_k, stat_room, remaining_total)
+        if add > 0:
+            out[k] += int(add)
+            remaining_total -= int(add)
+    return out
+
+
 def _maybe_json(v):
     if isinstance(v, str):
         try: return json.loads(v)
@@ -11238,14 +11268,8 @@ async def _build_mon_from_species(
         species_id = None
     if not move_list:
         move_list = await _default_levelup_moves(species_id, level, 1) if species_id else ["Tackle"]
-    # Special move roll: 0.1% chance per slot to be a non-level-up move (egg/machine only; no tutor in Gen 1)
-    if species_id:
-        special_moves = await _get_egg_machine_learnset_moves(species_id, 1)
-        if special_moves:
-            move_list = list(move_list)[:4]
-            for i in range(len(move_list)):
-                if random.random() < 0.001:  # 0.1% per slot
-                    move_list[i] = random.choice(special_moves)
+    # Wild encounter moves should stay legal level-up moves only.
+    move_list = list(move_list)[:4]
     try:
         capture_rate = int(float(entry.get("capture_rate") or 45))
     except Exception:
@@ -12405,7 +12429,7 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
             evs_for_stats = dict(current_evs)
             # Award EVs from defeated foes (wild EV farming)
             if has_ev_yield:
-                new_evs = _cap_evs({k: current_evs[k] + total_ev_yield.get(k, 0) for k in _STAT_KEYS_SHORT})
+                new_evs = _apply_ev_gain_locked(current_evs, total_ev_yield)
                 ev_gains = {k: new_evs[k] - current_evs[k] for k in _STAT_KEYS_SHORT if new_evs[k] - current_evs[k] > 0}
                 evs_for_stats = dict(new_evs)
                 if ev_gains:
@@ -14707,13 +14731,46 @@ class AdventureRouteView(discord.ui.View):
         await _route_panel_try_wild_encounter(itx, state, self.area_id, force=force)
 
 
-async def _route_panel_try_wild_encounter(itx: discord.Interaction, state: dict, area_id: str, *, force: bool = False) -> None:
-    """Roll (or force) a wild encounter on a panel route (route-1, route-2, etc.)."""
-    route = ADVENTURE_ROUTES.get(area_id, {})
+def _route_move_encounter_chance() -> float:
+    """Shared route encounter chance used by movement and battle button rolls."""
     try:
         chance = float(os.environ.get("ROUTE_MOVE_ENCOUNTER_CHANCE", "0.35"))
     except Exception:
         chance = 0.35
+    return max(0.0, min(1.0, chance))
+
+
+async def _route_try_force_with_ball_fallback(
+    itx: discord.Interaction,
+    state: dict,
+    area_id: str,
+    *,
+    maze_target_node: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Battle button behavior:
+    - Same encounter chance as route movement.
+    - If no encounter, roll the route ball-reward system instead.
+    Returns an optional panel message for no-battle outcomes.
+    """
+    chance = _route_move_encounter_chance()
+    if random.random() <= chance:
+        route_cfg = ADVENTURE_ROUTES.get(area_id, {})
+        if route_cfg.get("layout") == "maze":
+            await _route_maze_try_wild_encounter(itx, state, area_id, maze_target_node, force=True)
+        else:
+            await _route_panel_try_wild_encounter(itx, state, area_id, force=True)
+        return None
+    msg = await _roll_and_give_route_move_item_async(str(itx.user.id))
+    if msg:
+        return msg
+    return "No wild Pokémon appeared. You searched around but found no loot ball this time."
+
+
+async def _route_panel_try_wild_encounter(itx: discord.Interaction, state: dict, area_id: str, *, force: bool = False) -> None:
+    """Roll (or force) a wild encounter on a panel route (route-1, route-2, etc.)."""
+    route = ADVENTURE_ROUTES.get(area_id, {})
+    chance = _route_move_encounter_chance()
     if not force and random.random() > chance:
         return
 
@@ -14796,10 +14853,7 @@ async def _route_maze_try_wild_encounter(itx: discord.Interaction, state: dict, 
     encounters = node_cfg.get("encounters") or []
     if not encounters:
         return
-    try:
-        chance = float(os.environ.get("ROUTE_MOVE_ENCOUNTER_CHANCE", "0.35"))
-    except Exception:
-        chance = 0.35
+    chance = _route_move_encounter_chance()
     if not force and random.random() > chance:
         return
     enc_specs = []
@@ -14961,9 +15015,9 @@ class AdventureRoute1PersistentView(discord.ui.View):
             await _send_adventure_panel(itx, state, edit_original=False)
             return
         if action == "force":
-            await _route_maze_try_wild_encounter(itx, state, area_id, None, force=True)
+            route_msg = await _route_try_force_with_ball_fallback(itx, state, area_id, maze_target_node=None)
             await _save_adventure_state(uid, state)
-            await _send_adventure_panel(itx, state, edit_original=False)
+            await _send_adventure_panel(itx, state, edit_original=False, route_move_item_message=route_msg)
             return
         if action == "back":
             prev_area = route.get("prev")
@@ -15126,10 +15180,9 @@ class _AdventureRouteViewRoute1Methods:
             await itx.response.defer(ephemeral=False, thinking=False)
 
         state = await _get_adventure_state(str(itx.user.id))
-        # Force encounter
-        await self._r1_try_wild_encounter(itx, state, force=True)
+        route_msg = await _route_try_force_with_ball_fallback(itx, state, self.area_id)
         await _save_adventure_state(str(itx.user.id), state)
-        await _send_adventure_panel(itx, state, edit_original=False)
+        await _send_adventure_panel(itx, state, edit_original=False, route_move_item_message=route_msg)
 
     async def _on_maze_back(self, itx: discord.Interaction):
         if not self._guard(itx):
@@ -15194,9 +15247,9 @@ class _AdventureRouteViewRoute1Methods:
         if not itx.response.is_done():
             await itx.response.defer(ephemeral=False, thinking=False)
         state = await _get_adventure_state(str(itx.user.id))
-        await _route_maze_try_wild_encounter(itx, state, self.area_id, None, force=True)
+        route_msg = await _route_try_force_with_ball_fallback(itx, state, self.area_id, maze_target_node=None)
         await _save_adventure_state(str(itx.user.id), state)
-        await _send_adventure_panel(itx, state, edit_original=False)
+        await _send_adventure_panel(itx, state, edit_original=False, route_move_item_message=route_msg)
 
     async def _on_read_sign(self, itx: discord.Interaction):
         if not self._guard(itx):
