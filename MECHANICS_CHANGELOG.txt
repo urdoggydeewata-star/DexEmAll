@@ -11,6 +11,8 @@ Update rule:
 Format:
 - YYYY-MM-DD HH:MM UTC | short-hash | mechanics summary
 
+2026-02-20 06:32 UTC | 364a253b | Updated /mypokeinfo shiny marker to match quick-info sparkle icon and removed held-item icon from the panel.
+
 2026-02-20 06:24 UTC | 821f0d5a | Fixed PP persistence/consumption, kept moves through evolution, stabilized route force-encounter behavior, and enforced starter-like 12.5% female ratios for wild/hatched mons.
 
 2026-02-20 04:05 UTC | (this update) | Added this mechanics changelog file and started 24h history tracking.
