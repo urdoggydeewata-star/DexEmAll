@@ -3423,11 +3423,39 @@ _CONSUMABLE_ITEM_ID_OVERRIDES: frozenset[str] = frozenset(
 
 
 def _item_forces_consumable(item_id: Any) -> bool:
+    candidates: set[str] = set()
+    raw = str(item_id or "")
+    raw_norm = _normalize_item_token(raw)
+    if raw_norm:
+        candidates.add(raw_norm)
     try:
-        canon = _canonical_item_token(str(item_id or ""))
+        canon = _canonical_item_token(raw)
     except Exception:
-        canon = str(item_id or "").strip().lower().replace("-", "_").replace(" ", "_")
-    return canon in _CONSUMABLE_ITEM_ID_OVERRIDES
+        canon = ""
+    canon_norm = _normalize_item_token(canon)
+    if canon_norm:
+        candidates.add(canon_norm)
+    try:
+        pp_canon = _canonical_pp_item_id(raw)
+        if pp_canon:
+            candidates.add(_normalize_item_token(pp_canon))
+    except Exception:
+        pass
+    try:
+        if canon_norm:
+            pp_canon_2 = _canonical_pp_item_id(canon_norm)
+            if pp_canon_2:
+                candidates.add(_normalize_item_token(pp_canon_2))
+    except Exception:
+        pass
+    try:
+        for alias in _item_alias_tokens(canon_norm or raw_norm or raw):
+            n = _normalize_item_token(alias)
+            if n:
+                candidates.add(n)
+    except Exception:
+        pass
+    return any(c in _CONSUMABLE_ITEM_ID_OVERRIDES for c in candidates if c)
 
 
 async def _item_is_consumable_conn(conn, item_id: str) -> bool:
@@ -3596,7 +3624,12 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
         give_emoji_raw = (row_dict.get("emoji") or "").strip()
         give_emoji = give_emoji_raw if _is_displayable_item_emoji(give_emoji_raw) else ""
         give_disp = pretty_item_name(row_dict.get("name") or row_dict.get("id") or item)
-        give_is_consumable = _item_category_is_consumable(row_dict.get("category")) or _item_forces_consumable(give_id)
+        give_is_consumable = (
+            _item_category_is_consumable(row_dict.get("category"))
+            or _item_forces_consumable(give_id)
+            or _item_forces_consumable(row_dict.get("name") or "")
+            or bool(_canonical_pp_item_id(str(row_dict.get("name") or "")))
+        )
         # Show autocorrect if the matched item is different from what user typed
         ac_suffix = f" _(autocorrected to {give_disp})_" if item.lower().replace(" ", "-") != give_id.lower() else ""
 
@@ -26571,139 +26604,82 @@ class MovesPager(discord.ui.View):
         finally:
             _close_discord_files(files)
 
-# ---------------- /moves command (gen required; others optional) ----------------
+# ---------------- /moves command (team mon + current level) ----------------
 
 @bot.tree.command(
     name="moves",
-    description="List a Pokémon's moves for a generation in a clean 3×5 grid. Method/type/category optional."
+    description="Show level-up moves your team Pokémon can learn at its current level."
 )
-@app_commands.describe(
-    name_or_id="Pokémon name or National Dex number",
-    gen="Generation number (1–9)",
-    method="Optional: level-up, machine, tutor, egg (default: all methods)",
-    move_category="Optional: Physical, Special or Status",
-    move_type="Optional: move type (Fire, Water, etc.)"
-)
-@app_commands.choices(
-    method=[
-        app_commands.Choice(name="level-up", value="level-up"),
-        app_commands.Choice(name="machine",  value="machine"),
-        app_commands.Choice(name="tutor",    value="tutor"),
-        app_commands.Choice(name="egg",      value="egg"),
-    ],
-    move_category=[app_commands.Choice(name=x.title(), value=x) for x in CATEGORIES],
-    move_type=[app_commands.Choice(name=x.title(), value=x) for x in TYPES]
-)
-async def moves(
-    interaction: discord.Interaction,
-    name_or_id: str,
-    gen: int,
-    method: Optional[str] = None,
-    move_category: Optional[str] = None,
-    move_type: Optional[str] = None,
-):
+@app_commands.describe(mon="Team slot (1-6) OR Pokémon name on your team")
+async def moves(interaction: discord.Interaction, mon: str):
+    uid = str(interaction.user.id)
     await interaction.response.defer(ephemeral=True, thinking=True)
 
-    # --- lookup species in your pokedex table
-    target = name_or_id.strip()
-    con = await db_connect()
+    mon_id, mon_row, err = await _resolve_team_mon_by_name_or_slot(uid, mon)
+    if err:
+        return await interaction.followup.send(f"❌ {err}", ephemeral=True)
+
+    species_name = str(mon_row["species"])
     try:
-        if target.isdigit():
-            cur = await con.execute('SELECT id, name, introduced_in FROM pokedex WHERE id=?', (int(target),))
-        else:
-            cur = await con.execute('SELECT id, name, introduced_in FROM pokedex WHERE LOWER(name)=LOWER(?)', (target.lower(),))
-        row = await cur.fetchone(); await cur.close()
-        if not row and not target.isdigit():
-            cur = await con.execute('SELECT id, name, introduced_in FROM pokedex WHERE LOWER(name) LIKE ? ORDER BY id LIMIT 1', (target.lower()+'%',))
-            row = await cur.fetchone(); await cur.close()
-    finally:
-        await con.close()
+        level = int(mon_row["level"] or 1)
+    except Exception:
+        level = 1
 
-    if not row:
-        return await interaction.followup.send("Pokémon not found in your Pokédex cache.", ephemeral=True)
+    species_id = await _species_id_from_name(species_name)
+    if not species_id:
+        return await interaction.followup.send("❌ Could not resolve species in Pokédex.", ephemeral=True)
 
-    sid, sname, intro = row["id"], row["name"], row["introduced_in"]
-    if intro is not None and gen < int(intro):
-        return await interaction.followup.send(
-            f"**{_tc(sname)}** wasn’t in **Gen {gen}** (introduced in **Gen {intro}**).",
-            ephemeral=True
-        )
-
-    # --- build SQL filters
-    where = ["l.species_id = ?", "l.generation = ?"]
-    params: List[object] = [sid, gen]
-    if method:
-        where.append("l.method = ?"); params.append(method)
-    if move_category:
-        where.append("LOWER(m.damage_class) = ?"); params.append(move_category.lower())
-    if move_type:
-        where.append("LOWER(m.type) = ?"); params.append(move_type.lower())
-
-    # --- fetch learnset lines
-    con = await db_connect()
     try:
-        sql = f"""
-            SELECT
-              COALESCE(NULLIF(l.form_name,''), '(default)') AS form_label,
-              m.name AS move_name,
-              l.method,
-              l.level_learned
-            FROM learnsets l
-            JOIN moves m ON m.id = l.move_id
-            WHERE {' AND '.join(where)}
-        """
-        cur = await con.execute(sql, tuple(params))
-        rows = await cur.fetchall(); await cur.close()
-    finally:
-        await con.close()
+        user_gen = int(await _user_selected_gen(uid))
+    except Exception:
+        user_gen = 1
+    gen_min, gen_max = _learnset_gen_bounds_for_user_gen(user_gen)
 
+    rows = await _levelup_moves_for_species(int(species_id), gen_min, gen_max)
     if not rows:
-        bits = [f"Gen {gen}"]
-        if method:        bits.append(method)
-        if move_category: bits.append(move_category.title())
-        if move_type:     bits.append(move_type.title())
         return await interaction.followup.send(
-            f"No moves for **{_tc(sname)}** ({' · '.join(bits)}).",
-            ephemeral=True
+            f"❌ No level-up learnset data found for **{species_name.replace('-', ' ').title()}** "
+            f"(Gen window: **{gen_min}-{gen_max}**).",
+            ephemeral=True,
         )
 
-    # --- order & flatten to text lines
-    from collections import defaultdict
-    per_form: Dict[str, List[Tuple[int, Optional[int], str, str]]] = defaultdict(list)
-    counts = {"level-up":0,"machine":0,"tutor":0,"egg":0}
-    for r in rows:
-        mo = r["method"]; counts[mo] = counts.get(mo, 0) + 1
-        lvl = r["level_learned"] if mo == "level-up" else None
-        per_form[r["form_label"]].append((METHOD_ORDER.get(mo, 99), lvl, r["move_name"], mo))
+    now_rows, _locked_rows = _split_levelup_rows(rows, level)
+    current = await _get_current_moves(uid, mon_id)
+    current_norm = {_norm_move_name(m) for m in current}
 
-    def form_key(lbl: str): return (0, "") if lbl == "(default)" else (1, lbl.lower())
+    if not now_rows:
+        return await interaction.followup.send(
+            f"ℹ️ **{species_name.replace('-', ' ').title()}** has no new level-up moves at **Lv.{int(level)}** "
+            f"(Gen window: **{gen_min}-{gen_max}**).",
+            ephemeral=True,
+        )
 
-    flat: List[str] = []
-    for form_lbl in sorted(per_form.keys(), key=form_key):
-        entries = per_form[form_lbl]
-        entries.sort(key=lambda t: (t[0], (t[1] is None, t[1] if t[1] is not None else 999), t[2].lower()))
-        for _, lvl, name, mo in entries:
-            flat.append(_fmt_line(name, mo, lvl, form_lbl))
+    def _line(row: dict[str, Any]) -> str:
+        mv = str(row.get("move_name") or "").strip()
+        mv_norm = _norm_move_name(mv)
+        known_prefix = "✅ " if mv_norm in current_norm else ""
+        try:
+            unlock = int(row.get("unlock_level") or 1)
+        except Exception:
+            unlock = 1
+        return f"{known_prefix}Lv.{int(unlock):>2} • {mv.replace('-', ' ').title()}"
 
-    pages = _paginate_15(flat)
-
-    # --- title with your server's pokéball emoji & bold method name (if chosen)
-    ball = await _pokeball_emoji(interaction.guild)
-    method_txt = ("all methods" if not method else f"**{method.lower()}**")
-    title_prefix = " · ".join(
-        [f"{(ball + ' ') if ball else ''}{_tc(sname)}", f"Gen {gen}", method_txt]
-        + ([move_category.title()] if move_category else [])
-        + ([move_type.title()] if move_type else [])
+    now_lines = [_line(r) for r in now_rows][:30]
+    emb = discord.Embed(
+        title=f"{species_name.replace('-', ' ').title()} — /moves",
+        description=(
+            f"Current level: **{int(level)}**\n"
+            f"Generation rules: **Gen {int(user_gen)}** (level-up window **{gen_min}-{gen_max}**)"
+        ),
+        color=0x5865F2,
     )
-
-    # footer legend with bold symbols
-    legend = "Legend — " + "  ".join(f"**{v}**={k}" for k, v in METHOD_SYMBOL.items())
-    totals = "  ".join(f"{k}:{v}" for k, v in counts.items() if v)
-    if totals:
-        legend += f"  |  Totals: {totals}"
-
-    view = MovesPager(pages, title_prefix, legend, species=sname)
-    await view.send_initial(interaction)
+    emb.add_field(
+        name=f"Learnable now ({len(now_rows)})",
+        value="\n".join(now_lines) if now_lines else "—",
+        inline=False,
+    )
+    emb.set_footer(text="✅ = move already known")
+    await interaction.followup.send(embed=emb, ephemeral=True)
 # =========================
 #  fect message
 # =========================
