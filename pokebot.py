@@ -12682,7 +12682,14 @@ async def _start_pve_battle(
     if route_display_name is not None:
         st.adventure_route_display_name = route_display_name
     # Route battles should be public (non-ephemeral).
-    is_route_battle = str(area_id or "").strip().lower().startswith("route-")
+    # Include non "route-*" route IDs like "Viridian-Forest" too.
+    area_key = str(area_id or "").strip()
+    area_norm = area_key.lower()
+    is_route_battle = bool(area_key) and (
+        area_key in ADVENTURE_ROUTES
+        or area_norm.startswith("route-")
+        or area_norm.startswith("route")
+    )
     try:
         st.battle_mode = "route" if is_route_battle else "adventure"
     except Exception:
