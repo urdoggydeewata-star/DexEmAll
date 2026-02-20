@@ -1158,6 +1158,56 @@ def modify_stages(mon: Mon, changes: Dict[str, int], caused_by_opponent: bool = 
     
     # Track how many stats were lowered for Defiant/Competitive (activates for EACH stat)
     stats_lowered_count = 0
+
+    # Keep stage storage canonical so stat-changing status moves (e.g. Growl) apply
+    # reliably even if upstream data uses alias keys like "attack"/"defense".
+    if not isinstance(getattr(mon, "stages", None), dict):
+        mon.stages = {}
+    for stage_key in ("atk", "defn", "spa", "spd", "spe", "accuracy", "evasion"):
+        mon.stages.setdefault(stage_key, 0)
+
+    stat_aliases = {
+        "attack": "atk",
+        "atk": "atk",
+        "defense": "defn",
+        "def": "defn",
+        "defn": "defn",
+        "special_attack": "spa",
+        "special_atk": "spa",
+        "sp_attack": "spa",
+        "sp_atk": "spa",
+        "spatk": "spa",
+        "spa": "spa",
+        "special_defense": "spd",
+        "special_def": "spd",
+        "sp_defense": "spd",
+        "sp_def": "spd",
+        "spdef": "spd",
+        "spd": "spd",
+        "speed": "spe",
+        "spe": "spe",
+        "accuracy": "accuracy",
+        "acc": "accuracy",
+        "evasion": "evasion",
+        "evasiveness": "evasion",
+        "special": "special",
+    }
+    normalized_changes: Dict[str, int] = {}
+    for raw_stat, raw_change in dict(changes or {}).items():
+        key_raw = str(raw_stat or "").strip().lower().replace(" ", "_").replace("-", "_")
+        key = stat_aliases.get(key_raw, key_raw)
+        # Gen 1 "special" may appear in data; if no combined stage is tracked,
+        # apply to Sp. Atk as the best available canonical fallback.
+        if key == "special" and "special" not in mon.stages:
+            key = "spa"
+        try:
+            delta = int(raw_change)
+        except Exception:
+            continue
+        if delta == 0:
+            continue
+        normalized_changes[key] = int(normalized_changes.get(key, 0)) + delta
+    changes = normalized_changes
     
     for stat, change in changes.items():
         if stat not in mon.stages:
@@ -12102,8 +12152,12 @@ def apply_move(user: Mon, target: Mon, move_name: str, field_effects: Any = None
                         if t_item_data_cotton.get("powder_move_immunity"):
                             return f"**{user.species}** used **{move_name}**!\n{target.species}'s {target.item} protects it!"
             
-            # Apply stat drops to target
+            # Apply stat drops to target (generation-aware for String Shot to avoid
+            # double-applying its stage drop in mixed move tables).
+            status_gen = get_generation(field_effects=field_effects, battle_state=battle_state)
             stat_drops = effect_data["target_stat_drop"]
+            if status_move_id == "string-shot":
+                stat_drops = {"spe": -1} if status_gen <= 5 else {"spe": -2}
             drop_messages = modify_stages(target, stat_drops, caused_by_opponent=True, field_effects=field_effects)
             for msg in drop_messages:
                 main_msg += f"\n{msg}"
@@ -12144,30 +12198,14 @@ def apply_move(user: Mon, target: Mon, move_name: str, field_effects: Any = None
                 item_display = str(removed_item).replace("-", " ").title()
                 return base_msg + f"\n{target.species}'s {item_display} was corroded away!"
             
-            # String Shot: Generation-specific stat drop stages
+            # String Shot: base stat drop already applied above
             if status_move_id == "string-shot":
-                gen_string = get_generation(field_effects=field_effects)
-                
                 # Z-String Shot: +1 Speed (user)
                 if hasattr(user, '_is_z_move') and user._is_z_move:
                     z_msgs_str = modify_stages(user, {"spe": 1}, caused_by_opponent=False, field_effects=field_effects)
                     for z_msg in z_msgs_str:
                         main_msg += f"\n{z_msg}"
                     return main_msg
-                
-                # Override stat drops based on generation
-                # Gen I-II: -1 Speed
-                # Gen III-V: -1 Speed (hits adjacent handled elsewhere)
-                # Gen VI+: -2 Speed (hits adjacent handled elsewhere)
-                if gen_string <= 5:
-                    stat_drops = {"spe": -1}
-                else:  # Gen VI+
-                    stat_drops = {"spe": -2}
-                
-                # Apply stat drops
-                drop_messages = modify_stages(target, stat_drops, caused_by_opponent=True, field_effects=field_effects)
-                for msg in drop_messages:
-                    main_msg += f"\n{msg}"
                 return main_msg
             
             # Z-Cotton Spore: Reset all lowered stats

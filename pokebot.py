@@ -21286,15 +21286,25 @@ def _team_species_visual_scale(row: dict) -> float:
             raw_h = entry.get(hk)
             if raw_h in (None, "", 0, "0"):
                 continue
+            raw_h_text = str(raw_h).strip()
             try:
                 h = float(raw_h)
             except Exception:
                 continue
-            # Some datasets store decimeters as integer in "height".
-            if hk in ("height", "height_dm") and h > 20.0:
+            # Prefer explicit meter keys; for fallback "height"/"height_dm", many
+            # sources store decimeters (e.g. Pikachu=4, Charizard=17).
+            if hk == "height_dm":
                 h = h / 10.0
-            if hk in ("height", "height_dm") and h > 8.0:
-                h = h / 10.0
+            elif hk == "height":
+                looks_integer = False
+                if isinstance(raw_h, int):
+                    looks_integer = True
+                elif isinstance(raw_h, float) and float(raw_h).is_integer():
+                    looks_integer = True
+                elif re.fullmatch(r"[+-]?\d+", raw_h_text):
+                    looks_integer = True
+                if looks_integer:
+                    h = h / 10.0
             if h > 0:
                 height_m = h
                 break
@@ -21811,7 +21821,7 @@ def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None], *,
         {
             "target": str(target_name or ""),
             "current_gen": int(current_gen or 0),
-            "theme_rev": 2,
+            "theme_rev": 3,
             "slots": snapshot,
             "sync_ms": int(TEAM_BATTLE_SYNC_DURATION_MS),
             "sprite_cap": int(TEAM_MAX_SPRITE_FRAMES),
