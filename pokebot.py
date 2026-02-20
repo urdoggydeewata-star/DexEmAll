@@ -26604,7 +26604,108 @@ class MovesPager(discord.ui.View):
         finally:
             _close_discord_files(files)
 
-# ---------------- /moves command (team mon + current level) ----------------
+
+class MovesLearnsetView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        author_id: int,
+        species_display: str,
+        level: int,
+        user_gen: int,
+        gen_min: int,
+        gen_max: int,
+        missing_level_lines: list[str],
+        tm_lines: list[str],
+    ):
+        super().__init__(timeout=180)
+        self.author_id = int(author_id)
+        self.species_display = species_display
+        self.level = int(level)
+        self.user_gen = int(user_gen)
+        self.gen_min = int(gen_min)
+        self.gen_max = int(gen_max)
+        self._missing_pages = _paginate_15(missing_level_lines or ["—"])
+        self._tm_pages = _paginate_15(tm_lines or ["—"])
+        self.mode: str = "missing"
+        self.page: int = 0
+        self._sync_mode_button_styles()
+
+    def _pages(self) -> list[list[str]]:
+        return self._missing_pages if self.mode == "missing" else self._tm_pages
+
+    def _sync_mode_button_styles(self) -> None:
+        try:
+            self.btn_missing.style = discord.ButtonStyle.primary if self.mode == "missing" else discord.ButtonStyle.secondary
+            self.btn_tm.style = discord.ButtonStyle.primary if self.mode == "tm" else discord.ButtonStyle.secondary
+        except Exception:
+            pass
+
+    def _embed(self) -> discord.Embed:
+        pages = self._pages()
+        page_count = max(1, len(pages))
+        page_idx = max(0, min(self.page, page_count - 1))
+        col_texts = _split_cols_3x5(pages[page_idx])
+        if self.mode == "missing":
+            title = f"{self.species_display} — Missing Level-up Moves"
+            desc = (
+                f"Current level: **{self.level}**\n"
+                f"Generation rules: **Gen {self.user_gen}** (level-up window **{self.gen_min}-{self.gen_max}**)"
+            )
+            footer = "Lv.XX = unlock level"
+        else:
+            title = f"{self.species_display} — TM / Machine Moves"
+            desc = (
+                f"Current level: **{self.level}**\n"
+                f"Generation rules: **Gen {self.user_gen}** (learnset window **{self.gen_min}-{self.gen_max}**)"
+            )
+            footer = "✅ = move already known"
+        emb = discord.Embed(title=title, description=desc, color=0x5865F2)
+        for txt in col_texts:
+            emb.add_field(name="\u200b", value=txt, inline=True)
+        emb.set_footer(text=f"{footer} | Page {page_idx + 1}/{page_count}")
+        return emb
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.author_id:
+            await interaction.response.send_message("This isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Missing Lv Moves", style=discord.ButtonStyle.primary, row=0)
+    async def btn_missing(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.mode = "missing"
+        self.page = 0
+        self._sync_mode_button_styles()
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    @discord.ui.button(label="TM Moves", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_tm(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.mode = "tm"
+        self.page = 0
+        self._sync_mode_button_styles()
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    @discord.ui.button(label="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_prev(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        pages = self._pages()
+        if not pages:
+            self.page = 0
+        else:
+            self.page = (self.page - 1) % len(pages)
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    @discord.ui.button(label="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_next(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        pages = self._pages()
+        if not pages:
+            self.page = 0
+        else:
+            self.page = (self.page + 1) % len(pages)
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+
+# ---------------- /moves command (team mon + current level + buttons) ----------------
 
 @bot.tree.command(
     name="moves",
@@ -26635,51 +26736,58 @@ async def moves(interaction: discord.Interaction, mon: str):
         user_gen = 1
     gen_min, gen_max = _learnset_gen_bounds_for_user_gen(user_gen)
 
-    rows = await _levelup_moves_for_species(int(species_id), gen_min, gen_max)
-    if not rows:
+    level_rows = await _levelup_moves_for_species(int(species_id), gen_min, gen_max)
+    tm_rows = await _machine_moves_for_species(int(species_id), gen_min, gen_max)
+    if not level_rows and not tm_rows:
         return await interaction.followup.send(
-            f"❌ No level-up learnset data found for **{species_name.replace('-', ' ').title()}** "
+            f"❌ No learnset data found for **{species_name.replace('-', ' ').title()}** "
             f"(Gen window: **{gen_min}-{gen_max}**).",
             ephemeral=True,
         )
 
-    now_rows, _locked_rows = _split_levelup_rows(rows, level)
     current = await _get_current_moves(uid, mon_id)
     current_norm = {_norm_move_name(m) for m in current}
-
-    if not now_rows:
-        return await interaction.followup.send(
-            f"ℹ️ **{species_name.replace('-', ' ').title()}** has no new level-up moves at **Lv.{int(level)}** "
-            f"(Gen window: **{gen_min}-{gen_max}**).",
-            ephemeral=True,
-        )
-
-    def _line(row: dict[str, Any]) -> str:
+    missing_level_lines: list[str] = []
+    for row in level_rows:
         mv = str(row.get("move_name") or "").strip()
+        if not mv:
+            continue
         mv_norm = _norm_move_name(mv)
-        known_prefix = "✅ " if mv_norm in current_norm else ""
+        if mv_norm in current_norm:
+            continue
         try:
             unlock = int(row.get("unlock_level") or 1)
         except Exception:
             unlock = 1
-        return f"{known_prefix}Lv.{int(unlock):>2} • {mv.replace('-', ' ').title()}"
+        available_now = " • NOW" if unlock <= int(level) else ""
+        missing_level_lines.append(f"Lv.{int(unlock):>2} • {mv.replace('-', ' ').title()}{available_now}")
 
-    now_lines = [_line(r) for r in now_rows][:30]
-    emb = discord.Embed(
-        title=f"{species_name.replace('-', ' ').title()} — /moves",
-        description=(
-            f"Current level: **{int(level)}**\n"
-            f"Generation rules: **Gen {int(user_gen)}** (level-up window **{gen_min}-{gen_max}**)"
-        ),
-        color=0x5865F2,
+    tm_lines: list[str] = []
+    for row in tm_rows:
+        mv = str(row.get("move_name") or "").strip()
+        if not mv:
+            continue
+        mv_norm = _norm_move_name(mv)
+        known_prefix = "✅ " if mv_norm in current_norm else ""
+        tm_lines.append(f"{known_prefix}{mv.replace('-', ' ').title()}")
+
+    if not missing_level_lines:
+        missing_level_lines = ["— No missing level-up moves in this gen window —"]
+    if not tm_lines:
+        tm_lines = ["— No TM/machine moves in this gen window —"]
+
+    species_display = species_name.replace("-", " ").title()
+    view = MovesLearnsetView(
+        author_id=interaction.user.id,
+        species_display=species_display,
+        level=int(level),
+        user_gen=int(user_gen),
+        gen_min=int(gen_min),
+        gen_max=int(gen_max),
+        missing_level_lines=missing_level_lines,
+        tm_lines=tm_lines,
     )
-    emb.add_field(
-        name=f"Learnable now ({len(now_rows)})",
-        value="\n".join(now_lines) if now_lines else "—",
-        inline=False,
-    )
-    emb.set_footer(text="✅ = move already known")
-    await interaction.followup.send(embed=emb, ephemeral=True)
+    await interaction.followup.send(embed=view._embed(), view=view, ephemeral=True)
 # =========================
 #  fect message
 # =========================
@@ -27247,6 +27355,43 @@ async def _levelup_moves_for_species(species_id: int, gen_min: int, gen_max: int
         except Exception:
             unlock = 1
         out.append({"move_name": move_name, "unlock_level": max(1, unlock)})
+    return out
+
+
+async def _machine_moves_for_species(species_id: int, gen_min: int, gen_max: int) -> list[dict[str, Any]]:
+    try:
+        sid = int(species_id)
+        gmin = int(gen_min)
+        gmax = int(gen_max)
+    except Exception:
+        return []
+    if sid <= 0:
+        return []
+    if gmin > gmax:
+        gmin, gmax = gmax, gmin
+    async with db.session() as conn:
+        cur = await conn.execute(
+            """
+            SELECT
+                m.name AS move_name
+            FROM learnsets l
+            JOIN moves m ON m.id = l.move_id
+            WHERE l.species_id = ?
+              AND l.generation BETWEEN ? AND ?
+              AND LOWER(REPLACE(TRIM(COALESCE(l.method, '')), '_', '-')) = 'machine'
+            GROUP BY m.name
+            ORDER BY m.name ASC
+            """,
+            (sid, gmin, gmax),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+    out: list[dict[str, Any]] = []
+    for r in rows or []:
+        d = dict(r) if hasattr(r, "keys") else {}
+        move_name = str(d.get("move_name") or "").strip()
+        if move_name:
+            out.append({"move_name": move_name})
     return out
 
 
