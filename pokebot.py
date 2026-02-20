@@ -20482,6 +20482,50 @@ async def evolve_cmd(inter: discord.Interaction, name: str, slot: int | None = N
             pass
 
 
+@bot.tree.command(name="manualevolve", description="Manual alias for /evolve.")
+@app_commands.describe(
+    name="Pokémon name in your team (e.g. charmeleon)",
+    slot="If duplicates, which team slot (1–6)",
+    item="Optional evolution item (e.g. Thunder Stone)",
+)
+async def manualevolve_cmd(inter: discord.Interaction, name: str, slot: int | None = None, item: str | None = None):
+    """
+    Alias command for players who explicitly look for a manual evolve action.
+    Delegates to the main /evolve implementation.
+    """
+    cmd = None
+    try:
+        cmd = bot.tree.get_command("evolve")
+    except Exception:
+        cmd = None
+    cb = getattr(cmd, "callback", None)
+    if callable(cb):
+        try:
+            await cb(inter, name, slot, item)
+            return
+        except TypeError as e:
+            # Signature mismatch fallback for discord.py/fork differences.
+            msg = str(e).lower()
+            if (
+                "positional argument" in msg
+                or "unexpected keyword" in msg
+                or "required positional argument" in msg
+                or ("takes" in msg and "given" in msg)
+            ):
+                try:
+                    await cb(inter, name, slot)
+                    return
+                except Exception:
+                    pass
+    try:
+        if inter.response.is_done():
+            await inter.followup.send("❌ /evolve command is not loaded right now.", ephemeral=True)
+        else:
+            await inter.response.send_message("❌ /evolve command is not loaded right now.", ephemeral=True)
+    except Exception:
+        pass
+
+
 def _team_species_label(row: dict) -> str:
     nick = str(row.get("nickname") or "").strip()
     if nick and _daycare_norm_species(row.get("species")) != "egg":
