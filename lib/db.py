@@ -1006,6 +1006,8 @@ def _normalize_bag_item_id(item_id: Any) -> str:
         resolved = _catalog_resolve_market_key(token)
     except Exception:
         resolved = token
+    if not isinstance(resolved, str) or not resolved:
+        resolved = token
     if resolved in {"pokeball", "pok_ball", "poke_ball"}:
         return "poke_ball"
     # PP items often appear in multiple alias styles across old rows.
@@ -1018,7 +1020,7 @@ def _normalize_bag_item_id(item_id: Any) -> str:
     if resolved in {"maxelixir", "max_elixir"}:
         return "max_elixir"
     # Only rewrite when resolver actually mapped an alias.
-    if resolved != token:
+    if isinstance(resolved, str) and resolved != token:
         return resolved
     return raw
 

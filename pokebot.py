@@ -19501,7 +19501,8 @@ def _canonical_item_token(s: Any) -> str:
         resolved = _catalog_resolve_market_key(token)
     except Exception:
         resolved = token
-    token = resolved
+    if isinstance(resolved, str) and resolved:
+        token = resolved
     # Collapse known Poké Ball legacy aliases.
     if token in {"pokeball", "pok_ball", "poke_ball"}:
         token = "poke_ball"
