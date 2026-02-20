@@ -1,0 +1,71 @@
+CHANGELOG - Viridian Forest & Route 2-2 Changes
+==============================================
+
+[2025-02-19]
+
+
+1. VIRIDIAN FOREST - ENTRY NODE (2-1)
+   -----------------------------------
+   - Removed the back button from node 2-1 (entry node)
+   - Added route config: back_on_entry: False
+   - Updated maze view logic to respect route.get("back_on_entry", True)
+
+
+2. VIRIDIAN FOREST - SOUTH BUTTON ON 2-1 (BACK TO ROUTE 2)
+   -------------------------------------------------------
+   - Added South exit on node 2-1 that returns to Route 2 panel 3
+   - Exit config: {"id": "south", "label": "⬇️ South", "target": "__prev:3__"}
+   - Implemented special target handling: __prev:N__ transitions to prev area
+     with panel N set (route-2 panel 3)
+
+
+3. VIRIDIAN FOREST - NODE 1-3 AS PANEL
+   -----------------------------------
+   - Node 1-3 uses panel-style UI instead of maze exits
+   - Config: panel_node: True, panel_back_target: "1-2.5"
+   - Buttons shown on 1-3:
+     - ⬇️ South: returns to node 1-2.5
+     - ⬆️ North: exits to route-2-2
+   - Added handlers: _on_maze_panel_back, _on_maze_panel_fwd
+
+
+4. VIRIDIAN FOREST - FIX: 1-3 REACHABLE FROM 1-2.5
+   ------------------------------------------------
+   - Bug: Going Northwest from 1-2.5 to 1-3 was incorrectly transitioning
+     to route-2-2 (target matched exit_node, triggered exit logic)
+   - Fix: Only transition to next area when ALREADY on exit_node ( clicking
+     North on 1-3). When moving FROM another node TO exit_node, perform
+     _maze_set_node to stay in the maze.
+   - Northwest from 1-2.5 now correctly leads to panel 1-3
+
+
+5. VIRIDIAN FOREST - MAZE SIGNS
+   ----------------------------
+   - Added maze_signs route config (keyed by node id)
+   - Sign button appears on nodes that have a maze_signs entry
+   - Same format as panel_signs: label, text, text_alt, text_chance
+   - Updated _on_read_sign to handle maze routes (layout == "maze")
+   - Added sign buttons and _handle_sign to AdventureRoute1PersistentView
+     for interactions after view timeout
+
+
+6. ROUTE 2-2 - DOWN BUTTON
+   -----------------------
+   - Replaced Back button with ⬇️ Down button on route-2-2
+   - Down button returns to Viridian Forest node 1-3 (exit panel)
+   - Config: prev: "Viridian-Forest"
+             down_target: {"area": "Viridian-Forest", "node": "1-3"}
+   - Added _on_down_to_maze (ephemeral view) and _handle_down_to_maze
+     (persistent view) handlers
+   - Down button added to persistent view for post-timeout interactions
+
+
+FILES MODIFIED
+--------------
+- pokebot.py
+  - ADVENTURE_ROUTES: Viridian-Forest, route-2-2
+  - AdventureRouteView._build_buttons
+  - AdventureRoute1PersistentView (init, _handle_maze, _handle_down_to_maze,
+    _handle_sign)
+  - _AdventureRouteViewRoute1Methods (_on_down_to_maze, _on_read_sign)
+  - Maze exit handlers: target == exit_node logic, __prev:N__ handling
