@@ -17674,7 +17674,7 @@ class MPokeInfo(commands.Cog):
             theme_shadow = (0, 0, 0, 220)
 
         cache_payload = {
-            "panel": "mpokeinfo-front-v4",
+            "panel": "mpokeinfo-front-v5",
             "mon_id": int(mon.get("id") or 0),
             "species": str(species or "").strip().lower(),
             "level": int(level or 1),
@@ -18151,7 +18151,7 @@ class MPokeInfo(commands.Cog):
             width=nick_max_w,
         )
 
-        def _draw_front_shiny_stars(target_img: Any) -> None:
+        def _draw_shiny_marker(target_img: Any) -> None:
             if not shiny:
                 return
             try:
@@ -18160,32 +18160,19 @@ class MPokeInfo(commands.Cog):
                 return
             try:
                 from PIL import ImageFont  # type: ignore
-                star_font = ImageFont.truetype(
+                shiny_font = ImageFont.truetype(
                     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
                     max(10, int(round(14 * scale))),
                 )
-                side_star_font = ImageFont.truetype(
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                    max(8, int(round(10 * scale))),
-                )
             except Exception:
-                star_font = self._mpokeinfo_font(max(10, int(round(14 * scale))), bold=True)
-                side_star_font = self._mpokeinfo_font(max(8, int(round(10 * scale))), bold=True)
+                shiny_font = self._mpokeinfo_font(max(10, int(round(14 * scale))), bold=True)
             self._mpokeinfo_draw_shadow_text(
                 draw_star,
-                _pt(98, 79),
-                "★",
-                font=star_font,
-                fill=(255, 110, 132, 255),
-                shadow=(88, 20, 26, 220),
-            )
-            self._mpokeinfo_draw_shadow_text(
-                draw_star,
-                _pt(112, 69),
-                "★",
-                font=side_star_font,
-                fill=(255, 110, 132, 255),
-                shadow=(88, 20, 26, 220),
+                _pt(101, 74),
+                "✨",
+                font=shiny_font,
+                fill=(255, 230, 126, 255),
+                shadow=(92, 70, 22, 220),
             )
 
         ball_raw = str(mon.get("pokeball") or "poke_ball").strip().lower()
@@ -18209,15 +18196,6 @@ class MPokeInfo(commands.Cog):
                 pass
 
         held_item_raw = str(mon.get("held_item") or "").strip().lower()
-        held_icon = self._held_item_icon_path(held_item_raw)
-        if held_icon is not None:
-            try:
-                with Image.open(str(held_icon)) as src:
-                    icon = src.convert("RGBA")
-                icon.thumbnail((max(10, int(round(20 * sx))), max(10, int(round(20 * sy)))), resample=resample)
-                panel_static.alpha_composite(icon, dest=_pt(229, 73))
-            except Exception:
-                pass
 
         # --- moves / ability / item ---
         moves_clean = [str(m).replace("-", " ").replace("_", " ").title() for m in list(moves or []) if str(m).strip()]
@@ -18473,7 +18451,7 @@ class MPokeInfo(commands.Cog):
                         fr.alpha_composite(spr, dest=(dx, dy))
                     except Exception:
                         pass
-                    _draw_front_shiny_stars(fr)
+                    _draw_shiny_marker(fr)
                     out_frames.append(fr)
                 if out_frames:
                     out = BytesIO()
@@ -18512,7 +18490,7 @@ class MPokeInfo(commands.Cog):
                 panel_static.alpha_composite(spr, dest=(int(cx - (spr.width // 2)), int(cy - (spr.height // 2))))
             except Exception:
                 pass
-        _draw_front_shiny_stars(panel_static)
+        _draw_shiny_marker(panel_static)
 
         out = BytesIO()
         try:
