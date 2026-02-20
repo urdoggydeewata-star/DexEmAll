@@ -11,6 +11,8 @@ Update rule:
 Format:
 - YYYY-MM-DD HH:MM UTC | short-hash | mechanics summary
 
+2026-02-20 06:45 UTC | c52c2687 | Fixed Lucky Egg EXP bonus detection so EXP boost applies reliably regardless lucky-egg item ID formatting.
+
 2026-02-20 06:38 UTC | 12dfc30d | Applied starter-style 12.5% female ratio handling to owner give/import creation flows so gifted starter species use the same sex odds.
 
 2026-02-20 06:32 UTC | 364a253b | Updated /mypokeinfo shiny marker to match quick-info sparkle icon and removed held-item icon from the panel.
