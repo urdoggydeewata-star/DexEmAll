@@ -12312,13 +12312,22 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
 
         placeholders = ",".join("?" for _ in db_ids)
         cur = await conn.execute(
-            f"SELECT id, exp, exp_group, evs FROM pokemons WHERE id IN ({placeholders})",
+            f"SELECT id, exp, exp_group, evs, ivs, nature FROM pokemons WHERE id IN ({placeholders})",
             tuple(db_ids),
         )
         rows = await cur.fetchall()
         await cur.close()
         # Use int(id) as key so lookup matches mid regardless of DB driver type (int/str/bigint)
-        exp_map = {int(r["id"]): (int(r["exp"] or 0), r["exp_group"] or "medium_fast", r.get("evs")) for r in rows}
+        exp_map = {
+            int(r["id"]): (
+                int(r["exp"] or 0),
+                r["exp_group"] or "medium_fast",
+                r.get("evs"),
+                r.get("ivs"),
+                r.get("nature"),
+            )
+            for r in rows
+        }
 
         level_ups: List[Tuple[int, "Mon", int]] = []
         exp_summary: List[Tuple["Mon", int, int, int]] = []
@@ -12347,7 +12356,10 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
             mid = getattr(mon, "_db_id", None)
             if mid is None:
                 continue
-            cur_exp, eg, evs_raw = exp_map.get(int(mid), (0, "medium_fast", None))
+            cur_exp, eg, evs_raw, ivs_raw, nature_raw = exp_map.get(
+                int(mid),
+                (0, "medium_fast", None, None, "hardy"),
+            )
             total_gain = 0
             outsider = str(getattr(mon, "_owner_id", winner_id)) != str(winner_id)
             lucky_egg = (mon.item or "").lower().replace(" ", "-") == "lucky-egg"
@@ -12388,14 +12400,60 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
             exp_summary.append((mon, total_gain, old_level, new_lvl))
             if new_lvl > old_level:
                 level_ups.append((mid, mon, new_lvl))
+
+            current_evs = _normalize_ivs_evs(evs_raw, default_val=0)
+            evs_for_stats = dict(current_evs)
             # Award EVs from defeated foes (wild EV farming)
             if has_ev_yield:
-                current_evs = _normalize_ivs_evs(evs_raw, default_val=0)
                 new_evs = _cap_evs({k: current_evs[k] + total_ev_yield.get(k, 0) for k in _STAT_KEYS_SHORT})
                 ev_gains = {k: new_evs[k] - current_evs[k] for k in _STAT_KEYS_SHORT if new_evs[k] - current_evs[k] > 0}
+                evs_for_stats = dict(new_evs)
                 if ev_gains:
                     await conn.execute("UPDATE pokemons SET evs=? WHERE id=?", (json.dumps(new_evs, ensure_ascii=False), mid))
                     ev_summary.append((mon, ev_gains))
+
+            # Keep persisted stats in sync with level/EV updates.
+            try:
+                base_long = _mon_to_long_stats(getattr(mon, "base", {}) or {})
+                if any(int(base_long.get(k, 0) or 0) > 0 for k in ("hp", "attack", "defense", "special_attack", "special_defense", "speed")):
+                    ivs_for_stats = _normalize_ivs_evs(ivs_raw, default_val=0)
+                    ivs_long = {
+                        "hp": int(ivs_for_stats.get("hp", 0)),
+                        "attack": int(ivs_for_stats.get("atk", 0)),
+                        "defense": int(ivs_for_stats.get("defn", 0)),
+                        "special_attack": int(ivs_for_stats.get("spa", 0)),
+                        "special_defense": int(ivs_for_stats.get("spd", 0)),
+                        "speed": int(ivs_for_stats.get("spe", 0)),
+                    }
+                    evs_long = {
+                        "hp": int(evs_for_stats.get("hp", 0)),
+                        "attack": int(evs_for_stats.get("atk", 0)),
+                        "defense": int(evs_for_stats.get("defn", 0)),
+                        "special_attack": int(evs_for_stats.get("spa", 0)),
+                        "special_defense": int(evs_for_stats.get("spd", 0)),
+                        "speed": int(evs_for_stats.get("spe", 0)),
+                    }
+                    nature_name = str(
+                        nature_raw
+                        or getattr(mon, "nature_name", None)
+                        or getattr(mon, "nature", None)
+                        or "hardy"
+                    ).strip().lower() or "hardy"
+                    refreshed = calc_all_stats(base_long, ivs_long, evs_long, int(new_lvl), nature_name)
+                    await conn.execute(
+                        "UPDATE pokemons SET hp=?, atk=?, def=?, spa=?, spd=?, spe=? WHERE id=?",
+                        (
+                            int(refreshed.get("hp", 1) or 1),
+                            int(refreshed.get("attack", 0) or 0),
+                            int(refreshed.get("defense", 0) or 0),
+                            int(refreshed.get("special_attack", 0) or 0),
+                            int(refreshed.get("special_defense", 0) or 0),
+                            int(refreshed.get("speed", 0) or 0),
+                            int(mid),
+                        ),
+                    )
+            except Exception:
+                pass
         await conn.commit()
         db.invalidate_pokemons_cache(str(winner_id))
         try:
@@ -17243,8 +17301,8 @@ class MPokeInfo(commands.Cog):
         sy = float(h) / 300.0
         scale = min(sx, sy)
         if bool(is_registered):
-            theme_fill = (255, 116, 116, 255)
-            theme_shadow = (92, 20, 20, 220)
+            theme_fill = (122, 186, 255, 255)
+            theme_shadow = (16, 44, 98, 220)
         elif bool(shiny):
             theme_fill = (255, 224, 118, 255)
             theme_shadow = (98, 74, 24, 220)
@@ -17253,7 +17311,7 @@ class MPokeInfo(commands.Cog):
             theme_shadow = (0, 0, 0, 220)
 
         cache_payload = {
-            "panel": "mpokeinfo-front-v3",
+            "panel": "mpokeinfo-front-v4",
             "mon_id": int(mon.get("id") or 0),
             "species": str(species or "").strip().lower(),
             "level": int(level or 1),
@@ -17974,6 +18032,24 @@ class MPokeInfo(commands.Cog):
         stat_right = _pt(299, 0)[0]
         iv_right = _pt(333, 0)[0]
         ev_right = _pt(374, 0)[0]
+        nature_name_norm = str(mon.get("nature") or "hardy").strip().lower() or "hardy"
+        try:
+            nature_mods = stats.nature_multipliers(nature_name_norm)
+        except Exception:
+            nature_mods = {}
+        stat_to_nature_key = {
+            "atk": "attack",
+            "def": "defense",
+            "spa": "special_attack",
+            "spd": "special_defense",
+            "spe": "speed",
+        }
+        neutral_stat_fill = (235, 241, 247, 255)
+        neutral_stat_shadow = (0, 0, 0, 220)
+        raised_stat_fill = (116, 245, 172, 255)
+        raised_stat_shadow = (20, 88, 56, 220)
+        lowered_stat_fill = (255, 116, 130, 255)
+        lowered_stat_shadow = (96, 20, 34, 220)
         for key, yy in zip(stat_rows, stat_ys):
             y = _pt(0, yy)[1]
             sval = f"{int(final_stats.get(key, 0))}"
@@ -17984,12 +18060,25 @@ class MPokeInfo(commands.Cog):
             ival_w = self._mpokeinfo_text_width(draw_probe, ival, font_stats)
             eval_w = self._mpokeinfo_text_width(draw_probe, eval_, font_stats)
 
+            stat_fill = neutral_stat_fill
+            stat_shadow = neutral_stat_shadow
+            if key != "hp":
+                nature_key = stat_to_nature_key.get(key, "")
+                nmult = float(nature_mods.get(nature_key, 1.0) or 1.0) if nature_key else 1.0
+                if nmult > 1.0:
+                    stat_fill = raised_stat_fill
+                    stat_shadow = raised_stat_shadow
+                elif nmult < 1.0:
+                    stat_fill = lowered_stat_fill
+                    stat_shadow = lowered_stat_shadow
+
             self._mpokeinfo_draw_shadow_text(
                 draw,
                 (stat_right - sval_w, y),
                 sval,
                 font=font_stats,
-                fill=(235, 241, 247, 255),
+                fill=stat_fill,
+                shadow=stat_shadow,
             )
             self._mpokeinfo_draw_shadow_text(
                 draw,
@@ -18133,8 +18222,8 @@ class MPokeInfo(commands.Cog):
         sy = max(0.1, float(H) / 488.0)
         scale = min(sx, sy)
         if bool(is_registered):
-            theme_fill = (255, 116, 116, 255)
-            theme_shadow = (92, 20, 20, 220)
+            theme_fill = (122, 186, 255, 255)
+            theme_shadow = (16, 44, 98, 220)
         elif bool(shiny):
             theme_fill = (255, 224, 118, 255)
             theme_shadow = (98, 74, 24, 220)
@@ -18166,7 +18255,7 @@ class MPokeInfo(commands.Cog):
             except Exception:
                 profile_snapshot[k] = 0
         register_cache_payload = {
-            "panel": "register-back-v3",
+            "panel": "register-back-v4",
             "mon_id": int(mon.get("id") or 0),
             "species": str(species or "").strip().lower(),
             "level": int(level or 1),
@@ -19073,16 +19162,6 @@ class MPokeInfo(commands.Cog):
         team_slot = mon.get("team_slot")
         team_text = f"Slot {team_slot}" if team_slot else "—"
 
-        stats_obj = self._as_dict(mon.get("final_stats"))
-        hp_max = int(stats_obj.get("hp", mon.get("hp", 0))) or 1
-        hp_now = int(mon.get("hp_now", hp_max))
-        hp_pct = int(round((float(hp_now) / float(hp_max)) * 100.0)) if hp_max > 0 else 0
-        hp_pct = max(0, min(100, hp_pct))
-        hp_bar_fill = int(round((hp_pct / 100.0) * 16.0))
-        hp_bar_fill = max(0, min(16, hp_bar_fill))
-        hp_bar = f"[{'#' * hp_bar_fill}{'-' * (16 - hp_bar_fill)}]"
-        hp_display = f"{hp_now}/{hp_max}"
-
         def _stat6(d: dict | None) -> dict:
             d = d if isinstance(d, dict) else {}
             def _pick(*keys: str) -> int:
@@ -19102,6 +19181,109 @@ class MPokeInfo(commands.Cog):
                 "spe": _pick("speed", "spe"),
             }
 
+        ivs_map = _stat6(self._as_dict(mon.get("ivs")))
+        evs_map = _stat6(self._as_dict(mon.get("evs")))
+        stats_obj = self._as_dict(mon.get("final_stats"))
+
+        def _stats_payload_to_map(payload: Any) -> dict[str, Any]:
+            raw = payload
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw) if raw else {}
+                except Exception:
+                    raw = {}
+            return dict(raw) if isinstance(raw, Mapping) else {}
+
+        try:
+            base_stats_raw: dict[str, Any] = {}
+            if isinstance(dex, Mapping):
+                base_stats_raw = _stats_payload_to_map(dex.get("stats"))
+
+            species_norm = _daycare_norm_species(species)
+            form_norm = str(current_form or "").strip().lower().replace("_", "-").replace(" ", "-")
+            candidates: list[str] = []
+            if form_norm and form_norm not in {"normal", "base", "default"}:
+                if form_norm.startswith(f"{species_norm}-"):
+                    candidates.append(form_norm)
+                else:
+                    candidates.append(f"{species_norm}-{form_norm}")
+                    candidates.append(form_norm)
+            candidates.append(species_norm)
+
+            seen_keys: set[str] = set()
+            for candidate in candidates:
+                key = str(candidate or "").strip().lower()
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+
+                entry = None
+                if db_cache is not None:
+                    try:
+                        entry = db_cache.get_cached_pokedex(key)
+                    except Exception:
+                        entry = None
+                if entry is None:
+                    entry = await db.get_pokedex_by_name(key)
+                if not entry:
+                    continue
+
+                maybe_stats = _stats_payload_to_map(entry.get("stats"))
+                if maybe_stats:
+                    base_stats_raw = maybe_stats
+                    if key != species_norm:
+                        break
+
+            base_stats_long = normalize_base_stats(base_stats_raw)
+            if any(int(base_stats_long.get(k, 0) or 0) > 0 for k in ("hp", "attack", "defense", "special_attack", "special_defense", "speed")):
+                ivs_long = {
+                    "hp": int(ivs_map.get("hp", 0)),
+                    "attack": int(ivs_map.get("atk", 0)),
+                    "defense": int(ivs_map.get("def", 0)),
+                    "special_attack": int(ivs_map.get("spa", 0)),
+                    "special_defense": int(ivs_map.get("spd", 0)),
+                    "speed": int(ivs_map.get("spe", 0)),
+                }
+                evs_long = {
+                    "hp": int(evs_map.get("hp", 0)),
+                    "attack": int(evs_map.get("atk", 0)),
+                    "defense": int(evs_map.get("def", 0)),
+                    "special_attack": int(evs_map.get("spa", 0)),
+                    "special_defense": int(evs_map.get("spd", 0)),
+                    "speed": int(evs_map.get("spe", 0)),
+                }
+                nature_norm = str(mon.get("nature") or "hardy").strip().lower() or "hardy"
+                scaled_stats = calc_all_stats(base_stats_long, ivs_long, evs_long, int(level), nature_norm)
+                stats_obj.update(
+                    {
+                        "hp": int(scaled_stats.get("hp", 0)),
+                        "attack": int(scaled_stats.get("attack", 0)),
+                        "atk": int(scaled_stats.get("attack", 0)),
+                        "defense": int(scaled_stats.get("defense", 0)),
+                        "def": int(scaled_stats.get("defense", 0)),
+                        "defn": int(scaled_stats.get("defense", 0)),
+                        "special_attack": int(scaled_stats.get("special_attack", 0)),
+                        "special-attack": int(scaled_stats.get("special_attack", 0)),
+                        "spa": int(scaled_stats.get("special_attack", 0)),
+                        "special_defense": int(scaled_stats.get("special_defense", 0)),
+                        "special-defense": int(scaled_stats.get("special_defense", 0)),
+                        "spd": int(scaled_stats.get("special_defense", 0)),
+                        "speed": int(scaled_stats.get("speed", 0)),
+                        "spe": int(scaled_stats.get("speed", 0)),
+                    }
+                )
+        except Exception:
+            pass
+
+        hp_max = int(stats_obj.get("hp", mon.get("hp", 0))) or 1
+        hp_now = int(mon.get("hp_now", hp_max))
+        hp_pct = int(round((float(hp_now) / float(hp_max)) * 100.0)) if hp_max > 0 else 0
+        hp_pct = max(0, min(100, hp_pct))
+        hp_bar_fill = int(round((hp_pct / 100.0) * 16.0))
+        hp_bar_fill = max(0, min(16, hp_bar_fill))
+        hp_bar = f"[{'#' * hp_bar_fill}{'-' * (16 - hp_bar_fill)}]"
+        hp_display = f"{hp_now}/{hp_max}"
+
         def _fmt_stat_block(s: dict) -> str:
             return (
                 f"HP  {s['hp']:>3}  Atk {s['atk']:>3}  Def {s['def']:>3}\n"
@@ -19119,8 +19301,6 @@ class MPokeInfo(commands.Cog):
             }
         )
 
-        ivs_map = _stat6(self._as_dict(mon.get("ivs")))
-        evs_map = _stat6(self._as_dict(mon.get("evs")))
         ivs_line = _fmt_stat_block(ivs_map)
         evs_line = _fmt_stat_block(evs_map)
         total_ivs = int(sum(max(0, int(v)) for v in ivs_map.values()))
@@ -21055,6 +21235,7 @@ def _team_overview_cache_key(target_name: str, slots: dict[int, dict | None], *,
         {
             "target": str(target_name or ""),
             "current_gen": int(current_gen or 0),
+            "theme_rev": 2,
             "slots": snapshot,
             "sync_ms": int(TEAM_BATTLE_SYNC_DURATION_MS),
             "sprite_cap": int(TEAM_MAX_SPRITE_FRAMES),
@@ -21385,8 +21566,8 @@ def _team_overview_panel_file(
                 label_fill = (240, 242, 250, 255)
                 label_shadow = (0, 0, 0, 220)
                 if bool(row.get("is_registered")):
-                    label_fill = (255, 116, 116, 255)
-                    label_shadow = (92, 20, 20, 220)
+                    label_fill = (122, 186, 255, 255)
+                    label_shadow = (16, 44, 98, 220)
                 elif bool(row.get("shiny")):
                     label_fill = (255, 224, 118, 255)
                     label_shadow = (98, 74, 24, 220)
