@@ -1159,13 +1159,6 @@ def modify_stages(mon: Mon, changes: Dict[str, int], caused_by_opponent: bool = 
     # Track how many stats were lowered for Defiant/Competitive (activates for EACH stat)
     stats_lowered_count = 0
 
-    # Keep stage storage canonical so stat-changing status moves (e.g. Growl) apply
-    # reliably even if upstream data uses alias keys like "attack"/"defense".
-    if not isinstance(getattr(mon, "stages", None), dict):
-        mon.stages = {}
-    for stage_key in ("atk", "defn", "spa", "spd", "spe", "accuracy", "evasion"):
-        mon.stages.setdefault(stage_key, 0)
-
     stat_aliases = {
         "attack": "atk",
         "atk": "atk",
@@ -1192,6 +1185,28 @@ def modify_stages(mon: Mon, changes: Dict[str, int], caused_by_opponent: bool = 
         "evasiveness": "evasion",
         "special": "special",
     }
+    # Keep stage storage canonical so stat-changing status moves (e.g. Growl) apply
+    # reliably even if upstream data uses alias keys like "attack"/"defense".
+    if not isinstance(getattr(mon, "stages", None), dict):
+        mon.stages = {}
+    for stage_alias, stage_key in stat_aliases.items():
+        if stage_alias == stage_key or stage_alias == "special":
+            continue
+        if stage_alias not in mon.stages:
+            continue
+        try:
+            alias_val = int(mon.stages.get(stage_alias, 0))
+        except Exception:
+            alias_val = 0
+        try:
+            base_val = int(mon.stages.get(stage_key, 0))
+        except Exception:
+            base_val = 0
+        mon.stages[stage_key] = base_val + alias_val
+        mon.stages.pop(stage_alias, None)
+    for stage_key in ("atk", "defn", "spa", "spd", "spe", "accuracy", "evasion"):
+        mon.stages.setdefault(stage_key, 0)
+
     normalized_changes: Dict[str, int] = {}
     for raw_stat, raw_change in dict(changes or {}).items():
         key_raw = str(raw_stat or "").strip().lower().replace(" ", "_").replace("-", "_")
