@@ -715,100 +715,46 @@ def _patch_pvp_capture_reliability() -> None:
 _patch_pvp_capture_reliability()
 
 # =========================
-#  Terastallization helpers
+#  Terastallization helpers (from bot_core)
 # =========================
-VALID_TERA_TYPES: tuple[str, ...] = (
-    "normal", "fire", "water", "electric", "grass", "ice",
-    "fighting", "poison", "ground", "flying", "psychic", "bug",
-    "rock", "ghost", "dragon", "dark", "steel", "fairy", "stellar"
+from bot_core.tera_helpers import (
+    VALID_TERA_TYPES,
+    normalize_type_id as _normalize_type_id,
+    extract_species_types as _extract_species_types,
+    roll_default_tera_type as _roll_default_tera_type,
 )
 
-
-def _normalize_type_id(value: Any) -> str | None:
-    if value is None:
-        return None
-    s = str(value).strip().lower()
-    s = s.replace("type", "").replace("_", "-").replace(" ", "-")
-    return s or None
-
-
-def _extract_species_types(entry: Mapping[str, Any]) -> list[str]:
-    raw = entry.get("types")
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except Exception:
-            raw = [raw]
-    if raw is None:
-        return []
-    types: list[str] = []
-    for item in raw:
-        norm = _normalize_type_id(item)
-        if norm and norm not in types:
-            types.append(norm)
-    return types
-
-
-def _roll_default_tera_type(types: Sequence[str]) -> str | None:
-    if not types:
-        return None
-    return random.choice(list(types))
-
-
 # =========================
-#  Config / Intents
+#  Config / Intents (from bot_core)
 # =========================
-# Modern EXP Share (Gen VI+ behavior): when True, all non-fainted party mons gain full EXP.
-# Default to off unless explicitly enabled via environment so participant-only gains
-# remain the baseline when no Exp Share effect is present.
-EXP_SHARE_ALWAYS_ON = str(os.getenv("EXP_SHARE_ALWAYS_ON", "0")).strip().lower() in {"1", "true", "yes", "on"}
-
-# .env is already loaded above before importing db
-TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
-if not TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN in .env — add DISCORD_TOKEN=your_bot_token to .env")
+from bot_core.config import (
+    TOKEN,
+    EXP_SHARE_ALWAYS_ON,
+    OWNER_IDS,
+    STATIC_ADMIN_IDS,
+    BANNED_IDS,
+    CODE_BYPASS_IDS,
+    DEV_GUILD_ID,
+    DEV_GUILD,
+    EMBED_ECHO_GUILD_ID,
+    EMBED_ECHO_CHANNEL_IDS,
+    EMBED_ECHO_USER_IDS,
+    EMBED_ECHO_DELETE_SOURCE,
+    EMBED_ECHO_IGNORE_PREFIX_COMMANDS,
+    VERIFY_GUILD_ID,
+    VERIFY_CHANNEL_ID,
+    VERIFY_ROLE_ID,
+    VERIFY_BUTTON_CUSTOM_ID,
+    BETA_ANNOUNCEMENT_CHANNEL_ID,
+    BETA_CLAIM_CUSTOM_ID,
+    BOT_ACCESS_CODE,
+)
 
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True            # requires Members intent enabled in Dev Portal if you really need it
 intents.messages = True
 intents.message_content = True    # keep True if you still use prefix commands elsewhere
-
-# Owner-editable runtime settings (IDs/channels/roles live in config/owner_settings.json).
-_OWNER_SETTINGS = load_owner_settings()
-
-# ==== OWNER / ADMIN SETTINGS ====
-OWNER_IDS: set[int] = set(_OWNER_SETTINGS.owner_ids)
-STATIC_ADMIN_IDS: set[int] = set(_OWNER_SETTINGS.admin_ids)
-BANNED_IDS: frozenset[int] = frozenset(_OWNER_SETTINGS.banned_ids)
-CODE_BYPASS_IDS: frozenset[int] = frozenset(_OWNER_SETTINGS.code_bypass_ids)
-
-DEV_GUILD_ID = int(_OWNER_SETTINGS.dev_guild_id)
-DEV_GUILD = discord.Object(id=DEV_GUILD_ID)
-
-# Embed echo settings
-EMBED_ECHO_GUILD_ID: int | None = _OWNER_SETTINGS.embed_echo_guild_id
-EMBED_ECHO_CHANNEL_IDS: set[int] = set(_OWNER_SETTINGS.embed_echo_channel_ids)
-EMBED_ECHO_USER_IDS: set[int] | None = (
-    set(_OWNER_SETTINGS.embed_echo_user_ids)
-    if _OWNER_SETTINGS.embed_echo_user_ids is not None
-    else None
-)
-EMBED_ECHO_DELETE_SOURCE = bool(_OWNER_SETTINGS.embed_echo_delete_source)
-EMBED_ECHO_IGNORE_PREFIX_COMMANDS = bool(_OWNER_SETTINGS.embed_echo_ignore_prefix_commands)
-
-# Verification button settings
-VERIFY_GUILD_ID = int(_OWNER_SETTINGS.verify_guild_id)
-VERIFY_CHANNEL_ID = int(_OWNER_SETTINGS.verify_channel_id)
-VERIFY_ROLE_ID = int(_OWNER_SETTINGS.verify_role_id)
-VERIFY_BUTTON_CUSTOM_ID = str(_OWNER_SETTINGS.verify_button_custom_id)
-
-# Beta claim settings
-BETA_ANNOUNCEMENT_CHANNEL_ID = int(_OWNER_SETTINGS.beta_announcement_channel_id)
-BETA_CLAIM_CUSTOM_ID = str(_OWNER_SETTINGS.beta_claim_custom_id)
-
-# Access code gate: users must run /code <code> before using the bot (set BOT_ACCESS_CODE in .env)
-BOT_ACCESS_CODE: str = (os.getenv("BOT_ACCESS_CODE") or "").strip()
 
 _ACCESS_VERIFY_CACHE_TTL_SECONDS = 21600.0
 _ACCESS_VERIFY_CACHE: dict[int, tuple[bool, float]] = {}

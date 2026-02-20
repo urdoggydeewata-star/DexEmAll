@@ -1,0 +1,44 @@
+"""
+Bot core package - shared config, constants, and utilities extracted from pokebot.py.
+"""
+from .config import (
+    TOKEN,
+    EXP_SHARE_ALWAYS_ON,
+    OWNER_IDS,
+    STATIC_ADMIN_IDS,
+    BANNED_IDS,
+    CODE_BYPASS_IDS,
+    DEV_GUILD_ID,
+    DEV_GUILD,
+    VERIFY_GUILD_ID,
+    VERIFY_CHANNEL_ID,
+    VERIFY_ROLE_ID,
+    VERIFY_BUTTON_CUSTOM_ID,
+    BOT_ACCESS_CODE,
+    EMBED_ECHO_GUILD_ID,
+    EMBED_ECHO_CHANNEL_IDS,
+    EMBED_ECHO_USER_IDS,
+    BETA_ANNOUNCEMENT_CHANNEL_ID,
+    BETA_CLAIM_CUSTOM_ID,
+)
+
+__all__ = [
+    "TOKEN",
+    "EXP_SHARE_ALWAYS_ON",
+    "OWNER_IDS",
+    "STATIC_ADMIN_IDS",
+    "BANNED_IDS",
+    "CODE_BYPASS_IDS",
+    "DEV_GUILD_ID",
+    "DEV_GUILD",
+    "VERIFY_GUILD_ID",
+    "VERIFY_CHANNEL_ID",
+    "VERIFY_ROLE_ID",
+    "VERIFY_BUTTON_CUSTOM_ID",
+    "BOT_ACCESS_CODE",
+    "EMBED_ECHO_GUILD_ID",
+    "EMBED_ECHO_CHANNEL_IDS",
+    "EMBED_ECHO_USER_IDS",
+    "BETA_ANNOUNCEMENT_CHANNEL_ID",
+    "BETA_CLAIM_CUSTOM_ID",
+]
