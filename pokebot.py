@@ -8407,9 +8407,15 @@ ADVENTURE_ROUTES = {
         "name": "Viridian Forest",
         "layout": "maze",
         "entry_node": "2-1",
+        "back_on_entry": False,
         "exit_node": "1-3",
         "next": "route-2-2",
         "prev": "route-2",
+        "maze_signs": {
+            "2-1": {"label": "Read Sign", "text": "VIRIDIAN FOREST - Forest thick with trees. Paths lead in all directions."},
+            "1-2": {"label": "Read Sign", "text": "Trainers often rest here before venturing deeper."},
+            "1-3": {"label": "Read Sign", "text": "EXIT - North leads to Route 2. South leads back into the forest."},
+        },
         "nodes": {
             "2-1": {
                 "image": ASSETS_ROUTES / "viridian-forest-2-1.png",
@@ -8568,9 +8574,9 @@ ADVENTURE_ROUTES = {
             },
             "1-3": {
                 "image": ASSETS_ROUTES / "viridian-forest-1-3.png",
-                "exits": [
-                    {"id": "exit", "label": "🚪 Exit to Route 2", "target": "1-3"},
-                ],
+                "panel_node": True,
+                "panel_back_target": "1-2.5",
+                "exits": [],
                 "encounters": [
                     {"species": "caterpie", "weight": 30, "min_level": 3, "max_level": 5},
                     {"species": "weedle", "weight": 30, "min_level": 3, "max_level": 5},
@@ -14608,12 +14614,20 @@ class AdventureRouteView(discord.ui.View):
                 node_id = _maze_get_node(self.state, self.area_id, route)
                 entry_node = route.get("entry_node") or "start"
                 prev_area = route.get("prev")
-                if node_id == entry_node and prev_area and (self.state.get("area_history") or route.get("back_always")):
+                if node_id == entry_node and prev_area and (self.state.get("area_history") or route.get("back_always")) and route.get("back_on_entry", True):
                     back_btn = discord.ui.Button(label="⬅️ Back", style=discord.ButtonStyle.secondary, custom_id=f"adv:maze:{self.area_id}:back")
                     back_btn.callback = self._on_maze_back
                     self.add_item(back_btn)
                 node_cfg = nodes.get(node_id)
-                if node_cfg:
+                exit_node = route.get("exit_node")
+                if node_cfg and node_cfg.get("panel_node") and node_id == exit_node:
+                    south_btn = discord.ui.Button(label="⬇️ South", style=discord.ButtonStyle.secondary, custom_id=f"adv:maze:{self.area_id}:panel:back")
+                    south_btn.callback = self._on_maze_panel_back
+                    self.add_item(south_btn)
+                    fwd_btn = discord.ui.Button(label="⬆️ North", style=discord.ButtonStyle.primary, custom_id=f"adv:maze:{self.area_id}:panel:fwd")
+                    fwd_btn.callback = self._on_maze_panel_fwd
+                    self.add_item(fwd_btn)
+                elif node_cfg:
                     for exit_cfg in (node_cfg.get("exits") or []):
                         if isinstance(exit_cfg, dict) and exit_cfg.get("id") and exit_cfg.get("target"):
                             btn = discord.ui.Button(
@@ -14626,6 +14640,16 @@ class AdventureRouteView(discord.ui.View):
                 force_btn = discord.ui.Button(label="⚔️ Battle", style=discord.ButtonStyle.danger, custom_id=f"adv:maze:{self.area_id}:force")
                 force_btn.callback = self._on_maze_force
                 self.add_item(force_btn)
+                maze_signs = route.get("maze_signs") or {}
+                sign_cfg = maze_signs.get(node_id) if isinstance(maze_signs, dict) else None
+                if sign_cfg and isinstance(sign_cfg, dict):
+                    sign_btn = discord.ui.Button(
+                        label=sign_cfg.get("label", "Read Sign"),
+                        style=discord.ButtonStyle.secondary,
+                        custom_id=f"adv:sign:{self.area_id}:{node_id}",
+                    )
+                    sign_btn.callback = self._on_read_sign
+                    self.add_item(sign_btn)
             # Routes with panels (route-1, route-2) use Forward/Back navigation instead of path selection
             else:
                 panels = route.get("panels") or []
@@ -15348,6 +15372,42 @@ class _AdventureRouteViewRoute1Methods:
             await _save_adventure_state(str(itx.user.id), state)
         await _send_adventure_panel(itx, state, edit_original=False)
 
+    async def _on_maze_panel_back(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not itx.response.is_done():
+            await itx.response.defer(ephemeral=False, thinking=False)
+        state = await _get_adventure_state(str(itx.user.id))
+        route = ADVENTURE_ROUTES.get(self.area_id, {})
+        if route.get("layout") != "maze":
+            return await itx.followup.send("Not a maze route.", ephemeral=True)
+        node_cfg = (route.get("nodes") or {}).get(route.get("exit_node"), {})
+        back_target = node_cfg.get("panel_back_target")
+        if not back_target:
+            return await itx.followup.send("Can't go back from here.", ephemeral=True)
+        _maze_set_node(state, self.area_id, back_target)
+        await _save_adventure_state(str(itx.user.id), state)
+        await _route_maze_try_wild_encounter(itx, state, self.area_id, back_target, force=False)
+        await _save_adventure_state(str(itx.user.id), state)
+        await _send_adventure_panel(itx, state, edit_original=False)
+
+    async def _on_maze_panel_fwd(self, itx: discord.Interaction):
+        if not self._guard(itx):
+            return await itx.response.send_message("This isn't for you.", ephemeral=True)
+        if not itx.response.is_done():
+            await itx.response.defer(ephemeral=False, thinking=False)
+        state = await _get_adventure_state(str(itx.user.id))
+        route = ADVENTURE_ROUTES.get(self.area_id, {})
+        if route.get("layout") != "maze":
+            return await itx.followup.send("Not a maze route.", ephemeral=True)
+        next_area = route.get("next")
+        if next_area:
+            _adv_history_push(state, self.area_id)
+            state["area_id"] = next_area
+        state.get("route_panels", {}).pop(self.area_id, None)
+        await _save_adventure_state(str(itx.user.id), state)
+        await _send_adventure_panel(itx, state, edit_original=False)
+
     async def _on_maze_force(self, itx: discord.Interaction):
         if not self._guard(itx):
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
@@ -15363,12 +15423,18 @@ class _AdventureRouteViewRoute1Methods:
             return await itx.response.send_message("This isn't for you.", ephemeral=True)
         cid = (itx.data or {}).get("custom_id", "")
         route = ADVENTURE_ROUTES.get(self.area_id, {})
-        panel_signs = route.get("panel_signs") or {}
         try:
             parts = cid.split(":")
             if len(parts) >= 4:
-                area_id, panel = parts[2], int(parts[3])
-                sign_cfg = panel_signs.get(panel) if isinstance(panel_signs, dict) else None
+                sign_cfg = None
+                if route.get("layout") == "maze":
+                    node_id = parts[3]
+                    maze_signs = route.get("maze_signs") or {}
+                    sign_cfg = maze_signs.get(node_id) if isinstance(maze_signs, dict) else None
+                else:
+                    panel_signs = route.get("panel_signs") or {}
+                    if parts[3].isdigit():
+                        sign_cfg = panel_signs.get(int(parts[3])) if isinstance(panel_signs, dict) else None
                 if sign_cfg and isinstance(sign_cfg, dict):
                     text = sign_cfg.get("text", "")
                     text_alt = sign_cfg.get("text_alt")
