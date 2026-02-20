@@ -2744,6 +2744,92 @@ async def resolve_team_mon(
     if autocorrected_to:
         m["_autocorrected_to"] = autocorrected_to
     return m
+
+
+async def _resolve_team_mon_for_owner_id(
+    owner_id: str,
+    name: str,
+    slot: int | None = None,
+    *,
+    threshold: float = 0.85,
+    conn=None,
+) -> tuple[dict | None, str | None]:
+    """
+    Resolve a team Pokémon for an arbitrary owner_id (admin/owner tools).
+    Returns (row_or_none, error_message_or_none).
+    """
+    uid = str(owner_id)
+    query_name = str(name or "").strip()
+    if not query_name:
+        return None, "Please provide a Pokémon name."
+
+    async def _run(qconn):
+        cur = await qconn.execute(
+            """
+            SELECT id, species, team_slot, level, ivs, nature, form, hp_now, hp
+            FROM pokemons
+            WHERE owner_id=? AND team_slot BETWEEN 1 AND 6
+            ORDER BY team_slot, id
+            """,
+            (uid,),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        await cur.close()
+        return rows
+
+    if conn is not None:
+        team = await _run(conn)
+    else:
+        async with db.session() as c:
+            team = await _run(c)
+
+    if not team:
+        return None, "Target user's team is empty."
+
+    species_map: dict[str, list[dict]] = {}
+    for r in team:
+        species_map.setdefault(str(r.get("species") or "").lower(), []).append(r)
+
+    key = query_name.lower()
+    autocorrected_to = None
+    if key not in species_map:
+        names = list(species_map.keys())
+        best, score, suggestions = _fuzzy_best(query_name, names)
+        qc = _canon(query_name)
+        bc = _canon(best) if best else ""
+        is_prefixish = bool(best) and len(qc) >= 4 and (bc.startswith(qc) or qc.startswith(bc))
+        if best and (score >= threshold or is_prefixish):
+            key = best
+            autocorrected_to = best.title()
+        elif suggestions:
+            pretty = ", ".join(s.title() for s in suggestions)
+            return None, f"No **{query_name.title()}** in target team. Did you mean: {pretty} ?"
+        else:
+            have = ", ".join(sorted({str(r.get('species') or '').title() for r in team}))
+            return None, f"No **{query_name.title()}** in target team. Team contains: {have}."
+
+    mons = species_map[key]
+    if len(mons) > 1 and slot is None:
+        choices = ", ".join(f"slot {int(m.get('team_slot') or 0)} (ID #{int(m.get('id') or 0)})" for m in mons)
+        return None, f"Target has {len(mons)} **{key.title()}** in team: {choices}. Re-run with `slot:`."
+
+    if slot is not None:
+        chosen = None
+        for m in mons:
+            if int(m.get("team_slot") or 0) == int(slot):
+                chosen = dict(m)
+                break
+        if chosen is None:
+            choices = ", ".join(str(int(m.get("team_slot") or 0)) for m in mons)
+            return None, f"No **{key.title()}** in target slot {slot}. Available slots: {choices}."
+    else:
+        chosen = dict(mons[0])
+
+    if autocorrected_to:
+        chosen["_autocorrected_to"] = autocorrected_to
+    return chosen, None
+
+
 async def _item_index(conn) -> tuple[dict, list[str]]:
     """
     Build a lookup: candidate_string -> row_dict and the flat list of candidates.
@@ -20480,6 +20566,186 @@ async def evolve_cmd(inter: discord.Interaction, name: str, slot: int | None = N
                 await inter.response.send_message(msg, ephemeral=True)
         except Exception:
             pass
+
+
+@bot.tree.command(name="resetevs", description="(Owner) Reset EVs on a team Pokémon (self or target user).")
+@app_commands.describe(
+    name="Pokémon name in the target team",
+    slot="If duplicates, which team slot (1–6)",
+    user="Target user (defaults to yourself)",
+)
+async def resetevs_cmd(
+    inter: discord.Interaction,
+    name: str,
+    slot: app_commands.Range[int, 1, 6] | None = None,
+    user: discord.User | None = None,
+):
+    if not inter.response.is_done():
+        await inter.response.defer(ephemeral=True, thinking=False)
+
+    if int(inter.user.id) not in OWNER_IDS:
+        return await inter.followup.send("❌ This command is owner-only.", ephemeral=True)
+
+    target_user = user or inter.user
+    target_uid = str(target_user.id)
+    slot_i = int(slot) if slot is not None else None
+
+    async with db.session() as conn:
+        if str(target_uid) == str(inter.user.id):
+            mon = await resolve_team_mon(inter, name, slot_i, conn=conn)
+            if not mon:
+                return
+        else:
+            mon, err = await _resolve_team_mon_for_owner_id(target_uid, name, slot_i, conn=conn)
+            if not mon:
+                return await inter.followup.send(f"❌ {err or 'Could not resolve target Pokémon.'}", ephemeral=True)
+
+        mon_id = int(mon.get("id") or 0)
+        if mon_id <= 0:
+            return await inter.followup.send("❌ Could not resolve target Pokémon ID.", ephemeral=True)
+
+        cur = await conn.execute(
+            """
+            SELECT id, species, form, level, ivs, nature, hp_now, hp
+            FROM pokemons
+            WHERE owner_id=? AND id=? AND team_slot BETWEEN 1 AND 6
+            LIMIT 1
+            """,
+            (target_uid, mon_id),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return await inter.followup.send("❌ Target Pokémon is not currently in the team.", ephemeral=True)
+        row_d = dict(row) if hasattr(row, "keys") else {}
+
+        species_raw = str(row_d.get("species") or "").strip()
+        species_key = _daycare_norm_species(species_raw)
+        form_raw = str(row_d.get("form") or "").strip().lower().replace("_", "-").replace(" ", "-")
+        level = max(1, int(row_d.get("level") or 1))
+        nature = str(row_d.get("nature") or "hardy").strip().lower() or "hardy"
+        try:
+            hp_now_old = int(row_d.get("hp_now") if row_d.get("hp_now") is not None else row_d.get("hp") or 1)
+        except Exception:
+            hp_now_old = 1
+
+        base_stats_raw: Any = {}
+        species_id: Optional[int] = None
+        if db_cache is not None:
+            try:
+                cached_entry = (
+                    db_cache.get_cached_pokedex(species_key)
+                    or db_cache.get_cached_pokedex(species_key.replace("-", " "))
+                    or db_cache.get_cached_pokedex(species_raw.lower())
+                )
+                if cached_entry:
+                    base_stats_raw = cached_entry.get("stats") or {}
+                    try:
+                        species_id = int(cached_entry.get("id")) if cached_entry.get("id") is not None else None
+                    except Exception:
+                        species_id = None
+            except Exception:
+                pass
+
+        if not base_stats_raw:
+            cur = await conn.execute(
+                "SELECT id, stats FROM pokedex WHERE LOWER(name)=LOWER(?) OR LOWER(REPLACE(name,' ','-'))=LOWER(?) LIMIT 1",
+                (species_raw, species_key),
+            )
+            pokedex_row = await cur.fetchone()
+            await cur.close()
+            if pokedex_row:
+                pd = dict(pokedex_row) if hasattr(pokedex_row, "keys") else {}
+                base_stats_raw = pd.get("stats") or {}
+                try:
+                    species_id = int(pd.get("id")) if pd.get("id") is not None else species_id
+                except Exception:
+                    pass
+
+        if species_id and form_raw and form_raw not in {"", "normal", "base", "default"}:
+            form_keys = [form_raw]
+            if not form_raw.startswith(f"{species_key}-"):
+                form_keys.append(f"{species_key}-{form_raw}")
+            for fk in form_keys:
+                form_row = await _safe_pokedex_forms_fetchone(
+                    conn,
+                    "SELECT stats FROM pokedex_forms WHERE species_id=? AND LOWER(form_key)=LOWER(?) LIMIT 1",
+                    (species_id, fk),
+                )
+                if form_row and form_row.get("stats") is not None:
+                    base_stats_raw = form_row.get("stats")
+                    break
+
+        if isinstance(base_stats_raw, str):
+            try:
+                base_stats_raw = json.loads(base_stats_raw) if base_stats_raw else {}
+            except Exception:
+                base_stats_raw = {}
+
+        base_long = _normalize_stats_for_generator(base_stats_raw or {})
+        zero_evs_short = {k: 0 for k in _STAT_KEYS_SHORT}
+
+        if any(int(base_long.get(k, 0) or 0) > 0 for k in ("hp", "attack", "defense", "special_attack", "special_defense", "speed")):
+            ivs_short = _normalize_ivs_evs(row_d.get("ivs"), default_val=0)
+            ivs_long = {
+                "hp": int(ivs_short.get("hp", 0)),
+                "attack": int(ivs_short.get("atk", 0)),
+                "defense": int(ivs_short.get("defn", 0)),
+                "special_attack": int(ivs_short.get("spa", 0)),
+                "special_defense": int(ivs_short.get("spd", 0)),
+                "speed": int(ivs_short.get("spe", 0)),
+            }
+            evs_long = {
+                "hp": 0,
+                "attack": 0,
+                "defense": 0,
+                "special_attack": 0,
+                "special_defense": 0,
+                "speed": 0,
+            }
+            recalced = calc_all_stats(base_long, ivs_long, evs_long, level, nature)
+            new_hp = max(1, int(recalced.get("hp", 1) or 1))
+            new_hp_now = max(0, min(int(hp_now_old), new_hp))
+            await conn.execute(
+                """
+                UPDATE pokemons
+                SET evs=?, hp=?, hp_now=?, atk=?, def=?, spa=?, spd=?, spe=?
+                WHERE owner_id=? AND id=?
+                """,
+                (
+                    json.dumps(zero_evs_short, ensure_ascii=False),
+                    new_hp,
+                    new_hp_now,
+                    int(recalced.get("attack", 0) or 0),
+                    int(recalced.get("defense", 0) or 0),
+                    int(recalced.get("special_attack", 0) or 0),
+                    int(recalced.get("special_defense", 0) or 0),
+                    int(recalced.get("speed", 0) or 0),
+                    target_uid,
+                    mon_id,
+                ),
+            )
+        else:
+            await conn.execute(
+                "UPDATE pokemons SET evs=? WHERE owner_id=? AND id=?",
+                (json.dumps(zero_evs_short, ensure_ascii=False), target_uid, mon_id),
+            )
+
+        await conn.commit()
+
+    try:
+        db.invalidate_pokemons_cache(target_uid)
+    except Exception:
+        pass
+
+    species_disp = species_raw.replace("-", " ").title() if species_raw else "Pokémon"
+    slot_disp = int(mon.get("team_slot") or 0)
+    auto_note = f" (autocorrected to **{mon['_autocorrected_to']}**)" if mon.get("_autocorrected_to") else ""
+    if str(target_uid) == str(inter.user.id):
+        msg = f"✅ Reset EVs for **{species_disp}** (slot {slot_disp}){auto_note}."
+    else:
+        msg = f"✅ Reset EVs for **{target_user.display_name}**'s **{species_disp}** (slot {slot_disp}){auto_note}."
+    await inter.followup.send(msg, ephemeral=True)
 
 
 @bot.tree.command(name="manualevolve", description="Manual alias for /evolve.")
