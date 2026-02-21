@@ -7038,16 +7038,18 @@ class _BagAllItemsView(discord.ui.View):
 
 
 async def _fetch_user_items(user_id: int, wanted: list[str]) -> dict:
+    """Fetch items from bag, merging quantities by canonical ID (timer_ball + timer-ball -> one entry)."""
     wanted_norm: dict[str, str] = {}
     for w in wanted:
         n = _normalize_item(w)
         wanted_norm[n] = w
         wanted_norm[n.replace(" ", "")] = w
-    out: dict[str, int] = {}
+    # merged: norm_key -> (item_id_for_consume, total_qty) - prefer item_id with higher qty for _consume_item
+    merged: dict[str, tuple[str, int, int]] = {}  # norm -> (best_item_id, best_single_qty, total_qty)
     try:
         import lib.db as db
     except ImportError:
-        return out
+        return {}
     async with db.session() as conn:
         cur = await conn.execute(
             "SELECT item_id, qty FROM user_items WHERE owner_id=? AND qty>0",
@@ -7058,9 +7060,18 @@ async def _fetch_user_items(user_id: int, wanted: list[str]) -> dict:
         for row in rows:
             name = _normalize_item(row["item_id"])
             if name in wanted_norm or name.replace(" ", "") in wanted_norm:
-                # Use actual item_id so _consume_item can match DB
-                out[row["item_id"]] = int(row["qty"] or 0)
-    return out
+                qty = int(row["qty"] or 0)
+                item_id = str(row["item_id"] or "")
+                if name not in merged:
+                    merged[name] = (item_id, qty, qty)
+                else:
+                    _, _, tot = merged[name]
+                    # Prefer item_id from row with higher qty for _consume_item (consume from fullest stack)
+                    prev_id, prev_single, _ = merged[name]
+                    best_id = item_id if qty > prev_single else prev_id
+                    best_single = max(qty, prev_single)
+                    merged[name] = (best_id, best_single, tot + qty)
+    return {item_id: total for _k, (item_id, _single, total) in merged.items()}
 
 
 class _HealSelectView(discord.ui.View):

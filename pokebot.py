@@ -23840,12 +23840,12 @@ async def _decorate_items_with_usage(owner_id: int | str, items: list) -> list:
     """
     Mutates rows so that row['qty'] becomes 'free/total' (string) for display.
     'free' = total - how many are currently held by your Pokémon.
-    Ensures bag displays consistently in and out of battle.
+    Uses authoritative _get_item_qty for totals to avoid doubled display from
+    duplicate item_id spellings (e.g. timer_ball vs timer-ball) in the source.
     """
     uid = str(owner_id)
     merged_by_item: dict[str, dict[str, Any]] = {}
     order_idx = 0
-    rows_data = []
     for r in items:
         asdict = dict(r) if hasattr(r, "keys") else {
             "id": r[0] if len(r) > 0 else None,
@@ -23870,19 +23870,21 @@ async def _decorate_items_with_usage(owner_id: int | str, items: list) -> list:
         merged_by_item.values(),
         key=lambda d: (int(d.get("_order", 0)), str(d.get("name") or d.get("item_id") or "")),
     )
-    for asdict in merged_rows:
-        item_id = str(asdict.get("item_id") or asdict.get("id") or "").strip()
-        total = int((asdict.get("qty") or 0) or 0)
-        rows_data.append((asdict, item_id, total))
-
+    # Use authoritative _get_item_qty for each item to avoid doubled totals from
+    # duplicate item_id spellings (e.g. timer_ball and timer-ball both in user_items).
     async def _zero():
         return 0
+
+    auth_coros = [_get_item_qty(uid, str(d.get("item_id") or d.get("id") or "")) if (d.get("item_id") or d.get("id")) else _zero() for d in merged_rows]
+    auth_totals = await asyncio.gather(*auth_coros)
+    rows_data = [(d, str(d.get("item_id") or d.get("id") or "").strip(), int(a or 0)) for d, a in zip(merged_rows, auth_totals)]
 
     coros = [_count_item_in_use(uid, iid) if iid else _zero() for _, iid, _ in rows_data]
     used_list = await asyncio.gather(*coros)
     out = []
-    for (asdict, _, total), used in zip(rows_data, used_list):
+    for (asdict, _, auth_total), used in zip(rows_data, used_list):
         used = int(used) if isinstance(used, (int, float)) else 0
+        total = max(0, auth_total)
         free = max(0, total - used)
         asdict["qty"] = f"{free}/{total}"
         asdict.pop("_order", None)
