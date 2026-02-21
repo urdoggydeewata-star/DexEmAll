@@ -563,11 +563,12 @@ def _norm_pp_move_key(move_name: Any) -> str:
 
 
 def _canonical_move_name(move_name: Any) -> str:
-    """Title Case with spaces - the single canonical form for PP storage and display."""
+    """Title Case with spaces - the single canonical form for PP storage and display.
+    Collapses all whitespace so 'Tail  Whip' and 'Tail Whip' match."""
     s = str(move_name or "").strip().lower().replace("_", " ").replace("-", " ")
     if not s:
         return "Tackle"
-    return s.title()
+    return " ".join(s.split()).title()
 
 
 def _pp_global_max_for_move(move_name: str, generation: Optional[int] = None) -> int:

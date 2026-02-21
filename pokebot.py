@@ -10035,6 +10035,9 @@ async def _load_pp_from_db(st: "BattleState", uid: int) -> None:
                             max_caps[i] = max(base_caps[i], min(max_caps[i], global_caps[i]))
                             min_caps[i] = max(0, min(min_caps[i], max_caps[i]))
                             pps[i] = max(min_caps[i], min(pps[i], max_caps[i]))
+                            # If max cap equals base (no PP Up used), clamp current to base - avoid showing max PP
+                            if max_caps[i] <= base_caps[i]:
+                                pps[i] = min(pps[i], base_caps[i])
                         for m, left_i in zip(moves, pps):
                             canonical = _canonical_move_name(str(m).strip())
                             st._pp[key][canonical] = int(left_i)
@@ -10092,7 +10095,8 @@ async def _save_party_state_from_battle(st: "BattleState", uid: int) -> None:
                 cap_i = max_caps[i] if i < len(max_caps) else _pp_move_global_max(str(m), st.gen)
                 min_i = min_caps[i] if i < len(min_caps) else 0
                 stored_i = stored_pps[i] if i < len(stored_pps) else _pp_move_base(str(m), st.gen)
-                left = pp_store.get(m)
+                canonical = _canonical_move_name(m)
+                left = pp_store.get(canonical) or pp_store.get(m)
                 if left is None:
                     left = norm_pp_store.get(_norm_pp_move_key(str(m)))
                 try:

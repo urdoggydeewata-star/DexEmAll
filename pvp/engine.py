@@ -781,15 +781,15 @@ def _roll_missing_n0_moves() -> List[str]:
 
 
 def _normalize_moves_for_pp(moves: Any) -> List[str]:
-    """Normalize move names to display form (Title Case with spaces) so UI looks nice. PP lookup uses _norm_pp_move_key for matching."""
+    """Normalize move names to canonical form (Title Case, collapse whitespace) for PP storage/display."""
     if not moves:
         return ["Tackle"]
     out: List[str] = []
     for m in (moves if isinstance(moves, (list, tuple)) else [moves])[:4]:
-        s = str(m or "").strip().lower().replace("_", "-").replace(" ", "-")
+        s = str(m or "").strip().lower().replace("_", " ").replace("-", " ")
         if not s:
             s = "tackle"
-        out.append(s.replace("-", " ").title())
+        out.append(" ".join(s.split()).title())
     return out[:4] or ["Tackle"]
 
 
