@@ -40,7 +40,7 @@ from discord.ext import commands
 from discord import app_commands, ui, Interaction, Embed
 
 from pvp.engine import build_mon
-from pvp.panel import _base_pp, _max_pp, _norm_pp_move_key
+from pvp.panel import _base_pp, _canonical_move_name, _max_pp, _norm_pp_move_key
 from pvp.panel_capture import is_healing_item as _is_healing_item, heal_amount_for_item as _heal_amount_for_item
 import pvp.panel as _pvp_panel
 if TYPE_CHECKING:
@@ -10036,12 +10036,8 @@ async def _load_pp_from_db(st: "BattleState", uid: int) -> None:
                             min_caps[i] = max(0, min(min_caps[i], max_caps[i]))
                             pps[i] = max(min_caps[i], min(pps[i], max_caps[i]))
                         for m, left_i in zip(moves, pps):
-                            m_str = str(m).strip()
-                            st._pp[key][m_str] = int(left_i)
-                            try:
-                                st._pp[key][_norm_pp_move_key(m_str)] = int(left_i)
-                            except Exception:
-                                pass
+                            canonical = _canonical_move_name(str(m).strip())
+                            st._pp[key][canonical] = int(left_i)
             break
         except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
             if attempt == 0:
