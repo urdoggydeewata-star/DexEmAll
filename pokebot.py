@@ -84,6 +84,53 @@ from features.route_loot import (
     ROUTE_MOVE_TIMER_POOL_KEY,
     ROUTE_MOVE_LAST_STANDARD_ROLL,
     ROUTE_MOVE_BONUS_BERRIES,
+    roll_route_ball_by_absolute_rate,
+    route_pick_item_from_pool,
+)
+from features.adventure_constants import (
+    ASSETS_DIR,
+    ASSETS_CITIES,
+    ASSETS_ROUTES,
+    ASSETS_DAYCARE,
+    ASSETS_EGG_STAGES_DIR,
+    ASSETS_EGG_STAGE_1_INTACT,
+    ASSETS_EGG_STAGE_2_SLIGHT,
+    ASSETS_EGG_STAGE_3_CRACKED,
+    ASSETS_EGG_STAGE_4_MORE,
+    ASSETS_EGG_STAGE_5_HEAVY,
+    ASSETS_EGG_STAGE_6_EXTREME,
+    ASSETS_DAYCARE_EGG,
+    DAYCARE_CITY_ID,
+    DAYCARE_AREA_ID,
+    ROUTE_22_ENABLED,
+    DAYCARE_EGG_CAP,
+    DAYCARE_INCUBATE_MAX,
+    DAYCARE_BREED_THRESHOLD,
+    DAYCARE_EGG_INTERVAL_SECONDS,
+    DAYCARE_OVAL_CHARM_INTERVAL_MULT,
+    DAYCARE_OVAL_CHARM_BONUS_EGG_CHANCE,
+    DAYCARE_HATCH_MIN,
+    DAYCARE_HATCH_MAX,
+    DAYCARE_HATCH_BOOST_ABILITIES,
+    DAYCARE_HATCH_COMMAND_BONUS_CAP,
+    DAYCARE_MIRROR_HERB_ITEMS,
+    DAYCARE_HATCH_BOOST_CACHE_TTL_SECONDS,
+    DAYCARE_OVAL_CHARM_CACHE_TTL_SECONDS,
+    DAYCARE_INCENSE_BABIES,
+    _DAYCARE_HATCH_BOOST_CACHE,
+    _DAYCARE_OVAL_CHARM_CACHE,
+    DAYCARE_MAX_ANIM_FRAMES,
+    DAYCARE_GIF_MAX_SIZE,
+    DAYCARE_BOX_MAX_SIZE,
+    DAYCARE_STATIC_MAX_SIZE,
+    BOX_SPRITES_DIR,
+    LEGACY_SPRITES_DIR,
+    POKESPRITE_MASTER_ZIP,
+    DAYCARE_ZIP_CACHE_DIR,
+    ASSETS_BOX_BACKGROUNDS_DIR,
+    BOX_SPRITES_BACKGROUNDS_DIR,
+    BOX_BACKGROUND_FILENAMES,
+    ITEM_ICON_DIR,
 )
 
 # Always use the shared lib.db pooled backend for command queries.
@@ -3030,8 +3077,7 @@ def _item_title_line(row: dict) -> str:
     nm = row.get("name") or row["id"]
     nice = pretty_item_name(nm)
     return f"{emoji + ' ' if emoji else ''}{nice}"
-ASSETS_DIR = Path(__file__).resolve().parent / "assets"
-ITEM_ICON_DIR = ASSETS_DIR / "item_icons"
+
 def _looks_http(s: str | None) -> bool:
     return isinstance(s, str) and (s.startswith("http://") or s.startswith("https://"))
 
@@ -7495,67 +7541,6 @@ class StarterView(discord.ui.View):
 # =========================
 #  Adventure / Routes (Story Mode)
 # =========================
-ASSETS_DIR = Path(__file__).resolve().parent / "assets"
-ASSETS_CITIES = ASSETS_DIR / "cities"
-ASSETS_ROUTES = ASSETS_DIR / "routes"
-ASSETS_DAYCARE = ASSETS_DIR / "ui" / "daycare.png"
-ASSETS_EGG_STAGES_DIR = ASSETS_DIR / "ui" / "egg-stages"
-ASSETS_EGG_STAGE_1_INTACT = ASSETS_EGG_STAGES_DIR / "egg-stage-1-intact.png"
-ASSETS_EGG_STAGE_2_SLIGHT = ASSETS_EGG_STAGES_DIR / "egg-stage-2-slightly-cracked.png"
-ASSETS_EGG_STAGE_3_CRACKED = ASSETS_EGG_STAGES_DIR / "egg-stage-3-cracked.png"
-ASSETS_EGG_STAGE_4_MORE = ASSETS_EGG_STAGES_DIR / "egg-stage-4-more-cracked.png"
-ASSETS_EGG_STAGE_5_HEAVY = ASSETS_EGG_STAGES_DIR / "egg-stage-5-heavily-cracked.png"
-ASSETS_EGG_STAGE_6_EXTREME = ASSETS_EGG_STAGES_DIR / "egg-stage-6-extremely-cracked.png"
-ASSETS_DAYCARE_EGG = ASSETS_EGG_STAGE_1_INTACT
-
-DAYCARE_CITY_ID = "viridian-city"
-DAYCARE_AREA_ID = "pallet-daycare"
-ROUTE_22_ENABLED = False  # Set True to show Route 22 button in Viridian City
-DAYCARE_EGG_CAP = 3
-DAYCARE_INCUBATE_MAX = 6
-DAYCARE_BREED_THRESHOLD = 22.0
-DAYCARE_EGG_INTERVAL_SECONDS = 3600.0
-DAYCARE_OVAL_CHARM_INTERVAL_MULT = 0.75
-DAYCARE_OVAL_CHARM_BONUS_EGG_CHANCE = 0.15
-DAYCARE_HATCH_MIN = 45.0
-DAYCARE_HATCH_MAX = 80.0
-DAYCARE_HATCH_BOOST_ABILITIES = {"flame-body", "magma-armor"}
-DAYCARE_HATCH_COMMAND_BONUS_CAP = 0.18
-DAYCARE_MIRROR_HERB_ITEMS = {"mirror-herb", "mirror_herb"}
-DAYCARE_HATCH_BOOST_CACHE_TTL_SECONDS = 15.0
-DAYCARE_OVAL_CHARM_CACHE_TTL_SECONDS = 30.0
-DAYCARE_INCENSE_BABIES: dict[str, tuple[str, str]] = {
-    "snorlax": ("munchlax", "full-incense"),
-    "mr-mime": ("mime-jr", "odd-incense"),
-    "chansey": ("happiny", "luck-incense"),
-    "blissey": ("happiny", "luck-incense"),
-    "roselia": ("budew", "rose-incense"),
-    "roserade": ("budew", "rose-incense"),
-    "sudowoodo": ("bonsly", "rock-incense"),
-    "wobbuffet": ("wynaut", "lax-incense"),
-    "marill": ("azurill", "sea-incense"),
-    "azumarill": ("azurill", "sea-incense"),
-    "chimecho": ("chingling", "pure-incense"),
-    "mantine": ("mantyke", "wave-incense"),
-}
-
-_DAYCARE_HATCH_BOOST_CACHE: dict[str, tuple[bool, float]] = {}
-_DAYCARE_OVAL_CHARM_CACHE: dict[str, tuple[bool, float]] = {}
-DAYCARE_MAX_ANIM_FRAMES = 16
-DAYCARE_GIF_MAX_SIZE: tuple[int, int] = (56, 56)
-DAYCARE_BOX_MAX_SIZE: tuple[int, int] = (52, 52)
-DAYCARE_STATIC_MAX_SIZE: tuple[int, int] = (52, 52)
-BOX_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "box_sprites"
-LEGACY_SPRITES_DIR = Path(__file__).resolve().parent / "pvp" / "_common" / "sprites"
-POKESPRITE_MASTER_ZIP = Path(__file__).resolve().parent / "pokesprite-master.zip"
-DAYCARE_ZIP_CACHE_DIR = BOX_SPRITES_DIR / "_pokesprite_zip_cache"
-ASSETS_BOX_BACKGROUNDS_DIR = ASSETS_DIR / "ui" / "box-backgrounds"
-BOX_SPRITES_BACKGROUNDS_DIR = BOX_SPRITES_DIR / "backgrounds"
-BOX_BACKGROUND_FILENAMES: tuple[str, ...] = (
-    "box-bg-meadow.png",
-    "box-bg-space.png",
-    "box-bg-pond.png",
-)
 
 ADVENTURE_CITIES = {
     "pallet-town": {
@@ -8413,56 +8398,6 @@ RIVAL_BATTLES = {
 }
 
 
-def _weighted_choice(items: Sequence[Tuple[str, str, float]]) -> Tuple[str, str]:
-    """Pick (id, display_name) from weighted tuples (id, name, weight)."""
-    if not items:
-        return ("", "")
-    total = 0.0
-    norm: list[tuple[str, str, float]] = []
-    for key, name, weight in items:
-        w = max(0.0, float(weight or 0.0))
-        if w <= 0:
-            continue
-        norm.append((str(key), str(name), w))
-        total += w
-    if total <= 0 or not norm:
-        key, name, _ = items[-1]
-        return str(key), str(name)
-    r = random.uniform(0.0, total)
-    for key, name, weight in norm:
-        r -= weight
-        if r <= 0:
-            return key, name
-    return norm[-1][0], norm[-1][1]
-
-
-def _roll_route_ball_by_absolute_rate() -> tuple[str, str]:
-    """Roll route ball encounter using absolute percentage rates."""
-    if not ROUTE_MOVE_BALL_ENCOUNTER_RATES:
-        return ("__none__", "No Ball")
-    r = random.uniform(0.0, 100.0)
-    cumul = 0.0
-    for ball_id, ball_name, pct in ROUTE_MOVE_BALL_ENCOUNTER_RATES:
-        p = max(0.0, float(pct or 0.0))
-        if p <= 0.0:
-            continue
-        cumul += p
-        if r <= cumul:
-            return str(ball_id), str(ball_name)
-    return ("__none__", "No Ball")
-
-
-def _route_pick_item_from_pool(pool_key: str) -> tuple[str, str]:
-    pool = ROUTE_MOVE_ITEMS_BY_BALL.get(str(pool_key or "")) or ROUTE_MOVE_ITEMS_BY_BALL.get("poke_ball") or []
-    item_id, item_name = _weighted_choice(pool)
-    if item_id == "__bonus_berry__":
-        try:
-            return random.choice(ROUTE_MOVE_BONUS_BERRIES)
-        except Exception:
-            return ("oran_berry", "Oran Berry")
-    return item_id, item_name
-
-
 async def _roll_and_give_route_move_item_async(user_id: str) -> Optional[str]:
     """
     Roll route loot-ball encounter and grant rewards from the configured pool table.
@@ -8473,7 +8408,7 @@ async def _roll_and_give_route_move_item_async(user_id: str) -> Optional[str]:
     """
     if not ROUTE_MOVE_BALL_ENCOUNTER_RATES or not ROUTE_MOVE_ITEMS_BY_BALL:
         return None
-    ball_id, ball_name = _roll_route_ball_by_absolute_rate()
+    ball_id, ball_name = roll_route_ball_by_absolute_rate()
     if not ball_id or ball_id == "__none__":
         return None
     uid = str(user_id)
@@ -8496,7 +8431,7 @@ async def _roll_and_give_route_move_item_async(user_id: str) -> Optional[str]:
                     f"You found a **{ball_name}**! It repeated your last route ball reward: "
                     f"**2× {prev_item_name}**."
                 )
-            fallback_item_id, fallback_item_name = _route_pick_item_from_pool("poke_ball")
+            fallback_item_id, fallback_item_name = route_pick_item_from_pool("poke_ball")
             await _grant(fallback_item_id, fallback_item_name, 1)
             return (
                 f"You found a **{ball_name}**! No previous route reward to repeat, "
@@ -8505,7 +8440,7 @@ async def _roll_and_give_route_move_item_async(user_id: str) -> Optional[str]:
 
         # Timer Ball: uses standard pool with no modifier.
         pool_key = ROUTE_MOVE_TIMER_POOL_KEY if ball_id == "timer_ball" else ball_id
-        item_id, item_name = _route_pick_item_from_pool(pool_key)
+        item_id, item_name = route_pick_item_from_pool(pool_key)
         if not item_id:
             return None
 

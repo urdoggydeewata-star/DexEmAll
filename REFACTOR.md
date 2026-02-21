@@ -13,7 +13,8 @@ This document tracks the modular refactoring of `pokebot.py` (~29K lines) into s
 - **pvp/panel_capture.py** – Balls, healing items, `_ball_multiplier`, `_attempt_capture`, `status_bonus` (~310 lines). Reduces panel.py below 10k.
 
 ### 3. `features/` package
-- **features/route_loot.py** – GEN1_TMS/HMS, TM_SELLER_*, ROUTE_MOVE_BALL_ENCOUNTER_RATES, ROUTE_MOVE_ITEMS_BY_BALL, ROUTE_MOVE_* (~200 lines)
+- **features/route_loot.py** – GEN1_TMS/HMS, TM_SELLER_*, ROUTE_MOVE_* tables, weighted_choice, roll_route_ball_by_absolute_rate, route_pick_item_from_pool (~250 lines). Route ball rates adjusted ÷10 (rarer).
+- **features/adventure_constants.py** – ASSETS_*, DAYCARE_*, BOX_*, paths and daycare constants (~75 lines)
 
 ## Recommended Next Phases
 

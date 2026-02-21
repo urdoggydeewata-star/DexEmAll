@@ -1,7 +1,8 @@
 """Route move loot tables and TM data. Extracted from pokebot.py."""
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+import random
+from typing import Dict, List, Sequence, Tuple
 
 # Gen 1 TMs (consumable) and HMs (permanent)
 GEN1_TMS: List[Tuple[str, str]] = [
@@ -25,30 +26,31 @@ GEN1_HMS: List[Tuple[str, str]] = [
 TM_SELLER_PRICE = 500
 TM_SELLER_ITEMS = [GEN1_TMS[i - 1] for i in (1, 3, 5, 6, 7, 9, 11, 12, 15, 17, 20, 21, 22, 23, 24, 31, 34, 35, 37, 40, 42, 44, 45, 49, 50)]
 
+# Rates adjusted one decimal left (÷10) to make route balls rarer
 ROUTE_MOVE_BALL_ENCOUNTER_RATES: List[Tuple[str, str, float]] = [
-    ("poke_ball", "Poké Ball", 9.0),
-    ("great_ball", "Great Ball", 6.0),
-    ("ultra_ball", "Ultra Ball", 2.0),
-    ("master_ball", "Master Ball", 0.08),
-    ("nest_ball", "Nest Ball", 4.0),
-    ("net_ball", "Net Ball", 4.0),
-    ("dive_ball", "Dive Ball", 4.0),
-    ("heal_ball", "Heal Ball", 4.0),
-    ("dusk_ball", "Dusk Ball", 4.0),
-    ("dream_ball", "Dream Ball", 4.0),
-    ("sport_ball", "Sport Ball", 4.0),
-    ("level_ball", "Level Ball", 4.0),
-    ("moon_ball", "Moon Ball", 4.0),
-    ("friend_ball", "Friend Ball", 4.0),
-    ("love_ball", "Love Ball", 4.0),
-    ("heavy_ball", "Heavy Ball", 4.0),
-    ("fast_ball", "Fast Ball", 4.0),
-    ("premier_ball", "Premier Ball", 4.0),
-    ("repeat_ball", "Repeat Ball", 4.0),
-    ("tm_ball", "TM Ball", 4.0),
-    ("great_tm_ball", "Great TM Ball", 4.0),
-    ("ultra_tm_ball", "Ultra TM Ball", 4.0),
-    ("timer_ball", "Timer Ball", 4.0),
+    ("poke_ball", "Poké Ball", 0.9),
+    ("great_ball", "Great Ball", 0.6),
+    ("ultra_ball", "Ultra Ball", 0.2),
+    ("master_ball", "Master Ball", 0.008),
+    ("nest_ball", "Nest Ball", 0.4),
+    ("net_ball", "Net Ball", 0.4),
+    ("dive_ball", "Dive Ball", 0.4),
+    ("heal_ball", "Heal Ball", 0.4),
+    ("dusk_ball", "Dusk Ball", 0.4),
+    ("dream_ball", "Dream Ball", 0.4),
+    ("sport_ball", "Sport Ball", 0.4),
+    ("level_ball", "Level Ball", 0.4),
+    ("moon_ball", "Moon Ball", 0.4),
+    ("friend_ball", "Friend Ball", 0.4),
+    ("love_ball", "Love Ball", 0.4),
+    ("heavy_ball", "Heavy Ball", 0.4),
+    ("fast_ball", "Fast Ball", 0.4),
+    ("premier_ball", "Premier Ball", 0.4),
+    ("repeat_ball", "Repeat Ball", 0.4),
+    ("tm_ball", "TM Ball", 0.4),
+    ("great_tm_ball", "Great TM Ball", 0.4),
+    ("ultra_tm_ball", "Ultra TM Ball", 0.4),
+    ("timer_ball", "Timer Ball", 0.4),
 ]
 
 ROUTE_MOVE_ITEMS_BY_BALL: Dict[str, List[Tuple[str, str, float]]] = {
@@ -195,3 +197,54 @@ ROUTE_MOVE_BONUS_BERRIES: List[Tuple[str, str]] = [
     ("sitrus_berry", "Sitrus Berry"), ("aguav_berry", "Aguav Berry"), ("figy_berry", "Figy Berry"),
     ("iapapa_berry", "Iapapa Berry"), ("lum_berry", "Lum Berry"),
 ]
+
+
+def weighted_choice(items: Sequence[Tuple[str, str, float]]) -> Tuple[str, str]:
+    """Pick (id, display_name) from weighted tuples (id, name, weight)."""
+    if not items:
+        return ("", "")
+    total = 0.0
+    norm: List[Tuple[str, str, float]] = []
+    for key, name, weight in items:
+        w = max(0.0, float(weight or 0.0))
+        if w <= 0:
+            continue
+        norm.append((str(key), str(name), w))
+        total += w
+    if total <= 0 or not norm:
+        key, name, _ = items[-1]
+        return str(key), str(name)
+    r = random.uniform(0.0, total)
+    for key, name, weight in norm:
+        r -= weight
+        if r <= 0:
+            return key, name
+    return norm[-1][0], norm[-1][1]
+
+
+def roll_route_ball_by_absolute_rate() -> Tuple[str, str]:
+    """Roll route ball encounter using absolute percentage rates."""
+    if not ROUTE_MOVE_BALL_ENCOUNTER_RATES:
+        return ("__none__", "No Ball")
+    r = random.uniform(0.0, 100.0)
+    cumul = 0.0
+    for ball_id, ball_name, pct in ROUTE_MOVE_BALL_ENCOUNTER_RATES:
+        p = max(0.0, float(pct or 0.0))
+        if p <= 0.0:
+            continue
+        cumul += p
+        if r <= cumul:
+            return str(ball_id), str(ball_name)
+    return ("__none__", "No Ball")
+
+
+def route_pick_item_from_pool(pool_key: str) -> Tuple[str, str]:
+    """Pick item from a ball's loot pool."""
+    pool = ROUTE_MOVE_ITEMS_BY_BALL.get(str(pool_key or "")) or ROUTE_MOVE_ITEMS_BY_BALL.get("poke_ball") or []
+    item_id, item_name = weighted_choice(pool)
+    if item_id == "__bonus_berry__":
+        try:
+            return random.choice(ROUTE_MOVE_BONUS_BERRIES)
+        except Exception:
+            return ("oran_berry", "Oran Berry")
+    return item_id, item_name
