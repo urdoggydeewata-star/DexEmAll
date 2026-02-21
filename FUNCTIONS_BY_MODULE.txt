@@ -1,0 +1,442 @@
+================================================================================
+POKEBOT - FUNCTIONS AND CLASSES BY MODULE
+Main entry point: pokebot.py
+Generated for reference and modularization
+================================================================================
+
+================================================================================
+MODULE: pokebot.py (Main bot entry - commands, cogs, adventure, daycare, items)
+================================================================================
+
+--- Patching & Startup ---
+_patch_pvp_sprite_icon_fallback          Ensure PvP panel fallback to icon.png when full sprites missing
+_patch_adventure_switch_embed_privacy     Patch team switch embed to hide opponent info in adventure
+_patch_pvp_streaming_reliability          Patch PvP streaming reliability
+_patch_pvp_capture_reliability            Patch capture logic reliability
+
+--- Optional DB Tables ---
+_is_missing_table_error                   Check if exception indicates missing table
+_is_optional_table_disabled               Check if optional table is disabled
+_disable_optional_table                   Disable optional table for future queries
+_safe_optional_fetchone                   Safe fetchone for optional tables
+_safe_optional_fetchall                   Safe fetchall for optional tables
+_safe_pokedex_forms_fetchone              Safe pokedex_forms fetchone
+_safe_pokedex_forms_fetchall              Safe pokedex_forms fetchall
+
+--- Access & Role Gating ---
+_get_cached_access_verified               Get cached verification status
+_set_cached_access_verified               Set cached verification
+_get_cached_user_gen                     Get cached user generation
+_set_cached_user_gen                     Set cached generation
+_get_cached_admin_check                   Get cached admin status
+_set_cached_admin_check                  Set cached admin
+_get_cached_required_role                 Get cached required role check
+_set_cached_required_role                 Set cached role
+_get_cached_role_gate_exempt             Get role gate exemption
+_set_cached_role_gate_exempt              Set role gate exemption
+_ensure_role_gate_exempt_table            Ensure role_gate_exempt table exists
+_is_role_gate_exempt                      Check if user is exempt from role gate
+_grant_role_gate_exempt                   Grant exemption to user
+_revoke_role_gate_exempt                  Revoke exemption
+_list_role_gate_exempt                    List exempt users
+_parse_user_id_input                      Parse user ID from input
+_is_verify_button_interaction            Check if interaction is verify button
+_has_required_os_role                    Check if user has required role
+_send_required_role_block                 Send block message for missing role
+_check_required_role_interaction          Check role for interaction
+_is_static_admin                          Check if user is static admin
+_is_admin_user                            Check if user is admin
+
+--- Command Tree & Decorators ---
+_BannedCheckTree                          Command tree with banned user check
+owners_only                               Decorator for owner-only commands
+admin_only                                Decorator for admin-only commands
+
+--- Views & UI ---
+BetaClaimView                             View for beta claim button
+_close_discord_files                      Close Discord file objects
+ConfirmSwapView                           View for confirm/cancel swap
+QuantityModal                             Modal for buying item quantity
+BuyItemView                               View for buying items
+JumpModal                                 Modal for jump to page
+ItemsView                                 Paginated items catalog view
+OakIntroView                              Professor Oak intro view
+EvolutionConfirmView                      Evolution confirmation view
+StarterView                               Starter Pokémon selection view
+GivePokemonFormView                       Form view for giving Pokémon
+BagView                                   Paginated bag view with Prev/Next
+MPokeInfoFlipView                         View for MPokeInfo flip
+
+--- DB & Schema ---
+open_db                                   Open database connection
+check_schema                               Check database schema (admin)
+
+--- Owner/Admin Commands ---
+restartbot                                Restart bot (owner)
+am_i_admin                                Check if user is admin
+post_beta_announcement                    Post beta announcement (owner)
+hatchnow                                  Instantly hatch egg (owner)
+wipe_cmd                                  Wipe user data (owner)
+db_pool_stats                             DB pool statistics (admin)
+admin_list                                List admins
+admin_add                                 Add admin
+admin_remove                              Remove admin
+verified_add                              Add verified user
+verified_remove                           Remove verified user
+verified_list                             List verified users
+import_items_cmd                          Import items from PokeAPI
+fix_dupes                                 Fix duplicate items
+players                                   List players
+pokemons_cmd                              List member's Pokémon
+
+--- Item Helpers ---
+_canon_item_id                            Canonical item ID from PokeAPI name
+_item_english_name                        Get English item name from payload
+_item_english_desc                        Get English item description
+_upsert_item_row                          Upsert item row in items table
+_fetch_json                               Fetch JSON from URL
+_item_index                               Get item index for fuzzy
+_is_prefixish                             Check prefix match
+_resolve_item_fuzzy                       Fuzzy resolve item query
+_user_item_qty                            Get user item quantity
+_user_money                               Get user money
+_set_user_money                           Set user money
+_item_title_line                          Format item title line
+_looks_http                               Check if string looks like URL
+_is_displayable_item_emoji                Check if emoji is displayable
+item_icon_file                            Get item icon file for embed
+build_item_embed                          Build item embed with price/qty
+_decrement_user_item                      Decrement user item
+_get_item_qty                             Get item quantity in bag
+_has_exp_share_bag_item                   Check if user has Exp Share
+_count_item_in_use                        Count items held by team Pokémon
+_get_usage                                Get (used, total) for item
+_item_category_is_consumable              Check if category is consumable
+_item_forces_consumable                   Check if item forces consumable
+_item_is_consumable_conn                  Check consumable via conn
+_bag_adjust_conn                          Adjust bag qty in transaction
+_usage_str                                Format usage as string
+_norm_item_query                          Normalize item query
+_fetch_item_by_query                      Fetch item by query
+
+--- Bag & Inventory ---
+format_item_line                          Format single item line for bag display
+build_bag_embed                           Build bag embed with items
+_decorate_items_with_usage                Add free/total format for bag items
+_build_bag_embed_for_battle               Build bag embed for in-battle use
+
+--- Item Commands ---
+give_item                                 Give item to team Pokémon
+take_item                                 Take held item from Pokémon
+item_cmd                                  View item info
+items_cmd                                 Browse items catalog
+list_commands                             List available commands
+
+--- Cogs ---
+AdminItems                                Cog for admin item commands
+AdminGivePokemon                          Cog for admin give Pokémon
+OwnerShinyOddsCog                         Cog for shiny odds (owner)
+BagCog                                    Cog for /bag command
+EmojiLinkCog                              Cog for emoji linking
+MPokeInfo                                 Cog for /pokeinfo
+
+--- Response Helpers ---
+_reply                                    Wrapped reply for interactions
+_content_needs_plain_text                 Check if content needs plain text
+_wrap_content_into_embed                  Wrap content in embed
+_wrap_send_func                           Wrap send function
+_enable_embed_only_messages               Enable embed-only mode
+
+--- Sprite & Display ---
+_species_folder_name                      Normalize species folder name
+pokemon_sprite_attachment                 Get Pokémon sprite as attachment
+pretty_item_name                          Format item name for display
+render_item_line                          Render item line with emoji
+
+--- Pokémon Helpers ---
+_caught_hp_for_ball                       HP when caught for ball type
+_get_pokemon_ball                         Get Pokémon's ball
+_set_friendship                           Set friendship value
+_give_item                                Give item to user
+_user_max_unlocked_gen                    Get user max unlocked gen
+shiny_roll                                Roll for shiny
+normalize_base_stats                      Normalize stats dict
+parse_abilities                           Parse abilities into regular/hidden
+_norm_ability_id                          Normalize ability ID
+_ability_set_from_entry                   Get ability set from pokedex entry
+roll_hidden_ability                       Roll for hidden ability
+_set_shiny                                Set shiny flag
+_set_pokeball                             Set Pokémon ball
+_set_held_item                            Set held item
+_set_pokemon_moves                        Set Pokémon moves
+
+--- Gen & Move Helpers ---
+_normalize_stats_for_generator             Normalize stats for generator
+_ensure_user_in_gen1                      Ensure user in Gen 1
+_ensure_starter_mon_row                   Ensure starter exists
+_user_selected_gen                        Get user selected generation
+_default_levelup_moves                    Get default level-up moves
+_get_move_id                              Get move ID by name
+_species_can_learn_move_by_machine        Check TM/HM learnability
+_get_team_can_learn_move                   Get team mons that can learn move
+_get_species_id                           Get species ID
+_get_team_tutor_eligible                  Get tutor-eligible team mons
+_get_tutor_learnset_moves                 Get tutor learnset moves
+_get_egg_machine_learnset_moves           Get egg/machine learnset
+_get_non_levelup_learnset_moves           Get non-level-up learnset
+
+--- Market ---
+_roll_and_give_route_move_item_async      Roll and give route move item
+_is_pokemart                              Check if area is PokéMart
+_market_normalize_key                     Normalize market key
+_market_resolve_item_key                  Resolve item key
+_market_item_variants                     Get item variants
+_market_display                           Display name for market item
+_market_is_treasure                       Check if treasure item
+_market_price_embed                       Build market price embed
+_market_total_qty                         Get total qty for market item
+_market_buy                               Buy from market
+_market_sell                              Sell to market
+
+--- Adventure State ---
+_adv_default_state                        Default adventure state
+_adv_history_entry                        Get history entry
+_adv_history_push                         Push to history
+_adv_history_pop                          Pop from history
+_get_adventure_state                      Get user adventure state
+_save_adventure_state                     Save adventure state
+
+--- Daycare ---
+_daycare_default_record                   Default daycare record
+_daycare_get_record                        Get daycare record from state
+_daycare_parent_ids_from_state_data       Get parent IDs from state
+_daycare_parent_ids_for_owner              Get parent IDs for owner
+_daycare_norm_species                      Normalize species for daycare
+_daycare_parse_evolution_blob             Parse evolution blob
+_daycare_next_evo_entries                  Get next evolution entries
+_daycare_pokedex_rows_for_breeding        Get pokedex rows for breeding
+_daycare_pre_evo_map                      Pre-evolution map
+_daycare_resolve_egg_species               Resolve egg species
+_daycare_breeding_source_parent           Breeding source parent
+_daycare_apply_incense_baby_rules         Apply incense baby rules
+_daycare_parse_moves                      Parse moves from egg
+_daycare_egg_move_pool                    Get egg move pool
+_daycare_inherited_egg_moves              Get inherited egg moves
+_daycare_showdown_keys                    Showdown keys for species
+_daycare_sprite_folder_candidates         Sprite folder candidates
+_daycare_pokesprite_zip_arcs              Pokesprite zip paths
+_daycare_extract_pokesprite_box           Extract box sprite from zip
+_daycare_extract_pokesprite_egg_icon      Extract egg icon
+_daycare_norm_item                        Normalize item ID
+_daycare_ability_key                      Normalize ability key
+_daycare_short_to_long_stats              Convert short to long stat keys
+_daycare_parse_egg_groups                 Parse egg groups
+_daycare_species_entry                    Get species pokedex entry
+_daycare_pair_info                        Get pair breeding info
+_daycare_pick_nature                      Pick nature from parents
+_daycare_pick_ivs                         Pick IVs from parents
+_daycare_pick_ball                        Pick ball from parents
+_daycare_pick_ability                     Pick ability from parents
+_daycare_create_egg                      Create egg from parents
+_daycare_team_count                       Team non-egg count
+_team_non_egg_count                       Count non-egg in team
+_team_has_species                         Check if team has species
+_compact_team_slots                       Compact team slots
+_daycare_has_hatch_boost                  Check hatch boost ability
+_daycare_has_oval_charm                   Check Oval Charm
+_daycare_hatch_to_team                    Hatch egg to team/box
+_daycare_parent_rows                      Get parent rows
+_daycare_pair_context                     Get pair context
+_daycare_tick                             Daycare tick (breeding + hatching)
+_daycare_icon_path_for_species            Icon path for species
+_daycare_random_positions                 Random box positions
+_embed_with_daycare_panel                 Embed with daycare panel image
+
+--- Pokedex ---
+_ensure_pokedex_tables                    Create pokedex tables
+pokedex_mark_seen                         Mark species seen
+pokedex_get_entry                         Get pokedex entry
+pokedex_summary                           Get pokedex summary
+pokedex_seen_species                      Get seen species list
+pokedex_caught_species                    Get caught species list
+
+--- Adventure Routes ---
+_is_city                                  Check if area is city
+_city_is_cleared                          Check if city cleared
+_team_has_surf                            Check if team has Surf
+_route_required_trainers                  Get required trainers for route
+_route_is_cleared                         Check if route cleared
+_route_path_blockers_cleared              Check path blockers
+_add_discovered                           Add to discovered
+_pick_rival_starter                       Pick rival starter
+_asset_file                               Get asset as Discord file
+_embed_with_image                         Embed with image
+_embed_with_route_panel                    Embed with route panel
+
+--- Item Token & Aliases (AdminItems) ---
+_canonical_item_token                     Canonical item token
+_item_alias_tokens                        Get alias tokens for item
+_normalize_item_token                     Normalize item token
+_canonical_pp_item_id                     Canonical PP item ID
+
+--- Test & Setup ---
+test_slash                                Test command
+code_cmd                                  Access code command
+setup                                     Add cogs to bot
+on_app_command_error                      App command error handler
+main                                      Async main entry
+
+
+================================================================================
+MODULE: lib/db.py
+================================================================================
+connect                                   Open DB connection
+warm_pool                                 Warm connection pool
+session                                   Session context manager
+close                                     Close (no-op)
+_table_exists                             Check table exists
+_column_exists                            Check column exists
+migrate_monsters_to_pokemons               Migration (no-op for PG)
+ensure_pokemon_stat_columns               Ensure stat columns
+ensure_schema_migrations                   Run schema migrations
+get_inventory_page                        Get bag page (items, max_pages, total)
+invalidate_bag_cache                      Invalidate bag cache
+clear_all_bag_cache                       Clear all bag cache
+give_item                                 Add/remove items to bag
+add_pokemon_with_stats                    Add Pokémon with stats
+set_pokemon_moves                         Set Pokémon moves
+next_free_team_slot                       Get next free team slot
+set_team_slot                             Set team slot
+get_pokedex_by_name                      Get pokedex by species name
+init_schema                               Initialize schema
+
+
+================================================================================
+MODULE: lib/db_cache.py
+================================================================================
+get_cached_pokedex                        Get cached pokedex
+set_cached_pokedex                        Set cached pokedex
+get_cached_move                           Get cached move
+set_cached_move                           Set cached move
+get_cached_item                           Get cached item
+set_cached_item                          Set cached item
+get_cached_pokemons                       Get cached pokemons
+set_cached_pokemons                      Set cached pokemons
+invalidate_pokemons                      Invalidate pokemons cache
+get_cached_bag                            Get cached bag
+set_cached_bag                            Set cached bag
+invalidate_bag                            Invalidate bag cache
+
+
+================================================================================
+MODULE: lib/stats.py
+================================================================================
+pick_random_nature                        Pick random nature
+nature_multipliers                        Nature stat multipliers
+roll_ivs                                  Roll random IVs
+calc_hp                                   Calculate HP stat
+calc_other                                Calculate non-HP stat
+calc_all_stats                            Calculate all stats
+choose_ability                            Choose ability
+roll_gender                               Roll gender
+generate_mon                              Generate Pokémon
+
+
+================================================================================
+MODULE: lib/breeding_mechanics.py
+================================================================================
+resolve_egg_species                       Resolve egg species from parents
+parse_egg_groups                          Parse egg groups
+create_egg                                Create egg from parents
+inherited_egg_moves                       Get inherited egg moves
+
+
+================================================================================
+MODULE: lib/evolution_mechanics.py
+================================================================================
+Evolution logic and stone/trade evolutions
+
+
+================================================================================
+MODULE: bot_core/config.py
+================================================================================
+TOKEN, OWNER_IDS, STATIC_ADMIN_IDS, BANNED_IDS, and other config constants
+
+
+================================================================================
+MODULE: bot_core/fuzzy.py
+================================================================================
+FuzzyMatcher                              Fuzzy matching class
+normalize                                 Normalize for matching
+fuzzy_match                               Fuzzy match with threshold
+resolve_team_mon                          Resolve team mon by name/slot
+resolve_team_mon_for_owner_id             Resolve for owner ID
+_canon                                    Internal canon for compare
+_fuzzy_best                               Best fuzzy match
+
+
+================================================================================
+MODULE: bot_core/ball_helpers.py
+================================================================================
+_caught_friendship_for_ball               Friendship when caught
+_friendship_delta_with_ball_bonus         Friendship delta with ball bonus
+
+
+================================================================================
+MODULE: bot_core/tera_helpers.py
+================================================================================
+_normalize_type_id                        Normalize type ID
+_extract_species_types                    Extract types from entry
+_roll_default_tera_type                   Roll default Tera type
+
+
+================================================================================
+MODULE: features/route_loot.py
+================================================================================
+roll_route_ball_by_absolute_rate          Roll route ball
+route_pick_item_from_pool                 Pick item from pool
+GEN1_TMS, GEN1_HMS, TM_SELLER_*          Constants
+
+
+================================================================================
+MODULE: features/adventure_constants.py
+================================================================================
+ASSETS_*, DAYCARE_*, BOX_*, path constants
+
+
+================================================================================
+MODULE: pvp/panel.py
+================================================================================
+MoveView, BattleState, panel rendering, bag UI in battle
+_bag_embed_builder usage, _BagLikeView, _BagButton
+
+
+================================================================================
+MODULE: pvp/engine.py
+================================================================================
+build_mon, Mon class, battle engine, damage calculation
+
+
+================================================================================
+MODULE: pvp/panel_capture.py
+================================================================================
+is_healing_item, heal_amount_for_item, _attempt_capture, _ball_multiplier
+
+
+================================================================================
+MODULARIZATION STATUS
+================================================================================
+Files over 10k lines (as of generation):
+- pokebot.py: ~28,300 lines (main - needs extraction to cogs/, features/)
+- pvp/engine.py: ~18,850 lines (battle engine - consider splitting mechanics)
+
+Recommended extractions per REFACTOR.md:
+1. features/daycare.py - _daycare_* functions (~1,300 lines)
+2. features/adventure.py - Adventure panels, route logic (~3,000 lines)
+3. cogs/admin.py - AdminItems, AdminGivePokemon (~3,500 lines)
+4. cogs/bag_items.py - BagCog, give/take, item commands (~2,500 lines)
+5. bot_core/item_helpers.py - _canonical_item_token, _bag_adjust_conn, etc.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
