@@ -22,7 +22,7 @@ This document tracks the modular refactoring of `pokebot.py` (~29K lines) into s
 Extract to `bot_core/`:
 - **db_helpers.py** – `_ensure_pg_pokemons_columns`, `_pg_pokemons_column_flags`, `_tx_begin/commit/rollback`, `_wipe_user`, `_wipe_all`
 - **item_helpers.py** – `_canonical_item_token`, `_item_index`, `_resolve_item_fuzzy`, `_bag_adjust_conn`, `_count_item_in_use`, `_get_usage`, etc.
-- **fuzzy.py** – `FuzzyMatcher`, `_fuzzy_best`, `resolve_team_mon`, `_resolve_team_mon_for_owner_id`
+- **fuzzy.py** – `FuzzyMatcher`, `_fuzzy_best`, `resolve_team_mon`, `_resolve_team_mon_for_owner_id` ✅ DONE
 
 ### Phase 3: Cogs (Discord commands)
 Extract to `cogs/` (or `bot_core/cogs/`):
