@@ -31,6 +31,9 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 load_dotenv()
 
+# pokebot.py is the main entry point (run directly or via python -m). All modules below
+# are loaded at startup: pvp/, lib/, features/, bot_core/ (config, fuzzy, ball_helpers, tera_helpers).
+
 import aiohttp
 import discord
 from discord.ext import commands
@@ -563,6 +566,17 @@ from bot_core.fuzzy import (
     _fuzzy_best,
     resolve_team_mon,
     resolve_team_mon_for_owner_id as _resolve_team_mon_for_owner_id,
+)
+from bot_core.db_helpers import (
+    count_rows as _count,
+    ensure_pg_pokemons_columns as _ensure_pg_pokemons_columns,
+    pg_pokemons_column_flags as _pg_pokemons_column_flags,
+    tx_begin as _tx_begin,
+    tx_commit as _tx_commit,
+    tx_rollback as _tx_rollback,
+    wipe_user as _wipe_user,
+    recache_after_wipe as _recache_after_wipe,
+    wipe_all as _wipe_all,
 )
 
 # =========================
@@ -1609,162 +1623,8 @@ class OwnerShinyOddsCog(commands.Cog):
         await self._create_trigger(n)
         await interaction.followup.send(f"✅ Shiny odds set to **1 / {n}** for all NEW Pokémon inserts.", ephemeral=True)
 # =========================
-#  Owner admin management
+#  Owner admin management (db helpers: _count, _tx_*, _wipe_* from bot_core.db_helpers)
 # =========================
-async def _count(conn, table: str, where_sql: str = "", args: tuple = ()):
-    cur = await conn.execute(f"SELECT COUNT(*) AS c FROM {table} {where_sql}", args)
-    row = await cur.fetchone()
-    await cur.close()
-    return int(row["c"] if row else 0)
-
-_PG_POKEMONS_COLS_OK = False
-
-async def _ensure_pg_pokemons_columns(conn) -> None:
-    global _PG_POKEMONS_COLS_OK
-    if _PG_POKEMONS_COLS_OK or not getattr(db, "DB_IS_POSTGRES", False):
-        return
-    try:
-        await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS hp_now INTEGER")
-        await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS moves_pp JSONB")
-        await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS moves_pp_min JSONB")
-        await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS moves_pp_max JSONB")
-        await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS shiny INTEGER NOT NULL DEFAULT 0")
-        await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS is_hidden_ability INTEGER NOT NULL DEFAULT 0")
-        _PG_POKEMONS_COLS_OK = True
-    except Exception:
-        # leave flag false so we can try again later
-        pass
-
-async def _pg_pokemons_column_flags(conn) -> dict:
-    """Return existence flags for optional PG columns on pokemons."""
-    flags = {
-        "hp_now": True,
-        "moves_pp": True,
-        "moves_pp_min": False,
-        "moves_pp_max": False,
-        "shiny": True,
-        "is_hidden_ability": True,
-    }
-    if not getattr(db, "DB_IS_POSTGRES", False):
-        return flags
-    try:
-        flags["hp_now"] = await db._column_exists(conn, "pokemons", "hp_now")
-    except Exception:
-        flags["hp_now"] = False
-    try:
-        flags["moves_pp"] = await db._column_exists(conn, "pokemons", "moves_pp")
-    except Exception:
-        flags["moves_pp"] = False
-    try:
-        flags["moves_pp_min"] = await db._column_exists(conn, "pokemons", "moves_pp_min")
-    except Exception:
-        flags["moves_pp_min"] = False
-    try:
-        flags["moves_pp_max"] = await db._column_exists(conn, "pokemons", "moves_pp_max")
-    except Exception:
-        flags["moves_pp_max"] = False
-    try:
-        flags["shiny"] = await db._column_exists(conn, "pokemons", "shiny")
-    except Exception:
-        flags["shiny"] = False
-    try:
-        flags["is_hidden_ability"] = await db._column_exists(conn, "pokemons", "is_hidden_ability")
-    except Exception:
-        flags["is_hidden_ability"] = False
-    return flags
-
-async def _tx_begin(conn) -> None:
-    await conn.execute("BEGIN")
-
-async def _tx_commit(conn) -> None:
-    if getattr(db, "DB_IS_POSTGRES", False):
-        await conn.execute("COMMIT")
-    else:
-        await conn.commit()
-
-async def _tx_rollback(conn) -> None:
-    if getattr(db, "DB_IS_POSTGRES", False):
-        await conn.execute("ROLLBACK")
-    else:
-        await conn.rollback()
-
-async def _wipe_user(conn, uid: str) -> dict:
-    """
-    Remove EVERYTHING for one user.
-    Note: owner_id tables -> uid in owner_id; users/user_rulesets -> uid in user_id.
-    """
-    stats = {
-        "pokemons":       await _count(conn, "pokemons",       "WHERE owner_id=?", (uid,)),
-        "user_items":     await _count(conn, "user_items",     "WHERE owner_id=?", (uid,)),
-        "user_equipment": await _count(conn, "user_equipment", "WHERE owner_id=?", (uid,)),
-        "user_boxes":     await _count(conn, "user_boxes",     "WHERE owner_id=?", (uid,)),
-        "user_meta":      await _count(conn, "user_meta",      "WHERE owner_id=?", (uid,)),
-        "user_rulesets":  await _count(conn, "user_rulesets",  "WHERE user_id=?",  (uid,)),
-        "event_log":      await _count(conn, "event_log",      "WHERE user_id=?",  (uid,)),
-        "users":          await _count(conn, "users",          "WHERE user_id=?",  (uid,)),
-    }
-
-    await _tx_begin(conn)
-    try:
-        # Enable foreign keys to ensure CASCADE works
-        if not getattr(db, "DB_IS_POSTGRES", False):
-            await conn.execute("PRAGMA foreign_keys = ON")
-        # children first (in order of dependencies)
-        await conn.execute("DELETE FROM pokemons       WHERE owner_id=?", (uid,))
-        await conn.execute("DELETE FROM user_items     WHERE owner_id=?", (uid,))
-        await conn.execute("DELETE FROM user_equipment WHERE owner_id=?", (uid,))
-        await conn.execute("DELETE FROM user_boxes     WHERE owner_id=?", (uid,))
-        await conn.execute("DELETE FROM user_meta      WHERE owner_id=?",  (uid,))
-        await conn.execute("DELETE FROM user_rulesets  WHERE user_id=?",  (uid,))
-        await conn.execute("DELETE FROM event_log      WHERE user_id=?",  (uid,))
-        # finally the user row
-        await conn.execute("DELETE FROM users          WHERE user_id=?",  (uid,))
-        await _tx_commit(conn)
-        db.invalidate_pokemons_cache(uid)
-        db.invalidate_bag_cache(uid)
-    except Exception:
-        await _tx_rollback(conn)
-        raise
-    return stats
-
-async def _recache_after_wipe() -> None:
-    try:
-        if db_cache is not None:
-            db_cache.clear_cache()
-        if warm_cache is not None:
-            await warm_cache()
-    except Exception:
-        pass
-
-async def _wipe_all(conn) -> dict:
-    """Delete ALL players & data. Order matters (children -> parent)."""
-    stats = {
-        "pokemons":       await _count(conn, "pokemons"),
-        "user_items":     await _count(conn, "user_items"),
-        "user_equipment": await _count(conn, "user_equipment"),
-        "user_boxes":     await _count(conn, "user_boxes"),
-        "user_meta":      await _count(conn, "user_meta"),
-        "user_rulesets":  await _count(conn, "user_rulesets"),
-        "users":          await _count(conn, "users"),
-    }
-
-    await _tx_begin(conn)
-    try:
-        await conn.execute("DELETE FROM pokemons")
-        await conn.execute("DELETE FROM user_items")
-        await conn.execute("DELETE FROM user_equipment")
-        await conn.execute("DELETE FROM user_boxes")
-        await conn.execute("DELETE FROM user_meta")
-        await conn.execute("DELETE FROM user_rulesets")
-        await conn.execute("DELETE FROM users")
-        await _tx_commit(conn)
-        db.clear_all_pokemons_cache()
-        db.clear_all_bag_cache()
-    except Exception:
-        await _tx_rollback(conn)
-        raise
-    return stats
-
 
 @bot.tree.command(name="wipe", description="OWNER: wipe one user OR wipe ALL player data.")
 @owners_only()
