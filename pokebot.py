@@ -9189,6 +9189,12 @@ async def _daycare_tick(owner_id: str, state: dict, *, command_credit: float = 0
                 egg["progress"] = 0.0
                 hatch_steps = DAYCARE_HATCH_MIN
             if egg["progress"] >= hatch_steps:
+                # Block hatching if team already has same species (egg stays at 99% until species removed)
+                egg_species = await _daycare_resolve_egg_species(str(egg.get("species") or ""))
+                if egg_species and await _team_has_species(owner_id, egg_species):
+                    egg["progress"] = max(0.0, hatch_steps - 0.01)
+                    survivors.append(egg)
+                    continue
                 hatched = await _daycare_hatch_to_team(owner_id, egg)
                 if hatched:
                     display = str(hatched.get("species") or "Pokémon").replace("-", " ").title()
@@ -23938,6 +23944,7 @@ class BagView(ui.View):
                 for i in range(1, self.max_pages + 1)
             ]
 
+            items = await _decorate_items_with_usage(self.owner_id, items)
             embed, files = build_bag_embed(self.owner_id, items, self.page, self.max_pages, total_distinct)
             try:
                 await interaction.response.edit_message(embed=embed, view=self, attachments=files)
@@ -23995,11 +24002,66 @@ def build_bag_embed(owner_id: int, items: list[dict], page: int, max_pages: int,
     return e, files
 
 
+async def _decorate_items_with_usage(owner_id: int | str, items: list) -> list:
+    """
+    Mutates rows so that row['qty'] becomes 'free/total' (string) for display.
+    'free' = total - how many are currently held by your Pokémon.
+    Ensures bag displays consistently in and out of battle.
+    """
+    uid = str(owner_id)
+    merged_by_item: dict[str, dict[str, Any]] = {}
+    order_idx = 0
+    rows_data = []
+    for r in items:
+        asdict = dict(r) if hasattr(r, "keys") else {
+            "id": r[0] if len(r) > 0 else None,
+            "name": r[1] if len(r) > 1 else None,
+            "qty": r[2] if len(r) > 2 else 0,
+        }
+        raw_item_id = (asdict.get("id") or asdict.get("item_id") or asdict.get("name") or "").strip()
+        item_id = _canonical_item_token(raw_item_id) or raw_item_id
+        total = int((asdict.get("qty") or 0) or 0)
+        bucket = merged_by_item.get(item_id)
+        if bucket is None:
+            row_copy = dict(asdict)
+            row_copy["id"] = item_id
+            row_copy["item_id"] = item_id
+            row_copy["_order"] = order_idx
+            order_idx += 1
+            merged_by_item[item_id] = row_copy
+            bucket = row_copy
+        bucket["qty"] = int(bucket.get("qty") or 0) + total
+
+    merged_rows = sorted(
+        merged_by_item.values(),
+        key=lambda d: (int(d.get("_order", 0)), str(d.get("name") or d.get("item_id") or "")),
+    )
+    for asdict in merged_rows:
+        item_id = str(asdict.get("item_id") or asdict.get("id") or "").strip()
+        total = int((asdict.get("qty") or 0) or 0)
+        rows_data.append((asdict, item_id, total))
+
+    async def _zero():
+        return 0
+
+    coros = [_count_item_in_use(uid, iid) if iid else _zero() for _, iid, _ in rows_data]
+    used_list = await asyncio.gather(*coros)
+    out = []
+    for (asdict, _, total), used in zip(rows_data, used_list):
+        used = int(used) if isinstance(used, (int, float)) else 0
+        free = max(0, total - used)
+        asdict["qty"] = f"{free}/{total}"
+        asdict.pop("_order", None)
+        out.append(asdict)
+    return out
+
+
 async def _build_bag_embed_for_battle(owner_id: int | str, page: int = 1):
     """Build the same bag embed as /bag for in-battle use. Returns (embed, files)."""
     async with db.session() as conn:
         items, max_pages, total_distinct = await db.get_inventory_page(conn, str(owner_id), page)
     page = max(1, min(page, max_pages))
+    items = await _decorate_items_with_usage(owner_id, items)
     return build_bag_embed(int(owner_id) if isinstance(owner_id, str) else owner_id, items, page, max_pages, total_distinct)
 
 
@@ -24010,55 +24072,8 @@ class BagCog(commands.Cog):
         self.bot = bot
 
     async def _decorate_items_with_usage(self, owner_id: int | str, items: list) -> list:
-        """
-        Mutates rows so that row['qty'] becomes 'free/total' (string) for display.
-        'free' = total - how many are currently held by your Pokémon.
-        Runs _count_item_in_use in parallel for all items.
-        """
-        uid = str(owner_id)
-        merged_by_item: dict[str, dict[str, Any]] = {}
-        order_idx = 0
-        rows_data = []
-        for r in items:
-            asdict = dict(r) if hasattr(r, "keys") else {
-                "id": r[0] if len(r) > 0 else None,
-                "name": r[1] if len(r) > 1 else None,
-                "qty": r[2] if len(r) > 2 else 0,
-            }
-            raw_item_id = (asdict.get("id") or asdict.get("item_id") or asdict.get("name") or "").strip()
-            item_id = _canonical_item_token(raw_item_id) or raw_item_id
-            total = int((asdict.get("qty") or 0) or 0)
-            bucket = merged_by_item.get(item_id)
-            if bucket is None:
-                row_copy = dict(asdict)
-                row_copy["id"] = item_id
-                row_copy["item_id"] = item_id
-                row_copy["_order"] = order_idx
-                order_idx += 1
-                merged_by_item[item_id] = row_copy
-                bucket = row_copy
-            bucket["qty"] = int(bucket.get("qty") or 0) + total
-
-        merged_rows = sorted(
-            merged_by_item.values(),
-            key=lambda d: (int(d.get("_order", 0)), str(d.get("name") or d.get("item_id") or "")),
-        )
-        for asdict in merged_rows:
-            item_id = str(asdict.get("item_id") or asdict.get("id") or "").strip()
-            total = int((asdict.get("qty") or 0) or 0)
-            rows_data.append((asdict, item_id, total))
-        async def _zero():
-            return 0
-        coros = [_count_item_in_use(uid, iid) if iid else _zero() for _, iid, _ in rows_data]
-        used_list = await asyncio.gather(*coros)
-        out = []
-        for (asdict, _, total), used in zip(rows_data, used_list):
-            used = int(used) if isinstance(used, (int, float)) else 0
-            free = max(0, total - used)
-            asdict["qty"] = f"{free}/{total}"
-            asdict.pop("_order", None)
-            out.append(asdict)
-        return out
+        """Delegate to module-level _decorate_items_with_usage for consistent bag display."""
+        return await _decorate_items_with_usage(owner_id, items)
 
     @app_commands.command(name="bag", description="View your items (6 pages by default).")
     async def bag(self, interaction: Interaction, page: int = 1):
