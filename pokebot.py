@@ -10099,10 +10099,19 @@ async def _save_party_state_from_battle(st: "BattleState", uid: int) -> None:
                 left = pp_store.get(canonical) or pp_store.get(m)
                 if left is None:
                     left = norm_pp_store.get(_norm_pp_move_key(str(m)))
+                if left is None:
+                    for raw_key, raw_val in (pp_store or {}).items():
+                        if _canonical_move_name(raw_key) == canonical:
+                            left = raw_val
+                            break
                 try:
                     left_i = int(left) if left is not None else int(stored_i)
                 except Exception:
                     left_i = int(stored_i)
+                # When max cap equals base (no PP Up), clamp to at most base
+                base_i = base_caps[i] if i < len(base_caps) else int(_pp_move_base(str(m), st.gen))
+                if max_caps[i] <= base_i:
+                    left_i = min(left_i, base_i)
                 moves_pp.append(max(int(min_i), min(int(left_i), int(cap_i))))
             # Persist status (brn/par/psn/slp/frz/tox) for non-fainted mons; clear if fainted
             status_val = getattr(mon, "status", None) if mon.hp > 0 else None
