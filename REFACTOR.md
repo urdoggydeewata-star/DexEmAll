@@ -9,6 +9,12 @@ This document tracks the modular refactoring of `pokebot.py` (~29K lines) into s
 - **bot_core/tera_helpers.py** – `_normalize_type_id`, `_extract_species_types`, `_roll_default_tera_type` (~55 lines)
 - **bot_core/ball_helpers.py** – Ball normalization, friend/heal/luxury checks, `_caught_friendship_for_ball`, `_friendship_delta_with_ball_bonus` (~80 lines)
 
+### 2. `pvp/` package
+- **pvp/panel_capture.py** – Balls, healing items, `_ball_multiplier`, `_attempt_capture`, `status_bonus` (~310 lines). Reduces panel.py below 10k.
+
+### 3. `features/` package
+- **features/route_loot.py** – GEN1_TMS/HMS, TM_SELLER_*, ROUTE_MOVE_BALL_ENCOUNTER_RATES, ROUTE_MOVE_ITEMS_BY_BALL, ROUTE_MOVE_* (~200 lines)
+
 ## Recommended Next Phases
 
 ### Phase 2: Core utilities
