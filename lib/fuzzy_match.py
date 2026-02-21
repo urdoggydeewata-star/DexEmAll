@@ -133,33 +133,6 @@ class FuzzyMatcher:
         return FuzzyMatcher.fuzzy_match(query, all_moves, threshold=0.70)
 
     @staticmethod
-    async def fuzzy_species(conn, query: str) -> tuple[Optional[dict], float, list[str]]:
-        """Fuzzy match species name. Returns (species_row, confidence, suggestions)."""
-        cur = await conn.execute("SELECT id, name FROM pokedex")
-        species_rows = await cur.fetchall()
-        await cur.close()
-        species_names = [row["name"] for row in species_rows]
-        best_name, score, suggestions = FuzzyMatcher.fuzzy_match(query, species_names, threshold=0.70)
-        if best_name:
-            cur = await conn.execute("SELECT * FROM pokedex WHERE LOWER(name) = LOWER(?)", (best_name,))
-            species_row = await cur.fetchone()
-            await cur.close()
-            return dict(species_row) if species_row else None, score, suggestions
-        return None, 0.0, suggestions
-
-    @staticmethod
-    async def fuzzy_ability(conn, query: str, valid_abilities: Optional[list[str]] = None) -> tuple[Optional[str], float, list[str]]:
-        """Fuzzy match ability name."""
-        if valid_abilities:
-            choices = valid_abilities
-        else:
-            cur = await conn.execute("SELECT DISTINCT ability FROM pokemons WHERE ability IS NOT NULL")
-            rows = await cur.fetchall()
-            await cur.close()
-            choices = list(set(row["ability"] for row in rows if row["ability"]))
-        return FuzzyMatcher.fuzzy_match(query, choices, threshold=0.75)
-
-    @staticmethod
     async def fuzzy_item(conn, query: str, item_cache=None) -> tuple[Optional[str], float, list[str]]:
         """Fuzzy match item name. Uses item cache when available."""
         cache = item_cache if item_cache is not None else db_cache
