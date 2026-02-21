@@ -7,6 +7,7 @@ This document tracks the modular refactoring of `pokebot.py` (~29K lines) into s
 ### 1. `bot_core/` package
 - **bot_core/config.py** – Env vars, owner settings, verification IDs (~55 lines)
 - **bot_core/tera_helpers.py** – `_normalize_type_id`, `_extract_species_types`, `_roll_default_tera_type` (~55 lines)
+- **bot_core/ball_helpers.py** – Ball normalization, friend/heal/luxury checks, `_caught_friendship_for_ball`, `_friendship_delta_with_ball_bonus` (~80 lines)
 
 ## Recommended Next Phases
 

@@ -377,241 +377,8 @@ _patch_adventure_switch_embed_privacy()
 
 
 def _patch_pvp_streaming_reliability() -> None:
-    """
-    Runtime patch for PvP streaming when only pokebot.py is deployable.
-
-    - Keeps a stable public stream channel on battle state.
-    - Sends an initial "battle started" stream panel.
-    - Adds robust fallback if stream attachment send fails.
-    - Posts a public clarification that private panels != public stream.
-    """
-    # Modern streaming behavior is implemented in pvp/panel.py.
-    # Keep this runtime monkey-patch disabled to avoid double-posts or
-    # conflicting stream formats when both paths exist.
-    return
-    try:
-        # Modern pvp.panel already has reliable streaming with per-turn summary+image.
-        # Do not override it from pokebot.py unless those helpers are missing.
-        if (
-            callable(getattr(_pvp_panel, "_send_stream_panel", None))
-            and callable(getattr(_pvp_panel, "_resolve_stream_channel", None))
-        ):
-            return
-        original_send_stream = getattr(_pvp_panel, "_send_stream_panel", None)
-        if callable(original_send_stream) and not getattr(original_send_stream, "_dex_stream_patch", False):
-
-            async def _wrapped_send_stream_panel(channel, st, turn_summary: Optional[str] = None, gif_file: Optional[Any] = None):
-                stream_channel = channel
-                if stream_channel is None or not hasattr(stream_channel, "send"):
-                    stream_channel = getattr(st, "stream_channel", None)
-                if stream_channel is None or not hasattr(stream_channel, "send"):
-                    return None
-
-                try:
-                    turn_no = int(getattr(st, "turn", 0) or 0)
-                except Exception:
-                    turn_no = 0
-                summary_text = str(turn_summary or "").strip()
-                if not summary_text:
-                    try:
-                        cached_lines = [
-                            str(line).strip()
-                            for line in (getattr(st, "_last_turn_log", []) or [])
-                            if str(line).strip()
-                        ]
-                        if cached_lines:
-                            summary_text = "\n".join(cached_lines).strip()
-                    except Exception:
-                        summary_text = ""
-                if not summary_text:
-                    summary_text = "No significant actions this turn."
-
-                stream_key = None
-                try:
-                    stream_key = (turn_no, summary_text)
-                    if stream_key == getattr(st, "_stream_last_sent_key", None):
-                        return getattr(st, "_last_stream_message", None)
-                except Exception:
-                    stream_key = None
-
-                try:
-                    st.stream_channel = stream_channel
-                    st.stream_channel_id = getattr(stream_channel, "id", None)
-                except Exception:
-                    pass
-
-                p1 = _pvp_panel._format_pokemon_name(st._active(st.p1_id))
-                p2 = _pvp_panel._format_pokemon_name(st._active(st.p2_id))
-                desc = f"Turn {getattr(st, 'turn', '?')} • {getattr(st, 'fmt_label', 'Battle')} (Gen {getattr(st, 'gen', '?')})"
-                if summary_text:
-                    _sum = summary_text
-                    if len(_sum) > 2500:
-                        _sum = "...\n" + _sum[-2300:]
-                    desc += f"\n\n**Turn Summary:**\n{_sum}"
-                field_text_fn = getattr(_pvp_panel, "_field_conditions_text", None)
-                if callable(field_text_fn):
-                    try:
-                        field_text = field_text_fn(getattr(st, "field", None))
-                        if field_text:
-                            desc += f"\n{field_text}"
-                    except Exception:
-                        pass
-                emb = discord.Embed(
-                    title=f"📺 Battle Stream: **{p1}** vs **{p2}**",
-                    description=desc,
-                    color=discord.Color.purple(),
-                )
-
-                # Resolve a stream image file:
-                # - use supplied gif_file when provided,
-                # - otherwise render a fresh panel for this turn.
-                file_obj = None
-                gif_path_to_cleanup = None
-                try:
-                    if gif_file:
-                        if isinstance(gif_file, tuple) and len(gif_file) == 2:
-                            file_obj, gif_path_to_cleanup = gif_file
-                        elif isinstance(gif_file, discord.File):
-                            file_obj = gif_file
-                        elif isinstance(gif_file, (Path, str)):
-                            p = Path(gif_file)
-                            if p.exists():
-                                file_obj = discord.File(p, filename=p.name)
-                                gif_path_to_cleanup = p
-                    if file_obj is None:
-                        render_fn = getattr(_pvp_panel, "_render_gif_for_panel", None)
-                        if callable(render_fn):
-                            render_result = await render_fn(st, st.p1_id, hide_hp_text=True)
-                            if isinstance(render_result, tuple) and len(render_result) == 2:
-                                file_obj, gif_path_to_cleanup = render_result
-                            elif isinstance(render_result, discord.File):
-                                file_obj = render_result
-                    if file_obj is None:
-                        static_fn = getattr(_pvp_panel, "_fallback_static_panel_file", None)
-                        if callable(static_fn):
-                            file_obj = static_fn(st, st.p1_id, hide_hp_text=True, filename_prefix="stream-panel")
-                except Exception as e:
-                    print(f"[StreamPatch] stream render fallback failed: {e}")
-
-                msg = None
-                try:
-                    if file_obj is not None:
-                        try:
-                            emb.set_image(url=f"attachment://{file_obj.filename}")
-                        except Exception:
-                            pass
-                        try:
-                            # Preferred: embed + image
-                            msg = await stream_channel.send(embed=emb, file=file_obj)
-                        except Exception as e:
-                            print(f"[StreamPatch] embed+file send failed: {e}")
-                            # Fallback: text + image attachment (works even if embed path breaks)
-                            plain_text = f"📺 Battle Stream: {p1} vs {p2}\n{desc}"
-                            if len(plain_text) > 1800:
-                                plain_text = plain_text[:1800] + "…"
-                            msg = await stream_channel.send(content=plain_text, file=file_obj)
-                    else:
-                        # No image available; still send the embed summary
-                        msg = await stream_channel.send(embed=emb)
-                except Exception as e:
-                    print(f"[StreamPatch] stream embed/image send failed: {e}")
-                    try:
-                        txt = f"📺 Stream update • Turn {getattr(st, 'turn', '?')} • {getattr(st, 'fmt_label', 'Battle')}"
-                        if summary_text:
-                            _sum = summary_text
-                            if len(_sum) > 1500:
-                                _sum = "...\n" + _sum[-1300:]
-                            txt += f"\n{_sum}"
-                        msg = await stream_channel.send(txt)
-                    except Exception as e2:
-                        print(f"[StreamPatch] stream text fallback failed: {e2}")
-                        msg = None
-                finally:
-                    if file_obj is not None:
-                        try:
-                            file_obj.close()
-                        except Exception:
-                            pass
-                    if gif_path_to_cleanup is not None:
-                        try:
-                            if Path(gif_path_to_cleanup).exists():
-                                Path(gif_path_to_cleanup).unlink(missing_ok=True)
-                        except Exception:
-                            pass
-
-                if msg is not None:
-                    if stream_key is not None:
-                        st._stream_last_sent_key = stream_key
-                    st._last_stream_message = msg
-                return msg
-
-            _wrapped_send_stream_panel._dex_stream_patch = True  # type: ignore[attr-defined]
-            _pvp_panel._send_stream_panel = _wrapped_send_stream_panel
-
-        original_turn_loop = getattr(_pvp_panel, "_turn_loop", None)
-        if callable(original_turn_loop) and not getattr(original_turn_loop, "_dex_stream_patch", False):
-
-            async def _wrapped_turn_loop(st, p1_itx, p2_itx, *args, **kwargs):
-                try:
-                    st._p1_itx = p1_itx
-                    st._p2_itx = p2_itx
-                    if getattr(st, "stream_channel", None) is None:
-                        ch = getattr(p1_itx, "channel", None) or getattr(p2_itx, "channel", None)
-                        if ch is not None and hasattr(ch, "send"):
-                            st.stream_channel = ch
-                            st.stream_channel_id = getattr(ch, "id", None)
-
-                    # Do not emit an image-only kickoff post; stream updates should
-                    # mirror turn summaries (text + image together).
-                    if bool(getattr(st, "streaming_enabled", False)) and not bool(getattr(st, "_stream_started", False)):
-                        st._stream_started = True
-                except Exception:
-                    pass
-                return await original_turn_loop(st, p1_itx, p2_itx, *args, **kwargs)
-
-            _wrapped_turn_loop._dex_stream_patch = True  # type: ignore[attr-defined]
-            _pvp_panel._turn_loop = _wrapped_turn_loop
-
-        original_send_player_panel = getattr(_pvp_panel, "_send_player_panel", None)
-        if callable(original_send_player_panel) and not getattr(original_send_player_panel, "_dex_stream_patch", False):
-
-            async def _wrapped_send_player_panel(itx, st, for_user_id, view, gif_file=None, extra_lines=None):
-                result = await original_send_player_panel(itx, st, for_user_id, view, gif_file, extra_lines)
-                try:
-                    if bool(getattr(st, "streaming_enabled", False)) and int(for_user_id) == int(getattr(st, "p1_id", -1)):
-                        ch = getattr(st, "stream_channel", None) or getattr(itx, "channel", None)
-                        if ch is not None and hasattr(ch, "send"):
-                            st.stream_channel = ch
-                            st.stream_channel_id = getattr(ch, "id", None)
-                            summary_lines = list(getattr(st, "_last_turn_log", []) or [])
-                            summary_lines = [str(line).strip() for line in summary_lines if str(line).strip()]
-                            if not summary_lines:
-                                return result
-                            summary_text = "\n".join(summary_lines).strip()
-                            send_fn = getattr(_pvp_panel, "_send_stream_panel", None)
-                            if callable(send_fn):
-                                # Let stream panel render its own public-safe image.
-                                await send_fn(ch, st, summary_text, None)
-                except Exception as e:
-                    print(f"[StreamPatch] _send_player_panel stream mirror failed: {e}")
-                return result
-
-            _wrapped_send_player_panel._dex_stream_patch = True  # type: ignore[attr-defined]
-            _pvp_panel._send_player_panel = _wrapped_send_player_panel
-
-        accept_view_cls = getattr(_pvp_panel, "AcceptView", None)
-        if accept_view_cls is not None:
-            original_start_if_ready = getattr(accept_view_cls, "_start_if_ready", None)
-            if callable(original_start_if_ready) and not getattr(original_start_if_ready, "_dex_stream_patch", False):
-
-                async def _wrapped_start_if_ready(self, itx):
-                    result = await original_start_if_ready(self, itx)
-                    return result
-
-                _wrapped_start_if_ready._dex_stream_patch = True  # type: ignore[attr-defined]
-                accept_view_cls._start_if_ready = _wrapped_start_if_ready
-    except Exception:
-        pass
+    """No-op: streaming is handled by pvp/panel.py."""
+    pass
 
 
 _patch_pvp_streaming_reliability()
@@ -722,6 +489,14 @@ from bot_core.tera_helpers import (
     normalize_type_id as _normalize_type_id,
     extract_species_types as _extract_species_types,
     roll_default_tera_type as _roll_default_tera_type,
+)
+from bot_core.ball_helpers import (
+    normalize_ball_item_id as _normalize_ball_item_id,
+    is_friend_ball as _is_friend_ball,
+    is_heal_ball as _is_heal_ball,
+    is_luxury_ball as _is_luxury_ball,
+    caught_friendship_for_ball as _caught_friendship_for_ball,
+    friendship_delta_with_ball_bonus as _friendship_delta_with_ball_bonus,
 )
 
 # =========================
@@ -4678,70 +4453,6 @@ async def _get_base_friendship(species_name: str) -> int:
             pass
 
 
-def _normalize_ball_item_id(ball_name: Optional[str]) -> str:
-    """Normalize a Poké Ball identifier to canonical item_id style (snake_case)."""
-    raw = str(ball_name or "").strip().lower()
-    if not raw:
-        return "poke_ball"
-    norm = re.sub(r"[\s\-]+", "_", raw)
-    norm = re.sub(r"[^a-z0-9_]", "", norm)
-    aliases = {
-        "pokeball": "poke_ball",
-        "pok_ball": "poke_ball",
-        "poke_ball": "poke_ball",
-        "greatball": "great_ball",
-        "ultraball": "ultra_ball",
-        "masterball": "master_ball",
-        "safariball": "safari_ball",
-        "repeatball": "repeat_ball",
-        "timerball": "timer_ball",
-        "quickball": "quick_ball",
-        "duskball": "dusk_ball",
-        "netball": "net_ball",
-        "nestball": "nest_ball",
-        "heavyball": "heavy_ball",
-        "loveball": "love_ball",
-        "levelball": "level_ball",
-        "lureball": "lure_ball",
-        "moonball": "moon_ball",
-        "fastball": "fast_ball",
-        "friendball": "friend_ball",
-        "friendshipball": "friend_ball",
-        "friendship_ball": "friend_ball",
-        "healball": "heal_ball",
-        "luxuryball": "luxury_ball",
-        "premierball": "premier_ball",
-        "beastball": "beast_ball",
-        "diveball": "dive_ball",
-        "cherishball": "cherish_ball",
-        "sportball": "sport_ball",
-        "dreamball": "dream_ball",
-        "parkball": "park_ball",
-    }
-    return aliases.get(norm, norm)
-
-
-def _is_friend_ball(ball_item_id: Optional[str]) -> bool:
-    return _normalize_ball_item_id(ball_item_id) == "friend_ball"
-
-
-def _is_heal_ball(ball_item_id: Optional[str]) -> bool:
-    return _normalize_ball_item_id(ball_item_id) == "heal_ball"
-
-
-def _is_luxury_ball(ball_item_id: Optional[str]) -> bool:
-    return _normalize_ball_item_id(ball_item_id) == "luxury_ball"
-
-
-def _caught_friendship_for_ball(base_friendship: int, ball_item_id: Optional[str]) -> int:
-    """Apply on-catch friendship behavior from the catch ball."""
-    value = max(0, min(255, int(base_friendship or 0)))
-    if _is_friend_ball(ball_item_id):
-        # Friend Ball starts at 200 friendship.
-        value = max(value, 200)
-    return value
-
-
 def _caught_hp_for_ball(mon: "Mon", hp_max: int, ball_item_id: Optional[str]) -> int:
     """Apply on-catch HP behavior from the catch ball."""
     if _is_heal_ball(ball_item_id):
@@ -4778,14 +4489,6 @@ async def _get_pokemon_ball(owner_id: str, mon_id: int) -> Optional[str]:
             await conn.close()
         except Exception:
             pass
-
-
-def _friendship_delta_with_ball_bonus(delta: int, ball_item_id: Optional[str]) -> int:
-    """Luxury Ball gives +1 friendship on positive friendship gains."""
-    d = int(delta or 0)
-    if d > 0 and _is_luxury_ball(ball_item_id):
-        return d + 1
-    return d
 
 
 async def _set_friendship(owner_id: str, mon_id: int, value: int) -> None:
@@ -5598,7 +5301,9 @@ class AdminGivePokemon(commands.Cog):
 
         emb.add_field(name="IVs", value=self._fmt6(payload.get("ivs")), inline=False)
         emb.add_field(name="EVs", value=self._fmt6(payload.get("evs")), inline=False)
-        emb.add_field(name="Friendship", value=str(payload.get("friendship", "—")), inline=True)
+        fr_raw = payload.get("friendship", "—")
+        fr_pct = f"{round(100 * int(fr_raw) / 255)}%" if isinstance(fr_raw, (int, float)) and fr_raw != "—" else str(fr_raw)
+        emb.add_field(name="Friendship", value=fr_pct, inline=True)
 
         footer = f"Gen {payload.get('gen')} legality: {'✅' if not notes else '⚠️ ' + '; '.join(notes)}"
         if payload.get("gender_note"):
@@ -12588,6 +12293,49 @@ async def _award_exp_to_party(st: "BattleState", winner_id: int, defeated: list[
                     )
             except Exception:
                 pass
+
+        # Route/adventure battle friendship (canonical: +1 wild, +2 trainer per participant)
+        battle_mode = str(getattr(st, "battle_mode", "") or "").lower()
+        if battle_mode in ("route", "adventure") and st.winner == winner_id and exp_summary:
+            trainer_foe = not (str(st.p2_name or "").lower().startswith("wild "))
+            base_delta = 2 if trainer_foe else 1
+            owner_id = str(winner_id)
+            for mon, _exp_gain, _old_lvl, _new_lvl in exp_summary:
+                mid = getattr(mon, "_db_id", None)
+                if not mid:
+                    continue
+                ball_item_id = None
+                try:
+                    cur_b = await conn.execute(
+                        "SELECT pokeball FROM pokemons WHERE owner_id=? AND id=? LIMIT 1",
+                        (owner_id, mid),
+                    )
+                    row_b = await cur_b.fetchone()
+                    await cur_b.close()
+                    if row_b:
+                        ball_item_id = row_b.get("pokeball") if hasattr(row_b, "get") else (row_b[0] if row_b else None)
+                except Exception:
+                    pass
+                delta = _friendship_delta_with_ball_bonus(base_delta, ball_item_id)
+                if delta > 0:
+                    try:
+                        cur_f = await conn.execute(
+                            "SELECT friendship FROM pokemons WHERE owner_id=? AND id=? LIMIT 1",
+                            (owner_id, mid),
+                        )
+                        row_f = await cur_f.fetchone()
+                        await cur_f.close()
+                        cur_val = row_f.get("friendship") if row_f and hasattr(row_f, "get") else (row_f[0] if row_f else 50)
+                        if cur_val is None:
+                            cur_val = 50
+                        new_val = max(0, min(255, int(cur_val) + delta))
+                        await conn.execute(
+                            "UPDATE pokemons SET friendship=? WHERE owner_id=? AND id=?",
+                            (new_val, owner_id, mid),
+                        )
+                    except Exception:
+                        pass
+
         await conn.commit()
         db.invalidate_pokemons_cache(str(winner_id))
         try:
@@ -18037,7 +17785,7 @@ class MPokeInfo(commands.Cog):
         )
 
         fr_val = max(0, min(255, int(friendship_value or 0)))
-        fr_text = str(fr_val)
+        fr_text = f"{round(100 * fr_val / 255)}%"
         fr_font = self._mpokeinfo_fit_font(
             draw_probe,
             fr_text,
@@ -19479,7 +19227,7 @@ class MPokeInfo(commands.Cog):
         except Exception:
             fr = 0
         fr = max(0, min(255, fr))
-        friendship_text = f"{fr}/255"
+        friendship_text = f"{round(100 * fr / 255)}%"
 
         team_slot = mon.get("team_slot")
         team_text = f"Slot {team_slot}" if team_slot else "—"
@@ -22513,7 +22261,8 @@ class TeamPanelView(discord.ui.View):
         emb.add_field(name="Nature", value=str(row.get("nature") or "Unknown").replace("-", " ").title(), inline=True)
         ability = str(row.get("ability") or "Unknown").replace("-", " ").title()
         emb.add_field(name="Ability", value=ability, inline=True)
-        emb.add_field(name="Friendship", value=str(int(row.get("friendship") or 0)), inline=True)
+        fr_val = int(row.get("friendship") or 0)
+        emb.add_field(name="Friendship", value=f"{round(100 * fr_val / 255)}%", inline=True)
         emb.add_field(name="Lock", value=("🔒 Locked" if bool(row.get("is_locked")) else "—"), inline=True)
         held_item = str(row.get("held_item") or "").strip()
         item_emoji = (row.get("item_emoji") or "").strip()
@@ -24231,7 +23980,8 @@ async def _box_mon_info_payload(owner_id: str, box_no: int, box_pos: int) -> tup
     emb.add_field(name="Gender", value=str(d.get("gender") or "Unknown").title(), inline=True)
     emb.add_field(name="Nature", value=str(d.get("nature") or "Hardy").title(), inline=True)
     emb.add_field(name="Ability", value=str(d.get("ability") or "Unknown").replace("-", " ").title(), inline=True)
-    emb.add_field(name="Friendship", value=str(int(d.get("friendship") or 0)), inline=True)
+    fr_val = int(d.get("friendship") or 0)
+    emb.add_field(name="Friendship", value=f"{round(100 * fr_val / 255)}%", inline=True)
     emb.add_field(name="Lock", value=("🔒 Locked" if is_locked else "—"), inline=True)
     held = str(d.get("held_item") or "").strip()
     emb.add_field(name="Held Item", value=(pretty_item_name(held) if held else "None"), inline=True)
