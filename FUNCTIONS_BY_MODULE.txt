@@ -329,6 +329,26 @@ invalidate_bag                            Invalidate bag cache
 
 
 ================================================================================
+MODULE: lib/pokemon_utils.py
+================================================================================
+normalize_base_stats              Convert stats to long-form keys
+normalize_stats_for_generator    Alias for normalize_base_stats
+parse_abilities                  Parse abilities to (regular, hidden)
+normalize_ivs_evs                Normalize IVs/EVs to short-key dict
+roll_gender_from_ratio           Roll gender from ratio dict
+species_uses_starter_gender_ratio Check starter 87.5/12.5 ratio
+gender_ratio_from_entry          Get gender ratio from pokedex entry
+
+
+================================================================================
+MODULE: lib/exp_helpers.py
+================================================================================
+normalize_growth_rate_to_exp_group  Map growth_rate to exp_group
+get_exp_group_for_species          Get exp_group from pokedex
+get_exp_total_for_level            Get exp_total from exp_requirements
+
+
+================================================================================
 MODULE: lib/stats.py
 ================================================================================
 pick_random_nature                        Pick random nature

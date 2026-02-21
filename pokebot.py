@@ -77,6 +77,19 @@ from lib.rules import rules_for
 import lib.rules as _rules
 from lib import evolution_mechanics as evo_mech
 from lib import breeding_mechanics as breeding_mech
+from lib.pokemon_utils import (
+    STAT_KEYS_SHORT as _STAT_KEYS_SHORT,
+    normalize_base_stats as _normalize_stats_for_generator,
+    parse_abilities,
+    normalize_ivs_evs as _normalize_ivs_evs,
+    roll_gender_from_ratio as _roll_gender_from_ratio,
+    gender_ratio_from_entry as _gender_ratio_from_entry,
+)
+from lib.exp_helpers import (
+    get_exp_group_for_species as _get_exp_group_for_species,
+    get_exp_total_for_level as _get_exp_total_for_level,
+    normalize_growth_rate_to_exp_group as _normalize_growth_rate_to_exp_group,
+)
 import pvp.sprites as _pvp_sprites
 from features.route_loot import (
     GEN1_TMS,
@@ -3853,19 +3866,6 @@ async def render_label_global(bot: commands.Bot, preferred_guild: discord.Guild 
     label = _titleize(name_from_db or str(key or ""))
     emoji = await get_emoji_global(bot, preferred_guild, key, name_from_db=name_from_db, emoji_hint=emoji_hint)
     return f"{emoji} {label}" if emoji else label
-def _roll_gender_from_ratio(gender_ratio: dict) -> str:
-    """Return 'male' | 'female' | 'genderless' based on the Pokédex ratio."""
-    if not isinstance(gender_ratio, dict):
-        return "male"
-    if gender_ratio.get("genderless"):
-        return "genderless"
-    m = float(gender_ratio.get("male", 0) or 0.0)
-    f = float(gender_ratio.get("female", 0) or 0.0)
-    total = m + f
-    if total <= 0:
-        return "male"
-    return "male" if (random.random() * total) < m else "female"
-
 async def _get_base_friendship(species_name: str) -> int:
     """Read base friendship from pokedex; fallback to base_happiness → 50."""
     species_key = str(species_name or "").strip().lower()
@@ -4042,58 +4042,6 @@ async def shiny_roll(default_denominator: int = 4096) -> bool:
     we read N to match the DB odds; otherwise default to 1/4096 (or override here).
     """
     return random.randrange(max(1, int(default_denominator))) == 0
-
-
-def normalize_base_stats(src: dict | None) -> dict:
-    """
-    Accepts {'hp','atk','def','spa','spd','spe'} OR long keys and returns long keys
-    required by your generator: attack/defense/special_attack/special_defense/speed.
-    """
-    src = dict(src or {})
-    return {
-        "hp":              int(src.get("hp",                src.get("HP", 0))),
-        "attack":          int(src.get("attack",            src.get("atk", 0))),
-        "defense":         int(src.get("defense",           src.get("def", 0))),
-        "special_attack":  int(src.get("special_attack",    src.get("spa", 0))),
-        "special_defense": int(src.get("special_defense",   src.get("spd", 0))),
-        "speed":           int(src.get("speed",             src.get("spe", 0))),
-    }
-
-
-def parse_abilities(abilities_raw) -> tuple[list[str], list[str]]:
-    """
-    Normalizes ability data from your DB (strings, dicts, or JSON string) into:
-        (regular_ability_names, hidden_ability_names)
-    Accepts formats like:
-      - ["overgrow","chlorophyll"]
-      - [{"name":"overgrow"},{"name":"chlorophyll","is_hidden":true}]
-      - [{"ability":{"name":"overgrow"},"slot":1},{"ability":{"name":"chlorophyll"},"slot":3}]
-    """
-    # if JSON text, parse first
-    if isinstance(abilities_raw, str):
-        try:
-            abilities_raw = json.loads(abilities_raw)
-        except Exception:
-            abilities_raw = []
-    regs, hides = [], []
-    for a in (abilities_raw or []):
-        if isinstance(a, str):
-            regs.append(a)
-            continue
-        if isinstance(a, dict):
-            name = a.get("name") or (a.get("ability") or {}).get("name") or ""
-            is_hidden = bool(a.get("is_hidden") or a.get("hidden") or (a.get("slot") == 3))
-            if name:
-                (hides if is_hidden else regs).append(name)
-    # de-dup while preserving order
-    def _dedup(seq: list[str]) -> list[str]:
-        seen = set(); out = []
-        for s in seq:
-            k = s.lower()
-            if k not in seen:
-                seen.add(k); out.append(s)
-        return out
-    return _dedup(regs), _dedup(hides)
 
 
 def _norm_ability_id(value: Any) -> str:
@@ -9787,69 +9735,6 @@ def _wild_shiny_denominator() -> int:
         return 4096
 
 # Short stat keys used by build_mon (pvp/engine)
-_STAT_KEYS_SHORT = ("hp", "atk", "defn", "spa", "spd", "spe")
-
-def _normalize_ivs_evs(raw, default_val: int = 0) -> dict:
-    """Normalize IVs/EVs from team entry to short-key dict (hp, atk, defn, spa, spd, spe). No rolls."""
-    if not raw:
-        return {k: default_val for k in _STAT_KEYS_SHORT}
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw) if raw else {}
-            raw = parsed
-        except Exception:
-            raw = {}
-    if isinstance(raw, (list, tuple)) and len(raw) >= 6:
-        out = {k: default_val for k in _STAT_KEYS_SHORT}
-        for i, key in enumerate(_STAT_KEYS_SHORT):
-            try:
-                out[key] = int(float(raw[i]))
-            except Exception:
-                continue
-        return out
-    if isinstance(raw, dict):
-        long_to_short = {
-            "hp": "hp",
-            "attack": "atk", "atk": "atk",
-            "defense": "defn", "def": "defn", "defn": "defn",
-            "special_attack": "spa", "special_atk": "spa", "specialattack": "spa", "spa": "spa", "spatk": "spa", "sp_atk": "spa",
-            "special_defense": "spd", "special_def": "spd", "specialdefense": "spd", "spd": "spd", "spdef": "spd", "sp_def": "spd",
-            "speed": "spe", "spe": "spe",
-            "0": "hp", "1": "atk", "2": "defn", "3": "spa", "4": "spd", "5": "spe",
-        }
-        pref_aliases = {
-            "hp": ("ev_hp", "hp_ev", "iv_hp", "hp_iv"),
-            "atk": ("ev_atk", "atk_ev", "iv_atk", "atk_iv", "ev_attack", "attack_ev", "iv_attack", "attack_iv"),
-            "defn": ("ev_def", "def_ev", "iv_def", "def_iv", "ev_defense", "defense_ev", "iv_defense", "defense_iv", "ev_defn", "defn_ev", "iv_defn", "defn_iv"),
-            "spa": ("ev_spa", "spa_ev", "iv_spa", "spa_iv", "ev_sp_atk", "sp_atk_ev", "iv_sp_atk", "sp_atk_iv", "ev_special_attack", "special_attack_ev", "iv_special_attack", "special_attack_iv", "ev_special-attack", "special-attack_ev", "iv_special-attack", "special-attack_iv", "ev_spatk", "spatk_ev", "iv_spatk", "spatk_iv"),
-            "spd": ("ev_spd", "spd_ev", "iv_spd", "spd_iv", "ev_sp_def", "sp_def_ev", "iv_sp_def", "sp_def_iv", "ev_special_defense", "special_defense_ev", "iv_special_defense", "special_defense_iv", "ev_special-defense", "special-defense_ev", "iv_special-defense", "special-defense_iv", "ev_spdef", "spdef_ev", "iv_spdef", "spdef_iv"),
-            "spe": ("ev_spe", "spe_ev", "iv_spe", "spe_iv", "ev_speed", "speed_ev", "iv_speed", "speed_iv"),
-        }
-        out = {k: default_val for k in _STAT_KEYS_SHORT}
-        norm_raw: dict[str, Any] = {}
-        for key, val in raw.items():
-            k = str(key or "").lower().replace("-", "_").replace(" ", "_")
-            norm_raw[k] = val
-            short = long_to_short.get(k) or (k if k in _STAT_KEYS_SHORT else None)
-            if short is not None:
-                try:
-                    out[short] = int(float(val))
-                except (TypeError, ValueError):
-                    pass
-        for dest, keys in pref_aliases.items():
-            if out.get(dest, default_val) != default_val:
-                continue
-            for k in keys:
-                kn = str(k).lower().replace("-", "_").replace(" ", "_")
-                if kn in norm_raw and norm_raw.get(kn) not in (None, ""):
-                    try:
-                        out[dest] = int(float(norm_raw.get(kn)))
-                        break
-                    except Exception:
-                        continue
-        return out
-    return {k: default_val for k in _STAT_KEYS_SHORT}
-
 async def _build_mon_from_team_entry(team_entry: dict) -> Optional["Mon"]:
     """
     Build a trainer Mon from a fixed team entry. No rolls: uses species, level, moves, and
@@ -9956,51 +9841,6 @@ async def _build_mon_from_team_entry(team_entry: dict) -> Optional["Mon"]:
             "spe":  int(raw_stats.get("spe", 0)),
         }
     return build_mon(dto, set_level=level, heal=True)
-
-_STARTER_SPECIES_12P5_FEMALE: frozenset[str] = frozenset(
-    {
-        "bulbasaur", "charmander", "squirtle",
-        "chikorita", "cyndaquil", "totodile",
-        "treecko", "torchic", "mudkip",
-        "turtwig", "chimchar", "piplup",
-        "snivy", "tepig", "oshawott",
-        "chespin", "fennekin", "froakie",
-        "rowlet", "litten", "popplio",
-        "grookey", "scorbunny", "sobble",
-        "sprigatito", "fuecoco", "quaxly",
-        "pikachu", "eevee",
-    }
-)
-
-
-def _species_uses_starter_gender_ratio(species_name: Any) -> bool:
-    key = str(species_name or "").strip().lower().replace("_", "-").replace(" ", "-")
-    return key in _STARTER_SPECIES_12P5_FEMALE
-
-
-def _gender_ratio_from_entry(entry: dict, *, species_hint: Optional[str] = None) -> dict:
-    """Get gender ratio from DB/cache entry (gender_ratio or gender_rate) with starter fallback."""
-    gender_ratio = _j(entry.get("gender_ratio"), None) if entry else None
-    if not gender_ratio or not isinstance(gender_ratio, dict):
-        gr = entry.get("gender_rate") if entry else None
-        if isinstance(gr, str):
-            try:
-                gr = json.loads(gr)
-            except Exception:
-                gr = None
-        if isinstance(gr, (int, float)):
-            if int(gr) == -1:
-                gender_ratio = {"genderless": True}
-            else:
-                female = float(gr) * 12.5
-                gender_ratio = {"male": 100.0 - female, "female": female}
-    if not gender_ratio or not isinstance(gender_ratio, dict):
-        gender_ratio = {"male": 50.0, "female": 50.0}
-    species_name = str(species_hint or (entry.get("name") if isinstance(entry, dict) else "") or "")
-    if _species_uses_starter_gender_ratio(species_name) and not bool(gender_ratio.get("genderless")):
-        return {"male": 87.5, "female": 12.5}
-    return gender_ratio
-
 
 async def _build_mon_from_species(
     species: str,
@@ -10284,61 +10124,6 @@ async def _save_party_state_from_battle(st: "BattleState", uid: int) -> None:
         db.invalidate_pokemons_cache(str(uid))
 
 # --- Experience helpers (Adventure/PvE) ---
-# Valid exp_group codes (must match exp_groups / exp_requirements in DB)
-_VALID_EXP_GROUPS = frozenset({"erratic", "fast", "medium_fast", "medium_slow", "slow", "fluctuating"})
-
-
-def _normalize_growth_rate_to_exp_group(growth_rate: str | None) -> str:
-    """Map pokedex.growth_rate (e.g. 'medium-fast', 'Medium Fast') to exp_group code (e.g. 'medium_fast')."""
-    if not growth_rate or not str(growth_rate).strip():
-        return "medium_fast"
-    s = str(growth_rate).strip().lower().replace(" ", "_").replace("-", "_")
-    return s if s in _VALID_EXP_GROUPS else "medium_fast"
-
-
-async def _get_exp_group_for_species(conn, species: str) -> str:
-    """Get exp_group for a species from pokedex.growth_rate; fallback 'medium_fast'."""
-    if not species or not str(species).strip():
-        return "medium_fast"
-    try:
-        cur = await conn.execute(
-            "SELECT growth_rate FROM pokedex WHERE LOWER(name) = LOWER(?) OR LOWER(REPLACE(name,' ','-')) = LOWER(?) LIMIT 1",
-            (str(species).strip(), str(species).strip().replace(" ", "-")),
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        if row and row.get("growth_rate") is not None:
-            return _normalize_growth_rate_to_exp_group(str(row["growth_rate"]))
-    except Exception:
-        pass
-    return "medium_fast"
-
-
-async def _get_exp_total_for_level(conn, exp_group: str, level: int) -> int:
-    """Return exp_total from exp_requirements for (exp_group, level). Returns 0 if not found."""
-    if db_cache is not None:
-        try:
-            rows = db_cache.get_cached_exp_requirements()
-            if rows:
-                key = exp_group.strip().lower().replace(" ", "_")
-                for r in rows:
-                    if str(r.get("group_code") or "").strip().lower().replace(" ", "_") == key and int(r.get("level") or 0) == level:
-                        v = r.get("exp_total")
-                        return int(v) if v is not None else 0
-        except Exception:
-            pass
-    try:
-        cur = await conn.execute(
-            "SELECT exp_total FROM exp_requirements WHERE group_code = ? AND level = ? LIMIT 1",
-            (exp_group.strip().lower().replace(" ", "_"), level),
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        return int(row["exp_total"]) if row and row.get("exp_total") is not None else 0
-    except Exception:
-        return 0
-
-
 async def _calc_level_from_exp(exp_group: str, exp_val: int) -> int:
     """Return highest level where exp_total <= exp_val for a given exp_group."""
     if db_cache is not None:
