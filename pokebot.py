@@ -22644,16 +22644,59 @@ def _parse_box_csv_slots(raw: str) -> list[int]:
 
 
 async def _box_swap_many(owner_id: str, box_no: int, team_slots: list[int], box_positions: list[int]) -> tuple[bool, str]:
-    if not team_slots or not box_positions:
-        return False, "Enter at least one team slot and one box slot."
-    if len(team_slots) != len(box_positions):
-        return False, "Team slot list and box slot list must have the same number of entries."
+    """Swap/deposit/withdraw mons. Supports:
+    - Team slots only: deposit each to first free box slot
+    - Box positions only: withdraw each to first free team slot
+    - Both: paired swaps (and any remainder as deposit/withdraw)
+    Team limit 6; box capacity respected."""
+    if not team_slots and not box_positions:
+        return False, "Enter at least one team slot or one box slot."
     lines: list[str] = []
     any_ok = False
+    # Paired swaps
     for idx, (ts, bp) in enumerate(zip(team_slots, box_positions), start=1):
         ok, msg = await _box_swap_positions(owner_id, int(box_no), int(ts), int(bp))
         any_ok = any_ok or ok
         lines.append(f"{'✅' if ok else '❌'} Pair {idx} (Team {ts} ↔ Box {bp}): {msg}")
+    # Extra team slots: deposit to first free box slots
+    if len(team_slots) > len(box_positions):
+        extra_team = team_slots[len(box_positions):]
+        _, box_cap = await _box_get_box_count_and_capacity(owner_id)
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT box_pos FROM pokemons WHERE owner_id=? AND team_slot IS NULL AND box_no=?",
+                (owner_id, int(box_no)),
+            )
+            used_box = {int(r["box_pos"] or 0) for r in await cur.fetchall()}
+            await cur.close()
+        free_box_positions = [p for p in range(1, box_cap + 1) if p not in used_box][: len(extra_team)]
+        for i, ts in enumerate(extra_team):
+            if i < len(free_box_positions):
+                bp = free_box_positions[i]
+                ok, msg = await _box_swap_positions(owner_id, int(box_no), int(ts), int(bp))
+                any_ok = any_ok or ok
+                lines.append(f"{'✅' if ok else '❌'} Deposit Team {ts} → Box {bp}: {msg}")
+            else:
+                lines.append(f"❌ Team {ts}: No free box slot.")
+    # Extra box positions: withdraw to first free team slots
+    if len(box_positions) > len(team_slots):
+        extra_box = box_positions[len(team_slots):]
+        async with db.session() as conn:
+            cur = await conn.execute(
+                "SELECT team_slot FROM pokemons WHERE owner_id=? AND team_slot IS NOT NULL",
+                (owner_id,),
+            )
+            used_team = {int(r["team_slot"] or 0) for r in await cur.fetchall()}
+            await cur.close()
+        free_team_slots = [s for s in range(1, 7) if s not in used_team][: len(extra_box)]
+        for i, bp in enumerate(extra_box):
+            if i < len(free_team_slots):
+                ts = free_team_slots[i]
+                ok, msg = await _box_swap_positions(owner_id, int(box_no), int(ts), int(bp))
+                any_ok = any_ok or ok
+                lines.append(f"{'✅' if ok else '❌'} Withdraw Box {bp} → Team {ts}: {msg}")
+            else:
+                lines.append(f"❌ Box {bp}: Team is full (max 6).")
     return any_ok, "\n".join(lines)
 
 
@@ -22681,8 +22724,8 @@ async def _box_release_many(owner_id: str, box_no: int, positions: list[int]) ->
 
 
 class BoxSwapModal(ui.Modal, title="Box Swap (Team <-> Box)"):
-    team_slot = ui.TextInput(label="Team slot(s)", placeholder="e.g. 1,5,6", required=True, max_length=64)
-    box_pos = ui.TextInput(label="Box slot position(s)", placeholder="e.g. 12,4,17", required=True, max_length=128)
+    team_slot = ui.TextInput(label="Team slot(s)", placeholder="e.g. 1,5,6 (deposit to box)", required=False, max_length=64)
+    box_pos = ui.TextInput(label="Box slot position(s)", placeholder="e.g. 12,4,17 (withdraw to team)", required=False, max_length=128)
 
     def __init__(self, owner_id: str, box_no: int):
         super().__init__(timeout=120)
@@ -22694,8 +22737,8 @@ class BoxSwapModal(ui.Modal, title="Box Swap (Team <-> Box)"):
             return await interaction.response.send_message("this isn't for you", ephemeral=True)
         team_slots = _parse_box_csv_slots(str(self.team_slot.value))
         box_positions = _parse_box_csv_slots(str(self.box_pos.value))
-        if not team_slots or not box_positions:
-            return await interaction.response.send_message("Please enter valid team slot(s) and box slot(s).", ephemeral=True)
+        if not team_slots and not box_positions:
+            return await interaction.response.send_message("Please enter team slot(s) and/or box slot(s).", ephemeral=True)
         if any(not (1 <= int(ts) <= 6) for ts in team_slots):
             return await interaction.response.send_message("Each team slot must be between 1 and 6.", ephemeral=True)
         ok, msg = await _box_swap_many(self.owner_id, self.box_no, team_slots, box_positions)

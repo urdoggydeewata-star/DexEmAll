@@ -779,6 +779,20 @@ def _roll_missing_n0_moves() -> List[str]:
     # Return as a list of 4 moves
     return [physical, special, status, hazard]
 
+
+def _normalize_moves_for_pp(moves: Any) -> List[str]:
+    """Normalize move names to canonical form (lowercase, hyphens) so PP lookup matches everywhere."""
+    if not moves:
+        return ["Tackle"]
+    out: List[str] = []
+    for m in (moves if isinstance(moves, (list, tuple)) else [moves])[:4]:
+        s = str(m or "").strip().lower().replace(" ", "-").replace("_", "-")
+        if not s:
+            s = "tackle"
+        out.append(s)
+    return out[:4] or ["Tackle"]
+
+
 def build_mon(dto: Dict[str, Any], *, set_level: int = 100, heal: bool = True) -> Mon:
     """Convert DB row to battle Mon, forcing PvP level and (optionally) full heal."""
     nature_name = dto.get("nature") or ""
@@ -832,7 +846,7 @@ def build_mon(dto: Dict[str, Any], *, set_level: int = 100, heal: bool = True) -
         ivs=ivs, evs=evs, nature_name=nature_name, ability=dto.get("ability"),
         item=dto.get("item"), shiny=bool(dto.get("is_shiny")), gender=dto.get("gender"),
         status=status_from_dto, max_hp=max_hp, hp=hp_now, stats=stats,
-        moves=(dto.get("moves") or ["Tackle"])[:4] or ["Tackle"],
+        moves=_normalize_moves_for_pp(dto.get("moves") or ["Tackle"]),
         is_fully_evolved=bool(dto.get("is_fully_evolved", True)),  # For Eviolite
         weight_kg=float(dto.get("weight_kg", 100.0)),  # Weight for Low Kick/Grass Knot
         friendship=int(dto.get("friendship", 255)),  # Friendship for Return/Frustration
