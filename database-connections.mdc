@@ -1,0 +1,18 @@
+---
+description: Database connection pattern – always use context managers to avoid leaks
+globs: ["**/*.py"]
+---
+
+# Database connections
+
+**Pattern:** One acquire → one release. Every code path that gets a connection must release it (close or return to pool); use a context manager or `try/finally` so exceptions and early returns don’t skip the release.
+
+**Always use a context manager for database access.** Never open a connection without guaranteeing it is closed.
+
+- **Good:** `async with db.session() as conn:` then do all DB work inside the block. The connection is always released.
+- **Good:** `conn = await db.connect()` followed by `try: ... finally: await conn.close()` so the connection is closed on every path (including early returns and exceptions).
+- **Bad:** `conn = await db.connect()` ... (work) ... and only sometimes `await conn.close()` or only on the happy path. That leaks connections and will exhaust the pool.
+
+**PvP sync pool (`pvp/db_adapter`, `pvp/db_pool`):** Use `with get_connection() as conn:` when possible. If you use `conn = _open()`, you **must** return the connection with `_close_conn(conn)` in a `finally` block—**do not** use `conn.close()`, which closes the connection permanently and does not return it to the pool.
+
+When adding or modifying code that touches the database, follow the existing pattern in `lib/db.py`: every function that does `conn = await connect()` must use `try/finally` with `await conn.close()`, or use `async with db.session() as conn:`.
