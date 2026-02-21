@@ -320,6 +320,8 @@ async def init_schema() -> None:
                     await conn.execute("ALTER TABLE pokemons ADD COLUMN exp INTEGER NOT NULL DEFAULT 0")
                 if not await _column_exists(conn, "pokemons", "exp_group"):
                     await conn.execute("ALTER TABLE pokemons ADD COLUMN exp_group TEXT NOT NULL DEFAULT 'medium_fast'")
+                if not await _column_exists(conn, "pokemons", "status"):
+                    await conn.execute("ALTER TABLE pokemons ADD COLUMN status TEXT")
         except Exception:
             pass
         # ensure users.user_gender exists for Postgres too

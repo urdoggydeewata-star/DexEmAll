@@ -73,6 +73,7 @@ ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS moves_pp_max JSONB;
 ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS is_hidden_ability INTEGER;
 ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS exp INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS exp_group TEXT NOT NULL DEFAULT 'medium_fast';
+ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS status TEXT;
 
 -- Experience groups (Gen III+). exp_requirements seeded by ensure_exp_tables() in lib.db
 CREATE TABLE IF NOT EXISTS exp_groups (

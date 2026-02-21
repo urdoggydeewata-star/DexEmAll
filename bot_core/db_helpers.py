@@ -39,6 +39,7 @@ async def ensure_pg_pokemons_columns(conn: Any) -> None:
         await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS moves_pp_max JSONB")
         await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS shiny INTEGER NOT NULL DEFAULT 0")
         await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS is_hidden_ability INTEGER NOT NULL DEFAULT 0")
+        await conn.execute("ALTER TABLE pokemons ADD COLUMN IF NOT EXISTS status TEXT")
         _PG_POKEMONS_COLS_OK = True
     except Exception:
         pass

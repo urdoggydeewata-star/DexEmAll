@@ -10104,14 +10104,18 @@ async def _save_party_state_from_battle(st: "BattleState", uid: int) -> None:
                 except Exception:
                     left_i = int(stored_i)
                 moves_pp.append(max(int(min_i), min(int(left_i), int(cap_i))))
+            # Persist status (brn/par/psn/slp/frz/tox) for non-fainted mons; clear if fainted
+            status_val = getattr(mon, "status", None) if mon.hp > 0 else None
+            status_val = str(status_val).strip() if status_val else None
             try:
                 await conn.execute(
-                    "UPDATE pokemons SET hp_now=?, moves_pp=?, moves_pp_min=?, moves_pp_max=? WHERE id=?",
+                    "UPDATE pokemons SET hp_now=?, moves_pp=?, moves_pp_min=?, moves_pp_max=?, status=? WHERE id=?",
                     (
                         int(mon.hp),
                         json.dumps(moves_pp, ensure_ascii=False),
                         json.dumps(min_caps, ensure_ascii=False),
                         json.dumps(max_caps, ensure_ascii=False),
+                        status_val,
                         int(db_id),
                     ),
                 )
@@ -10122,6 +10126,11 @@ async def _save_party_state_from_battle(st: "BattleState", uid: int) -> None:
                 )
         await conn.commit()
         db.invalidate_pokemons_cache(str(uid))
+        if db_cache is not None:
+            try:
+                db_cache.clear_battle_party_cache()
+            except Exception:
+                pass
 
 # --- Experience helpers (Adventure/PvE) ---
 async def _calc_level_from_exp(exp_group: str, exp_val: int) -> int:
@@ -11349,11 +11358,25 @@ async def _heal_party(user_id: str) -> int:
                         int(row["id"]),
                     ),
                 )
+                try:
+                    await conn.execute(
+                        "UPDATE pokemons SET status=NULL WHERE owner_id=? AND id=?",
+                        (user_id, int(row["id"])),
+                    )
+                except Exception:
+                    pass
             except Exception:
                 await conn.execute(
                     "UPDATE pokemons SET hp=?, hp_now=?, moves_pp=? WHERE id=?",
                     (hp_max, hp_max, json.dumps(stored_max, ensure_ascii=False), int(row["id"])),
                 )
+                try:
+                    await conn.execute(
+                        "UPDATE pokemons SET status=NULL WHERE owner_id=? AND id=?",
+                        (user_id, int(row["id"])),
+                    )
+                except Exception:
+                    pass
             healed += 1
         await conn.commit()
         db.invalidate_pokemons_cache(user_id)
@@ -16224,6 +16247,7 @@ class MPokeInfo(commands.Cog):
             "use_back_sprite": int(bool(use_back_sprite)),
             "registered_theme": int(bool(is_registered)),
             "ot_name": str(getattr(interaction.user, "display_name", "") or ""),
+            "status": str(mon.get("status") or "").strip().lower() or None,
         }
         cache_raw = json.dumps(cache_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
         cache_key = hashlib.sha1(cache_raw.encode("utf-8")).hexdigest()
@@ -16488,6 +16512,23 @@ class MPokeInfo(commands.Cog):
                 font=gender_font,
                 fill=gfill,
                 shadow=theme_shadow,
+            )
+
+        # Status condition badge (brn/par/psn/tox/slp/frz) - persists from battle
+        status_raw = str(mon.get("status") or "").strip().lower()
+        if status_raw:
+            _STATUS_LABELS = {"brn": "BRN", "par": "PAR", "psn": "PSN", "tox": "TOX", "slp": "SLP", "frz": "FRZ"}
+            status_label = _STATUS_LABELS.get(status_raw, status_raw.upper()[:3])
+            status_font = self._mpokeinfo_font(max(7, int(round(9 * scale))), bold=True)
+            status_x, status_y = _pt(268, 14)
+            status_fill = (220, 80, 80, 255)  # reddish for status
+            self._mpokeinfo_draw_shadow_text(
+                draw,
+                (status_x, status_y),
+                status_label,
+                font=status_font,
+                fill=status_fill,
+                shadow=(80, 20, 20, 200),
             )
 
         type_tokens = [str(t or "").strip() for t in list(types or []) if str(t or "").strip()]
@@ -18294,14 +18335,22 @@ class MPokeInfo(commands.Cog):
             overview_lines.append(f"Can Gigantamax: {'Yes' if can_gmax else 'No'}")
 
         emb.add_field(name="Overview", value="\n".join(overview_lines)[:1024], inline=False)
+        status_raw = str(mon.get("status") or "").strip().lower()
+        status_display = ""
+        if status_raw:
+            _STATUS_NAMES = {"brn": "Burn", "par": "Paralysis", "psn": "Poison", "tox": "Badly Poisoned", "slp": "Sleep", "frz": "Freeze"}
+            status_display = _STATUS_NAMES.get(status_raw, status_raw.upper()) if status_raw else ""
+        vitals_parts = [
+            f"HP: **{hp_display}** {hp_bar} ({hp_pct}%)",
+            f"EXP to next: **{exp_next_text}**",
+            f"Friendship: **{friendship_text}**",
+            f"Total IVs: **{total_ivs}/186**",
+        ]
+        if status_display:
+            vitals_parts.insert(1, f"Status: **{status_display}** ⚠️")
         emb.add_field(
             name="Vitals",
-            value=(
-                f"HP: **{hp_display}** {hp_bar} ({hp_pct}%)\n"
-                f"EXP to next: **{exp_next_text}**\n"
-                f"Friendship: **{friendship_text}**\n"
-                f"Total IVs: **{total_ivs}/186**"
-            )[:1024],
+            value="\n".join(vitals_parts)[:1024],
             inline=False,
         )
         emb.add_field(name="Battle Stats", value=f"```{stats_line}```", inline=False)

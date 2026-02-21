@@ -822,11 +822,16 @@ def build_mon(dto: Dict[str, Any], *, set_level: int = 100, heal: bool = True) -
     hp_now = max_hp if heal else int(dto.get("hp_now", max_hp))
     hp_now = max(1, min(max_hp, hp_now))
 
+    # Restore status from DB (brn/par/psn/slp/frz/tox) - persists across battles until cured
+    status_from_dto = dto.get("status")
+    status_from_dto = status_from_dto.strip() if isinstance(status_from_dto, str) and status_from_dto else None
+    if heal:
+        status_from_dto = None  # Full heal clears status
     mon = Mon(
         species=dto["species"], level=level, types=dto["types"], base=base,
         ivs=ivs, evs=evs, nature_name=nature_name, ability=dto.get("ability"),
         item=dto.get("item"), shiny=bool(dto.get("is_shiny")), gender=dto.get("gender"),
-        status=None, max_hp=max_hp, hp=hp_now, stats=stats,
+        status=status_from_dto, max_hp=max_hp, hp=hp_now, stats=stats,
         moves=(dto.get("moves") or ["Tackle"])[:4] or ["Tackle"],
         is_fully_evolved=bool(dto.get("is_fully_evolved", True)),  # For Eviolite
         weight_kg=float(dto.get("weight_kg", 100.0)),  # Weight for Low Kick/Grass Knot

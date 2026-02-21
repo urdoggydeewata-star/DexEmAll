@@ -542,6 +542,10 @@ async def get_party_for_engine(user_id: int, *, save_to_battle_cache: bool = Fal
             except Exception:
                 pass
 
+            # Status: persisting brn/par/psn/slp/frz/tox from previous battle
+            status_val = row_dict.get("status")
+            status_val = status_val.strip() if isinstance(status_val, str) and status_val else None
+
             mon_data = {
                 "id": row["id"],
                 "owner_id": row["owner_id"],
@@ -572,6 +576,7 @@ async def get_party_for_engine(user_id: int, *, save_to_battle_cache: bool = Fal
                 "tera_type": row_dict.get("tera_type"),
                 "exp": row_dict.get("exp"),
                 "exp_group": (str(row_dict.get("exp_group") or "medium_fast")).strip().lower().replace(" ", "_"),
+                "status": status_val,  # brn/par/psn/slp/frz/tox from previous battle
             }
             mega_map: Dict[str, Dict[str, Any]] = {}
             try:
