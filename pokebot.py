@@ -38,6 +38,7 @@ from discord import app_commands, ui, Interaction, Embed
 
 from pvp.engine import build_mon
 from pvp.panel import _base_pp, _max_pp, _norm_pp_move_key
+from pvp.panel_capture import is_healing_item as _is_healing_item, heal_amount_for_item as _heal_amount_for_item
 import pvp.panel as _pvp_panel
 if TYPE_CHECKING:
     from pvp.engine import Mon
@@ -3537,11 +3538,69 @@ async def give_item(interaction: discord.Interaction, name: str, item: str, slot
                     ephemeral=True,
                 )
 
-        # Get current held item
-        cur = await conn.execute("SELECT held_item FROM pokemons WHERE owner_id=? AND id=?", (uid, mon_id))
+        # Get current held item and mon stats
+        cur = await conn.execute("SELECT held_item, hp, hp_now, moves, moves_pp, moves_pp_min, moves_pp_max FROM pokemons WHERE owner_id=? AND id=?", (uid, mon_id))
         hold_row = await cur.fetchone()
         await cur.close()
         current_held = (hold_row["held_item"] if hasattr(hold_row, "keys") else (hold_row[0] if hold_row else None)) or None
+
+        # Healing items: use on mon (restore HP, consume) instead of equipping
+        if give_is_consumable and _is_healing_item(give_id):
+            consumed = await _bag_adjust_conn(conn, uid, give_id, -1)
+            if not consumed:
+                return await interaction.followup.send(
+                    f"❌ No copies of {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** left in your bag.{ac_suffix}",
+                    ephemeral=True,
+                )
+            hp_max = max(1, int(hold_row.get("hp") or hold_row.get("hp_now") or 1))
+            hp_now = max(0, int(hold_row.get("hp_now") or hp_max))
+            heal_amt = _heal_amount_for_item(give_id)
+            new_hp = hp_max if heal_amt is None else min(hp_max, hp_now + heal_amt)
+            healed = new_hp - hp_now
+            updates = ["hp_now=?"]
+            params = [int(new_hp)]
+            if heal_amt is None and "full" in str(give_id).lower() and "restore" in str(give_id).lower():
+                updates.append("status=NULL")
+                moves_raw = hold_row.get("moves")
+                try:
+                    moves = json.loads(moves_raw) if moves_raw else []
+                except Exception:
+                    moves = []
+                if moves:
+                    user_gen = await _user_selected_gen(uid)
+                    base_pps = [_pp_move_base(str(m), user_gen) for m in moves[:4]]
+                    global_caps = [_pp_move_global_max(str(m), user_gen) for m in moves[:4]]
+                    stored_max_raw = hold_row.get("moves_pp_max")
+                    stored_max = _pp_parse_int_list(stored_max_raw, count=len(base_pps), defaults=base_pps, lo=1, hi=999)
+                    for i in range(len(stored_max)):
+                        stored_max[i] = max(base_pps[i], min(stored_max[i], global_caps[i]))
+                    updates.append("moves_pp=?")
+                    updates.append("moves_pp_min=?")
+                    updates.append("moves_pp_max=?")
+                    params.extend([json.dumps(stored_max, ensure_ascii=False), json.dumps([0] * len(stored_max), ensure_ascii=False), json.dumps(stored_max, ensure_ascii=False)])
+            params.extend([uid, mon_id])
+            try:
+                await conn.execute(
+                    f"UPDATE pokemons SET {', '.join(updates)} WHERE owner_id=? AND id=?",
+                    tuple(params),
+                )
+                await conn.commit()
+                db.invalidate_pokemons_cache(uid)
+                db.invalidate_bag_cache(uid)
+            except Exception:
+                try:
+                    await conn.rollback()
+                except Exception:
+                    pass
+                return await interaction.followup.send("❌ Failed to use healing item. Please try again.", ephemeral=True)
+            new_usage = await _stock_text(give_id, consumable=True)
+            pp_line = ""
+            if heal_amt is None and "full" in str(give_id).lower() and "restore" in str(give_id).lower():
+                pp_line = " PP was fully restored."
+            return await interaction.followup.send(
+                f"✅ Used {(give_emoji + ' ') if give_emoji else ''}**{give_disp}** on **{mon_name}** (+{healed} HP).{pp_line} (**{new_usage}** in bag).{ac_suffix}",
+                ephemeral=True,
+            )
 
         # Check if already holding the same item
         if current_held and _canonical_item_token(current_held) == _canonical_item_token(give_id):
@@ -6395,6 +6454,11 @@ async def _ensure_starter_mon_row(uid: str, species: str, mon: dict, entry: dict
             if col_flags.get("moves_pp"):
                 cols.append("moves_pp")
                 vals.append(json.dumps(pps, ensure_ascii=False))
+                if col_flags.get("moves_pp_min") and col_flags.get("moves_pp_max"):
+                    cols.append("moves_pp_min")
+                    cols.append("moves_pp_max")
+                    vals.append(json.dumps([0] * len(pps), ensure_ascii=False))
+                    vals.append(json.dumps(pps, ensure_ascii=False))
             if col_flags.get("shiny"):
                 cols.append("shiny")
                 vals.append(int(bool(mon.get("is_shiny"))))

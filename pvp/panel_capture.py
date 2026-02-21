@@ -18,6 +18,15 @@ _HEALING_ITEMS = {
     "moomoo milk": 100,
 }
 
+
+def is_healing_item(item_key: str) -> bool:
+    """Return True if item restores HP (for /give use-on-mon flow)."""
+    norm = _normalize_item(item_key)
+    if norm in _HEALING_ITEMS:
+        return True
+    compact = norm.replace(" ", "")
+    return any(k.replace(" ", "") == compact for k in _HEALING_ITEMS)
+
 _BALLS_BASIC = {
     "poke ball": 1.0,
     "poké ball": 1.0,

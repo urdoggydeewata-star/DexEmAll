@@ -4678,9 +4678,20 @@ class BattleState:
                     if mon:
                         mon_name = _format_pokemon_name(mon)
                         log.append(f"**{mon_name}** recovered HP using {item_used.title()} (+{healed} HP).")
-                        # Clear status if full restore was used
+                        # Full Restore: clear status and restore all move PP to max
                         if "full restore" in item_used:
                             mon.status = None
+                            self._ensure_pp_loaded(uid, mon)
+                            key = self._get_mon_key(uid, mon)
+                            if key not in self._pp:
+                                self._pp[key] = {}
+                            store = self._pp[key]
+                            for mv in (mon.moves or [])[:4]:
+                                if (mv or "").strip().lower() != "struggle":
+                                    cap = _pp_global_max_for_move(mv, generation=self.gen)
+                                    store[mv] = cap
+                                    store[_norm_pp_move_key(mv)] = cap
+                            log.append(f"**{mon_name}**'s moves had their PP fully restored!")
                     continue
                 if act.get("kind") == "throw":
                     # Only P1 throws at Wild opponent
