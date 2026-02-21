@@ -459,14 +459,20 @@ def apply_spite(user: Any, target: Any, battle_state: Any = None, field_effects:
             # Apply Spite to user instead
             user_last_move = getattr(user, 'last_move_used', None) or getattr(user, '_last_move', None)
             if user_last_move:
-                # Reduce user's PP instead
+                from .panel import _canonical_move_name
                 current_pp = battle_state._pp_left(user_id, user_last_move)
                 if current_pp > 0:
                     if generation >= 4:
                         reduction = min(4, current_pp)
                     else:
                         reduction = random.randint(2, 5) if generation == 2 else min(random.randint(2, 5), current_pp)
-                    battle_state._pp[user_id][user_last_move] = max(0, current_pp - reduction)
+                    canonical = _canonical_move_name(user_last_move)
+                    new_pp = max(0, current_pp - reduction)
+                    if hasattr(battle_state, "_get_mon_key"):
+                        key = battle_state._get_mon_key(user_id, user)
+                        battle_state._pp.setdefault(key, {})[canonical] = new_pp
+                    else:
+                        battle_state._pp.setdefault(user_id, {})[canonical] = new_pp
                     return f"{target.species}'s Magic Bounce reflected Spite back!\n{user.species}'s {user_last_move} lost {reduction} PP!"
             return f"{target.species}'s Magic Bounce reflected Spite back, but it failed!"
     
@@ -499,9 +505,16 @@ def apply_spite(user: Any, target: Any, battle_state: Any = None, field_effects:
         reduction = random.randint(2, 5)
         reduction = min(reduction, current_pp)
     
-    # Reduce PP
-    battle_state._pp[target_id][target_last_move] = max(0, current_pp - reduction)
-    
+    # Reduce PP; use canonical move name for consistent storage
+    from .panel import _canonical_move_name
+    canonical = _canonical_move_name(target_last_move)
+    new_pp = max(0, current_pp - reduction)
+    if hasattr(battle_state, "_get_mon_key"):
+        key = battle_state._get_mon_key(target_id, target)
+        battle_state._pp.setdefault(key, {})[canonical] = new_pp
+    else:
+        battle_state._pp.setdefault(target_id, {})[canonical] = new_pp
+
     # Generation-specific message format
     if generation == 2:
         return f"{target.species}'s {target_last_move} was reduced by {reduction}!"
@@ -1231,26 +1244,26 @@ def apply_mimic(target_last_move: Optional[str], user: Any, target: Any = None, 
     
     # Handle PP based on generation
     if battle_state and hasattr(battle_state, '_pp'):
-        user_id = getattr(user, '_player_id', None)
+        from .panel import _canonical_move_name
+        user_id = getattr(battle_state, 'p1_id', None) if user in getattr(battle_state, 'p1_team', []) else getattr(battle_state, 'p2_id', None)
+        if user_id is None:
+            user_id = getattr(user, '_player_id', None)
         if user_id:
-            # Ensure user_id exists in _pp dictionary
-            if user_id not in battle_state._pp:
-                battle_state._pp[user_id] = {}
-            
-            # Get Mimic's current PP (Gen I uses Mimic's PP)
-            mimic_pp = battle_state._pp.get(user_id, {}).get("Mimic", 0)
-            
-            if generation == 1:
-                # Gen I: Copied move uses Mimic's PP
-                battle_state._pp[user_id][target_last_move] = mimic_pp
-            elif generation <= 4:
-                # Gen II-IV: Copied move gets 5 PP
-                battle_state._pp[user_id][target_last_move] = 5
+            canonical_move = _canonical_move_name(target_last_move)
+            if hasattr(battle_state, "_get_mon_key"):
+                key = battle_state._get_mon_key(user_id, user)
+                store = battle_state._pp.setdefault(key, {})
             else:
-                # Gen V+: Copied move gets max PP
+                store = battle_state._pp.setdefault(user_id, {})
+            mimic_pp = store.get("Mimic", 0) or store.get(_canonical_move_name("Mimic"), 0)
+            if generation == 1:
+                store[canonical_move] = mimic_pp
+            elif generation <= 4:
+                store[canonical_move] = 5
+            else:
                 move_data = get_move(target_last_move)
                 max_pp = move_data.get("pp", 5) if move_data else 5
-                battle_state._pp[user_id][target_last_move] = max_pp
+                store[canonical_move] = max_pp
     
     return True, f"{user.species} learned {target_last_move}!"
 

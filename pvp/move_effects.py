@@ -3039,11 +3039,19 @@ def apply_secondary_effect(attacker: Any, defender: Any, move_name: str, move_hi
                         defender_id = battle_state.p2_id
                     
                     if defender_id:
+                        from .panel import _canonical_move_name
                         current_pp = battle_state._pp_left(defender_id, defender_last_move)
                         if current_pp > 0:
-                            # Reduce PP
                             reduction = min(reduction_amount, current_pp)
-                            battle_state._pp[defender_id][defender_last_move] = max(0, current_pp - reduction)
+                            canonical = _canonical_move_name(defender_last_move)
+                            new_pp = max(0, current_pp - reduction)
+                            if hasattr(battle_state, "_get_mon_key"):
+                                key = battle_state._get_mon_key(defender_id, defender)
+                                if key not in battle_state._pp:
+                                    battle_state._pp[key] = {}
+                                battle_state._pp[key][canonical] = new_pp
+                            else:
+                                battle_state._pp.setdefault(defender_id, {})[canonical] = new_pp
                             
                             # Generation-specific message format
                             move_name_lower = move_name.lower().replace(" ", "-")

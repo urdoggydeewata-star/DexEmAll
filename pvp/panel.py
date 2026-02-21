@@ -8129,6 +8129,9 @@ async def _load_pp_state_for_user(st: BattleState, uid: int) -> None:
                     max_caps[i] = max(base_caps[i], min(max_caps[i], global_caps[i]))
                     min_caps[i] = max(0, min(min_caps[i], max_caps[i]))
                     pps[i] = max(min_caps[i], min(pps[i], max_caps[i]))
+                    # When moves_pp_max equals base (no PP Up), clamp loaded PP to at most base
+                    if max_caps[i] <= base_caps[i]:
+                        pps[i] = min(pps[i], base_caps[i])
                 for mv, left_i in zip(moves, pps):
                     canonical = _canonical_move_name(mv)
                     store[canonical] = int(left_i)
@@ -8186,10 +8189,19 @@ async def _save_pp_state_for_user(st: BattleState, uid: int) -> None:
                     left = pp_store.get(_norm_pp_move_key(mv))
                 if left is None:
                     left = norm_pp_store.get(_norm_pp_move_key(mv))
+                if left is None:
+                    for raw_key, raw_val in (pp_store or {}).items():
+                        if _canonical_move_name(raw_key) == canonical:
+                            left = raw_val
+                            break
                 try:
                     left_i = int(left) if left is not None else int(stored_i)
                 except Exception:
                     left_i = int(stored_i)
+                # When max cap equals base (no PP Up), clamp to at most base
+                base_i = base_caps[i] if i < len(base_caps) else max(1, int(_base_pp(mv, generation=st.gen)))
+                if max_caps[i] <= base_i:
+                    left_i = min(left_i, base_i)
                 moves_pp.append(max(int(min_i), min(int(left_i), int(cap_i))))
             try:
                 await conn.execute(
