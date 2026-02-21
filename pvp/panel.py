@@ -7267,12 +7267,12 @@ def _ball_multiplier(ball_name: str, mon: Mon, battle_state: BattleState) -> flo
     elif b in ("sport ball",):
         base = 1.5 if gen >= 8 else 1.0
     elif b in ("great ball",):
-        base = 0.15
+        base = 1.5
     elif b in ("ultra ball",):
-        base = 0.2
+        base = 2.0
     elif b in ("master ball",):
         base = 9999.0
-    return max(base, 0.01)
+    return max(base, 0.1)
 
 def _attempt_capture(mon: Mon, ball_name: str, battle_state: BattleState) -> Tuple[bool, int]:
     """Return (caught, shakes). shakes counts successful shakes."""

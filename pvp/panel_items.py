@@ -16,13 +16,14 @@ _HEALING_ITEMS = {
     "moomoo milk": 100,
 }
 
+# Official game catch rate modifiers per Bulbapedia (Poke 1x, Great 1.5x, Ultra 2x, Master guaranteed)
 _BALLS_BASIC = {
-    "poke ball": 0.1,
-    "poké ball": 0.1,
-    "great ball": 0.15,
-    "ultra ball": 0.2,
+    "poke ball": 1.0,
+    "poké ball": 1.0,
+    "great ball": 1.5,
+    "ultra ball": 2.0,
     "master ball": 9999.0,
-    "safari ball": 0.15,
+    "safari ball": 1.5,
     "repeat ball": None,
     "timer ball": None,
     "quick ball": None,
@@ -35,16 +36,16 @@ _BALLS_BASIC = {
     "lure ball": None,
     "moon ball": None,
     "fast ball": None,
-    "friend ball": 0.1,
-    "heal ball": 0.1,
-    "luxury ball": 0.1,
-    "premier ball": 0.1,
+    "friend ball": 1.0,
+    "heal ball": 1.0,
+    "luxury ball": 1.0,
+    "premier ball": 1.0,
     "beast ball": None,
     "dive ball": None,
-    "cherish ball": 0.1,
-    "sport ball": 0.1,
+    "cherish ball": 1.0,
+    "sport ball": 1.0,
     "dream ball": None,
-    "park ball": 0.1,
+    "park ball": 1.0,
 }
 
 _ULTRA_BEAST_SPECIES = {
