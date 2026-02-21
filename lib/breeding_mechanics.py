@@ -625,6 +625,9 @@ async def create_egg(
     hatch_steps = random.uniform(float(hatch_min), float(hatch_max))
     child_ivs = pick_ivs_fn(parent_a, parent_b)
     child_nature = pick_nature_fn(parent_a, parent_b)
+    # Synchronize does not affect breeding; Ralts line bred eggs always get Serious nature
+    if norm_species(child_species) in {"ralts", "kirlia", "gardevoir", "gallade"}:
+        child_nature = "serious"
     child_ability, child_hidden = pick_ability_fn(parent_a, parent_b, child_entry, pair_info_data)
     child_ball = pick_ball_fn(parent_a, parent_b, pair_info_data)
     inherited_moves = await inherited_egg_moves_fn(parent_a, parent_b, child_species)
