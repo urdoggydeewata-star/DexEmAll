@@ -12569,6 +12569,9 @@ class AdventureCityView(discord.ui.View):
         await itx.response.defer(ephemeral=True, thinking=False)
         state = await _get_adventure_state(str(itx.user.id))
         _, next_id = itx.data["custom_id"].split("adv:next:", 1)
+        # Pallet Town Next must go to Route 1, not Route 2 (fix misrouting)
+        if state.get("area_id") == "pallet-town" and next_id != "route-1":
+            next_id = "route-1"
         _adv_history_push(state, state.get("area_id"))
         # Reset panel route navigation when entering so it always starts at Panel 1.
         if next_id in _get_panel_routes():
