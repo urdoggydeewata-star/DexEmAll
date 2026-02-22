@@ -12471,14 +12471,8 @@ class AdventureCityView(discord.ui.View):
                 )
                 sub_btn.callback = self._on_sub_area
                 self.add_item(sub_btn)
-        # Sub-areas (e.g. pallet-pokemon-center) use parent city for navigation (routes, next)
-        nav_city_id = self.area_id
-        nav_city = city
-        if city.get("parent_city"):
-            nav_city_id = str(city.get("parent_city", ""))
-            nav_city = ADVENTURE_CITIES.get(nav_city_id, {}) or city
-        cleared = _city_is_cleared(self.state, nav_city_id)
-        routes = nav_city.get("routes")
+        cleared = _city_is_cleared(self.state, self.area_id)
+        routes = city.get("routes")
         if routes and isinstance(routes, (list, tuple)):
             for route_id in routes:
                 if route_id == "route-22" and not ROUTE_22_ENABLED:
@@ -12489,10 +12483,8 @@ class AdventureCityView(discord.ui.View):
                 next_btn.callback = self._on_next
                 self.add_item(next_btn)
         else:
-            next_id = nav_city.get("next")
-            # Pallet Town (and start cities): always allow leaving to route-1; no rival required
-            allow_next = cleared or (nav_city_id == "pallet-town" and next_id == "route-1")
-            if next_id and allow_next:
+            next_id = city.get("next")
+            if next_id and cleared:
                 next_btn = discord.ui.Button(label="Next", style=discord.ButtonStyle.primary, custom_id=f"adv:next:{next_id}")
                 next_btn.callback = self._on_next
                 self.add_item(next_btn)
