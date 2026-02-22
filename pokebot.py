@@ -40,7 +40,7 @@ from discord.ext import commands
 from discord import app_commands, ui, Interaction, Embed
 
 from pvp.engine import build_mon
-from pvp.panel import _base_pp, _canonical_move_name, _max_pp, _norm_pp_move_key
+from pvp.panel import _base_pp, _canonical_move_name, _max_pp, _norm_pp_move_key, _pp_get_from_store, _pp_set_in_store
 from pvp.panel_capture import is_healing_item as _is_healing_item, heal_amount_for_item as _heal_amount_for_item
 import pvp.panel as _pvp_panel
 if TYPE_CHECKING:
@@ -10039,8 +10039,7 @@ async def _load_pp_from_db(st: "BattleState", uid: int) -> None:
                             if max_caps[i] <= base_caps[i]:
                                 pps[i] = min(pps[i], base_caps[i])
                         for m, left_i in zip(moves, pps):
-                            canonical = _canonical_move_name(str(m).strip())
-                            st._pp[key][canonical] = int(left_i)
+                            _pp_set_in_store(st._pp[key], str(m).strip(), int(left_i))
             break
         except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
             if attempt == 0:
@@ -10095,15 +10094,7 @@ async def _save_party_state_from_battle(st: "BattleState", uid: int) -> None:
                 cap_i = max_caps[i] if i < len(max_caps) else _pp_move_global_max(str(m), st.gen)
                 min_i = min_caps[i] if i < len(min_caps) else 0
                 stored_i = stored_pps[i] if i < len(stored_pps) else _pp_move_base(str(m), st.gen)
-                canonical = _canonical_move_name(m)
-                left = pp_store.get(canonical) or pp_store.get(m)
-                if left is None:
-                    left = norm_pp_store.get(_norm_pp_move_key(str(m)))
-                if left is None:
-                    for raw_key, raw_val in (pp_store or {}).items():
-                        if _canonical_move_name(raw_key) == canonical:
-                            left = raw_val
-                            break
+                left = _pp_get_from_store(pp_store or {}, m)
                 try:
                     left_i = int(left) if left is not None else int(stored_i)
                 except Exception:

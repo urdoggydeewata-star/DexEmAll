@@ -191,11 +191,17 @@ def get_available_moves(mon: Any, pp_store: Dict[str, int], z_move_mode: bool = 
     # Dynamax Pokemon are immune to these restrictions
     is_dynamaxed = getattr(mon, 'dynamaxed', False)
     
+    # PP lookup uses canonical move names for consistency
+    def _pp_for(move: str) -> int:
+        from .panel import _pp_get_from_store
+        v = _pp_get_from_store(pp_store, move)
+        return int(v) if v is not None else 0
+
     # Check Encore first (highest priority restriction)
     if mon.encored_move and mon.encore_turns > 0 and not is_dynamaxed:
         # Z-Moves bypass Encore
         if not z_move_mode:
-            if pp_store.get(mon.encored_move, 0) > 0:
+            if _pp_for(mon.encored_move) > 0:
                 return [mon.encored_move]
             mon.encored_move = None
             mon.encore_turns = 0
@@ -253,7 +259,7 @@ def get_available_moves(mon: Any, pp_store: Dict[str, int], z_move_mode: bool = 
             # For now, assume the restriction is applied elsewhere if imprisoning is active
         
         # Check PP
-        if pp_store.get(move, 0) > 0:
+        if _pp_for(move) > 0:
             available.append(move)
     
     # If no moves available, return Struggle
@@ -276,7 +282,7 @@ def get_available_moves(mon: Any, pp_store: Dict[str, int], z_move_mode: bool = 
                 # But we still need to check PP
                 z_available = []
                 for move in mon.moves:
-                    if pp_store.get(move, 0) > 0:
+                    if _pp_for(move) > 0:
                         z_available.append(move)
                 if z_available:
                     return z_available

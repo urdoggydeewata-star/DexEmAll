@@ -571,6 +571,34 @@ def _canonical_move_name(move_name: Any) -> str:
     return " ".join(s.split()).title()
 
 
+def _pp_get_from_store(store: Dict[str, int], move_name: Any) -> Optional[int]:
+    """Get PP value from store; resolves any key format to canonical. Returns None if not found."""
+    canonical = _canonical_move_name(move_name)
+    val = store.get(canonical)
+    if val is not None:
+        return int(val)
+    val = store.get(move_name)
+    if val is not None:
+        return int(val)
+    norm = _norm_pp_move_key(move_name)
+    val = store.get(norm)
+    if val is not None:
+        return int(val)
+    for raw_key, raw_val in store.items():
+        if _canonical_move_name(raw_key) == canonical:
+            return int(raw_val)
+    return None
+
+
+def _pp_set_in_store(store: Dict[str, int], move_name: Any, value: int) -> None:
+    """Set PP in store using ONLY canonical key. Removes any legacy keys for this move."""
+    canonical = _canonical_move_name(move_name)
+    to_remove = [k for k in store if k != canonical and _canonical_move_name(k) == canonical]
+    for k in to_remove:
+        del store[k]
+    store[canonical] = max(0, int(value))
+
+
 def _pp_global_max_for_move(move_name: str, generation: Optional[int] = None) -> int:
     try:
         return max(1, int(_max_pp(move_name, generation=generation)))
@@ -753,8 +781,9 @@ def _is_damaging_move(move_name: str) -> bool:
 
 
 def _record_last_move(mon: Mon, move_name: str, battle_state: Any = None) -> None:
-    """Track the last move name (and its base type) used by a Pokémon."""
-    mon.last_move_used = move_name
+    """Track the last move name (and its base type) used by a Pokémon.
+    Stored in canonical form for consistent PP lookups (Spite, Eerie Spell, etc.)."""
+    mon.last_move_used = _canonical_move_name(move_name)
     # Buffer move-usage counters for /register profiles; flush at battle end.
     try:
         if battle_state is not None:
@@ -1270,16 +1299,14 @@ class BattleState:
         is_transformed = getattr(mon, '_transformed', False) or getattr(mon, '_imposter_transformed', False)
         
         for m in moves:
-            canonical = _canonical_move_name(m)
-            if canonical not in store:
+            existing = _pp_get_from_store(store, m)
+            if existing is None:
                 if is_transformed:
-                    # Transformed Pokemon get 5 PP per move (or max if less than 5)
                     base_pp = _base_pp(m, generation=self.gen)
                     loaded_pp = min(5, base_pp) if base_pp < 5 else 5
                 else:
-                    # Normal Pokemon start with their base PP (database value). DB overrides (moves_pp) may replace this.
                     loaded_pp = _base_pp(m, generation=self.gen)
-                store[canonical] = loaded_pp
+                _pp_set_in_store(store, m, loaded_pp)
 
     def _pp_left(self, uid: int, move_name: str, mon: Optional[Mon] = None) -> int:
         """Get remaining PP for a move. If mon is None, uses active Pokemon."""
@@ -1290,16 +1317,7 @@ class BattleState:
         self._ensure_pp_loaded(uid, mon)
         key = self._get_mon_key(uid, mon)
         store = self._pp.get(key, {}) or {}
-        canonical = _canonical_move_name(move_name)
-        left = store.get(canonical) or store.get(move_name)
-        if left is None:
-            norm_name = _norm_pp_move_key(move_name)
-            left = store.get(norm_name)
-            if left is None:
-                for raw_key, raw_val in store.items():
-                    if _norm_pp_move_key(raw_key) == norm_name or _canonical_move_name(raw_key) == canonical:
-                        left = raw_val
-                        break
+        left = _pp_get_from_store(store, move_name)
         try:
             return int(left) if left is not None else int(_base_pp(move_name, generation=self.gen))
         except Exception:
@@ -1331,19 +1349,10 @@ class BattleState:
         if key not in self._pp:
             self._pp[key] = {}
         store = self._pp[key]
-        canonical = _canonical_move_name(move_name)
-        resolved_key = canonical if canonical in store else move_name if move_name in store else None
-        if resolved_key is None:
-            norm_name = _norm_pp_move_key(move_name)
-            resolved_key = norm_name if norm_name in store else canonical
-            for raw_key in store.keys():
-                if _norm_pp_move_key(raw_key) == norm_name or _canonical_move_name(raw_key) == canonical:
-                    resolved_key = raw_key
-                    break
-        left = store.get(resolved_key)
+        left = _pp_get_from_store(store, move_name)
         if left is None:
             left = _base_pp(move_name, generation=self.gen)
-        
+
         # Calculate PP cost (1 normally, 2+ if Pressure is active)
         pp_cost = 1
         
@@ -1428,11 +1437,9 @@ class BattleState:
             if pressure_count > 0:
                 pp_cost = 1 + pressure_count
         
-        # Spend PP (can't go below 0). Store under canonical form only.
+        # Spend PP (can't go below 0). Use canonical-only storage.
         new_left = max(0, int(left) - int(pp_cost))
-        store[canonical] = new_left
-        if resolved_key != canonical:
-            store[resolved_key] = new_left  # Update old key if we looked up via different format
+        _pp_set_in_store(store, move_name, new_left)
     
     def _initialize_max_pp(self) -> None:
         """Initialize all moves with max PP for PVP battles."""
@@ -1454,10 +1461,8 @@ class BattleState:
                             moves = ["Tackle"]
                     for move in moves:
                         move_str = str(move) if move else "Tackle"
-                        canonical = _canonical_move_name(move_str)
-                        # Use base PP as starting pool; it will be overridden by stored moves_pp if available.
                         start_pp = _base_pp(move_str, generation=self.gen)
-                        self._pp[key][canonical] = start_pp
+                        _pp_set_in_store(self._pp[key], move_str, start_pp)
     
     def _cache_all_moves(self) -> None:
         """Pre-cache all move data for all Pokémon in the battle. Uses db_cache when available, then DB."""
@@ -8133,8 +8138,7 @@ async def _load_pp_state_for_user(st: BattleState, uid: int) -> None:
                     if max_caps[i] <= base_caps[i]:
                         pps[i] = min(pps[i], base_caps[i])
                 for mv, left_i in zip(moves, pps):
-                    canonical = _canonical_move_name(mv)
-                    store[canonical] = int(left_i)
+                    _pp_set_in_store(store, mv, int(left_i))
 
 
 async def _save_pp_state_for_user(st: BattleState, uid: int) -> None:
@@ -8149,12 +8153,6 @@ async def _save_pp_state_for_user(st: BattleState, uid: int) -> None:
                 continue
             key = st._get_mon_key(uid, mon)
             pp_store = st._pp.get(key, {}) or {}
-            norm_pp_store: Dict[str, int] = {}
-            for raw_key, raw_val in pp_store.items():
-                try:
-                    norm_pp_store[_norm_pp_move_key(raw_key)] = int(raw_val)
-                except Exception:
-                    continue
             move_list = (mon.moves or [])[:4]
             row_d: Dict[str, Any] = {}
             try:
@@ -8183,17 +8181,7 @@ async def _save_pp_state_for_user(st: BattleState, uid: int) -> None:
                 cap_i = max_caps[i] if i < len(max_caps) else _pp_global_max_for_move(mv, generation=st.gen)
                 min_i = min_caps[i] if i < len(min_caps) else 0
                 stored_i = stored_pps[i] if i < len(stored_pps) else max(1, int(_base_pp(mv, generation=st.gen)))
-                canonical = _canonical_move_name(mv)
-                left = pp_store.get(canonical) or pp_store.get(mv)
-                if left is None:
-                    left = pp_store.get(_norm_pp_move_key(mv))
-                if left is None:
-                    left = norm_pp_store.get(_norm_pp_move_key(mv))
-                if left is None:
-                    for raw_key, raw_val in (pp_store or {}).items():
-                        if _canonical_move_name(raw_key) == canonical:
-                            left = raw_val
-                            break
+                left = _pp_get_from_store(pp_store, mv)
                 try:
                     left_i = int(left) if left is not None else int(stored_i)
                 except Exception:
