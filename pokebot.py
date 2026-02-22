@@ -12672,7 +12672,14 @@ class AdventureCityView(discord.ui.View):
             state = await _get_adventure_state(str(itx.user.id))
             if not isinstance(state.get("area_history"), list) or not state.get("area_history"):
                 return await itx.followup.send("No previous area.", ephemeral=False)
-            state["area_id"] = _adv_history_pop(state, "pallet-town")
+            popped = _adv_history_pop(state, "pallet-town")
+            # Viridian City Back must go to Route 1 panel 3 (from Pallet), not Viridian Forest/Route 2
+            if self.area_id == "viridian-city" and popped not in ("route-1",):
+                popped = "route-1"
+                rp = state.setdefault("route_panels", {})
+                rp["route-1"] = {"panel": 3, "pos": "end"}
+                state["route_panels"] = rp
+            state["area_id"] = popped
             await _save_adventure_state(str(itx.user.id), state)
             await _send_adventure_panel(itx, state, edit_original=True)
         finally:
